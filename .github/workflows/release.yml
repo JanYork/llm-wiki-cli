@@ -3,12 +3,8 @@ name: Build release artifacts
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
     tags:
       - "v*"
-    paths:
-      - ".github/workflows/release.yml"
 
 permissions:
   contents: read
@@ -122,3 +118,34 @@ jobs:
           name: lwc-checksums
           path: SHA256SUMS
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build
+      - checksums
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lwc-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "lwc ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            release-assets/*.tar.gz \
+            release-assets/*.zip \
+            release-assets/SHA256SUMS
