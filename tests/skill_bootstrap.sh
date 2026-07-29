@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-test_root="$(mktemp -d "${TMPDIR:-/tmp}/lwc-skill-bootstrap.XXXXXX")"
+test_root="$(mktemp -d "$repo_root/.skill-bootstrap-test.XXXXXX")"
 system_tmp_root=""
 skill_fixture="$test_root/using-lwc"
 cp -R "$repo_root/skills/using-lwc" "$skill_fixture"
