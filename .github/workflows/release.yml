@@ -1,0 +1,124 @@
+name: Build release artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    paths:
+      - ".github/workflows/release.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            archive: tar
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Test
+        run: cargo test --locked --release --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package Unix archive
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          archive="lwc-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${archive}"
+          cp "target/${{ matrix.target }}/release/lwc" "dist/${archive}/"
+          cp README.md README.zh-CN.md LICENSE "dist/${archive}/"
+          tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
+          cd dist
+          shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
+
+      - name: Package Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $version = (Select-String '^version = "([^"]+)"' Cargo.toml).Matches[0].Groups[1].Value
+          $archive = "lwc-$version-${{ matrix.target }}"
+          $stage = Join-Path dist $archive
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\lwc.exe" $stage
+          Copy-Item README.md, README.zh-CN.md, LICENSE $stage
+          Compress-Archive -Path $stage -DestinationPath "dist\$archive.zip"
+          $hash = (Get-FileHash "dist\$archive.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive.zip" | Set-Content "dist\$archive.zip.sha256" -Encoding ascii
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: lwc-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  checksums:
+    name: Combined checksums
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lwc-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: find artifacts -type f -name '*.sha256' -exec cat {} + | tr -d '\r' | sort -k2 > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lwc-checksums
+          path: SHA256SUMS
+          if-no-files-found: error
