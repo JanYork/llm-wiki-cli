@@ -21,6 +21,9 @@ fail() {
   exit 1
 }
 
+cmp "$repo_root/install.sh" \
+  "$repo_root/skills/using-lwc/scripts/install-lwc.sh" ||
+  fail "Skill installer must match the reviewed release installer"
 test -f "$bootstrap" || fail "missing $bootstrap"
 
 json_assert() {

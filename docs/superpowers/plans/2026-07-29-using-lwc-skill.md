@@ -38,9 +38,9 @@ the existing `lwc` CLI, Markdown references, Bash test harness.
 - Create `skills/using-lwc/references/memory-policy.md`: detailed scope,
   write-back, ingest, and safety policy.
 - Create `tests/skill_bootstrap.sh`: isolated executable bootstrap regression
-  tests.
+  tests and installer-copy parity.
 - Existing `tests/install_script.sh`: release-installer regression test reused
-  by final verification and installer-copy parity.
+  by final verification.
 - Modify `README.md`: document the companion Skill and installation.
 - Modify `README.zh-CN.md`: keep the Chinese README structurally aligned.
 

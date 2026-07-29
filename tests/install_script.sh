@@ -3,7 +3,6 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 installer="$repo_root/install.sh"
-skill_installer="$repo_root/skills/using-lwc/scripts/install-lwc.sh"
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/lwc-installer-test.XXXXXX")"
 trap 'rm -rf "$test_root"' EXIT
 
@@ -20,8 +19,6 @@ assert_contains() {
 
 command -v zip >/dev/null || fail "zip is required"
 command -v unzip >/dev/null || fail "unzip is required"
-cmp "$installer" "$skill_installer" ||
-  fail "Skill installer must match the reviewed release installer"
 
 release_dir="$test_root/release"
 mock_bin="$test_root/bin"
