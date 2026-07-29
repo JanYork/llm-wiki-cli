@@ -27,6 +27,8 @@ the existing `lwc` CLI, Markdown references, Bash test harness.
 - Create `skills/using-lwc/agents/openai.yaml`: generated Skill UI metadata.
 - Create `skills/using-lwc/scripts/bootstrap.sh`: deterministic bootstrap and
   project discovery, emitting JSON.
+- Create `skills/using-lwc/scripts/install-lwc.sh`: reviewed local installer,
+  kept identical to the repository release installer.
 - Create `skills/using-lwc/assets/global-purpose.md`: initial global Wiki
   purpose.
 - Create `skills/using-lwc/assets/global-schema.md`: initial global Wiki
@@ -38,7 +40,7 @@ the existing `lwc` CLI, Markdown references, Bash test harness.
 - Create `tests/skill_bootstrap.sh`: isolated executable bootstrap regression
   tests.
 - Existing `tests/install_script.sh`: release-installer regression test reused
-  by final verification.
+  by final verification and installer-copy parity.
 - Modify `README.md`: document the companion Skill and installation.
 - Modify `README.zh-CN.md`: keep the Chinese README structurally aligned.
 
@@ -92,6 +94,7 @@ hypothetical rules that no scenario exposed.
 - Create: `tests/skill_bootstrap.sh`
 - Create:
   `skills/using-lwc/scripts/bootstrap.sh`
+- Create: `skills/using-lwc/scripts/install-lwc.sh`
 - Create: `skills/using-lwc/assets/global-purpose.md`
 - Create: `skills/using-lwc/assets/global-schema.md`
 
@@ -99,7 +102,7 @@ hypothetical rules that no scenario exposed.
 
 Cover these isolated temporary-home cases:
 
-1. missing CLI installs through a mocked official installer;
+1. missing CLI installs through a mocked bundled installer;
 2. missing global Wiki initializes once and applies both assets;
 3. repeat execution performs no install or global overwrite;
 4. existing ancestor project Wiki is detected;
@@ -130,13 +133,13 @@ Expected: fail because
 - [ ] **Step 3: Initialize the Skill with the official generator**
 
 Read `skill-creator/references/openai_yaml.md`, then run the official
-`/Users/muyouzhi/.codex/skills/.system/skill-creator/scripts/init_skill.py`
+`${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/init_skill.py`
 with `scripts,references,assets` resources and only these interface fields:
 
 ```text
 display_name=LWC Memory
 short_description=Use lwc as durable Agent memory
-default_prompt=Use lwc to recall and preserve durable knowledge for this task.
+default_prompt=Use $using-lwc to recall and preserve durable knowledge for this task.
 ```
 
 - [ ] **Step 4: Add fixed global purpose and schema assets**
@@ -148,11 +151,9 @@ Wiki.
 
 - [ ] **Step 5: Implement the minimum POSIX bootstrap**
 
-Use existing system commands and the published installer:
-
-```text
-https://github.com/JanYork/llm-wiki-cli/releases/latest/download/install.sh
-```
+Use existing system commands and the bundled reviewed installer. Keep
+`skills/using-lwc/scripts/install-lwc.sh` byte-for-byte identical to the root
+`install.sh`; never download and execute a remote shell script.
 
 An existing command is usable only when `lwc --version` matches
 `^lwc [0-9]+\.[0-9]+\.[0-9]+` and scoped init help is available. Do not check
@@ -209,7 +210,7 @@ Frontmatter contains only:
 ```yaml
 ---
 name: using-lwc
-description: Use when beginning or continuing substantive project, research, planning, debugging, decision-making, or knowledge work that may benefit a later session.
+description: Use LWC as durable external memory to recall and maintain a persistent, source-grounded, revisable Wiki across Agent sessions. Use when beginning or continuing substantive project, research, planning, debugging, decision-making, document-ingest, or knowledge work that may benefit a later session.
 ---
 ```
 
@@ -228,7 +229,7 @@ The body must require:
 - [ ] **Step 4: Regenerate UI metadata**
 
 Run
-`/Users/muyouzhi/.codex/skills/.system/skill-creator/scripts/generate_openai_yaml.py`
+`${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/generate_openai_yaml.py`
 with the same three interface values used during initialization.
 
 - [ ] **Step 5: Validate the Skill structure**
@@ -236,7 +237,7 @@ with the same three interface values used during initialization.
 Run:
 
 ```bash
-python3 /Users/muyouzhi/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/quick_validate.py" \
   skills/using-lwc
 ```
 

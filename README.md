@@ -85,8 +85,8 @@ Install from GitHub:
 curl --proto '=https' --tlsv1.2 -fsSL https://github.com/JanYork/llm-wiki-cli/releases/latest/download/install.sh | sh
 ```
 
-The installer detects macOS, Linux, or Windows Git Bash and the host
-architecture, verifies the release checksum, and installs or updates `lwc`.
+The installer supports x86_64/aarch64 macOS, glibc Linux, and Windows Git Bash,
+verifies the release checksum, and installs or updates `lwc`.
 It uses `~/.local/bin` by default, or updates an existing copy in
 `~/.local/bin` or `~/.cargo/bin`. To choose another directory:
 
@@ -107,6 +107,37 @@ git clone https://github.com/JanYork/llm-wiki-cli.git
 cd llm-wiki-cli
 cargo install --locked --path .
 ```
+
+## Companion Agent Skill
+
+The repository includes [`skills/using-lwc`](skills/using-lwc), an Agent Skill
+that makes `lwc` a proactive memory layer for substantive sessions. From a
+local checkout, install it for Codex with:
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+cp -R skills/using-lwc "${CODEX_HOME:-$HOME/.codex}/skills/"
+```
+
+When triggered, the Skill:
+
+- finds a compatible CLI or installs the official checksum-verified release;
+- initializes global memory in `~/.lwc/` once;
+- recalls bounded global and project context before repeated investigation;
+- asks before creating project-local `.lwc/` state;
+- separates project facts from reusable global knowledge;
+- integrates sources and writes durable answers back into the Wiki.
+
+Set `LWC_AUTO_INSTALL=0` to disable automatic CLI installation. Automatic
+installation executes the reviewed installer bundled in the Skill, trusts this
+repository and its GitHub Release publishing boundary, and verifies the
+downloaded archive against `SHA256SUMS`; the checksum is integrity protection,
+not publisher code signing. Release binaries cover x86_64/aarch64 macOS, glibc
+Linux, and Windows through Git Bash. `SKILL.md` follows the Agent Skills
+resource layout, while
+`agents/openai.yaml` supplies OpenAI/Codex metadata. Other Agent harnesses may
+load the Skill when they support that layout, but universal compatibility is
+not assumed.
 
 ## Quick Start
 

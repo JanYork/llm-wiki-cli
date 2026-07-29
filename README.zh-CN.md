@@ -81,8 +81,8 @@ Wiki：来源保持不可变，有价值的综合结果会成为持久页面，�
 curl --proto '=https' --tlsv1.2 -fsSL https://github.com/JanYork/llm-wiki-cli/releases/latest/download/install.sh | sh
 ```
 
-安装脚本会自动识别 macOS、Linux 或 Windows Git Bash 及其 CPU 架构，校验
-Release 文件的 SHA-256，然后安装或更新 `lwc`。默认安装到 `~/.local/bin`；
+安装脚本支持 x86_64/aarch64 的 macOS、glibc Linux 和 Windows Git Bash，校验
+Release 文件的 SHA-256 后安装或更新 `lwc`。默认安装到 `~/.local/bin`；
 如果 `~/.local/bin` 或 `~/.cargo/bin` 中已有 `lwc`，则会原地更新。也可以指定
 安装目录：
 
@@ -103,6 +103,32 @@ git clone https://github.com/JanYork/llm-wiki-cli.git
 cd llm-wiki-cli
 cargo install --locked --path .
 ```
+
+## 配套 Agent Skill
+
+仓库内置 [`skills/using-lwc`](skills/using-lwc) Agent Skill，让 `lwc` 在有长期
+价值的会话中主动承担外部记忆层。可在本地检出目录中安装到 Codex：
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+cp -R skills/using-lwc "${CODEX_HOME:-$HOME/.codex}/skills/"
+```
+
+Skill 触发后会：
+
+- 查找兼容 CLI，缺失时安装经过校验的官方 Release；
+- 首次自动初始化 `~/.lwc/` 全局记忆；
+- 在重复调查前读取有界的全局与项目上下文；
+- 创建项目级 `.lwc/` 前先询问用户；
+- 区分项目事实与可跨项目复用的全局知识；
+- 完整整合来源，并把值得保留的答案写回 Wiki。
+
+设置 `LWC_AUTO_INSTALL=0` 可禁用自动安装。自动安装执行 Skill 随附、经过审查
+的本地安装器；其信任边界是当前仓库与 GitHub Release 发布权限，并使用
+`SHA256SUMS` 验证下载归档完整性。该校验不是发布者代码签名。Release 二进制覆盖
+x86_64/aarch64 的 macOS、glibc Linux，以及 Windows Git Bash。`SKILL.md` 遵循
+Agent Skills 的资源目录形式，`agents/openai.yaml` 提供 OpenAI/Codex 元数据；
+其他 Agent 运行时只有在支持该目录约定时才可加载，本项目不宣称普遍兼容。
 
 ## 快速开始
 

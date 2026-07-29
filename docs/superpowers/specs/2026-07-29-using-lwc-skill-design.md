@@ -29,7 +29,8 @@ skills/
     ├── agents/
     │   └── openai.yaml
     ├── scripts/
-    │   └── bootstrap.sh
+    │   ├── bootstrap.sh
+    │   └── install-lwc.sh
     ├── assets/
     │   ├── global-purpose.md
     │   └── global-schema.md
@@ -63,13 +64,13 @@ rewrites, or other work with no plausible future value.
 
 ### 1. Bootstrap once
 
-Run `scripts/bootstrap.sh` once near the start of the session.
+Run `scripts/bootstrap.sh` once near the start of work in each active root.
 
 The script must:
 
 1. Find a usable `lwc` executable.
-2. If absent, install the latest GitHub Release using the repository's
-   published installer without asking the user.
+2. If absent, install the latest GitHub Release using the reviewed installer
+   bundled with the Skill, without asking the user.
 3. Initialize `~/.lwc/wiki.db` when global memory is absent.
 4. On first global initialization, set a global purpose and schema for stable
    cross-project knowledge.
@@ -86,10 +87,14 @@ executable exists. If the command is absent or belongs to another program,
 install the official CLI into `~/.local/bin` and use that absolute path:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://github.com/JanYork/llm-wiki-cli/releases/latest/download/install.sh |
-  LWC_INSTALL_DIR="$HOME/.local/bin" sh
+LWC_INSTALL_DIR="$HOME/.local/bin" sh scripts/install-lwc.sh
 ```
+
+`scripts/install-lwc.sh` must remain byte-for-byte identical to the reviewed
+root `install.sh`. It downloads only the selected release archive and
+`SHA256SUMS`, verifies integrity before replacement, and never executes a
+downloaded shell script. This trusts the Skill package and GitHub Release
+publishing boundary; SHA-256 is integrity protection, not publisher signing.
 
 On first global initialization, apply the fixed repository-owned
 `assets/global-purpose.md` and `assets/global-schema.md` through `lwc purpose
