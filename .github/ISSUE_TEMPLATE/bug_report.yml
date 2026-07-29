@@ -1,0 +1,66 @@
+name: Bug report
+description: Report a reproducible defect in lwc.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, private source contents, or exploit details.
+        Follow `SECURITY.md` for security-sensitive reports.
+  - type: input
+    id: lwc_version
+    attributes:
+      label: lwc version
+      description: Output from `lwc --version`, commit, or release tag.
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: operating_system
+    attributes:
+      label: Operating system
+      description: Include version when relevant.
+      placeholder: macOS 15.0 / Ubuntu 24.04
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest reproducible sequence.
+      placeholder: |
+        1. Run ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: json_error
+    attributes:
+      label: JSON error output
+      description: Paste the exact JSON error payload if one was returned.
+      render: json
+      placeholder: '{"error":{"code":"...","message":"..."}}'
+    validations:
+      required: false
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+      description: Logs, sample inputs, screenshots, or related details.
+    validations:
+      required: false

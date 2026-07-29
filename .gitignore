@@ -1,0 +1,5 @@
+/target/
+.lwc/
+/.omx/
+.DS_Store
+*.swp
