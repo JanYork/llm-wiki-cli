@@ -78,6 +78,21 @@ Wiki：来源保持不可变，有价值的综合结果会成为持久页面，�
 从 GitHub 安装：
 
 ```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/JanYork/llm-wiki-cli/releases/latest/download/install.sh | sh
+```
+
+安装脚本会自动识别 macOS、Linux 或 Windows Git Bash 及其 CPU 架构，校验
+Release 文件的 SHA-256，然后安装或更新 `lwc`。默认安装到 `~/.local/bin`；
+如果 `~/.local/bin` 或 `~/.cargo/bin` 中已有 `lwc`，则会原地更新。也可以指定
+安装目录：
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/JanYork/llm-wiki-cli/releases/latest/download/install.sh | LWC_INSTALL_DIR="$HOME/bin" sh
+```
+
+也可以使用 Cargo 从 GitHub 源码构建并安装：
+
+```bash
 cargo install --locked --git https://github.com/JanYork/llm-wiki-cli
 ```
 

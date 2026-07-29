@@ -41,5 +41,8 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all-targets
 
+      - name: Test release installer
+        run: ./tests/install_script.sh
+
       - name: Build release binary
         run: cargo build --locked --release

@@ -82,6 +82,21 @@ The result is accumulated knowledge, not only retrieval.
 Install from GitHub:
 
 ```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/JanYork/llm-wiki-cli/releases/latest/download/install.sh | sh
+```
+
+The installer detects macOS, Linux, or Windows Git Bash and the host
+architecture, verifies the release checksum, and installs or updates `lwc`.
+It uses `~/.local/bin` by default, or updates an existing copy in
+`~/.local/bin` or `~/.cargo/bin`. To choose another directory:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/JanYork/llm-wiki-cli/releases/latest/download/install.sh | LWC_INSTALL_DIR="$HOME/bin" sh
+```
+
+Alternatively, build and install from GitHub with Cargo:
+
+```bash
 cargo install --locked --git https://github.com/JanYork/llm-wiki-cli
 ```
 

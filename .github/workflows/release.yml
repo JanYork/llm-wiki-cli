@@ -131,6 +131,8 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v4
         with:
           pattern: lwc-*
@@ -148,4 +150,5 @@ jobs:
             --generate-notes \
             release-assets/*.tar.gz \
             release-assets/*.zip \
-            release-assets/SHA256SUMS
+            release-assets/SHA256SUMS \
+            install.sh
