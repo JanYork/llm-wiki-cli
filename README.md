@@ -31,40 +31,44 @@ This project adapts those ideas into an agent-first Rust CLI backed by SQLite.
 ## Core Design
 
 ```text
-+---------------------------- Agent Plane -----------------------------+
-| User Task --> LLM Agent --> using-lwc Skill                          |
-|                            trigger | bootstrap | recall | write-back  |
-+-----------------------------------+----------------------------------+
-                                    |
-                              JSON / stdin / files
-                                    v
-+------------------------------ CLI Layer ------------------------------+
++-----------------------------------------------------------------------+
+|                              AGENT PLANE                              |
++-----------------------------------------------------------------------+
+| User Task -> LLM Agent -> using-lwc Skill                             |
+|                         trigger | bootstrap | recall | write-back     |
++-----------------------------------------------------------------------+
+                                   |
+                          JSON / stdin / files
+                                   v
++-----------------------------------------------------------------------+
+|                               CLI LAYER                               |
++-----------------------------------------------------------------------+
 | clap command router                                                   |
-| init | schema | purpose | source | page | ingest | search | context  |
-| graph | lint | maintenance | log                                     |
-+-------------------+-------------------------------+-------------------+
-                    |                               |
-                    v                               v
-+-------------------+----------------+  +-----------+-------------------+
-| Scope Resolver                     |  | Import / Validation           |
-| project | global | all (merge)     |  | UTF-8 | size | ext | symlink |
-+-------------------+----------------+  +-----------+-------------------+
-                    |                               |
-                    +---------------+---------------+
-                                    |
-                                    v
-+--------------------------- SQLite Store ------------------------------+
-| Canonical | WAL | foreign keys | transactions | migrations           |
-| meta | sources | pages | page_sources | links | ingest_jobs          |
+| init | schema | purpose | source | page | ingest | search | context   |
+| graph | lint | maintenance | log                                      |
++-----------------------------------------------------------------------+
+                                   |
+                                   v
++----------------------------------+------------------------------------+
+| SCOPE RESOLVER                   | IMPORT / VALIDATION                |
+| project | global | all (merge)   | UTF-8 | size | ext | symlink       |
++----------------------------------+------------------------------------+
+                                   |
+                                   v
++-----------------------------------------------------------------------+
+|                             SQLITE STORE                              |
++-----------------------------------------------------------------------+
+| Canonical | WAL | foreign keys | transactions | migrations            |
+| meta | sources | pages | page_sources | links | ingest_jobs           |
 | operations | search_fts                                               |
-+------------+------------------+--------------------+------------------+
-             |                  |                    |
-             v                  v                    v
-+------------+------+ +---------+---------+ +--------+------------------+
-| Search Pipeline   | | Graph Engine      | | Markdown Projection      |
-| custom tokenizer | | links / citations | | raw/ | wiki/ | index.md   |
-| FTS5 + BM25       | | neighbors / types | | log.md | overview.md     |
-+-------------------+ +-------------------+ +---------------------------+
++-----------------------------------------------------------------------+
+                                   |
+                                   v
++---------------------+---------------------+---------------------------+
+| SEARCH PIPELINE     | GRAPH ENGINE        | MARKDOWN PROJECTION       |
+| custom tokenizer    | links / citations   | raw/ | wiki/ | index.md   |
+| FTS5 + BM25         | neighbors / types   | log.md | overview.md      |
++---------------------+---------------------+---------------------------+
 ```
 
 The persistent knowledge model has three logical layers:
