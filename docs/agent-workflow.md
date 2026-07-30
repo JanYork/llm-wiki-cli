@@ -12,6 +12,8 @@ Use `lwc` as durable external memory. The database stores evidence and compiled 
 6. Split inputs larger than 64 MiB before ingestion.
 7. Treat `.lwc/raw`, `.lwc/wiki`, `.lwc/schema.md`, and `.lwc/purpose.md` as
    generated projections. Rebuild them with `lwc maintenance materialize`.
+8. Read commands keep current stores read-only. A writable legacy store may be
+   migrated transactionally once before the requested read.
 
 ## Start a session
 
@@ -27,11 +29,20 @@ This returns the purpose, schema, page index, and recent operations. Use
 ```bash
 lwc source add-dir path/to/corpus/
 lwc ingest list --status pending
-lwc ingest next --context-limit 50
+lwc ingest next --context-limit 50 --source-max-chars 100000
 ```
 
 `ingest next` atomically claims one task and returns the immutable source,
-purpose, schema, and bounded page index. Analyze it before generating pages:
+purpose, schema, and bounded page index. If `source_window.has_more` is true,
+continue from `source_window.next_offset_chars` until the complete source has
+been read:
+
+```bash
+lwc source show 12 --offset-chars 100000 --max-chars 100000
+```
+
+Offsets count Unicode characters, not bytes. Analyze the complete source before
+generating pages:
 
 ```bash
 lwc search "terms from the new source"
@@ -62,10 +73,19 @@ Use `[[stable-slug]]` links inside Markdown bodies. A page update atomically
 replaces its previous source IDs and extracted links, so always pass the
 complete current citation set.
 
-Finish only after writing at least one cited source-summary page:
+Finish only after writing a cited source-summary page and at least one cited
+non-source page:
 
 ```bash
 lwc ingest complete 12
+```
+
+When a source genuinely changes no non-source page, record the exception rather
+than fabricating a page:
+
+```bash
+lwc ingest complete 12 \
+  --no-derived-pages-reason "Duplicate evidence; existing synthesis already covers every supported claim"
 ```
 
 Use `lwc ingest fail 12 --message "reason"` for a recoverable processing error,
@@ -74,11 +94,17 @@ then `lwc ingest retry 12`. Queue state and analysis survive process restarts.
 ## Query
 
 ```bash
-lwc search "question keywords" --limit 20
+lwc search "question keywords" --type auto --limit 20
 lwc page show relevant-slug
-lwc source show 12
+lwc source show 12 --max-chars 100000
 lwc graph related relevant-slug
 ```
+
+The default `--type auto` returns compiled pages first, hides the raw source
+paired with a matching `kind=source` page, and falls back to sources when
+needed. Use `--type source` to inspect immutable evidence, `--type page` for
+compiled knowledge, `--type all` to audit both layers, and repeat `--kind` to
+restrict page kinds.
 
 Low-level searches are private and read-only by default. Add `--record` only
 for a top-level query whose wording should appear in the durable operation log.
@@ -111,6 +137,10 @@ semantic pass the CLI cannot perform:
 - important concepts without pages;
 - missing research needed to resolve uncertainty.
 
+`untitled_source` identifies legacy rows that still need a readable title.
+`shallow_ingest` identifies completed legacy jobs with only a source summary
+and no explicit no-derived-pages reason.
+
 If lint reports search index rows missing, orphaned, or duplicated, run:
 
 ```bash
@@ -127,6 +157,8 @@ lwc maintenance reindex
 ## Search contract
 
 - Search terms are plain text, never raw FTS syntax.
+- `--type auto` is the page-first default. `page`, `source`, and `all` expose
+  explicit retrieval layers; `--kind` applies only to page results.
 - Multi-character CJK queries use dictionary-free adjacent bigrams; the index
   also retains non-stopword CJK unigrams. Latin text uses lowercased
   alphanumeric tokens.
@@ -135,6 +167,27 @@ lwc maintenance reindex
   title/summary/body scoring scale; project wins exact ties.
 - Search is lexical. If no suitable hit exists, inspect the index and sources;
   do not treat an empty result as proof that the knowledge is absent.
+
+## Storage maintenance
+
+The FTS5 table is contentless: canonical source and page text is stored once in
+the normal tables, while FTS retains only its index. During an idle maintenance
+window:
+
+```bash
+lwc maintenance compact
+```
+
+The command optimizes FTS and attempts a WAL truncate checkpoint. If `busy` is
+true, an active reader prevented full reclamation; retry later. Never infer
+success from the command exit alone—inspect `busy` and `after_bytes`.
+
+## Development-only benchmark
+
+Do not run the repository benchmark during ordinary memory work. When
+developing or auditing LWC itself, follow `benchmarks/README.md`, use a
+sanitized corpus plus reviewed JSONL ground truth, and compare release binaries
+under the same conditions.
 
 ## Projection contract
 

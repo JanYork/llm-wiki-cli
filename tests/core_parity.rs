@@ -124,7 +124,7 @@ fn directory_ingest_reports_partial_import_as_an_error() {
 }
 
 #[test]
-fn agent_ingest_queue_persists_two_steps_and_requires_a_source_summary() {
+fn agent_ingest_queue_persists_two_steps_and_requires_integrated_pages() {
     let world = TestWorld::new();
     world.ok(&["init"]);
     let source = world.write("paper.md", "注意力机制连接查询、键和值。");
@@ -172,8 +172,28 @@ fn agent_ingest_queue_persists_two_steps_and_requires_a_source_summary() {
         "--source",
         &source_id,
     ]);
+    let concept = world.write(
+        "concept.md",
+        "注意力机制使用查询、键和值，并由 [[attention-source]] 提供来源。",
+    );
+    world.ok(&[
+        "page",
+        "put",
+        "attention-mechanism",
+        "--title",
+        "Attention mechanism",
+        "--kind",
+        "concept",
+        "--summary",
+        "查询、键和值之间的注意力关系",
+        "--file",
+        as_str(&concept),
+        "--source",
+        &source_id,
+    ]);
     let completed = world.ok(&["ingest", "complete", &source_id]);
     assert_eq!(completed["job"]["status"], "completed");
+    assert_eq!(completed["integration"]["derived_pages"], 1);
 
     let persisted = world.ok(&["ingest", "list", "--status", "completed"]);
     assert_eq!(persisted["jobs"].as_array().unwrap().len(), 1);

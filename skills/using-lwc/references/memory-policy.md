@@ -52,6 +52,11 @@ its installation directory is already on `PATH`.
    "$LWC" --scope all search "task terms" --limit 20
    ```
 
+   This defaults to page-first `--type auto`. Use `--type source` when exact
+   immutable evidence is required, `--type page` for compiled knowledge, and
+   repeat `--kind` to restrict page kinds. Use `--type all` only when auditing
+   both layers.
+
 4. Work from current evidence. Inspect cited pages and sources when accuracy
    depends on them.
 5. During meaningful milestones and before finishing, update knowledge that
@@ -169,13 +174,19 @@ For each meaningful safe source:
 
 ```bash
 "$LWC" source add path/to/source
-"$LWC" ingest next --context-limit 50
+"$LWC" ingest next --context-limit 50 --source-max-chars 100000
 "$LWC" ingest analyze <SOURCE_ID> --file analysis.md
 "$LWC" page put source-<SOURCE_ID> \
   --title "Source summary" \
   --kind source \
   --summary "What this source contributes" \
   --file source-summary.md \
+  --source <SOURCE_ID>
+"$LWC" page put stable-concept \
+  --title "Stable concept" \
+  --kind concept \
+  --summary "How this source changes shared knowledge" \
+  --file concept.md \
   --source <SOURCE_ID>
 "$LWC" ingest complete <SOURCE_ID>
 ```
@@ -185,13 +196,25 @@ job may not be the source most recently added.
 
 Before completion:
 
+- if `source_window.has_more=true`, continue reading with
+  `source show <SOURCE_ID> --offset-chars <NEXT> --max-chars 100000` until the
+  full Unicode source has been read;
 - identify claims, entities, concepts, contradictions, uncertainty, and gaps;
 - search the existing Wiki;
 - update every affected source, entity, concept, comparison, and synthesis page
   rather than creating an isolated summary;
 - preserve older conflicting claims with their provenance;
 - create useful `[[wikilinks]]`;
-- ensure at least one cited `kind=source` summary exists.
+- ensure at least one cited `kind=source` summary and at least one cited
+  non-source page exist.
+
+When a source genuinely changes no non-source page, do not create filler. Use a
+specific audited exception:
+
+```bash
+"$LWC" ingest complete <SOURCE_ID> \
+  --no-derived-pages-reason "Duplicate evidence; existing synthesis already covers every supported claim"
+```
 
 One source may legitimately update many pages. Do not stop after `source add`,
 FTS search, or a single detached summary.
@@ -215,6 +238,10 @@ stores changed; `--scope all` is not valid for lint. Fix deterministic missing
 summaries, links, citations, and index problems. Use scope-specific
 `maintenance reindex` only for reported index inconsistencies.
 
+If storage growth matters, run scope-specific `maintenance compact` only during
+an idle window. Inspect `busy` and `after_bytes`; a successful process exit does
+not mean an active reader allowed a full WAL truncate.
+
 Periodically perform the semantic work the CLI cannot:
 
 - reconcile stale or contradicted claims;
@@ -223,6 +250,10 @@ Periodically perform the semantic work the CLI cannot:
 - create pages for important missing concepts;
 - identify questions and sources needed to close knowledge gaps;
 - revise overview and synthesis pages so they reflect the whole corpus.
+
+Do not run the repository benchmark during ordinary memory use. When developing
+or auditing LWC itself, follow `benchmarks/README.md` and use a sanitized corpus
+plus reviewed JSONL ground truth.
 
 ## Failure patterns
 

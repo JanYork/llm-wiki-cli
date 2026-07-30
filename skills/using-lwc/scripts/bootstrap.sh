@@ -37,12 +37,10 @@ supported_lwc_version() {
   [ "$#" -eq 3 ] || return 1
   case "$1$2$3" in *[!0-9]*|'') return 1 ;; esac
 
-  [ "$1" -gt 0 ] ||
-    [ "$2" -gt 1 ] ||
-    { [ "$2" -eq 1 ] && [ "$3" -ge 2 ]; }
+  [ "$1" -gt 0 ] || [ "$2" -ge 2 ]
 }
 
-# v0.1.2 prevents the global store from being mistaken for project memory.
+# v0.2.0 adds layered search, bounded source windows, and the v6 store.
 usable_lwc() {
   candidate="$1"
   candidate_version="$("$candidate" --version 2>/dev/null || true)"
@@ -125,7 +123,7 @@ if [ -d "${TMPDIR:-/tmp}" ]; then
 fi
 
 installed=false
-global_initialized=false
+global_initialized_now=false
 
 lwc_path="$(command -v lwc 2>/dev/null || true)"
 if [ -z "$lwc_path" ] || ! usable_lwc "$lwc_path"; then
@@ -167,8 +165,10 @@ if [ "$apply_global_policy" = true ]; then
     die "failed to set global memory schema"
   printf 'complete\n' > "$global_policy_state" ||
     die "cannot complete global initialization state"
-  global_initialized=true
+  global_initialized_now=true
 fi
+global_initialized=false
+[ -f "$global_wiki" ] && global_initialized=true
 
 project_wiki=""
 project_root=""
@@ -272,6 +272,7 @@ printf '"lwc_version":"%s",' "$(json_escape "$lwc_version")"
 printf '"installed":%s,' "$installed"
 printf '"global_wiki":"%s",' "$(json_escape "$global_wiki")"
 printf '"global_initialized":%s,' "$global_initialized"
+printf '"global_initialized_now":%s,' "$global_initialized_now"
 printf '"project_wiki":"%s",' "$(json_escape "$project_wiki")"
 printf '"project_root":"%s",' "$(json_escape "$project_root")"
 printf '"project_confidence":"%s",' "$(json_escape "$project_confidence")"

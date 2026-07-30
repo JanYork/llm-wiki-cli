@@ -64,11 +64,11 @@ This project adapts those ideas into an agent-first Rust CLI backed by SQLite.
 +-----------------------------------------------------------------------+
                                    |
                                    v
-+---------------------+---------------------+---------------------------+
-| SEARCH PIPELINE     | GRAPH ENGINE        | MARKDOWN PROJECTION       |
-| custom tokenizer    | links / citations   | raw/ | wiki/ | index.md   |
-| FTS5 + BM25         | neighbors / types   | log.md | overview.md      |
-+---------------------+---------------------+---------------------------+
++-----------------------+-----------------------+-----------------------+
+| SEARCH PIPELINE       | GRAPH ENGINE          | MARKDOWN PROJECTION   |
+| CJK n-grams + Latin   | links + citations     | raw/ + wiki/          |
+| contentless FTS5/BM25 | structural evidence   | index/log/overview    |
++-----------------------+-----------------------+-----------------------+
 ```
 
 The persistent knowledge model has three logical layers:
@@ -83,6 +83,10 @@ SQLite is canonical. The Markdown tree is a rebuildable projection for people
 and tools such as Obsidian. Agents mutate knowledge through `lwc`, not by editing
 `.lwc/wiki.db` or projected Markdown directly. Successful commands return JSON
 on stdout; failures return structured JSON on stderr.
+
+Read commands keep current-format stores read-only. When an older writable
+store is opened by a newer CLI, its schema is migrated transactionally once
+before the read proceeds.
 
 ## Why This Is Not Just RAG
 
@@ -172,14 +176,25 @@ printf '# Purpose\nBuild a durable project Wiki.\n' | lwc purpose set -
 lwc source add-dir docs/
 ```
 
+Files without an explicit title use their source origin as a stable,
+human-readable fallback. Identical bytes are deduplicated by SHA-256.
+
 ### 3. Analyze and integrate one source
 
 ```bash
-lwc ingest next --context-limit 50
+lwc ingest next --context-limit 50 --source-max-chars 100000
 lwc ingest analyze 1 --file analysis.md
 ```
 
-Create at least one cited source-summary page before completing the ingest task:
+If `source_window.has_more` is true, continue reading from
+`source_window.next_offset_chars`:
+
+```bash
+lwc source show 1 --offset-chars 100000 --max-chars 100000
+```
+
+Create a cited source-summary page and integrate its contribution into at least
+one non-source page before completing the ingest task:
 
 ```bash
 lwc page put source-1 \
@@ -189,16 +204,32 @@ lwc page put source-1 \
   --file source-summary.md \
   --source 1
 
+lwc page put durable-concept \
+  --title "Durable Concept" \
+  --kind concept \
+  --summary "How this source changes shared knowledge" \
+  --file concept.md \
+  --source 1
+
 lwc ingest complete 1
 ```
 
-This `kind=source` step is required. A source is not considered integrated just because it was imported or because only concept/entity pages were updated.
+Both layers are required: the source page is a navigation and provenance aid;
+the non-source page makes knowledge compound. If a source genuinely changes no
+shared page, complete it with a specific audited explanation:
+
+```bash
+lwc ingest complete 1 \
+  --no-derived-pages-reason "Duplicate evidence; existing synthesis already covers every supported claim"
+```
 
 ### 4. Query the accumulated Wiki
 
 ```bash
 lwc context --limit 50
 lwc search "question keywords" --limit 20
+lwc search "concept only" --type page --kind concept
+lwc search "exact evidence" --type source
 lwc page show source-1
 ```
 
@@ -207,11 +238,11 @@ lwc page show source-1
 The intended workflow is:
 
 1. Collect immutable sources.
-2. Claim one ingest task with `lwc ingest next`.
-3. Read the returned schema, purpose, source snapshot, and bounded context.
+2. Claim one ingest task with a bounded `lwc ingest next`.
+3. Read every returned source window, plus the schema, purpose, and bounded context.
 4. Analyze before generating pages.
-5. Write or revise durable pages with explicit `--source` citations.
-6. Complete only after a cited `kind=source` summary exists.
+5. Write or revise a source summary and shared durable pages with explicit `--source` citations.
+6. Complete only after both integration gates pass, or record why no shared page should change.
 7. Use `search`, `context`, `graph`, and `lint` to keep the Wiki coherent over time.
 
 See [docs/agent-workflow.md](docs/agent-workflow.md) for the full operating contract.
@@ -245,6 +276,11 @@ or links; `search --record` only appends the query operation to each selected st
 Search is lexical and deterministic.
 
 - Search terms are plain text, not raw FTS syntax.
+- `--type auto` is the default: compiled pages rank first, paired raw sources
+  are hidden, and raw sources provide fallback recall.
+- Use `--type page`, `--type source`, or `--type all` to select a layer.
+  Repeat `--kind` to restrict page results, such as
+  `--kind concept --kind synthesis`.
 - Multi-character CJK query terms use adjacent bigrams; the index also retains
   non-stopword unigrams so one-character queries remain searchable.
 - Latin text is tokenized into lowercased alphanumeric terms.
@@ -260,6 +296,7 @@ Useful maintenance commands:
 lwc lint
 lwc maintenance reindex
 lwc maintenance materialize
+lwc maintenance compact
 lwc log --limit 20
 ```
 
@@ -268,10 +305,33 @@ Notes:
 - `lint` reports deterministic structural problems and records the lint pass.
 - `maintenance reindex` rebuilds derived search artifacts from SQLite.
 - `maintenance materialize` rebuilds the projected Markdown tree from SQLite.
+- `maintenance compact` optimizes the contentless FTS5 index and attempts a
+  WAL truncate checkpoint. Run it while the Wiki is idle and inspect `busy`
+  plus `after_bytes`.
 - Search queries are private by default; add `--record` only when you want the query wording stored in the durable operation log.
 
 For backups, stop active `lwc` commands and copy the complete `.lwc/` directory.
 Do not copy only `wiki.db` while a writer may still be using its WAL files.
+
+## Benchmark Suite
+
+The opt-in benchmark imports a local UTF-8 corpus into a temporary Wiki and
+reports import time, search P50/P95, Recall@5/10, MRR, and storage before/after
+compaction. Ground truth is a JSONL file of queries and expected
+corpus-relative paths:
+
+```bash
+cargo build --release
+LWC_BENCH_CORPUS=/path/to/sanitized-corpus \
+LWC_BENCH_QUERY_SET=/path/to/query-set.jsonl \
+LWC_BENCH_BINARY="$PWD/target/release/lwc" \
+cargo test --test search_benchmark -- --ignored --nocapture
+```
+
+Normal `cargo test --all-targets` covers page-first search, type/kind filters,
+UTF-8 source windows, ingest completion gates, graph precision, migrations,
+lint, and WAL compaction. See [benchmarks/README.md](benchmarks/README.md) for
+the workload contract and fair before/after comparison rules.
 
 ## Limits and Non-Goals
 

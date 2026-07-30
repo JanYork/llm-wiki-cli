@@ -1,0 +1,3 @@
+{"query":"sqlite write ahead log","expected_paths":["storage/sqlite.md"],"note":"storage topic"}
+{"query":"ownership borrowing data races","expected_paths":["lang/rust.md"],"note":"language topic"}
+{"query":"python list comprehensions","expected_paths":["lang/python.md"],"note":"language topic"}

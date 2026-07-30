@@ -6,7 +6,7 @@ mod scope;
 mod store;
 mod tokenize;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use error::{AppError, Result};
 use import::collect_documents;
 use scope::{
@@ -19,7 +19,7 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
 };
-use store::{PagePutInput, SourceAddInput, Store};
+use store::{PagePutInput, SearchMode, SearchOptions, SourceAddInput, Store};
 
 const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -38,15 +38,17 @@ Every successful command prints JSON to stdout. Failures print a structured JSON
 - Treat `source add` as collection only. A source is integrated only after the ingest loop completes.\n  \
 - Ground factual pages with repeated --source IDs and preserve uncertainty in page bodies.\n  \
 - Search compiled pages first, inspect cited sources when needed, and write durable answers back as kind=query pages.\n  \
-- Run lint after a batch of changes; use maintenance commands only to repair derived artifacts.\n\n\
+- Current stores stay read-only for read commands; a writable legacy store is migrated transactionally once before reading.\n  \
+- Run lint after a batch of changes; compact storage only during an idle maintenance window.\n\n\
 Persistent workflow:\n  \
 1. lwc init\n  \
 2. lwc source add-dir docs/\n  \
-3. lwc ingest next\n  \
+3. lwc ingest next --source-max-chars 100000\n  \
 4. lwc ingest analyze <SOURCE_ID> --file analysis.md\n  \
 5. lwc page put source-<SOURCE_ID> --title ... --kind source --file summary.md --source <SOURCE_ID>\n  \
-6. lwc ingest complete <SOURCE_ID>\n  \
-7. lwc search \"question\"\n\n\
+6. lwc page put <SHARED-SLUG> --title ... --kind concept --file concept.md --source <SOURCE_ID>\n  \
+7. lwc ingest complete <SOURCE_ID>\n  \
+8. lwc search \"question\"\n\n\
 Scopes:\n  \
 project  Use the nearest ancestor .lwc/wiki.db (default).\n  \
 global   Use ~/.lwc/wiki.db for reusable cross-project knowledge.\n  \
@@ -107,7 +109,7 @@ enum Command {
     /// Drive the persistent Agent ingest state machine.
     #[command(
         long_about = "Compile immutable sources into persistent Wiki knowledge through a crash-safe state machine:\n  pending -> analyzing -> generating -> completed\n\nFailed or interrupted work can be returned to pending with retry.",
-        after_help = "Required Agent loop:\n  1. `ingest next` atomically claims one source and returns context.\n  2. Analyze claims, entities, concepts, contradictions, uncertainty, and affected pages.\n  3. `ingest analyze <ID> --file ...` persists that plan and enters generating.\n  4. Write/update pages with `page put`; always create or update a cited kind=source summary.\n  5. `ingest complete <ID>` enforces the source-summary gate.\n  6. Run `lint` after a batch.\n\nNever skip directly from raw search results to completed."
+        after_help = "Required Agent loop:\n  1. `ingest next --source-max-chars N` atomically claims one source and returns bounded context.\n  2. Continue long sources with `source show <ID> --offset-chars N --max-chars N` until window.has_more=false.\n  3. Analyze claims, entities, concepts, contradictions, uncertainty, and affected pages.\n  4. `ingest analyze <ID> --file ...` persists that plan and enters generating.\n  5. Write/update pages with `page put`; always create a cited kind=source summary and integrate the source into non-source knowledge.\n  6. `ingest complete <ID>` enforces both gates. If no non-source page should change, pass a specific --no-derived-pages-reason.\n  7. Run `lint` after a batch.\n\nNever skip directly from raw search results to completed."
     )]
     Ingest {
         #[command(subcommand)]
@@ -124,8 +126,8 @@ enum Command {
     },
     /// Rebuild derived search or Markdown artifacts from SQLite.
     #[command(
-        long_about = "Repair derived artifacts without changing canonical source or page knowledge. SQLite remains authoritative.",
-        after_help = "When to use:\n  Use `materialize` when generated Markdown is missing or stale. Use `reindex` only when lint reports FTS integrity problems or after a tokenizer migration.\n\nNext action:\n  Run `lint` again and verify its total is zero."
+        long_about = "Repair or compact derived artifacts without changing canonical source or page knowledge. SQLite remains authoritative.",
+        after_help = "When to use:\n  Use `materialize` when generated Markdown is missing or stale. Use `reindex` only when lint reports FTS integrity problems or after a tokenizer migration. Use `compact` during an idle maintenance window to optimize FTS and reclaim WAL space.\n\nNext action:\n  After repair, run `lint` again and verify its total is zero. After compact, inspect busy and after_bytes."
     )]
     Maintenance {
         #[command(subcommand)]
@@ -134,14 +136,23 @@ enum Command {
     /// Search compiled Wiki pages and immutable raw sources.
     #[command(
         long_about = "Search compiled Wiki pages and immutable raw sources with SQLite FTS5.\n\n\
-The default is read-only and does not persist the query. Use --record only when the query itself should become part of the operation history. \
+The default --type auto ranks Wiki pages first, hides their paired raw sources, and falls back to raw sources when needed. \
+Use --type page for compiled knowledge, --type source for immutable evidence, or --type all for both. Repeat --kind to restrict page kinds. \
+Read results[].type, kind, identifier, title, snippet, rank, and scope; a lower numeric rank is more relevant. \
+The command is read-only by default and does not persist the query. Use --record only when the query itself should become part of the operation history. \
 Use --scope all to merge project and global results; ranking remains deterministic across stores. \
 Combining --scope all with --record appends the query operation to each selected store.",
-        after_help = "Examples:\n  lwc search \"注意力机制\"\n  lwc search \"release policy\" --limit 10\n  lwc --scope all search \"shared convention\"\n  lwc search \"durable research question\" --record"
+        after_help = "Examples:\n  lwc search \"注意力机制\"\n  lwc search \"release policy\" --type page --kind concept --kind synthesis --limit 10\n  lwc search \"exact evidence\" --type source\n  lwc search \"audit both layers\" --type all\n  lwc --scope all search \"shared convention\"\n  lwc search \"durable research question\" --record"
     )]
     Search {
         /// Natural-language or keyword query. FTS syntax is escaped automatically.
         query: String,
+        /// Search auto-ranked Wiki pages with source fallback, pages only, sources only, or both.
+        #[arg(long = "type", value_enum, default_value = "auto")]
+        target: SearchTarget,
+        /// Restrict page results to this kind; repeat for multiple kinds.
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
         /// Maximum number of merged results to return (1..=1000).
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -162,7 +173,7 @@ Each selected store includes its schema, purpose, page summaries, and recent ope
     },
     /// Report deterministic structural maintenance issues and record the lint pass.
     #[command(
-        long_about = "Check the complete Wiki for missing schema, uncited or orphaned pages, dangling links, and missing, orphaned, or duplicate search-index rows.\n\n\
+        long_about = "Check the complete Wiki for missing schema, untitled sources, shallow completed ingests, uncited or orphaned pages, dangling links, and missing, orphaned, or duplicate search-index rows.\n\n\
 counts and total describe the complete Wiki; limit and offset paginate only the returned issues. Semantic contradictions and stale claims remain the Agent's responsibility.",
         after_help = "Examples:\n  lwc lint\n  lwc lint --limit 100 --offset 100"
     )]
@@ -228,7 +239,7 @@ Content is deduplicated by SHA-256. Re-adding identical bytes returns the existi
     Add {
         /// Source file to snapshot; stdin is intentionally unsupported.
         file: PathBuf,
-        /// Human-readable title; defaults to no explicit title.
+        /// Human-readable title; defaults deterministically to the source origin.
         #[arg(long)]
         title: Option<String>,
     },
@@ -245,6 +256,11 @@ Valid files are committed even if other files are empty, oversized, unreadable, 
         directory: PathBuf,
     },
     /// List source metadata without returning full source bodies.
+    #[command(
+        long_about = "Return source metadata in deterministic ID order without loading bodies.\n\n\
+Read sources, limit, offset, and has_more from the JSON response. When has_more=true, add limit to offset and request the next page.",
+        after_help = "Examples:\n  lwc source list --limit 100\n  lwc source list --limit 100 --offset 100"
+    )]
     List {
         /// Maximum sources returned (1..=1000).
         #[arg(long, default_value_t = 100)]
@@ -253,10 +269,21 @@ Valid files are committed even if other files are empty, oversized, unreadable, 
         #[arg(long, default_value_t = 0)]
         offset: usize,
     },
-    /// Return one source including its immutable full body.
+    /// Return a resumable Unicode-safe window of one immutable source.
+    #[command(
+        long_about = "Return source metadata plus a Unicode-character window of the immutable body.\n\n\
+Omit --max-chars to read from --offset-chars through the end. When window.has_more=true, continue from window.next_offset_chars; byte offsets are never required.",
+        after_help = "Examples:\n  lwc source show 42\n  lwc source show 42 --max-chars 100000\n  lwc source show 42 --offset-chars 100000 --max-chars 100000"
+    )]
     Show {
         /// Numeric source ID returned by source add/list or ingest next.
         id: i64,
+        /// Unicode character offset for resumable reads.
+        #[arg(long, default_value_t = 0)]
+        offset_chars: usize,
+        /// Maximum Unicode characters returned; omit for the remaining source.
+        #[arg(long)]
+        max_chars: Option<usize>,
     },
     /// List Wiki pages that cite a source.
     Refs {
@@ -293,12 +320,15 @@ enum IngestCommand {
     #[command(
         long_about = "Atomically claim the oldest pending job, mark it analyzing, increment its attempt count, and return the immutable source plus bounded Wiki context.\n\n\
 Only one concurrent Agent can claim a given source. A null job means the queue has no pending work.",
-        after_help = "Examples:\n  lwc ingest next\n  lwc ingest next --context-limit 100"
+        after_help = "Examples:\n  lwc ingest next --source-max-chars 100000\n  lwc ingest next --context-limit 100 --source-max-chars 50000"
     )]
     Next {
         /// Maximum pages and recent operations included in the packet (1..=1000).
         #[arg(long, default_value_t = 50)]
         context_limit: usize,
+        /// Bound the claimed source body; continue with source show --offset-chars.
+        #[arg(long)]
+        source_max_chars: Option<usize>,
     },
     /// Persist an Agent's source analysis and move the job to generating.
     #[command(
@@ -313,15 +343,19 @@ The analysis should identify claims, entities, concepts, contradictions, missing
         #[arg(long)]
         file: PathBuf,
     },
-    /// Mark a generated source as completed after enforcing its citation gate.
+    /// Complete a generated source after enforcing summary and integration gates.
     #[command(
-        long_about = "Move a generating job to completed only after the source is cited by at least one source summary page (a page written with --kind source).\n\n\
-This gate prevents an Agent from marking ingestion complete after merely indexing raw text or updating unrelated concept pages.",
-        after_help = "Example:\n  lwc ingest complete 42"
+        long_about = "Move a generating job to completed only after the source is cited by at least one kind=source summary and at least one non-source Wiki page.\n\n\
+If the source legitimately changes no shared knowledge, provide a specific non-empty --no-derived-pages-reason. The reason is stored with the job and audited by lint. \
+This prevents completion after merely indexing raw text or writing a detached summary.",
+        after_help = "Examples:\n  lwc ingest complete 42\n  lwc ingest complete 42 --no-derived-pages-reason \"Duplicate evidence; existing synthesis already covers every supported claim\""
     )]
     Complete {
         /// Source ID whose Wiki integration is complete.
         source_id: i64,
+        /// Explain why this source legitimately changes no non-source Wiki page.
+        #[arg(long)]
+        no_derived_pages_reason: Option<String>,
     },
     /// Record a recoverable ingest failure and preserve its diagnostic.
     #[command(after_help = "Example:\n  lwc ingest fail 42 --message \"source requires OCR\"")]
@@ -347,7 +381,7 @@ This gate prevents an Agent from marking ingestion complete after merely indexin
 enum GraphCommand {
     /// Rank pages related to one Wiki page.
     #[command(
-        long_about = "Rank related pages deterministically using bidirectional wikilinks, shared source citations, Adamic-Adar common neighbors, and page-type affinity.\n\n\
+        long_about = "Rank related pages deterministically using bidirectional wikilinks, shared source citations, and Adamic-Adar common neighbors; page-type affinity only refines candidates that already have structural evidence.\n\n\
 The result exposes each scoring signal so Agents can explain why pages are related.",
         after_help = "Examples:\n  lwc graph related customer-membership\n  lwc graph related customer-membership --limit 50"
     )]
@@ -376,6 +410,21 @@ Use this after an index-integrity lint issue or a tokenizer migration; normal so
         after_help = "Example:\n  lwc maintenance reindex"
     )]
     Reindex,
+    /// Optimize FTS and truncate reusable WAL space when no reader blocks checkpointing.
+    #[command(
+        long_about = "Optimize the derived FTS5 index, record the maintenance pass, and run a best-effort WAL TRUNCATE checkpoint.\n\n\
+The command reports busy=true instead of claiming compaction when an active reader prevents a complete checkpoint.",
+        after_help = "Example:\n  lwc maintenance compact"
+    )]
+    Compact,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SearchTarget {
+    Auto,
+    Page,
+    Source,
+    All,
 }
 
 #[derive(Subcommand)]
@@ -384,7 +433,7 @@ enum PageCommand {
     #[command(
         long_about = "Create or replace a persistent Wiki page, its source citations, wikilinks, FTS row, operation record, and Markdown projection in one logical update.\n\n\
 Use [[slug]] in the Markdown body to create graph edges. Repeat --source for every immutable source supporting the page. \
-Typical kinds are source, concept, entity, query, comparison, and synthesis. Every completed ingest requires at least one cited kind=source summary page.",
+Typical kinds are source, concept, entity, query, comparison, and synthesis. Every completed ingest requires a cited kind=source summary plus a cited non-source page, unless completion records a specific no-derived-pages reason.",
         after_help = "Examples:\n  lwc page put source-42 --title \"Paper summary\" --kind source --summary \"Main findings\" --file summary.md --source 42\n  lwc page put attention --title \"Attention\" --kind concept --summary \"Attention mechanisms\" --file concept.md --source 42 --source 57\n  lwc page put durable-answer --title \"Architecture decision\" --kind query --file answer.md --source 42"
     )]
     Put {
@@ -407,6 +456,11 @@ Typical kinds are source, concept, entity, query, comparison, and synthesis. Eve
         source_ids: Vec<i64>,
     },
     /// List page metadata without returning full Markdown bodies.
+    #[command(
+        long_about = "Return page slug, title, kind, summary, and update time in deterministic order without loading Markdown bodies.\n\n\
+Read pages, limit, offset, and has_more from the JSON response. When has_more=true, add limit to offset and request the next page.",
+        after_help = "Examples:\n  lwc page list --limit 100\n  lwc page list --limit 100 --offset 100"
+    )]
     List {
         /// Maximum pages returned (1..=1000).
         #[arg(long, default_value_t = 100)]
@@ -472,7 +526,7 @@ fn run(cli: Cli) -> Result<Value> {
                 }
                 SchemaCommand::Show => {
                     let store =
-                        Store::open_read_only(scope_name(store_path.scope), &store_path.path)?;
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
                     to_json(store.schema_show()?)
                 }
             }
@@ -491,7 +545,7 @@ fn run(cli: Cli) -> Result<Value> {
                 }
                 PurposeCommand::Show => {
                     let store =
-                        Store::open_read_only(scope_name(store_path.scope), &store_path.path)?;
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
                     to_json(store.purpose_show()?)
                 }
             }
@@ -582,19 +636,30 @@ fn run(cli: Cli) -> Result<Value> {
                 }
                 SourceCommand::List { limit, offset } => {
                     let store =
-                        Store::open_read_only(scope_name(store_path.scope), &store_path.path)?;
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
                     validate_limit(limit)?;
                     validate_offset(offset)?;
                     to_json(store.source_list(limit, offset)?)
                 }
-                SourceCommand::Show { id } => {
+                SourceCommand::Show {
+                    id,
+                    offset_chars,
+                    max_chars,
+                } => {
                     let store =
-                        Store::open_read_only(scope_name(store_path.scope), &store_path.path)?;
-                    to_json(store.source_show(id)?)
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    validate_offset(offset_chars)?;
+                    if max_chars == Some(0) {
+                        return Err(AppError::new(
+                            "invalid_limit",
+                            "max-chars must be greater than zero",
+                        ));
+                    }
+                    to_json(store.source_show(id, offset_chars, max_chars)?)
                 }
                 SourceCommand::Refs { id, limit, offset } => {
                     let store =
-                        Store::open_read_only(scope_name(store_path.scope), &store_path.path)?;
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
                     validate_limit(limit)?;
                     validate_offset(offset)?;
                     to_json(store.source_refs(id, limit, offset)?)
@@ -632,19 +697,19 @@ fn run(cli: Cli) -> Result<Value> {
                 }
                 PageCommand::List { limit, offset } => {
                     let store =
-                        Store::open_read_only(scope_name(store_path.scope), &store_path.path)?;
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
                     validate_limit(limit)?;
                     validate_offset(offset)?;
                     to_json(store.page_list(limit, offset)?)
                 }
                 PageCommand::Show { slug } => {
                     let store =
-                        Store::open_read_only(scope_name(store_path.scope), &store_path.path)?;
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
                     to_json(store.page_show(&slug)?)
                 }
                 PageCommand::Links { slug } => {
                     let store =
-                        Store::open_read_only(scope_name(store_path.scope), &store_path.path)?;
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
                     to_json(store.page_links(&slug)?)
                 }
             }
@@ -659,15 +724,24 @@ fn run(cli: Cli) -> Result<Value> {
                     offset,
                 } => {
                     let store =
-                        Store::open_read_only(scope_name(store_path.scope), &store_path.path)?;
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
                     validate_limit(limit)?;
                     validate_offset(offset)?;
                     to_json(store.ingest_list(status.as_deref(), limit, offset)?)
                 }
-                IngestCommand::Next { context_limit } => {
+                IngestCommand::Next {
+                    context_limit,
+                    source_max_chars,
+                } => {
                     let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                     validate_limit(context_limit)?;
-                    let response = store.ingest_next(context_limit)?;
+                    if source_max_chars == Some(0) {
+                        return Err(AppError::new(
+                            "invalid_limit",
+                            "source-max-chars must be greater than zero",
+                        ));
+                    }
+                    let response = store.ingest_next(context_limit, source_max_chars)?;
                     store.materialize_wiki()?;
                     to_json(response)
                 }
@@ -679,9 +753,16 @@ fn run(cli: Cli) -> Result<Value> {
                     store.materialize_wiki()?;
                     to_json(response)
                 }
-                IngestCommand::Complete { source_id } => {
+                IngestCommand::Complete {
+                    source_id,
+                    no_derived_pages_reason,
+                } => {
                     let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
-                    let response = store.ingest_complete(source_id)?;
+                    if let Some(reason) = no_derived_pages_reason.as_deref() {
+                        require_text("no-derived-pages-reason", reason)?;
+                    }
+                    let response =
+                        store.ingest_complete(source_id, no_derived_pages_reason.as_deref())?;
                     store.materialize_wiki()?;
                     to_json(response)
                 }
@@ -703,7 +784,7 @@ fn run(cli: Cli) -> Result<Value> {
         Command::Graph { command } => {
             ensure_scope_supported(cli.scope, false, "graph")?;
             let store_path = resolve_store_path(cli.scope, &cwd)?;
-            let store = Store::open_read_only(scope_name(store_path.scope), &store_path.path)?;
+            let store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
             match command {
                 GraphCommand::Related { slug, limit } => {
                     validate_limit(limit)?;
@@ -722,15 +803,34 @@ fn run(cli: Cli) -> Result<Value> {
                     store.materialize_wiki()?;
                     to_json(response)
                 }
+                MaintenanceCommand::Compact => to_json(store.compact()?),
             }
         }
         Command::Search {
             query,
+            target,
+            kinds,
             limit,
             record,
         } => {
             require_text("query", &query)?;
             validate_limit(limit)?;
+            for kind in &kinds {
+                require_text("kind", kind)?;
+            }
+            if matches!(target, SearchTarget::Source) && !kinds.is_empty() {
+                return Err(AppError::new(
+                    "invalid_input",
+                    "--kind filters Wiki pages and cannot be combined with --type source",
+                ));
+            }
+            let mode = match target {
+                SearchTarget::Auto => SearchMode::Auto,
+                SearchTarget::Page => SearchMode::Page,
+                SearchTarget::Source => SearchMode::Source,
+                SearchTarget::All => SearchMode::All,
+            };
+            let options = SearchOptions { mode, kinds };
             let paths = resolve_read_store_paths(cli.scope, &cwd, true)?;
             let mut stores = if record {
                 paths
@@ -741,13 +841,13 @@ fn run(cli: Cli) -> Result<Value> {
                 paths
                     .into_iter()
                     .map(|store_path| {
-                        Store::open_read_only(scope_name(store_path.scope), &store_path.path)
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)
                     })
                     .collect::<Result<Vec<_>>>()?
             };
             let mut results = Vec::new();
             for store in &stores {
-                results.extend(store.search(&query, limit)?.results);
+                results.extend(store.search_with_options(&query, limit, &options)?.results);
             }
             if record {
                 for store in &mut stores {
@@ -756,8 +856,9 @@ fn run(cli: Cli) -> Result<Value> {
                 }
             }
             results.sort_by(|left, right| {
-                left.rank
-                    .total_cmp(&right.rank)
+                search_type_priority(&left.result_type, mode)
+                    .cmp(&search_type_priority(&right.result_type, mode))
+                    .then_with(|| left.rank.total_cmp(&right.rank))
                     .then_with(|| scope_priority(&left.scope).cmp(&scope_priority(&right.scope)))
                     .then_with(|| left.result_type.cmp(&right.result_type))
                     .then_with(|| left.identifier.cmp(&right.identifier))
@@ -770,7 +871,7 @@ fn run(cli: Cli) -> Result<Value> {
             let paths = resolve_read_store_paths(cli.scope, &cwd, true)?;
             let mut stores = Vec::new();
             for store_path in paths {
-                let store = Store::open_read_only(scope_name(store_path.scope), &store_path.path)?;
+                let store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
                 stores.push(store.context_store(limit)?);
             }
             Ok(json!({"stores": stores}))
@@ -789,7 +890,7 @@ fn run(cli: Cli) -> Result<Value> {
             ensure_scope_supported(cli.scope, false, "log")?;
             validate_limit(limit)?;
             let store_path = resolve_store_path(cli.scope, &cwd)?;
-            let store = Store::open_read_only(scope_name(store_path.scope), &store_path.path)?;
+            let store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
             to_json(store.log(limit)?)
         }
     }
@@ -868,6 +969,14 @@ fn validate_offset(offset: usize) -> Result<()> {
 
 fn scope_priority(scope: &str) -> u8 {
     if scope == "project" { 0 } else { 1 }
+}
+
+fn search_type_priority(result_type: &str, mode: SearchMode) -> u8 {
+    if matches!(mode, SearchMode::Auto | SearchMode::All) && result_type == "source" {
+        1
+    } else {
+        0
+    }
 }
 
 fn scope_name(scope: Scope) -> &'static str {

@@ -14,12 +14,14 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::CStr,
+    fs,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-const USER_VERSION: i32 = 5;
+const USER_VERSION: i32 = 6;
 const SEARCH_INDEX_VERSION: i32 = 4;
+const INGEST_WORKFLOW_VERSION: i32 = 5;
 const TOKENIZER_ID: &str = "cjk-bigram@1/bounded-terms";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 const TIMESTAMP_SQL: &str = "STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')";
@@ -40,6 +42,8 @@ pub const DEFAULT_SCHEMA: &str = r#"# Wiki Schema
 - Use `[[stable-slug]]` for cross-references.
 - Read an existing page before replacing it and preserve still-valid knowledge.
 - Record contradictions instead of silently choosing one source.
+- Treat source summaries as navigation, not a substitute for entity, concept, comparison, and synthesis pages.
+- Before completing ingest, update affected shared pages or record why the source needs no derived-page update.
 "#;
 pub const DEFAULT_PURPOSE: &str = r#"# Project Purpose
 
@@ -68,6 +72,27 @@ WITH issues(code, page, target, message) AS (
         'missing_summary', slug, NULL, 'page summary is missing'
     FROM pages
     WHERE summary IS NULL OR TRIM(summary) = ''
+    UNION ALL
+    SELECT
+        'untitled_source', NULL, CAST(id AS TEXT), 'source title is missing'
+    FROM sources
+    WHERE title IS NULL OR TRIM(title) = ''
+    UNION ALL
+    SELECT
+        'shallow_ingest',
+        NULL,
+        CAST(ij.source_id AS TEXT),
+        'completed ingest has no cited non-source page and no explicit reason'
+    FROM ingest_jobs ij
+    WHERE ij.status = 'completed'
+      AND (ij.no_derived_pages_reason IS NULL OR TRIM(ij.no_derived_pages_reason) = '')
+      AND NOT EXISTS (
+          SELECT 1
+          FROM page_sources ps
+          JOIN pages p ON p.slug = ps.page_slug
+          WHERE ps.source_id = ij.source_id
+            AND LOWER(COALESCE(p.kind, '')) <> 'source'
+      )
     UNION ALL
     SELECT
         'uncited_page', p.slug, NULL, 'page has no cited sources'
@@ -215,6 +240,16 @@ pub struct SourceShowResponse {
     pub scope: String,
     pub database: String,
     pub source: SourceRecord,
+    pub window: SourceWindow,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SourceWindow {
+    pub offset_chars: usize,
+    pub returned_chars: usize,
+    pub total_chars: usize,
+    pub next_offset_chars: Option<usize>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -304,14 +339,31 @@ pub struct SearchResult {
     pub result_type: String,
     pub identifier: String,
     pub title: Option<String>,
+    pub kind: Option<String>,
     pub summary: Option<String>,
     pub snippet: String,
     pub rank: f64,
+    #[serde(skip)]
+    paired_source_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SearchResponse {
     pub results: Vec<SearchResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    Auto,
+    Page,
+    Source,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub mode: SearchMode,
+    pub kinds: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -339,12 +391,14 @@ pub struct IngestJobSummary {
     pub status: String,
     pub attempts: i64,
     pub last_error: Option<String>,
+    pub no_derived_pages_reason: Option<String>,
     pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct IngestWork {
     pub source: SourceRecord,
+    pub source_window: SourceWindow,
     pub status: String,
     pub attempts: i64,
     pub analysis: Option<String>,
@@ -375,6 +429,15 @@ pub struct IngestMutationResponse {
     pub scope: String,
     pub database: String,
     pub job: IngestJobSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration: Option<IngestIntegration>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct IngestIntegration {
+    pub source_summary_pages: usize,
+    pub derived_pages: usize,
+    pub no_derived_pages_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -410,6 +473,17 @@ pub struct MaterializeResponse {
     pub scope: String,
     pub database: String,
     pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CompactResponse {
+    pub scope: String,
+    pub database: String,
+    pub busy: bool,
+    pub log_frames: i64,
+    pub checkpointed_frames: i64,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -514,6 +588,16 @@ impl Store {
         })
     }
 
+    pub fn open_for_read(scope: impl Into<String>, database: impl AsRef<Path>) -> Result<Self> {
+        let scope = scope.into();
+        let database = database.as_ref().to_path_buf();
+        match Self::open_read_only(scope.clone(), &database) {
+            Ok(store) => Ok(store),
+            Err(error) if error.code == "unsupported_store_version" => Self::open(scope, database),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn schema_set(&mut self, schema: &str) -> Result<SchemaResponse> {
         let tx = self
             .conn
@@ -560,6 +644,12 @@ impl Store {
 
     pub fn source_add(&mut self, input: SourceAddInput) -> Result<SourceAddResponse> {
         let content_hash = hash_content(&input.content);
+        let title = input
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or(&input.origin)
+            .to_string();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -568,12 +658,7 @@ impl Store {
                 "INSERT OR IGNORE INTO sources(content_hash, title, origin, content, created_at)
                  VALUES (?1, ?2, ?3, ?4, {TIMESTAMP_SQL})"
             ),
-            params![
-                &content_hash,
-                input.title.as_deref(),
-                &input.origin,
-                &input.content
-            ],
+            params![&content_hash, &title, &input.origin, &input.content],
         )? == 1;
         let source_id = tx.query_row(
             "SELECT id FROM sources WHERE content_hash = ?1",
@@ -581,12 +666,7 @@ impl Store {
             |row| row.get::<_, i64>(0),
         )?;
         if created {
-            index_source(
-                &tx,
-                source_id,
-                input.title.as_deref(),
-                input.content.as_str(),
-            )?;
+            index_source(&tx, source_id, Some(&title), input.content.as_str())?;
         }
         tx.execute(
             &format!(
@@ -639,11 +719,18 @@ impl Store {
         })
     }
 
-    pub fn source_show(&self, id: i64) -> Result<SourceShowResponse> {
+    pub fn source_show(
+        &self,
+        id: i64,
+        offset_chars: usize,
+        max_chars: Option<usize>,
+    ) -> Result<SourceShowResponse> {
+        let (source, window) = window_source(self.load_source(id)?, offset_chars, max_chars)?;
         Ok(SourceShowResponse {
             scope: self.scope.clone(),
             database: self.database_string(),
-            source: self.load_source(id)?,
+            source,
+            window,
         })
     }
 
@@ -834,8 +921,32 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub fn search(&self, query: &str, limit: usize) -> Result<SearchResponse> {
+        self.search_with_options(
+            query,
+            limit,
+            &SearchOptions {
+                mode: SearchMode::All,
+                kinds: Vec::new(),
+            },
+        )
+    }
+
+    pub fn search_with_options(
+        &self,
+        query: &str,
+        limit: usize,
+        options: &SearchOptions,
+    ) -> Result<SearchResponse> {
         let tokens = tokenize_for_query(query);
+        let candidate_multiplier = if options.kinds.is_empty()
+            && matches!(options.mode, SearchMode::Auto | SearchMode::All)
+        {
+            4
+        } else {
+            8
+        };
         let mut results = if tokens.is_empty() {
             Vec::new()
         } else {
@@ -844,13 +955,59 @@ impl Store {
                 &self.scope,
                 query,
                 &tokens,
-                limit.saturating_mul(4).clamp(limit, 1000),
+                limit
+                    .saturating_mul(candidate_multiplier)
+                    .clamp(limit, 1000),
             )?
         };
 
+        let normalized_kinds = options
+            .kinds
+            .iter()
+            .map(|kind| kind.trim().to_lowercase())
+            .collect::<BTreeSet<_>>();
+        results.retain(|result| {
+            let type_matches = match options.mode {
+                SearchMode::Auto | SearchMode::All => true,
+                SearchMode::Page => result.result_type == "page",
+                SearchMode::Source => result.result_type == "source",
+            };
+            let kind_matches = normalized_kinds.is_empty()
+                || result.result_type == "source"
+                || result
+                    .kind
+                    .as_deref()
+                    .map(str::to_lowercase)
+                    .is_some_and(|kind| normalized_kinds.contains(&kind));
+            type_matches && kind_matches
+        });
+
+        if options.mode == SearchMode::Auto {
+            let summarized_sources = results
+                .iter()
+                .filter(|result| {
+                    result.result_type == "page"
+                        && result
+                            .kind
+                            .as_deref()
+                            .is_some_and(|kind| kind.eq_ignore_ascii_case("source"))
+                })
+                .flat_map(|result| result.paired_source_ids.iter().copied())
+                .collect::<BTreeSet<_>>();
+            results.retain(|result| {
+                result.result_type != "source"
+                    || result
+                        .identifier
+                        .parse::<i64>()
+                        .map(|id| !summarized_sources.contains(&id))
+                        .unwrap_or(true)
+            });
+        }
+
         results.sort_by(|left, right| {
-            left.rank
-                .total_cmp(&right.rank)
+            search_type_priority(left, options.mode)
+                .cmp(&search_type_priority(right, options.mode))
+                .then_with(|| left.rank.total_cmp(&right.rank))
                 .then_with(|| left.result_type.cmp(&right.result_type))
                 .then_with(|| left.identifier.cmp(&right.identifier))
         });
@@ -873,7 +1030,8 @@ impl Store {
             validate_ingest_status(status)?;
         }
         let mut statement = self.conn.prepare(
-            "SELECT source_id, status, attempts, last_error, updated_at
+            "SELECT source_id, status, attempts, last_error,
+                    no_derived_pages_reason, updated_at
              FROM ingest_jobs
              WHERE ?1 IS NULL OR status = ?1
              ORDER BY source_id ASC
@@ -897,7 +1055,11 @@ impl Store {
         })
     }
 
-    pub fn ingest_next(&mut self, context_limit: usize) -> Result<IngestPacket> {
+    pub fn ingest_next(
+        &mut self,
+        context_limit: usize,
+        source_max_chars: Option<usize>,
+    ) -> Result<IngestPacket> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -932,7 +1094,7 @@ impl Store {
             scope: self.scope.clone(),
             database: self.database_string(),
             job: source_id
-                .map(|source_id| self.load_ingest_work(source_id))
+                .map(|source_id| self.load_ingest_work(source_id, source_max_chars))
                 .transpose()?,
             schema: self.schema_text()?,
             purpose: self.purpose_text()?,
@@ -965,22 +1127,24 @@ impl Store {
         self.ingest_mutation_response(source_id)
     }
 
-    pub fn ingest_complete(&mut self, source_id: i64) -> Result<IngestMutationResponse> {
+    pub fn ingest_complete(
+        &mut self,
+        source_id: i64,
+        no_derived_pages_reason: Option<&str>,
+    ) -> Result<IngestMutationResponse> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_ingest_state(&tx, source_id, &["generating"])?;
-        let has_summary: bool = tx.query_row(
-            "SELECT EXISTS(
-                 SELECT 1
-                 FROM page_sources ps
-                 JOIN pages p ON p.slug = ps.page_slug
-                 WHERE ps.source_id = ?1 AND LOWER(COALESCE(p.kind, '')) = 'source'
-             )",
+        let source_summary_pages: i64 = tx.query_row(
+            "SELECT COUNT(*)
+             FROM page_sources ps
+             JOIN pages p ON p.slug = ps.page_slug
+             WHERE ps.source_id = ?1 AND LOWER(COALESCE(p.kind, '')) = 'source'",
             params![source_id],
             |row| row.get(0),
         )?;
-        if !has_summary {
+        if source_summary_pages == 0 {
             return Err(AppError::new(
                 "source_summary_missing",
                 format!(
@@ -988,19 +1152,60 @@ impl Store {
                 ),
             ));
         }
+        let derived_pages: i64 = tx.query_row(
+            "SELECT COUNT(*)
+             FROM page_sources ps
+             JOIN pages p ON p.slug = ps.page_slug
+             WHERE ps.source_id = ?1 AND LOWER(COALESCE(p.kind, '')) <> 'source'",
+            params![source_id],
+            |row| row.get(0),
+        )?;
+        let reason = no_derived_pages_reason
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty());
+        if derived_pages == 0 && reason.is_none() {
+            return Err(AppError::new(
+                "ingest_integration_required",
+                format!(
+                    "source {source_id} needs at least one cited non-source page; if no shared knowledge changes, retry with --no-derived-pages-reason"
+                ),
+            ));
+        }
+        if derived_pages > 0 && reason.is_some() {
+            return Err(AppError::new(
+                "invalid_input",
+                "--no-derived-pages-reason is only valid when no non-source page cites this source",
+            ));
+        }
         tx.execute(
             &format!(
                 "UPDATE ingest_jobs
                  SET status = 'completed',
                      last_error = NULL,
+                     no_derived_pages_reason = ?2,
                      updated_at = {TIMESTAMP_SQL}
                  WHERE source_id = ?1"
             ),
-            params![source_id],
+            params![source_id, reason],
         )?;
-        record_operation(&tx, "ingest_complete", &source_id.to_string(), &json!({}))?;
+        record_operation(
+            &tx,
+            "ingest_complete",
+            &source_id.to_string(),
+            &json!({
+                "source_summary_pages": source_summary_pages,
+                "derived_pages": derived_pages,
+                "no_derived_pages_reason": reason,
+            }),
+        )?;
         tx.commit()?;
-        self.ingest_mutation_response(source_id)
+        let mut response = self.ingest_mutation_response(source_id)?;
+        response.integration = Some(IngestIntegration {
+            source_summary_pages: source_summary_pages as usize,
+            derived_pages: derived_pages as usize,
+            no_derived_pages_reason: reason.map(str::to_string),
+        });
+        Ok(response)
     }
 
     pub fn ingest_fail(&mut self, source_id: i64, message: &str) -> Result<IngestMutationResponse> {
@@ -1092,6 +1297,42 @@ impl Store {
             database: self.database_string(),
             sources,
             pages,
+        })
+    }
+
+    pub fn compact(&mut self) -> Result<CompactResponse> {
+        let wal_path = PathBuf::from(format!("{}-wal", self.database.display()));
+        let before_bytes = fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO search_fts(search_fts) VALUES('optimize')", [])?;
+        record_operation(
+            &tx,
+            "maintenance_compact",
+            "wiki.db",
+            &json!({ "wal_before_bytes": before_bytes }),
+        )?;
+        tx.commit()?;
+
+        let (busy, log_frames, checkpointed_frames) =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?;
+        let after_bytes = fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0);
+        Ok(CompactResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            busy: busy != 0,
+            log_frames,
+            checkpointed_frames,
+            before_bytes,
+            after_bytes,
         })
     }
 
@@ -1226,7 +1467,11 @@ impl Store {
             .map_err(Into::into)
     }
 
-    fn load_ingest_work(&self, source_id: i64) -> Result<IngestWork> {
+    fn load_ingest_work(
+        &self,
+        source_id: i64,
+        source_max_chars: Option<usize>,
+    ) -> Result<IngestWork> {
         let (status, attempts, analysis) = self
             .conn
             .query_row(
@@ -1249,8 +1494,11 @@ impl Store {
                     format!("ingest job not found for source {source_id}"),
                 )
             })?;
+        let (source, source_window) =
+            window_source(self.load_source(source_id)?, 0, source_max_chars)?;
         Ok(IngestWork {
-            source: self.load_source(source_id)?,
+            source,
+            source_window,
             status,
             attempts,
             analysis,
@@ -1261,7 +1509,8 @@ impl Store {
         let job = self
             .conn
             .query_row(
-                "SELECT source_id, status, attempts, last_error, updated_at
+                "SELECT source_id, status, attempts, last_error,
+                        no_derived_pages_reason, updated_at
                  FROM ingest_jobs
                  WHERE source_id = ?1",
                 params![source_id],
@@ -1278,6 +1527,7 @@ impl Store {
             scope: self.scope.clone(),
             database: self.database_string(),
             job,
+            integration: None,
         })
     }
 
@@ -1712,6 +1962,10 @@ fn prepare_store(conn: &mut Connection, allow_create: bool) -> Result<bool> {
         migrate_ingest_workflow(conn)?;
         version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     }
+    if version == INGEST_WORKFLOW_VERSION {
+        migrate_compound_wiki(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
     if version != USER_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
@@ -1747,7 +2001,7 @@ fn migrate_ingest_workflow(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match current {
-        USER_VERSION => {
+        INGEST_WORKFLOW_VERSION | USER_VERSION => {
             tx.commit()?;
             return Ok(());
         }
@@ -1793,13 +2047,58 @@ fn migrate_ingest_workflow(conn: &mut Connection) -> Result<()> {
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![INGEST_WORKFLOW_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", INGEST_WORKFLOW_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to commit v{INGEST_WORKFLOW_VERSION} workflow migration: {error}"),
+        )
+    })
+}
+
+fn migrate_compound_wiki(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match current {
+        USER_VERSION => {
+            tx.commit()?;
+            return Ok(());
+        }
+        INGEST_WORKFLOW_VERSION => {}
+        other => {
+            return Err(AppError::new(
+                "unsupported_store_version",
+                format!("cannot migrate wiki database version {other} to {USER_VERSION}"),
+            ));
+        }
+    }
+
+    tx.execute_batch(
+        "ALTER TABLE ingest_jobs
+         ADD COLUMN no_derived_pages_reason TEXT;
+
+         UPDATE sources
+         SET title = origin
+         WHERE title IS NULL OR TRIM(title) = '';",
+    )?;
+    rebuild_search_index(&tx).map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to prepare v{USER_VERSION} compact search index: {error}"),
+        )
+    })?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![USER_VERSION.to_string()],
     )?;
     tx.pragma_update(None, "user_version", USER_VERSION)?;
     tx.commit().map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to commit v{USER_VERSION} workflow migration: {error}"),
+            format!("failed to commit v{USER_VERSION} Wiki migration: {error}"),
         )
     })
 }
@@ -1869,6 +2168,7 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
             attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
             analysis TEXT,
             last_error TEXT,
+            no_derived_pages_reason TEXT,
             updated_at TEXT NOT NULL,
             FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
         );
@@ -1881,7 +2181,10 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
             identifier UNINDEXED,
             title_terms,
             summary_terms,
-            body_terms
+            body_terms,
+            content='',
+            contentless_delete=1,
+            contentless_unindexed=1
         );
 
         INSERT INTO meta(key, value) VALUES ('format_version', '{USER_VERSION}');
@@ -1953,12 +2256,20 @@ fn rebuild_search_index(tx: &Transaction<'_>) -> Result<(usize, usize)> {
         DROP TABLE IF EXISTS source_fts;
         DROP TABLE IF EXISTS page_fts;
         DROP TABLE IF EXISTS search_fts;
+        DROP TABLE IF EXISTS search_fts_data;
+        DROP TABLE IF EXISTS search_fts_idx;
+        DROP TABLE IF EXISTS search_fts_content;
+        DROP TABLE IF EXISTS search_fts_docsize;
+        DROP TABLE IF EXISTS search_fts_config;
         CREATE VIRTUAL TABLE search_fts USING fts5(
             doc_type UNINDEXED,
             identifier UNINDEXED,
             title_terms,
             summary_terms,
-            body_terms
+            body_terms,
+            content='',
+            contentless_delete=1,
+            contentless_unindexed=1
         );
         ",
     )?;
@@ -2009,7 +2320,7 @@ fn validate_store(conn: &Connection) -> Result<()> {
         "SELECT page_slug, source_id FROM page_sources LIMIT 0",
         "SELECT from_slug, to_slug FROM links LIMIT 0",
         "SELECT action, target, detail_json, created_at FROM operations LIMIT 0",
-        "SELECT source_id, status, attempts, analysis, last_error, updated_at FROM ingest_jobs LIMIT 0",
+        "SELECT source_id, status, attempts, analysis, last_error, no_derived_pages_reason, updated_at FROM ingest_jobs LIMIT 0",
         "SELECT rowid, doc_type, identifier, title_terms, summary_terms, body_terms FROM search_fts LIMIT 0",
     ] {
         conn.prepare(sql).map_err(|error| {
@@ -2084,6 +2395,47 @@ fn read_source_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRecord>
     })
 }
 
+fn window_source(
+    mut source: SourceRecord,
+    offset_chars: usize,
+    max_chars: Option<usize>,
+) -> Result<(SourceRecord, SourceWindow)> {
+    if max_chars == Some(0) {
+        return Err(AppError::new(
+            "invalid_limit",
+            "max-chars must be greater than zero",
+        ));
+    }
+    let total_chars = source.content.chars().count();
+    if offset_chars > total_chars {
+        return Err(AppError::new(
+            "invalid_offset",
+            format!("offset-chars {offset_chars} exceeds source length {total_chars}"),
+        ));
+    }
+    let requested = max_chars.unwrap_or_else(|| total_chars.saturating_sub(offset_chars));
+    let content = source
+        .content
+        .chars()
+        .skip(offset_chars)
+        .take(requested)
+        .collect::<String>();
+    let returned_chars = content.chars().count();
+    let consumed = offset_chars.saturating_add(returned_chars);
+    let has_more = consumed < total_chars;
+    source.content = content;
+    Ok((
+        source,
+        SourceWindow {
+            offset_chars,
+            returned_chars,
+            total_chars,
+            next_offset_chars: has_more.then_some(consumed),
+            has_more,
+        },
+    ))
+}
+
 fn read_source_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceSummary> {
     Ok(SourceSummary {
         id: row.get(0)?,
@@ -2101,7 +2453,8 @@ fn read_ingest_job_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<IngestJo
         status: row.get(1)?,
         attempts: row.get(2)?,
         last_error: row.get(3)?,
-        updated_at: row.get(4)?,
+        no_derived_pages_reason: row.get(4)?,
+        updated_at: row.get(5)?,
     })
 }
 
@@ -2320,6 +2673,10 @@ fn search_index(
                     ELSE s.title
                 END AS title,
                 CASE search_fts.doc_type
+                    WHEN 'page' THEN p.kind
+                    ELSE NULL
+                END AS kind,
+                CASE search_fts.doc_type
                     WHEN 'page' THEN p.summary
                     ELSE NULL
                 END AS summary,
@@ -2343,6 +2700,7 @@ fn search_index(
             doc_type,
             identifier,
             title,
+            kind,
             summary,
             CASE
                 WHEN INSTR(LOWER(body), LOWER(?3)) > 0 THEN
@@ -2358,7 +2716,16 @@ fn search_index(
                     - LENGTH(REPLACE(LOWER(body), LOWER(?3), ''))
                 ) / LENGTH(?3)
             END AS phrase_count,
-            fts_rank
+            fts_rank,
+            CASE
+                WHEN doc_type = 'page' AND LOWER(COALESCE(kind, '')) = 'source'
+                THEN (
+                    SELECT GROUP_CONCAT(ps.source_id, ',')
+                    FROM page_sources ps
+                    WHERE ps.page_slug = identifier
+                )
+                ELSE NULL
+            END AS paired_source_ids
         FROM ranked";
     let mut statement = conn.prepare(sql)?;
     statement
@@ -2366,8 +2733,16 @@ fn search_index(
             params![match_query, limit as i64, query, first_token],
             |row| {
                 let title = row.get::<_, Option<String>>(2)?;
-                let phrase_count = row.get::<_, i64>(5)?;
-                let fts_rank = row.get::<_, f64>(6)?;
+                let phrase_count = row.get::<_, i64>(6)?;
+                let fts_rank = row.get::<_, f64>(7)?;
+                let paired_source_ids = row
+                    .get::<_, Option<String>>(8)?
+                    .map(|ids| {
+                        ids.split(',')
+                            .filter_map(|id| id.parse::<i64>().ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Ok(SearchResult {
                     scope: scope.to_string(),
                     result_type: row.get(0)?,
@@ -2380,13 +2755,23 @@ fn search_index(
                         tokens.len(),
                     ),
                     title,
-                    summary: row.get(3)?,
-                    snippet: row.get(4)?,
+                    kind: row.get(3)?,
+                    summary: row.get(4)?,
+                    snippet: row.get(5)?,
+                    paired_source_ids,
                 })
             },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+fn search_type_priority(result: &SearchResult, mode: SearchMode) -> u8 {
+    if matches!(mode, SearchMode::Auto | SearchMode::All) && result.result_type == "source" {
+        1
+    } else {
+        0
+    }
 }
 
 fn comparable_rank(
@@ -2398,6 +2783,12 @@ fn comparable_rank(
 ) -> f64 {
     let normalized_query = query.to_lowercase();
     let normalized_title = title.unwrap_or("").to_lowercase();
+    let query_terms = tokenize_for_query(query);
+    let title_terms = tokenize_for_query(title.unwrap_or(""))
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let title_covers_query =
+        query_terms.len() > 1 && query_terms.iter().all(|term| title_terms.contains(term));
     let title_score = if !normalized_query.is_empty() && normalized_title == normalized_query {
         1_000.0
     } else if token_count > 1
@@ -2405,6 +2796,8 @@ fn comparable_rank(
         && normalized_title.contains(&normalized_query)
     {
         500.0
+    } else if title_covers_query {
+        300.0
     } else {
         0.0
     };
@@ -2463,6 +2856,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(source_add_count, 2);
+    }
+
+    #[test]
+    fn title_token_coverage_bridges_query_separators() {
+        let query = "系统设置 支付渠道管理";
+        let rank = comparable_rank(
+            Some("01-系统设置-支付渠道管理.md"),
+            query,
+            0,
+            0.0,
+            tokenize_for_query(query).len(),
+        );
+
+        assert!(
+            rank <= -250.0,
+            "all title terms should receive a strong title boost despite separator differences"
+        );
     }
 
     #[test]

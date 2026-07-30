@@ -62,11 +62,11 @@ Wiki。Agent 负责理解与综合，`lwc` 负责保存来源、页面、引用�
 +-----------------------------------------------------------------------+
                                    |
                                    v
-+---------------------+---------------------+---------------------------+
-| SEARCH PIPELINE     | GRAPH ENGINE        | MARKDOWN PROJECTION       |
-| custom tokenizer    | links / citations   | raw/ | wiki/ | index.md   |
-| FTS5 + BM25         | neighbors / types   | log.md | overview.md      |
-+---------------------+---------------------+---------------------------+
++-----------------------+-----------------------+-----------------------+
+| SEARCH PIPELINE       | GRAPH ENGINE          | MARKDOWN PROJECTION   |
+| CJK n-grams + Latin   | links + citations     | raw/ + wiki/          |
+| contentless FTS5/BM25 | structural evidence   | index/log/overview    |
++-----------------------+-----------------------+-----------------------+
 ```
 
 持久化知识模型分为三个逻辑层：
@@ -80,6 +80,9 @@ Wiki。Agent 负责理解与综合，`lwc` 负责保存来源、页面、引用�
 SQLite 是唯一的规范事实源。Markdown 树是供人和 Obsidian 等工具使用的可重建
 投影。Agent 通过 `lwc` 修改知识，而不是直接编辑 `.lwc/wiki.db` 或投影出来的
 Markdown。命令成功时向 stdout 返回 JSON，失败时向 stderr 返回结构化 JSON。
+
+对于当前格式的 store，读取命令保持只读；新版 CLI 第一次打开可写的旧版 store
+时，会先在事务中完成一次 schema 迁移，再继续读取。
 
 ## 为什么它不只是 RAG
 
@@ -163,14 +166,25 @@ printf '# Purpose\nBuild a durable project Wiki.\n' | lwc purpose set -
 lwc source add-dir docs/
 ```
 
+没有显式标题的文件会确定性地使用来源路径作为可读标题；内容相同的文件会通过
+SHA-256 去重。
+
 ### 3. 分析并整合一个来源
 
 ```bash
-lwc ingest next --context-limit 50
+lwc ingest next --context-limit 50 --source-max-chars 100000
 lwc ingest analyze 1 --file analysis.md
 ```
 
-在完成该 ingest 任务之前，先创建至少一个带引用的 source-summary 页面：
+如果返回的 `source_window.has_more` 为 true，就从
+`source_window.next_offset_chars` 继续读取：
+
+```bash
+lwc source show 1 --offset-chars 100000 --max-chars 100000
+```
+
+完成 ingest 之前，既要创建带引用的 source-summary 页面，也要把这个来源的贡献
+整合进至少一个非 source 页面：
 
 ```bash
 lwc page put source-1 \
@@ -180,16 +194,31 @@ lwc page put source-1 \
   --file source-summary.md \
   --source 1
 
+lwc page put durable-concept \
+  --title "Durable Concept" \
+  --kind concept \
+  --summary "How this source changes shared knowledge" \
+  --file concept.md \
+  --source 1
+
 lwc ingest complete 1
 ```
 
-这个 `kind=source` 步骤是必需的。一个来源不会因为已经导入，或者只更新了 concept/entity 页面，就被视为已经完成整合。
+两层都必需：source 页面负责导航和来源追溯，非 source 页面让知识真正持续积累。
+如果某个来源确实不应改变任何共享页面，需要记录一条具体且可审计的说明：
+
+```bash
+lwc ingest complete 1 \
+  --no-derived-pages-reason "Duplicate evidence; existing synthesis already covers every supported claim"
+```
 
 ### 4. 查询已沉淀的 Wiki
 
 ```bash
 lwc context --limit 50
 lwc search "question keywords" --limit 20
+lwc search "concept only" --type page --kind concept
+lwc search "exact evidence" --type source
 lwc page show source-1
 ```
 
@@ -198,11 +227,11 @@ lwc page show source-1
 标准工作流如下：
 
 1. 收集不可变来源。
-2. 用 `lwc ingest next` 领取一个 ingest 任务。
-3. 读取返回的 schema、purpose、来源快照和有界上下文。
+2. 用有界的 `lwc ingest next` 领取一个 ingest 任务。
+3. 读完所有来源窗口，以及返回的 schema、purpose 和有界上下文。
 4. 先分析，再生成页面。
-5. 用显式 `--source` 引用来写入或修订持久化页面。
-6. 只有在存在一个带引用的 `kind=source` 摘要页后，才能 complete。
+5. 用显式 `--source` 引用写入或修订 source 摘要与共享知识页面。
+6. 只有两道整合门禁都通过，或明确记录无需更新共享页面的原因后，才能 complete。
 7. 用 `search`、`context`、`graph` 和 `lint` 持续维护 Wiki 的一致性。
 
 完整操作约定见 [docs/agent-workflow.md](docs/agent-workflow.md)。
@@ -235,6 +264,10 @@ lwc --scope all context
 搜索是词法型（lexical）且确定性的。
 
 - 搜索词是纯文本，不是原始 FTS 语法。
+- 默认的 `--type auto` 会优先返回已编译的 Wiki 页面、隐藏与其配对的 raw
+  source，并在页面不足时回退到 raw source。
+- 用 `--type page`、`--type source` 或 `--type all` 选择检索层；可重复传入
+  `--kind` 限定页面类型，例如 `--kind concept --kind synthesis`。
 - 多字 CJK 查询使用相邻 bigram；索引还会保留非停用单字，使单字查询仍可检索。
 - 拉丁文本会被切成小写的字母数字 token。
 - 排名使用固定的 title/summary/body 权重，因此在 `--scope all` 下，project 和 global 的结果仍可直接比较。
@@ -249,6 +282,7 @@ lwc --scope all context
 lwc lint
 lwc maintenance reindex
 lwc maintenance materialize
+lwc maintenance compact
 lwc log --limit 20
 ```
 
@@ -257,9 +291,29 @@ lwc log --limit 20
 - `lint` 报告确定性的结构问题，并记录这次 lint。
 - `maintenance reindex` 从 SQLite 重建派生搜索产物。
 - `maintenance materialize` 从 SQLite 重建投影出来的 Markdown 树。
+- `maintenance compact` 优化 contentless FTS5 索引并尝试执行 WAL truncate
+  checkpoint。应在 Wiki 空闲时运行，并检查返回的 `busy` 与 `after_bytes`。
 - 搜索查询默认是私有的；只有需要把查询文本写入持久化操作日志时，才加 `--record`。
 
 备份前应停止正在运行的 `lwc` 命令，并复制完整的 `.lwc/` 目录。写入进程可能仍在使用 WAL 文件时，不要只复制 `wiki.db`。
+
+## 基准测试集
+
+可选基准会把本地 UTF-8 语料导入临时 Wiki，并报告导入耗时、搜索 P50/P95、
+Recall@5/10、MRR，以及 compact 前后的存储占用。Ground truth 使用 JSONL
+描述查询与期望命中的语料相对路径：
+
+```bash
+cargo build --release
+LWC_BENCH_CORPUS=/path/to/sanitized-corpus \
+LWC_BENCH_QUERY_SET=/path/to/query-set.jsonl \
+LWC_BENCH_BINARY="$PWD/target/release/lwc" \
+cargo test --test search_benchmark -- --ignored --nocapture
+```
+
+常规 `cargo test --all-targets` 覆盖 page-first 搜索、type/kind 过滤、UTF-8
+来源窗口、ingest 完成门禁、图关系精度、迁移、lint 与 WAL compact。工作负载约定
+和公平前后对比规则见 [benchmarks/README.md](benchmarks/README.md)。
 
 ## 限制与非目标
 

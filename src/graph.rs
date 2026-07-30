@@ -85,14 +85,13 @@ pub fn related(seed: &GraphPage, pages: &[GraphPage], limit: usize) -> Vec<Relat
             &outlinks_map,
             &inlinks_map,
         );
-        let type_affinity_score =
-            type_affinity_score(&seed_kind, &normalized_kind(page.kind.as_deref()));
-        let total_score =
-            direct_link_score + shared_source_score + common_neighbor_score + type_affinity_score;
-
-        if total_score <= 0.0 {
+        let structural_score = direct_link_score + shared_source_score + common_neighbor_score;
+        if structural_score <= 0.0 {
             continue;
         }
+        let type_affinity_score =
+            type_affinity_score(&seed_kind, &normalized_kind(page.kind.as_deref()));
+        let total_score = structural_score + type_affinity_score;
 
         results.push(RelatedPage {
             slug: page.slug.clone(),
@@ -300,23 +299,38 @@ mod tests {
 
     #[test]
     fn applies_type_affinity_matrix() {
-        let seed = page("seed", "Seed", Some("concept"), &[], &[]);
-        let entity = page("entity", "Entity", Some("entity"), &[], &[]);
-        let query = page("query", "Query", Some("query"), &[], &[]);
+        let seed = page("seed", "Seed", Some("concept"), &[1], &[]);
+        let entity = page("entity", "Entity", Some("entity"), &[1], &[]);
+        let query = page("query", "Query", Some("query"), &[1], &[]);
 
         let results = related(&seed, &[query, entity], 10);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].slug, "entity");
         approx_eq(results[0].type_affinity_score, 1.2);
+        approx_eq(results[0].total_score, 5.2);
         approx_eq(results[1].type_affinity_score, 1.0);
+        approx_eq(results[1].total_score, 5.0);
+    }
+
+    #[test]
+    fn ignores_type_affinity_without_structural_evidence() {
+        let seed = page("seed", "Seed", Some("concept"), &[], &[]);
+        let unrelated = page("unrelated", "Unrelated", Some("entity"), &[], &[]);
+
+        let results = related(&seed, &[unrelated], 10);
+
+        assert!(
+            results.is_empty(),
+            "page kinds must refine real graph evidence, not invent a relationship"
+        );
     }
 
     #[test]
     fn sorts_by_score_then_slug_stably() {
-        let seed = page("seed", "Seed", Some("entity"), &[], &[]);
-        let alpha = page("alpha", "Alpha", Some("entity"), &[], &[]);
-        let beta = page("beta", "Beta", Some("entity"), &[], &[]);
-        let gamma = page("gamma", "Gamma", Some("query"), &[], &[]);
+        let seed = page("seed", "Seed", Some("entity"), &[1], &[]);
+        let alpha = page("alpha", "Alpha", Some("entity"), &[1], &[]);
+        let beta = page("beta", "Beta", Some("entity"), &[1], &[]);
+        let gamma = page("gamma", "Gamma", Some("query"), &[1], &[]);
 
         let results = related(&seed, &[beta, gamma, alpha], 3);
         assert_eq!(
@@ -326,8 +340,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["alpha", "beta", "gamma"]
         );
-        approx_eq(results[0].total_score, 0.8);
-        approx_eq(results[1].total_score, 0.8);
-        approx_eq(results[2].total_score, 0.8);
+        approx_eq(results[0].total_score, 4.8);
+        approx_eq(results[1].total_score, 4.8);
+        approx_eq(results[2].total_score, 4.8);
     }
 }
