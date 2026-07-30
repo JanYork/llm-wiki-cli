@@ -29,28 +29,40 @@ Wiki。Agent 负责理解与综合，`lwc` 负责保存来源、页面、引用�
 ## 核心设计
 
 ```text
-+----------------+  ingest  +--------------------+  JSON I/O +----------------+
-| Source Files   | -------> | lwc CLI            | <-------> | LLM Agent      |
-| immutable      |          | ingest/page/query  |           | reason/update  |
-+----------------+          +---------+----------+           +----------------+
-                                      |
-                               transactions
-                                      |
-                                      v
-         +----------------------------------------------------------+
-         | SQLite Stores (Canonical)                                |
-         | project: .lwc/wiki.db   global: ~/.lwc/wiki.db           |
-         | sources | pages | citations | links | FTS                |
-         | schema | purpose | ingest queue | operation log          |
-         +----------------------------+-----------------------------+
-                                      |
-                           materialize / rebuild
-                                      |
-                                      v
-         +----------------------------------------------------------+
-         | Markdown Projection (Derived)                            |
-         | .lwc/raw/ | .lwc/wiki/ | schema.md | purpose.md          |
-         +----------------------------------------------------------+
++---------------------------- Agent Plane -----------------------------+
+| User Task --> LLM Agent --> using-lwc Skill                          |
+|                            trigger | bootstrap | recall | write-back  |
++-----------------------------------+----------------------------------+
+                                    |
+                              JSON / stdin / files
+                                    v
++------------------------------ CLI Layer ------------------------------+
+| clap command router                                                   |
+| init | schema | purpose | source | page | ingest | search | context  |
+| graph | lint | maintenance | log                                     |
++-------------------+-------------------------------+-------------------+
+                    |                               |
+                    v                               v
++-------------------+----------------+  +-----------+-------------------+
+| Scope Resolver                     |  | Import / Validation           |
+| project | global | all (merge)     |  | UTF-8 | size | ext | symlink |
++-------------------+----------------+  +-----------+-------------------+
+                    |                               |
+                    +---------------+---------------+
+                                    |
+                                    v
++--------------------------- SQLite Store ------------------------------+
+| Canonical | WAL | foreign keys | transactions | migrations           |
+| meta | sources | pages | page_sources | links | ingest_jobs          |
+| operations | search_fts                                               |
++------------+------------------+--------------------+------------------+
+             |                  |                    |
+             v                  v                    v
++------------+------+ +---------+---------+ +--------+------------------+
+| Search Pipeline   | | Graph Engine      | | Markdown Projection      |
+| custom tokenizer | | links / citations | | raw/ | wiki/ | index.md   |
+| FTS5 + BM25       | | neighbors / types | | log.md | overview.md     |
++-------------------+ +-------------------+ +---------------------------+
 ```
 
 持久化知识模型分为三个逻辑层：
