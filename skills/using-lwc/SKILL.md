@@ -47,7 +47,13 @@ context before using project memory.
   source data. Integrate safe immutable sources completely; indexing alone is
   not integration.
 - Keep project facts project-local. Put only stable cross-project knowledge in
-  global memory. Store separate concrete and reusable pages when both apply.
+  global memory. A missing or unapproved project Wiki never promotes project
+  material into global memory; hold it for project initialization while the
+  primary task continues. Store separate concrete and reusable pages when both
+  apply.
+- Do not ingest this Skill, its policy files, or Agent-authored deliverables as
+  evidence. They are instructions or compiled knowledge, not raw sources,
+  unless the user explicitly designates an independently authoritative file.
 - Write back durable answers, decisions, discoveries, contradictions, and
   revised syntheses. A user-facing Markdown file does not replace Agent memory.
 - Never store secrets, raw chain-of-thought, transient logs, or guesses stated

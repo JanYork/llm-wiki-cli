@@ -104,10 +104,19 @@ fn project_store_path(root: &Path) -> PathBuf {
 
 fn find_project_store(start: &Path) -> Option<PathBuf> {
     let global = global_store_path().ok();
+    let home = global
+        .as_deref()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .filter(|home| start.starts_with(home));
+
     for candidate in start.ancestors() {
         let path = project_store_path(candidate);
         if global.as_ref() != Some(&path) && path.is_file() {
             return Some(path);
+        }
+        if home == Some(candidate) {
+            break;
         }
     }
     None
@@ -207,6 +216,28 @@ mod tests {
         fs::create_dir_all(&global_store).unwrap();
         fs::create_dir_all(&project).unwrap();
         fs::write(global_store.join(STORE_FILE), "").unwrap();
+
+        let home_text = home.to_string_lossy().into_owned();
+        // SAFETY: test-only environment mutation is scoped to this process.
+        unsafe { env::set_var("HOME", &home_text) };
+
+        assert!(resolve_store_path(Scope::Project, &project).is_err());
+        assert_eq!(
+            init_store_path(Scope::Project, &project).unwrap().path,
+            project.join(STORE_DIR).join(STORE_FILE)
+        );
+    }
+
+    #[test]
+    fn project_scope_does_not_search_above_home_boundary() {
+        let _lock = HOME_LOCK.lock().unwrap();
+        let world = TempDir::new().unwrap();
+        let home = world.path().join("isolated-home");
+        let project = home.join("work/project");
+        let outside_store = world.path().join(STORE_DIR);
+        fs::create_dir_all(&outside_store).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(outside_store.join(STORE_FILE), "").unwrap();
 
         let home_text = home.to_string_lossy().into_owned();
         // SAFETY: test-only environment mutation is scoped to this process.
