@@ -44,8 +44,7 @@ jobs:
       - name: Test release installer
         run: ./tests/install_script.sh
 
-      - name: Test using-lwc bootstrap scope
-        run: ./tests/using_lwc_bootstrap.sh
+      # Companion Agent Skill checks are local-only; do not add them to repository CI.
 
       - name: Build release binary
         run: cargo build --locked --release
