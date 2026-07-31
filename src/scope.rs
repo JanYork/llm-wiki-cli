@@ -2,12 +2,13 @@ use crate::error::{AppError, Result};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
 };
 
 const STORE_DIR: &str = ".lwc";
 const STORE_FILE: &str = "wiki.db";
+const PROJECT_ROOT_ENV: &str = "LWC_PROJECT_ROOT";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -34,7 +35,7 @@ pub fn init_store_path(scope: Scope, cwd: &Path) -> Result<StorePath> {
     match scope {
         Scope::Project => Ok(StorePath::new(
             Scope::Project,
-            find_project_store(cwd).unwrap_or_else(|| project_store_path(cwd)),
+            project_store(cwd, true)?.expect("initialization always returns a project path"),
         )),
         Scope::Global => Ok(StorePath::new(Scope::Global, global_store_path()?)),
         Scope::All => Err(scope_not_supported("init")),
@@ -44,7 +45,7 @@ pub fn init_store_path(scope: Scope, cwd: &Path) -> Result<StorePath> {
 pub fn resolve_store_path(scope: Scope, cwd: &Path) -> Result<StorePath> {
     match scope {
         Scope::Project => {
-            let path = find_project_store(cwd).ok_or_else(|| {
+            let path = project_store(cwd, false)?.ok_or_else(|| {
                 store_not_found("no project wiki found from the current directory")
             })?;
             Ok(StorePath::new(Scope::Project, path))
@@ -72,7 +73,7 @@ pub fn resolve_read_store_paths(
             }
 
             let mut stores = Vec::with_capacity(2);
-            if let Some(path) = find_project_store(cwd) {
+            if let Some(path) = project_store(cwd, false)? {
                 stores.push(StorePath::new(Scope::Project, path));
             }
 
@@ -102,24 +103,137 @@ fn project_store_path(root: &Path) -> PathBuf {
     root.join(STORE_DIR).join(STORE_FILE)
 }
 
-fn find_project_store(start: &Path) -> Option<PathBuf> {
+fn project_store(cwd: &Path, initialize: bool) -> Result<Option<PathBuf>> {
+    let configured = configured_project_paths(cwd)?;
+    let (start, boundary, initialization_root) = match configured.as_ref() {
+        Some((cwd, root)) => (cwd.as_path(), Some(root.as_path()), root.as_path()),
+        None => (cwd, None, cwd),
+    };
+
+    let store = find_project_store(start, boundary)?
+        .or_else(|| initialize.then(|| project_store_path(initialization_root)));
+    if let (Some(root), Some(path)) = (boundary, store.as_deref()) {
+        ensure_project_path(path, root)?;
+    }
+    Ok(store)
+}
+
+fn configured_project_paths(cwd: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
+    let Some(root) = env::var_os(PROJECT_ROOT_ENV) else {
+        return Ok(None);
+    };
+    if root.is_empty() {
+        return Err(AppError::new(
+            "project_root_invalid",
+            format!("{PROJECT_ROOT_ENV} is empty"),
+        ));
+    }
+
+    let root = fs::canonicalize(&root).map_err(|error| {
+        AppError::new(
+            "project_root_invalid",
+            format!("cannot resolve {PROJECT_ROOT_ENV}: {error}"),
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(AppError::new(
+            "project_root_invalid",
+            format!("{PROJECT_ROOT_ENV} is not a directory: {}", root.display()),
+        ));
+    }
+
+    let cwd = fs::canonicalize(cwd)?;
+    if !cwd.starts_with(&root) {
+        return Err(AppError::new(
+            "project_root_mismatch",
+            format!(
+                "current directory {} is outside {PROJECT_ROOT_ENV} {}",
+                cwd.display(),
+                root.display()
+            ),
+        ));
+    }
+
+    Ok(Some((cwd, root)))
+}
+
+fn ensure_project_path(path: &Path, root: &Path) -> Result<()> {
+    if !path.starts_with(root) {
+        return Err(project_root_escape(path, root, "path is outside the root"));
+    }
+
+    let mut existing = path;
+    loop {
+        match fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing.parent().ok_or_else(|| {
+                    project_root_escape(path, root, "path has no existing ancestor")
+                })?;
+            }
+            Err(error) => {
+                return Err(project_root_escape(path, root, &error.to_string()));
+            }
+        }
+    }
+
+    let resolved = fs::canonicalize(existing)
+        .map_err(|error| project_root_escape(path, root, &error.to_string()))?;
+    if !resolved.starts_with(root) {
+        return Err(project_root_escape(
+            path,
+            root,
+            &format!("{} resolves outside the root", existing.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn project_root_escape(path: &Path, root: &Path, reason: &str) -> AppError {
+    AppError::new(
+        "project_root_escape",
+        format!(
+            "project path {} escapes LWC_PROJECT_ROOT {}: {reason}",
+            path.display(),
+            root.display()
+        ),
+    )
+}
+
+fn find_project_store(start: &Path, configured_boundary: Option<&Path>) -> Result<Option<PathBuf>> {
     let global = global_store_path().ok();
-    let home = global
-        .as_deref()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .filter(|home| start.starts_with(home));
+    let boundary = configured_boundary.or_else(|| {
+        global
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .filter(|home| start.starts_with(home))
+    });
+    let mut found: Option<PathBuf> = None;
 
     for candidate in start.ancestors() {
         let path = project_store_path(candidate);
         if global.as_ref() != Some(&path) && path.is_file() {
-            return Some(path);
+            if configured_boundary.is_none() {
+                return Ok(Some(path));
+            }
+            if let Some(previous) = found {
+                return Err(AppError::new(
+                    "project_scope_conflict",
+                    format!(
+                        "multiple project Wikis exist inside LWC_PROJECT_ROOT: {} and {}",
+                        previous.display(),
+                        path.display()
+                    ),
+                ));
+            }
+            found = Some(path);
         }
-        if home == Some(candidate) {
+        if boundary == Some(candidate) {
             break;
         }
     }
-    None
+    Ok(found)
 }
 
 fn global_store_path() -> Result<PathBuf> {

@@ -51,6 +51,7 @@ Persistent workflow:\n  \
 8. lwc search \"question\"\n\n\
 Scopes:\n  \
 project  Use the nearest ancestor .lwc/wiki.db (default).\n  \
+         Set LWC_PROJECT_ROOT to cap discovery and initialization at an authorized root.\n  \
 global   Use ~/.lwc/wiki.db for reusable cross-project knowledge.\n  \
 all      Read project and global stores together; valid only for search and context.\n  \
          search --record appends the query operation to both selected stores.\n\n\

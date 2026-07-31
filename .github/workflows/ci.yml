@@ -44,5 +44,8 @@ jobs:
       - name: Test release installer
         run: ./tests/install_script.sh
 
+      - name: Test using-lwc bootstrap scope
+        run: ./tests/using_lwc_bootstrap.sh
+
       - name: Build release binary
         run: cargo build --locked --release

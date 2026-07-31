@@ -48,6 +48,7 @@ usable_lwc() {
     grep -Eq '^lwc [0-9]+\.[0-9]+\.[0-9]+' || return 1
   supported_lwc_version "$candidate_version" || return 1
   "$candidate" init --help 2>&1 | grep -q -- '--scope'
+  "$candidate" --help 2>&1 | grep -q -- 'LWC_PROJECT_ROOT'
 }
 
 managed_lwc_path() {
@@ -114,12 +115,28 @@ home_dir="$(
   pwd -P
 )" || die "cannot resolve HOME"
 cwd="$(pwd -P)"
+project_boundary=""
+if [ -n "${LWC_PROJECT_ROOT:-}" ]; then
+  [ -d "$LWC_PROJECT_ROOT" ] ||
+    die "LWC_PROJECT_ROOT is not a directory: $LWC_PROJECT_ROOT"
+  project_boundary="$(
+    CDPATH= cd "$LWC_PROJECT_ROOT" >/dev/null 2>&1
+    pwd -P
+  )" || die "cannot resolve LWC_PROJECT_ROOT"
+  case "$cwd" in
+    "$project_boundary"|"$project_boundary/"*) ;;
+    *) die "current directory is outside LWC_PROJECT_ROOT: $project_boundary" ;;
+  esac
+fi
 tmp_dir=""
 if [ -d "${TMPDIR:-/tmp}" ]; then
   tmp_dir="$(
     CDPATH= cd "${TMPDIR:-/tmp}" >/dev/null 2>&1
     pwd -P
   )"
+fi
+if [ -n "$project_boundary" ] && is_excluded_root "$project_boundary"; then
+  die "LWC_PROJECT_ROOT is not a safe project root: $project_boundary"
 fi
 
 installed=false
@@ -175,6 +192,8 @@ project_root=""
 project_confidence="none"
 project_evidence=""
 suggest_project_init=false
+scope_conflict=false
+project_wiki_count=0
 
 cursor="$cwd"
 while :; do
@@ -182,10 +201,16 @@ while :; do
     break
   fi
   if [ -f "$cursor/.lwc/wiki.db" ]; then
-    project_wiki="$cursor/.lwc/wiki.db"
-    project_root="$cursor"
-    project_confidence="existing"
-    project_evidence=".lwc/wiki.db"
+    project_wiki_count=$((project_wiki_count + 1))
+    if [ "$project_wiki_count" -eq 1 ]; then
+      project_wiki="$cursor/.lwc/wiki.db"
+      project_root="$cursor"
+    fi
+    if [ -z "$project_boundary" ]; then
+      break
+    fi
+  fi
+  if [ -n "$project_boundary" ] && [ "$cursor" = "$project_boundary" ]; then
     break
   fi
   parent="$(dirname "$cursor")"
@@ -193,7 +218,16 @@ while :; do
   cursor="$parent"
 done
 
-if [ -z "$project_wiki" ]; then
+if [ "$project_wiki_count" -gt 1 ]; then
+  project_wiki=""
+  project_root="$project_boundary"
+  project_confidence="conflict"
+  project_evidence="multiple .lwc/wiki.db ancestors"
+  scope_conflict=true
+elif [ "$project_wiki_count" -eq 1 ]; then
+  project_confidence="existing"
+  project_evidence=".lwc/wiki.db"
+elif [ -z "$project_wiki" ]; then
   weak_root=""
   weak_evidence=""
   cursor="$cwd"
@@ -254,12 +288,20 @@ if [ -z "$project_wiki" ]; then
       fi
     fi
 
+    if [ -n "$project_boundary" ] && [ "$cursor" = "$project_boundary" ]; then
+      break
+    fi
     parent="$(dirname "$cursor")"
     [ "$parent" != "$cursor" ] || break
     cursor="$parent"
   done
 
-  if [ -z "$project_root" ] && [ -n "$weak_root" ]; then
+  if [ -z "$project_root" ] && [ -n "$project_boundary" ]; then
+    project_root="$project_boundary"
+    project_confidence="authorized"
+    project_evidence="LWC_PROJECT_ROOT"
+    suggest_project_init=true
+  elif [ -z "$project_root" ] && [ -n "$weak_root" ]; then
     project_root="$weak_root"
     project_confidence="weak"
     project_evidence="$weak_evidence"
@@ -273,9 +315,11 @@ printf '"installed":%s,' "$installed"
 printf '"global_wiki":"%s",' "$(json_escape "$global_wiki")"
 printf '"global_initialized":%s,' "$global_initialized"
 printf '"global_initialized_now":%s,' "$global_initialized_now"
+printf '"project_boundary":"%s",' "$(json_escape "$project_boundary")"
 printf '"project_wiki":"%s",' "$(json_escape "$project_wiki")"
 printf '"project_root":"%s",' "$(json_escape "$project_root")"
 printf '"project_confidence":"%s",' "$(json_escape "$project_confidence")"
 printf '"project_evidence":"%s",' "$(json_escape "$project_evidence")"
-printf '"suggest_project_init":%s' "$suggest_project_init"
+printf '"suggest_project_init":%s,' "$suggest_project_init"
+printf '"scope_conflict":%s' "$scope_conflict"
 printf '}\n'

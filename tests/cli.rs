@@ -36,6 +36,16 @@ impl TestWorld {
             .unwrap()
     }
 
+    fn command_in_project_root(&self, cwd: &Path, root: &Path, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_lwc"))
+            .current_dir(cwd)
+            .env("HOME", &self.home)
+            .env("LWC_PROJECT_ROOT", root)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
     fn ok(&self, cwd: &Path, args: &[&str]) -> Value {
         let output = self.command(cwd, args);
         assert!(
@@ -130,6 +140,7 @@ fn help_documents_the_agent_workflow_and_command_side_effects() {
                 "Agent operating contract:",
                 "Persistent workflow:",
                 "~/.lwc/wiki.db",
+                "LWC_PROJECT_ROOT",
                 "JSON",
                 "Do not edit .lwc/wiki.db",
             ],
@@ -601,6 +612,80 @@ fn project_and_global_stores_are_isolated_and_combined_deterministically() {
 
     let unsupported = world.err(&world.project, &["--scope", "all", "schema", "show"]);
     assert_eq!(unsupported["error"]["code"], "scope_not_supported");
+}
+
+#[test]
+fn configured_project_root_blocks_ancestor_project_reuse() {
+    let world = TestWorld::new();
+    let outer = world.home.join("work");
+    let project = outer.join("project");
+    let nested = project.join("src");
+    fs::create_dir_all(&nested).unwrap();
+    world.ok(&outer, &["init"]);
+
+    let output = world.command_in_project_root(&nested, &project, &["init"]);
+    assert!(
+        output.status.success(),
+        "bounded init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let initialized = stdout_json(&output);
+    let expected_database = fs::canonicalize(&project).unwrap().join(".lwc/wiki.db");
+
+    assert_eq!(
+        initialized["database"],
+        expected_database.to_string_lossy().as_ref()
+    );
+    assert!(project.join(".lwc/wiki.db").is_file());
+}
+
+#[test]
+fn configured_project_root_rejects_a_cwd_outside_it() {
+    let world = TestWorld::new();
+    let outside = world.home.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+
+    let output = world.command_in_project_root(&outside, &world.project, &["init"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr_json(&output)["error"]["code"],
+        "project_root_mismatch"
+    );
+    assert!(!outside.join(".lwc/wiki.db").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_project_root_rejects_a_symlinked_store_directory() {
+    use std::os::unix::fs::symlink;
+
+    let world = TestWorld::new();
+    let outside = world.home.join("outside-store");
+    fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, world.project.join(".lwc")).unwrap();
+
+    let output = world.command_in_project_root(&world.project, &world.project, &["init"]);
+    assert!(!output.status.success());
+    assert_eq!(stderr_json(&output)["error"]["code"], "project_root_escape");
+    assert!(!outside.join("wiki.db").exists());
+}
+
+#[test]
+fn configured_project_root_rejects_multiple_ancestor_stores() {
+    let world = TestWorld::new();
+    let nested = world.project.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    world.ok(&world.project, &["init"]);
+
+    let nested_init = world.command_in_project_root(&nested, &nested, &["init"]);
+    assert!(nested_init.status.success());
+
+    let output = world.command_in_project_root(&nested, &world.project, &["context"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr_json(&output)["error"]["code"],
+        "project_scope_conflict"
+    );
 }
 
 #[test]

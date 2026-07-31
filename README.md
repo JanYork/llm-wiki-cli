@@ -144,9 +144,14 @@ When triggered, the Skill:
 - finds a compatible CLI or installs the official checksum-verified release;
 - initializes global memory in `~/.lwc/` once;
 - recalls bounded global and project context before repeated investigation;
-- asks before creating project-local `.lwc/` state;
+- initializes the active project on explicit invocation, otherwise asks first;
+- refuses project writes outside the current authorized workspace root;
 - separates project facts from reusable global knowledge;
 - integrates sources and writes durable answers back into the Wiki.
+
+The Skill uses `LWC_PROJECT_ROOT` first as the canonical authorized workspace
+boundary, then narrows it to the selected active project; discovery and
+initialization cannot traverse above it.
 
 Set `LWC_AUTO_INSTALL=0` to disable automatic CLI installation. Automatic
 installation executes the reviewed installer bundled in the Skill, trusts this
