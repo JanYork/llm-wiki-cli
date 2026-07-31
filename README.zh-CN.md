@@ -43,7 +43,7 @@ Wiki。Agent 负责理解与综合，`lwc` 负责保存来源、页面、引用�
 +-----------------------------------------------------------------------+
 | clap command router                                                   |
 | init | schema | purpose | source | page | ingest | search | context   |
-| graph | lint | maintenance | log                                      |
+| graph | lint | maintenance | checkpoint | log                         |
 +-----------------------------------------------------------------------+
                                    |
                                    v
@@ -164,6 +164,10 @@ printf '# Schema\nEvery factual page cites sources.\n' | lwc schema set -
 printf '# Purpose\nBuild a durable project Wiki.\n' | lwc purpose set -
 ```
 
+初始化项目时，LWC 会按需把项目相对路径 `.lwc/` 加入 Git 的本地
+`info/exclude`，不会修改仓库 `.gitignore`。只有明确准备版本化 Wiki 时才使用
+`lwc init --no-git-exclude`。
+
 ### 2. 加入来源材料
 
 ```bash
@@ -173,12 +177,34 @@ lwc source add-dir docs/
 没有显式标题的文件会确定性地使用来源路径作为可读标题；内容相同的文件会通过
 SHA-256 去重。
 
+解析后位于当前项目 Wiki 根目录之外的来源必须显式传入
+`--allow-external-source`。检测到高置信度凭证特征时默认拒绝；只有确认不可变
+快照安全后，才能传入 `--acknowledge-sensitive-source`。
+
+需要原子导入经过筛选的一组来源时，可使用相对 manifest 所在目录解析的 JSON：
+
+```json
+{
+  "sources": [
+    {"path": "ARCHITECTURE.md", "title": "Architecture contract"},
+    {"path": "src/store.rs", "title": "SQLite store"}
+  ]
+}
+```
+
+```bash
+lwc source add-manifest lwc-sources.json
+```
+
 ### 3. 分析并整合一个来源
 
 ```bash
 lwc ingest next --context-limit 50 --source-max-chars 100000
 lwc ingest analyze 1 --file analysis.md
 ```
+
+如果 manifest 或调度器已经选定明确的 pending source ID，使用
+`lwc ingest claim 7` 精确领取。
 
 如果返回的 `source_window.has_more` 为 true，就从
 `source_window.next_offset_chars` 继续读取：
@@ -231,7 +257,8 @@ lwc page show source-1
 标准工作流如下：
 
 1. 收集不可变来源。
-2. 用有界的 `lwc ingest next` 领取一个 ingest 任务。
+2. 用有界的 `lwc ingest next` 领取任务；已经明确 source ID 时使用
+   `ingest claim <ID>`。
 3. 读完所有来源窗口，以及返回的 schema、purpose 和有界上下文。
 4. 先分析，再生成页面。
 5. 用显式 `--source` 引用写入或修订 source 摘要与共享知识页面。
@@ -287,19 +314,27 @@ lwc lint
 lwc maintenance reindex
 lwc maintenance materialize
 lwc maintenance compact
+lwc checkpoint create before-large-update
+lwc checkpoint list
 lwc log --limit 20
 ```
 
 说明：
 
-- `lint` 报告确定性的结构问题，并记录这次 lint。
+- `lint` 默认完全只读；只有这次检查确实需要进入持久操作历史时才加 `--record`。
 - `maintenance reindex` 从 SQLite 重建派生搜索产物。
 - `maintenance materialize` 从 SQLite 重建投影出来的 Markdown 树。
 - `maintenance compact` 优化 contentless FTS5 索引并尝试执行 WAL truncate
   checkpoint。应在 Wiki 空闲时运行，并检查返回的 `busy` 与 `after_bytes`。
 - 搜索查询默认是私有的；只有需要把查询文本写入持久化操作日志时，才加 `--record`。
 
-备份前应停止正在运行的 `lwc` 命令，并复制完整的 `.lwc/` 目录。写入进程可能仍在使用 WAL 文件时，不要只复制 `wiki.db`。
+`lwc checkpoint create <NAME>` 使用 SQLite 在线备份 API。执行
+`lwc checkpoint restore <NAME>` 时，LWC 会先创建 `pre-restore-*` 安全
+checkpoint，再恢复数据库并重建投影。受保护删除使用 `source remove <ID>` 和
+`page remove <SLUG>`：仍被页面引用的来源、仍有入链的页面都会被拒绝删除。
+
+需要文件系统级外部备份时，应先停止正在运行的 `lwc` 命令并复制完整 `.lwc/`
+目录；写入进程可能仍在使用 WAL 文件时，不要只复制 `wiki.db`。
 
 ## 基准测试集
 

@@ -45,7 +45,7 @@ This project adapts those ideas into an agent-first Rust CLI backed by SQLite.
 +-----------------------------------------------------------------------+
 | clap command router                                                   |
 | init | schema | purpose | source | page | ingest | search | context   |
-| graph | lint | maintenance | log                                      |
+| graph | lint | maintenance | checkpoint | log                         |
 +-----------------------------------------------------------------------+
                                    |
                                    v
@@ -175,6 +175,10 @@ printf '# Schema\nEvery factual page cites sources.\n' | lwc schema set -
 printf '# Purpose\nBuild a durable project Wiki.\n' | lwc purpose set -
 ```
 
+Project initialization adds the project-relative `.lwc/` path to Git's local
+`info/exclude` file when needed, without changing the repository `.gitignore`.
+Use `lwc init --no-git-exclude` only when the Wiki is intentionally versioned.
+
 ### 2. Add source material
 
 ```bash
@@ -183,6 +187,26 @@ lwc source add-dir docs/
 
 Files without an explicit title use their source origin as a stable,
 human-readable fallback. Identical bytes are deduplicated by SHA-256.
+Project sources that resolve outside the active Wiki root require
+`--allow-external-source`. High-confidence credential markers are rejected
+unless the reviewed source is explicitly acknowledged with
+`--acknowledge-sensitive-source`.
+
+For a curated atomic import, paths in a JSON manifest resolve from the
+manifest's directory:
+
+```json
+{
+  "sources": [
+    {"path": "ARCHITECTURE.md", "title": "Architecture contract"},
+    {"path": "src/store.rs", "title": "SQLite store"}
+  ]
+}
+```
+
+```bash
+lwc source add-manifest lwc-sources.json
+```
 
 ### 3. Analyze and integrate one source
 
@@ -190,6 +214,9 @@ human-readable fallback. Identical bytes are deduplicated by SHA-256.
 lwc ingest next --context-limit 50 --source-max-chars 100000
 lwc ingest analyze 1 --file analysis.md
 ```
+
+Use `lwc ingest claim 7` when a manifest or scheduler already selected an exact
+pending source ID.
 
 If `source_window.has_more` is true, continue reading from
 `source_window.next_offset_chars`:
@@ -243,7 +270,8 @@ lwc page show source-1
 The intended workflow is:
 
 1. Collect immutable sources.
-2. Claim one ingest task with a bounded `lwc ingest next`.
+2. Claim one ingest task with bounded `lwc ingest next`, or `ingest claim <ID>`
+   when the source was selected explicitly.
 3. Read every returned source window, plus the schema, purpose, and bounded context.
 4. Analyze before generating pages.
 5. Write or revise a source summary and shared durable pages with explicit `--source` citations.
@@ -302,12 +330,15 @@ lwc lint
 lwc maintenance reindex
 lwc maintenance materialize
 lwc maintenance compact
+lwc checkpoint create before-large-update
+lwc checkpoint list
 lwc log --limit 20
 ```
 
 Notes:
 
-- `lint` reports deterministic structural problems and records the lint pass.
+- `lint` is read-only by default. Add `--record` only when the lint pass belongs
+  in durable operation history.
 - `maintenance reindex` rebuilds derived search artifacts from SQLite.
 - `maintenance materialize` rebuilds the projected Markdown tree from SQLite.
 - `maintenance compact` optimizes the contentless FTS5 index and attempts a
@@ -315,8 +346,15 @@ Notes:
   plus `after_bytes`.
 - Search queries are private by default; add `--record` only when you want the query wording stored in the durable operation log.
 
-For backups, stop active `lwc` commands and copy the complete `.lwc/` directory.
-Do not copy only `wiki.db` while a writer may still be using its WAL files.
+`lwc checkpoint create <NAME>` uses SQLite's online backup API. Restore with
+`lwc checkpoint restore <NAME>`; LWC first creates a `pre-restore-*` safety
+checkpoint and then rebuilds the projection. Use `source remove <ID>` and
+`page remove <SLUG>` for guarded deletion: sources with citations and pages
+with inbound links are refused.
+
+For an external filesystem backup, stop active `lwc` commands and copy the
+complete `.lwc/` directory. Do not copy only `wiki.db` while a writer may still
+be using its WAL files.
 
 ## Benchmark Suite
 

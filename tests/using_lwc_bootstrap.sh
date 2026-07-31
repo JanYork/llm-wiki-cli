@@ -25,13 +25,15 @@ cat > "$mock_bin/lwc" <<'MOCK_LWC'
 #!/bin/sh
 case "$*" in
   "--version")
-    printf 'lwc 0.2.0\n'
+    printf 'lwc 0.3.0\n'
     ;;
   "init --help")
     printf '%s\n' '--scope'
     ;;
   "--help")
     printf '%s\n' 'Set LWC_PROJECT_ROOT to bound project discovery.'
+    ;;
+  "checkpoint --help"|"source add-manifest --help")
     ;;
   "--scope global init")
     mkdir -p "$HOME/.lwc"

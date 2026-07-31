@@ -10,18 +10,33 @@ use clap::{Parser, Subcommand, ValueEnum};
 use error::{AppError, Result};
 use import::collect_documents;
 use scope::{
-    Scope, ensure_scope_supported, init_store_path, resolve_read_store_paths, resolve_store_path,
+    Scope, StorePath, ensure_scope_supported, init_store_path, resolve_read_store_paths,
+    resolve_store_path,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     env, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
 };
 use store::{PagePutInput, SearchMode, SearchOptions, SourceAddInput, Store};
 
 const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceManifest {
+    sources: Vec<SourceManifestEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceManifestEntry {
+    path: PathBuf,
+    title: Option<String>,
+}
 
 #[derive(Parser)]
 #[command(
@@ -68,9 +83,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initialize the selected Wiki and materialize its Markdown tree.
+    /// Initialize the selected Wiki, locally exclude project state from Git, and materialize it.
     #[command(after_help = "Examples:\n  lwc init\n  lwc --scope global init")]
-    Init,
+    Init {
+        /// Do not add the project .lwc directory to Git's local exclude file.
+        #[arg(long)]
+        no_git_exclude: bool,
+    },
     /// Read or replace the durable instructions that govern Wiki maintenance.
     #[command(
         long_about = "Manage the durable schema that tells every Agent how pages, citations, links, naming, uncertainty, and maintenance should work.",
@@ -92,7 +111,7 @@ enum Command {
     /// Add, inspect, and trace immutable source snapshots.
     #[command(
         long_about = "Manage immutable evidence. Adding a source stores a content-addressed snapshot, indexes its raw text, records provenance, and creates a pending ingest job; it does not create synthesized Wiki knowledge.",
-        after_help = "When to use:\n  Use `add` for one curated source and `add-dir` for a deterministic UTF-8 text corpus. Use `show` when an Agent needs exact evidence, and `refs` to find every Wiki page citing it.\n\nNext action:\n  After add/add-dir, call `lwc ingest next`; do not treat a pending ingest job as integrated knowledge."
+        after_help = "When to use:\n  Use `add` for one curated source, `add-manifest` for an atomic reviewed set, and `add-dir` for a deterministic UTF-8 text corpus. Use `show` when an Agent needs exact evidence, and `refs` to find every Wiki page citing it.\n\nNext action:\n  Claim returned manifest IDs with `lwc ingest claim`; otherwise use `lwc ingest next`. Do not treat a pending job as integrated knowledge."
     )]
     Source {
         #[command(subcommand)]
@@ -134,6 +153,15 @@ enum Command {
         #[command(subcommand)]
         command: MaintenanceCommand,
     },
+    /// Create, list, and safely restore complete SQLite checkpoints.
+    #[command(
+        long_about = "Manage recoverable full-database checkpoints using SQLite's online backup API. Restore validates the checkpoint, preserves the current database as pre-restore-*, and then refreshes generated projections.",
+        after_help = "Use a checkpoint before a multi-source ingest or broad replacement of existing pages."
+    )]
+    Checkpoint {
+        #[command(subcommand)]
+        command: CheckpointCommand,
+    },
     /// Search compiled Wiki pages and immutable raw sources.
     #[command(
         long_about = "Search compiled Wiki pages and immutable raw sources with SQLite FTS5.\n\n\
@@ -172,11 +200,11 @@ Each selected store includes its schema, purpose, page summaries, and recent ope
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Report deterministic structural maintenance issues and record the lint pass.
+    /// Report deterministic structural maintenance issues.
     #[command(
-        long_about = "Check the complete Wiki for missing schema, untitled sources, shallow completed ingests, uncited or orphaned pages, dangling links, and missing, orphaned, or duplicate search-index rows.\n\n\
-counts and total describe the complete Wiki; limit and offset paginate only the returned issues. Semantic contradictions and stale claims remain the Agent's responsibility.",
-        after_help = "Examples:\n  lwc lint\n  lwc lint --limit 100 --offset 100"
+        long_about = "Read-only by default. Check the complete Wiki for missing schema, untitled sources, shallow completed ingests, uncited or orphaned pages, dangling links, and missing, orphaned, or duplicate search-index rows.\n\n\
+counts and total describe the complete Wiki; limit and offset paginate only the returned issues. Semantic contradictions and stale claims remain the Agent's responsibility. Use --record only when this validation event belongs in durable history.",
+        after_help = "Examples:\n  lwc lint\n  lwc lint --limit 100 --offset 100\n  lwc lint --record"
     )]
     Lint {
         /// Maximum issues returned in this page (1..=1000).
@@ -185,6 +213,9 @@ counts and total describe the complete Wiki; limit and offset paginate only the 
         /// Zero-based issue offset.
         #[arg(long, default_value_t = 0)]
         offset: usize,
+        /// Append this lint pass to the operation log.
+        #[arg(long)]
+        record: bool,
     },
     /// Show newest ingest, page, query, lint, and maintenance operations first.
     #[command(after_help = "Examples:\n  lwc log\n  lwc log --limit 100")]
@@ -243,6 +274,12 @@ Content is deduplicated by SHA-256. Re-adding identical bytes returns the existi
         /// Human-readable title; defaults deterministically to the source origin.
         #[arg(long)]
         title: Option<String>,
+        /// Permit a project source that resolves outside the active project root.
+        #[arg(long)]
+        allow_external_source: bool,
+        /// Confirm that a flagged source was reviewed and is safe to snapshot.
+        #[arg(long)]
+        acknowledge_sensitive_source: bool,
     },
     /// Recursively snapshot supported UTF-8 text files and enqueue them.
     #[command(
@@ -255,6 +292,23 @@ Valid files are committed even if other files are empty, oversized, unreadable, 
     AddDir {
         /// Root directory to scan recursively.
         directory: PathBuf,
+        /// Permit a project source directory outside the active project root.
+        #[arg(long)]
+        allow_external_source: bool,
+        /// Confirm that flagged sources were reviewed and are safe to snapshot.
+        #[arg(long)]
+        acknowledge_sensitive_source: bool,
+    },
+    /// Atomically add a curated JSON list of source paths and optional titles.
+    AddManifest {
+        /// JSON manifest; relative source paths resolve from its parent directory.
+        manifest: PathBuf,
+        /// Permit project sources that resolve outside the active project root.
+        #[arg(long)]
+        allow_external_source: bool,
+        /// Confirm that flagged sources were reviewed and are safe to snapshot.
+        #[arg(long)]
+        acknowledge_sensitive_source: bool,
     },
     /// List source metadata without returning full source bodies.
     #[command(
@@ -297,6 +351,11 @@ Omit --max-chars to read from --offset-chars through the end. When window.has_mo
         #[arg(long, default_value_t = 0)]
         offset: usize,
     },
+    /// Remove one source only when no Wiki page cites it.
+    Remove {
+        /// Numeric source ID.
+        id: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -325,6 +384,17 @@ Only one concurrent Agent can claim a given source. A null job means the queue h
     )]
     Next {
         /// Maximum pages and recent operations included in the packet (1..=1000).
+        #[arg(long, default_value_t = 50)]
+        context_limit: usize,
+        /// Bound the claimed source body; continue with source show --offset-chars.
+        #[arg(long)]
+        source_max_chars: Option<usize>,
+    },
+    /// Atomically claim one specific pending source and return Agent context.
+    Claim {
+        /// Pending source ID to claim.
+        source_id: i64,
+        /// Maximum pages included in the packet (1..=1000).
         #[arg(long, default_value_t = 50)]
         context_limit: usize,
         /// Bound the claimed source body; continue with source show --offset-chars.
@@ -420,6 +490,22 @@ The command reports busy=true instead of claiming compaction when an active read
     Compact,
 }
 
+#[derive(Subcommand)]
+enum CheckpointCommand {
+    /// Create a named full-database checkpoint without changing Wiki knowledge.
+    Create {
+        /// Safe checkpoint name; an existing checkpoint is never overwritten.
+        name: String,
+    },
+    /// List named checkpoints in deterministic order.
+    List,
+    /// Restore a checkpoint after automatically saving the current database.
+    Restore {
+        /// Existing checkpoint name.
+        name: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SearchTarget {
     Auto,
@@ -480,6 +566,11 @@ Read pages, limit, offset, and has_more from the JSON response. When has_more=tr
         /// Existing Wiki page slug.
         slug: String,
     },
+    /// Remove one page only when no other page links to it.
+    Remove {
+        /// Existing Wiki page slug.
+        slug: String,
+    },
 }
 
 fn main() {
@@ -501,16 +592,19 @@ fn main() {
 fn run(cli: Cli) -> Result<Value> {
     let cwd = env::current_dir()?;
     match cli.command {
-        Command::Init => {
+        Command::Init { no_git_exclude } => {
             ensure_scope_supported(cli.scope, false, "init")?;
             let store_path = init_store_path(cli.scope, &cwd)?;
+            let git_exclude =
+                configure_git_exclude(store_path.scope, &store_path.path, no_git_exclude)?;
             let (mut store, created) =
                 Store::initialize(scope_name(store_path.scope), &store_path.path)?;
             store.materialize()?;
             Ok(json!({
                 "scope": scope_name(store_path.scope),
                 "database": store_path.path,
-                "created": created
+                "created": created,
+                "git_exclude": git_exclude
             }))
         }
         Command::Schema { command } => {
@@ -555,28 +649,30 @@ fn run(cli: Cli) -> Result<Value> {
             ensure_scope_supported(cli.scope, false, "source")?;
             let store_path = resolve_store_path(cli.scope, &cwd)?;
             match command {
-                SourceCommand::Add { file, title } => {
-                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
-                    if file == Path::new("-") {
-                        return Err(AppError::new(
-                            "invalid_input",
-                            "source add requires a file path",
-                        ));
-                    }
-                    if let Some(title) = title.as_deref() {
-                        require_text("title", title)?;
-                    }
-                    let content = read_utf8(&file, false)?;
-                    require_text("source content", &content)?;
-                    let response = store.source_add(SourceAddInput {
+                SourceCommand::Add {
+                    file,
+                    title,
+                    allow_external_source,
+                    acknowledge_sensitive_source,
+                } => {
+                    let input = prepare_source_input(
+                        &store_path,
+                        &file,
                         title,
-                        origin: file.display().to_string(),
-                        content,
-                    })?;
+                        allow_external_source,
+                        acknowledge_sensitive_source,
+                    )?;
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.source_add(input)?;
                     store.materialize()?;
                     to_json(response)
                 }
-                SourceCommand::AddDir { directory } => {
+                SourceCommand::AddDir {
+                    directory,
+                    allow_external_source,
+                    acknowledge_sensitive_source,
+                } => {
+                    validate_source_scope(&store_path, &directory, allow_external_source)?;
                     let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                     let files = collect_documents(&directory).map_err(|error| {
                         AppError::new("invalid_source_directory", error.to_string())
@@ -593,6 +689,7 @@ fn run(cli: Cli) -> Result<Value> {
                                 continue;
                             }
                         };
+                        validate_sensitive_source(&file, &content, acknowledge_sensitive_source)?;
                         let title = file
                             .strip_prefix(&directory)
                             .unwrap_or(&file)
@@ -635,6 +732,60 @@ fn run(cli: Cli) -> Result<Value> {
                         "skipped_files": skipped_files,
                     }))
                 }
+                SourceCommand::AddManifest {
+                    manifest,
+                    allow_external_source,
+                    acknowledge_sensitive_source,
+                } => {
+                    let raw = read_utf8(&manifest, false)?;
+                    let parsed: SourceManifest = serde_json::from_str(&raw)
+                        .map_err(|error| AppError::new("invalid_manifest", error.to_string()))?;
+                    if parsed.sources.is_empty() {
+                        return Err(AppError::new(
+                            "invalid_manifest",
+                            "manifest sources must not be empty",
+                        ));
+                    }
+                    let base = manifest.parent().unwrap_or_else(|| Path::new("."));
+                    let mut paths = Vec::with_capacity(parsed.sources.len());
+                    let mut inputs = Vec::with_capacity(parsed.sources.len());
+                    for entry in parsed.sources {
+                        let path = base.join(entry.path);
+                        let input = prepare_source_input(
+                            &store_path,
+                            &path,
+                            entry.title,
+                            allow_external_source,
+                            acknowledge_sensitive_source,
+                        )?;
+                        paths.push(path);
+                        inputs.push(input);
+                    }
+
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let responses = store.source_add_many(inputs)?;
+                    let created = responses.iter().filter(|response| response.created).count();
+                    let duplicates = responses.len() - created;
+                    let sources = paths
+                        .into_iter()
+                        .zip(responses)
+                        .map(|(path, response)| {
+                            json!({
+                                "path": path,
+                                "source": response.source,
+                                "created": response.created
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    store.materialize()?;
+                    Ok(json!({
+                        "scope": scope_name(store_path.scope),
+                        "database": store_path.path,
+                        "created": created,
+                        "duplicates": duplicates,
+                        "sources": sources
+                    }))
+                }
                 SourceCommand::List { limit, offset } => {
                     let store =
                         Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
@@ -664,6 +815,12 @@ fn run(cli: Cli) -> Result<Value> {
                     validate_limit(limit)?;
                     validate_offset(offset)?;
                     to_json(store.source_refs(id, limit, offset)?)
+                }
+                SourceCommand::Remove { id } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.source_remove(id)?;
+                    store.materialize()?;
+                    to_json(response)
                 }
             }
         }
@@ -713,6 +870,12 @@ fn run(cli: Cli) -> Result<Value> {
                         Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
                     to_json(store.page_links(&slug)?)
                 }
+                PageCommand::Remove { slug } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.page_remove(&slug)?;
+                    store.materialize_wiki()?;
+                    to_json(response)
+                }
             }
         }
         Command::Ingest { command } => {
@@ -743,6 +906,24 @@ fn run(cli: Cli) -> Result<Value> {
                         ));
                     }
                     let response = store.ingest_next(context_limit, source_max_chars)?;
+                    store.materialize_wiki()?;
+                    to_json(response)
+                }
+                IngestCommand::Claim {
+                    source_id,
+                    context_limit,
+                    source_max_chars,
+                } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    validate_limit(context_limit)?;
+                    if source_max_chars == Some(0) {
+                        return Err(AppError::new(
+                            "invalid_limit",
+                            "source-max-chars must be greater than zero",
+                        ));
+                    }
+                    let response =
+                        store.ingest_claim(source_id, context_limit, source_max_chars)?;
                     store.materialize_wiki()?;
                     to_json(response)
                 }
@@ -805,6 +986,28 @@ fn run(cli: Cli) -> Result<Value> {
                     to_json(response)
                 }
                 MaintenanceCommand::Compact => to_json(store.compact()?),
+            }
+        }
+        Command::Checkpoint { command } => {
+            ensure_scope_supported(cli.scope, false, "checkpoint")?;
+            let store_path = resolve_store_path(cli.scope, &cwd)?;
+            match command {
+                CheckpointCommand::Create { name } => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    to_json(store.checkpoint_create(&name)?)
+                }
+                CheckpointCommand::List => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    to_json(store.checkpoint_list()?)
+                }
+                CheckpointCommand::Restore { name } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.checkpoint_restore(&name)?;
+                    store.materialize()?;
+                    to_json(response)
+                }
             }
         }
         Command::Search {
@@ -877,15 +1080,25 @@ fn run(cli: Cli) -> Result<Value> {
             }
             Ok(json!({"stores": stores}))
         }
-        Command::Lint { limit, offset } => {
+        Command::Lint {
+            limit,
+            offset,
+            record,
+        } => {
             ensure_scope_supported(cli.scope, false, "lint")?;
             validate_limit(limit)?;
             validate_offset(offset)?;
             let store_path = resolve_store_path(cli.scope, &cwd)?;
-            let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
-            let response = store.lint(limit, offset)?;
-            store.materialize_wiki()?;
-            to_json(response)
+            if record {
+                let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                let response = store.lint(limit, offset)?;
+                store.record_lint(response.total)?;
+                store.materialize_wiki()?;
+                to_json(response)
+            } else {
+                let store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                to_json(store.lint(limit, offset)?)
+            }
         }
         Command::Log { limit } => {
             ensure_scope_supported(cli.scope, false, "log")?;
@@ -948,6 +1161,148 @@ fn require_text(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn prepare_source_input(
+    store_path: &StorePath,
+    path: &Path,
+    title: Option<String>,
+    allow_external_source: bool,
+    acknowledge_sensitive_source: bool,
+) -> Result<SourceAddInput> {
+    if path == Path::new("-") {
+        return Err(AppError::new(
+            "invalid_input",
+            "source add requires a file path",
+        ));
+    }
+    if let Some(title) = title.as_deref() {
+        require_text("title", title)?;
+    }
+    let resolved = validate_source_scope(store_path, path, allow_external_source)?;
+    let content = read_utf8(&resolved, false)?;
+    require_text("source content", &content)?;
+    validate_sensitive_source(&resolved, &content, acknowledge_sensitive_source)?;
+    Ok(SourceAddInput {
+        title,
+        origin: path.display().to_string(),
+        content,
+    })
+}
+
+fn validate_source_scope(
+    store_path: &StorePath,
+    path: &Path,
+    allow_external_source: bool,
+) -> Result<PathBuf> {
+    let resolved = fs::canonicalize(path)?;
+    if store_path.scope == Scope::Project && !allow_external_source {
+        let project_root = store_path
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| {
+                AppError::new(
+                    "invalid_store_path",
+                    "project Wiki path has no project root",
+                )
+            })?;
+        let project_root = fs::canonicalize(project_root)?;
+        if !resolved.starts_with(&project_root) {
+            return Err(AppError::new(
+                "external_source_requires_acknowledgement",
+                format!(
+                    "source {} resolves outside project root {}; retry with --allow-external-source only after confirming it belongs in this Wiki",
+                    resolved.display(),
+                    project_root.display()
+                ),
+            ));
+        }
+    }
+    Ok(resolved)
+}
+
+fn validate_sensitive_source(path: &Path, content: &str, acknowledged: bool) -> Result<()> {
+    if acknowledged {
+        return Ok(());
+    }
+    let mut reasons = Vec::new();
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let env_file = name == ".env"
+        || (name.starts_with(".env.")
+            && ![".env.example", ".env.sample", ".env.template"].contains(&name.as_str()));
+    let private_file = matches!(
+        name.as_str(),
+        "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519"
+    ) || path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| {
+            ["key", "p12", "pfx"]
+                .iter()
+                .any(|extension| value.eq_ignore_ascii_case(extension))
+        })
+        .unwrap_or(false);
+    if env_file {
+        reasons.push("environment credential file");
+    }
+    if private_file {
+        reasons.push("private-key or credential file");
+    }
+    if [
+        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+    ]
+    .iter()
+    .any(|marker| content.contains(marker))
+    {
+        reasons.push("private-key marker");
+    }
+    if [
+        ("AKIA", 20),
+        ("ASIA", 20),
+        ("ghp_", 20),
+        ("github_pat_", 24),
+        ("sk-proj-", 24),
+        ("xoxb-", 24),
+        ("xoxp-", 24),
+    ]
+    .iter()
+    .any(|(prefix, minimum)| contains_token(content, prefix, *minimum))
+    {
+        reasons.push("known credential prefix");
+    }
+
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::new(
+        "possible_secret_detected",
+        format!(
+            "possible sensitive source {}: {}; inspect it and retry with --acknowledge-sensitive-source only when the immutable snapshot is safe",
+            path.display(),
+            reasons.join(", ")
+        ),
+    ))
+}
+
+fn contains_token(content: &str, prefix: &str, minimum_length: usize) -> bool {
+    content.match_indices(prefix).any(|(index, _)| {
+        content[index..]
+            .chars()
+            .take_while(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+            .count()
+            >= minimum_length
+    })
+}
+
 fn validate_limit(limit: usize) -> Result<()> {
     if !(1..=1000).contains(&limit) {
         return Err(AppError::new(
@@ -986,6 +1341,106 @@ fn scope_name(scope: Scope) -> &'static str {
         Scope::Global => "global",
         Scope::All => "all",
     }
+}
+
+fn configure_git_exclude(scope: Scope, database: &Path, disabled: bool) -> Result<Value> {
+    if scope != Scope::Project {
+        return Ok(json!({ "status": "not_applicable" }));
+    }
+    if disabled {
+        return Ok(json!({ "status": "disabled" }));
+    }
+
+    let project_root = database
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| AppError::new("git_exclude_failed", "project Wiki path has no root"))?;
+    let top_level = match git_output(project_root, &["rev-parse", "--show-toplevel"])? {
+        Some(output) => PathBuf::from(output),
+        None => return Ok(json!({ "status": "not_git" })),
+    };
+    let top_level = fs::canonicalize(top_level)?;
+    let project_root = fs::canonicalize(project_root)?;
+    let relative = project_root.strip_prefix(&top_level).map_err(|_| {
+        AppError::new(
+            "git_exclude_failed",
+            format!(
+                "project root {} is outside Git root {}",
+                project_root.display(),
+                top_level.display()
+            ),
+        )
+    })?;
+    let relative_lwc = relative.join(".lwc");
+    let git_path = relative_lwc.to_string_lossy().replace('\\', "/");
+    let pattern = format!("/{git_path}/");
+
+    let ignored = ProcessCommand::new("git")
+        .current_dir(&top_level)
+        .args(["check-ignore", "-q", "--no-index", "--", &git_path])
+        .status()
+        .map_err(|error| AppError::new("git_exclude_failed", error.to_string()))?;
+    if ignored.success() {
+        return Ok(json!({ "status": "already_ignored", "pattern": pattern }));
+    }
+    if ignored.code() != Some(1) {
+        return Err(AppError::new(
+            "git_exclude_failed",
+            "git check-ignore failed",
+        ));
+    }
+
+    let exclude_text = git_output(&top_level, &["rev-parse", "--git-path", "info/exclude"])?
+        .ok_or_else(|| AppError::new("git_exclude_failed", "Git exclude path is unavailable"))?;
+    let exclude_path = {
+        let path = PathBuf::from(exclude_text);
+        if path.is_absolute() {
+            path
+        } else {
+            top_level.join(path)
+        }
+    };
+    if let Some(parent) = exclude_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let existing = match fs::read_to_string(&exclude_path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(AppError::new("git_exclude_failed", error.to_string())),
+    };
+    if !existing.lines().any(|line| line.trim() == pattern) {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&exclude_path)?;
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            file.write_all(b"\n")?;
+        }
+        writeln!(file, "{pattern}")?;
+    }
+    Ok(json!({
+        "status": "added",
+        "path": exclude_path,
+        "pattern": pattern
+    }))
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> Result<Option<String>> {
+    let output = match ProcessCommand::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(AppError::new("git_exclude_failed", error.to_string())),
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8(output.stdout)
+        .map_err(|_| AppError::new("git_exclude_failed", "Git returned non-UTF-8 output"))?;
+    Ok(Some(value.trim().to_string()))
 }
 
 fn to_json<T: Serialize>(value: T) -> Result<Value> {

@@ -6,7 +6,7 @@ use crate::{
 };
 use rusqlite::{
     Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
-    ffi, params,
+    backup::Backup, ffi, params,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -16,7 +16,7 @@ use std::{
     ffi::CStr,
     fs,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const USER_VERSION: i32 = 6;
@@ -226,6 +226,14 @@ pub struct SourceAddResponse {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SourceRemoveResponse {
+    pub scope: String,
+    pub database: String,
+    pub source_id: i64,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SourceListResponse {
     pub scope: String,
     pub database: String,
@@ -280,6 +288,14 @@ pub struct PagePutResponse {
     pub database: String,
     pub page: PageWriteRecord,
     pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PageRemoveResponse {
+    pub scope: String,
+    pub database: String,
+    pub slug: String,
+    pub removed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -487,6 +503,30 @@ pub struct CompactResponse {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CheckpointRecord {
+    pub name: String,
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CheckpointResponse {
+    pub scope: String,
+    pub database: String,
+    pub checkpoint: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_checkpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CheckpointListResponse {
+    pub scope: String,
+    pub database: String,
+    pub checkpoints: Vec<CheckpointRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LintIssue {
     pub code: String,
     pub page: Option<String>,
@@ -643,53 +683,42 @@ impl Store {
     }
 
     pub fn source_add(&mut self, input: SourceAddInput) -> Result<SourceAddResponse> {
-        let content_hash = hash_content(&input.content);
-        let title = input
-            .title
-            .as_deref()
-            .filter(|title| !title.trim().is_empty())
-            .unwrap_or(&input.origin)
-            .to_string();
+        self.source_add_many(vec![input])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::new("invalid_input", "source input is missing"))
+    }
+
+    pub fn source_add_many(
+        &mut self,
+        inputs: Vec<SourceAddInput>,
+    ) -> Result<Vec<SourceAddResponse>> {
+        if inputs.is_empty() {
+            return Err(AppError::new(
+                "invalid_input",
+                "at least one source is required",
+            ));
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let created = tx.execute(
-            &format!(
-                "INSERT OR IGNORE INTO sources(content_hash, title, origin, content, created_at)
-                 VALUES (?1, ?2, ?3, ?4, {TIMESTAMP_SQL})"
-            ),
-            params![&content_hash, &title, &input.origin, &input.content],
-        )? == 1;
-        let source_id = tx.query_row(
-            "SELECT id FROM sources WHERE content_hash = ?1",
-            params![&content_hash],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if created {
-            index_source(&tx, source_id, Some(&title), input.content.as_str())?;
+        let mut inserted = Vec::with_capacity(inputs.len());
+        for input in &inputs {
+            inserted.push(insert_source(&tx, input)?);
         }
-        tx.execute(
-            &format!(
-                "INSERT OR IGNORE INTO ingest_jobs(source_id, status, updated_at)
-                 VALUES (?1, 'pending', {TIMESTAMP_SQL})"
-            ),
-            params![source_id],
-        )?;
-
-        record_operation(
-            &tx,
-            "source_add",
-            &input.origin,
-            &json!({ "source_id": source_id, "created": created }),
-        )?;
         tx.commit()?;
 
-        Ok(SourceAddResponse {
-            scope: self.scope.clone(),
-            database: self.database_string(),
-            source: self.load_source_summary(source_id)?,
-            created,
-        })
+        inserted
+            .into_iter()
+            .map(|(source_id, created)| {
+                Ok(SourceAddResponse {
+                    scope: self.scope.clone(),
+                    database: self.database_string(),
+                    source: self.load_source_summary(source_id)?,
+                    created,
+                })
+            })
+            .collect()
     }
 
     pub fn source_list(&self, limit: usize, offset: usize) -> Result<SourceListResponse> {
@@ -765,6 +794,37 @@ impl Store {
             limit,
             offset,
             has_more,
+        })
+    }
+
+    pub fn source_remove(&mut self, id: i64) -> Result<SourceRemoveResponse> {
+        self.load_source_summary(id)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let references: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM page_sources WHERE source_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if references > 0 {
+            return Err(AppError::new(
+                "source_in_use",
+                format!("source {id} is cited by {references} Wiki page(s)"),
+            ));
+        }
+        tx.execute(
+            "DELETE FROM search_fts WHERE doc_type = 'source' AND identifier = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute("DELETE FROM sources WHERE id = ?1", params![id])?;
+        record_operation(&tx, "source_remove", &id.to_string(), &json!({}))?;
+        tx.commit()?;
+        Ok(SourceRemoveResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            source_id: id,
+            removed: true,
         })
     }
 
@@ -918,6 +978,37 @@ impl Store {
             outgoing,
             backlinks,
             missing,
+        })
+    }
+
+    pub fn page_remove(&mut self, slug: &str) -> Result<PageRemoveResponse> {
+        self.load_page(slug)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let references: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM links WHERE to_slug = ?1 AND from_slug <> ?1",
+            params![slug],
+            |row| row.get(0),
+        )?;
+        if references > 0 {
+            return Err(AppError::new(
+                "page_in_use",
+                format!("page {slug} has {references} inbound Wiki link(s)"),
+            ));
+        }
+        tx.execute(
+            "DELETE FROM search_fts WHERE doc_type = 'page' AND identifier = ?1",
+            params![slug],
+        )?;
+        tx.execute("DELETE FROM pages WHERE slug = ?1", params![slug])?;
+        record_operation(&tx, "page_remove", slug, &json!({}))?;
+        tx.commit()?;
+        Ok(PageRemoveResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            slug: slug.to_string(),
+            removed: true,
         })
     }
 
@@ -1075,31 +1166,26 @@ impl Store {
             )
             .optional()?;
         if let Some(source_id) = source_id {
-            tx.execute(
-                &format!(
-                    "UPDATE ingest_jobs
-                     SET status = 'analyzing',
-                         attempts = attempts + 1,
-                         last_error = NULL,
-                         updated_at = {TIMESTAMP_SQL}
-                     WHERE source_id = ?1 AND status = 'pending'"
-                ),
-                params![source_id],
-            )?;
-            record_operation(&tx, "ingest_claim", &source_id.to_string(), &json!({}))?;
+            claim_ingest_job(&tx, source_id)?;
         }
         tx.commit()?;
 
-        Ok(IngestPacket {
-            scope: self.scope.clone(),
-            database: self.database_string(),
-            job: source_id
-                .map(|source_id| self.load_ingest_work(source_id, source_max_chars))
-                .transpose()?,
-            schema: self.schema_text()?,
-            purpose: self.purpose_text()?,
-            pages: self.load_page_summaries(context_limit, 0)?,
-        })
+        self.ingest_packet(source_id, context_limit, source_max_chars)
+    }
+
+    pub fn ingest_claim(
+        &mut self,
+        source_id: i64,
+        context_limit: usize,
+        source_max_chars: Option<usize>,
+    ) -> Result<IngestPacket> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_ingest_state(&tx, source_id, &["pending"])?;
+        claim_ingest_job(&tx, source_id)?;
+        tx.commit()?;
+        self.ingest_packet(Some(source_id), context_limit, source_max_chars)
     }
 
     pub fn ingest_analyze(
@@ -1336,6 +1422,94 @@ impl Store {
         })
     }
 
+    pub fn checkpoint_create(&self, name: &str) -> Result<CheckpointResponse> {
+        validate_checkpoint_name(name)?;
+        let path = checkpoint_path(&self.database, name)?;
+        create_checkpoint(&self.conn, &path)?;
+        Ok(CheckpointResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            checkpoint: name.to_string(),
+            path: path.to_string_lossy().into_owned(),
+            safety_checkpoint: None,
+        })
+    }
+
+    pub fn checkpoint_list(&self) -> Result<CheckpointListResponse> {
+        let directory = checkpoint_directory(&self.database)?;
+        let mut checkpoints = Vec::new();
+        if directory.is_dir() {
+            for entry in fs::read_dir(&directory)? {
+                let entry = entry?;
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_file()
+                    || path.extension().and_then(|value| value.to_str()) != Some("db")
+                {
+                    continue;
+                }
+                let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                checkpoints.push(CheckpointRecord {
+                    name: name.to_string(),
+                    path: path.to_string_lossy().into_owned(),
+                    bytes: metadata.len(),
+                });
+            }
+        }
+        checkpoints.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(CheckpointListResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            checkpoints,
+        })
+    }
+
+    pub fn checkpoint_restore(&mut self, name: &str) -> Result<CheckpointResponse> {
+        validate_checkpoint_name(name)?;
+        let path = checkpoint_path(&self.database, name)?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            AppError::new(
+                "checkpoint_not_found",
+                format!("checkpoint {name} is unavailable: {error}"),
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(AppError::new(
+                "checkpoint_invalid",
+                format!("checkpoint {name} is not a regular file"),
+            ));
+        }
+
+        let source = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        configure_read_only_connection(&source)?;
+        prepare_store_read_only(&source)?;
+
+        let safety_checkpoint = fresh_safety_checkpoint_name(&self.database)?;
+        let safety_path = checkpoint_path(&self.database, &safety_checkpoint)?;
+        create_checkpoint(&self.conn, &safety_path)?;
+
+        {
+            let backup = Backup::new(&source, &mut self.conn)?;
+            backup.run_to_completion(100, Duration::from_millis(10), None)?;
+        }
+        validate_store(&self.conn)?;
+        self.record_top_level_operation(
+            "checkpoint_restore",
+            name,
+            json!({ "safety_checkpoint": safety_checkpoint }),
+        )?;
+        Ok(CheckpointResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            checkpoint: name.to_string(),
+            path: path.to_string_lossy().into_owned(),
+            safety_checkpoint: Some(safety_checkpoint),
+        })
+    }
+
     pub fn materialize(&mut self) -> Result<MaterializeResponse> {
         self.materialize_inner(true)
     }
@@ -1380,15 +1554,12 @@ impl Store {
         })
     }
 
-    pub fn lint(&mut self, limit: usize, offset: usize) -> Result<LintResponse> {
+    pub fn lint(&self, limit: usize, offset: usize) -> Result<LintResponse> {
         let scope = self.scope.clone();
         let database = self.database_string();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut counts = BTreeMap::new();
         {
-            let mut statement = tx.prepare(&format!(
+            let mut statement = self.conn.prepare(&format!(
                 "{LINT_ISSUES_SQL}
                  SELECT code, COUNT(*) FROM issues GROUP BY code ORDER BY code"
             ))?;
@@ -1406,7 +1577,7 @@ impl Store {
         let total = counts.values().sum();
 
         let issues = {
-            let mut statement = tx.prepare(&format!(
+            let mut statement = self.conn.prepare(&format!(
                 "{LINT_ISSUES_SQL}
                  SELECT code, page, target, message
                  FROM issues
@@ -1426,9 +1597,6 @@ impl Store {
         };
         let has_more = offset.saturating_add(issues.len()) < total;
 
-        record_operation(&tx, "lint", "wiki", &json!({ "issues": total }))?;
-        tx.commit()?;
-
         Ok(LintResponse {
             scope,
             database,
@@ -1439,6 +1607,10 @@ impl Store {
             offset,
             has_more,
         })
+    }
+
+    pub fn record_lint(&mut self, issues: usize) -> Result<()> {
+        self.record_top_level_operation("lint", "wiki", json!({ "issues": issues }))
     }
 
     pub fn log(&self, limit: usize) -> Result<LogResponse> {
@@ -1502,6 +1674,24 @@ impl Store {
             status,
             attempts,
             analysis,
+        })
+    }
+
+    fn ingest_packet(
+        &self,
+        source_id: Option<i64>,
+        context_limit: usize,
+        source_max_chars: Option<usize>,
+    ) -> Result<IngestPacket> {
+        Ok(IngestPacket {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            job: source_id
+                .map(|source_id| self.load_ingest_work(source_id, source_max_chars))
+                .transpose()?,
+            schema: self.schema_text()?,
+            purpose: self.purpose_text()?,
+            pages: self.load_page_summaries(context_limit, 0)?,
         })
     }
 
@@ -1751,6 +1941,101 @@ impl Store {
     fn database_string(&self) -> String {
         self.database.to_string_lossy().into_owned()
     }
+}
+
+fn validate_checkpoint_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 80
+        || name != name.trim()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\'])
+        || name.chars().any(char::is_control)
+    {
+        return Err(AppError::new(
+            "checkpoint_name_invalid",
+            "checkpoint name must be one safe filename segment of at most 80 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn checkpoint_directory(database: &Path) -> Result<PathBuf> {
+    let store_directory = database
+        .parent()
+        .ok_or_else(|| AppError::new("invalid_store_path", "database has no parent"))?;
+    let directory = store_directory.join("checkpoints");
+    if let Ok(metadata) = fs::symlink_metadata(&directory)
+        && (metadata.file_type().is_symlink() || !metadata.is_dir())
+    {
+        return Err(AppError::new(
+            "checkpoint_path_invalid",
+            format!(
+                "checkpoint directory is not a regular directory: {}",
+                directory.display()
+            ),
+        ));
+    }
+    Ok(directory)
+}
+
+fn checkpoint_path(database: &Path, name: &str) -> Result<PathBuf> {
+    validate_checkpoint_name(name)?;
+    Ok(checkpoint_directory(database)?.join(format!("{name}.db")))
+}
+
+fn create_checkpoint(source: &Connection, path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::new("checkpoint_path_invalid", "checkpoint has no parent"))?;
+    fs::create_dir_all(parent)?;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            let code = if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "checkpoint_exists"
+            } else {
+                "checkpoint_create_failed"
+            };
+            AppError::new(code, format!("cannot create {}: {error}", path.display()))
+        })?;
+
+    let result = (|| -> Result<()> {
+        let mut destination = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        {
+            let backup = Backup::new(source, &mut destination)?;
+            backup.run_to_completion(100, Duration::from_millis(10), None)?;
+        }
+        prepare_store_read_only(&destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+fn fresh_safety_checkpoint_name(database: &Path) -> Result<String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| AppError::new("system_time_error", error.to_string()))?
+        .as_millis();
+    for suffix in 0..1000 {
+        let name = if suffix == 0 {
+            format!("pre-restore-{millis}")
+        } else {
+            format!("pre-restore-{millis}-{suffix}")
+        };
+        if !checkpoint_path(database, &name)?.exists() {
+            return Ok(name);
+        }
+    }
+    Err(AppError::new(
+        "checkpoint_create_failed",
+        "could not allocate a safety checkpoint name",
+    ))
 }
 
 fn artifact_snapshot(
@@ -2369,6 +2654,45 @@ fn validate_store(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn insert_source(tx: &Transaction<'_>, input: &SourceAddInput) -> Result<(i64, bool)> {
+    let content_hash = hash_content(&input.content);
+    let title = input
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or(&input.origin)
+        .to_string();
+    let created = tx.execute(
+        &format!(
+            "INSERT OR IGNORE INTO sources(content_hash, title, origin, content, created_at)
+             VALUES (?1, ?2, ?3, ?4, {TIMESTAMP_SQL})"
+        ),
+        params![&content_hash, &title, &input.origin, &input.content],
+    )? == 1;
+    let source_id = tx.query_row(
+        "SELECT id FROM sources WHERE content_hash = ?1",
+        params![&content_hash],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if created {
+        index_source(tx, source_id, Some(&title), input.content.as_str())?;
+    }
+    tx.execute(
+        &format!(
+            "INSERT OR IGNORE INTO ingest_jobs(source_id, status, updated_at)
+             VALUES (?1, 'pending', {TIMESTAMP_SQL})"
+        ),
+        params![source_id],
+    )?;
+    record_operation(
+        tx,
+        "source_add",
+        &input.origin,
+        &json!({ "source_id": source_id, "created": created }),
+    )?;
+    Ok((source_id, created))
+}
+
 fn record_operation(
     tx: &Transaction<'_>,
     action: &str,
@@ -2511,6 +2835,27 @@ fn require_ingest_state(tx: &Transaction<'_>, source_id: i64, allowed: &[&str]) 
             ),
         ))
     }
+}
+
+fn claim_ingest_job(tx: &Transaction<'_>, source_id: i64) -> Result<()> {
+    let updated = tx.execute(
+        &format!(
+            "UPDATE ingest_jobs
+             SET status = 'analyzing',
+                 attempts = attempts + 1,
+                 last_error = NULL,
+                 updated_at = {TIMESTAMP_SQL}
+             WHERE source_id = ?1 AND status = 'pending'"
+        ),
+        params![source_id],
+    )?;
+    if updated != 1 {
+        return Err(AppError::new(
+            "invalid_ingest_state",
+            format!("source {source_id} is not pending"),
+        ));
+    }
+    record_operation(tx, "ingest_claim", &source_id.to_string(), &json!({}))
 }
 
 fn validate_page_slug(slug: &str) -> Result<()> {

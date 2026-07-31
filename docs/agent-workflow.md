@@ -14,6 +14,8 @@ Use `lwc` as durable external memory. The database stores evidence and compiled 
    generated projections. Rebuild them with `lwc maintenance materialize`.
 8. Read commands keep current stores read-only. A writable legacy store may be
    migrated transactionally once before the requested read.
+9. Project initialization locally excludes `.lwc/` from Git unless
+   `--no-git-exclude` is explicit.
 
 ## Start a session
 
@@ -32,6 +34,16 @@ lwc ingest list --status pending
 lwc ingest next --context-limit 50 --source-max-chars 100000
 ```
 
+Prefer `source add-manifest` for a reviewed multi-file set. Its JSON `sources`
+entries contain `path` plus an optional `title`, and relative paths resolve from
+the manifest directory. The command preflights every entry before one
+transaction writes the batch.
+
+Project sources outside the active Wiki root require
+`--allow-external-source`. Do not use
+`--acknowledge-sensitive-source` merely to bypass a warning: inspect or redact
+the source first, and acknowledge only a safe immutable snapshot.
+
 `ingest next` atomically claims one task and returns the immutable source,
 purpose, schema, and bounded page index. If `source_window.has_more` is true,
 continue from `source_window.next_offset_chars` until the complete source has
@@ -40,6 +52,9 @@ been read:
 ```bash
 lwc source show 12 --offset-chars 100000 --max-chars 100000
 ```
+
+When a manifest or scheduler already selected a specific pending source, use
+`lwc ingest claim 12` instead of relying on queue order.
 
 Offsets count Unicode characters, not bytes. Analyze the complete source before
 generating pages:
@@ -141,6 +156,9 @@ semantic pass the CLI cannot perform:
 `shallow_ingest` identifies completed legacy jobs with only a source summary
 and no explicit no-derived-pages reason.
 
+Lint is read-only by default. Use `lwc lint --record` only when the validation
+event itself belongs in durable operation history.
+
 If lint reports search index rows missing, orphaned, or duplicated, run:
 
 ```bash
@@ -182,6 +200,22 @@ The command optimizes FTS and attempts a WAL truncate checkpoint. If `busy` is
 true, an active reader prevented full reclamation; retry later. Never infer
 success from the command exit alone—inspect `busy` and `after_bytes`.
 
+## Mutation recovery
+
+Before a multi-source ingest or broad replacement of existing pages, create a
+named checkpoint:
+
+```bash
+lwc checkpoint create before-architecture-refresh
+```
+
+`checkpoint restore` validates the selected database, creates a
+`pre-restore-*` copy of the current state, restores through SQLite's online
+backup API, and rebuilds raw and Markdown projections.
+
+Use `source remove <ID>` and `page remove <SLUG>` instead of editing SQLite.
+Removal refuses a cited source or a page with inbound links.
+
 ## Development-only benchmark
 
 Do not run the repository benchmark during ordinary memory work. When
@@ -191,8 +225,9 @@ under the same conditions.
 
 ## Projection contract
 
-- `lwc init`, source/page writes, schema/purpose writes, and successful ingest
-  completion refresh the Markdown projection.
+- `lwc init`, source/page writes and removals, schema/purpose writes,
+  checkpoint restores, and successful ingest completion refresh the Markdown
+  projection.
 - `lwc maintenance materialize` performs a full consistent rebuild from SQLite.
 - A private manifest removes only stale files previously written by `lwc`;
   user-created files and `raw/assets` are preserved.

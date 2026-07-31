@@ -37,10 +37,10 @@ supported_lwc_version() {
   [ "$#" -eq 3 ] || return 1
   case "$1$2$3" in *[!0-9]*|'') return 1 ;; esac
 
-  [ "$1" -gt 0 ] || [ "$2" -ge 2 ]
+  [ "$1" -gt 0 ] || [ "$2" -ge 3 ]
 }
 
-# v0.2.0 adds layered search, bounded source windows, and the v6 store.
+# v0.3.0 adds mutation recovery, source safety gates, and atomic manifests.
 usable_lwc() {
   candidate="$1"
   candidate_version="$("$candidate" --version 2>/dev/null || true)"
@@ -49,6 +49,8 @@ usable_lwc() {
   supported_lwc_version "$candidate_version" || return 1
   "$candidate" init --help 2>&1 | grep -q -- '--scope'
   "$candidate" --help 2>&1 | grep -q -- 'LWC_PROJECT_ROOT'
+  "$candidate" checkpoint --help >/dev/null 2>&1
+  "$candidate" source add-manifest --help >/dev/null 2>&1
 }
 
 managed_lwc_path() {
