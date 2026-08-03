@@ -105,6 +105,15 @@ fn directory_ingest_is_recursive_filtered_and_idempotent() {
             .iter()
             .any(|source| source["title"] == "nested/two.sql")
     );
+    let status = world.ok(&["source", "status", "--all"]);
+    assert_eq!(status["checks"].as_array().unwrap().len(), 3);
+    assert!(
+        status["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| check["head_revision"] == 1 && check["filesystem_state"] == "current")
+    );
 }
 
 #[test]

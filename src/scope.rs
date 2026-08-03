@@ -157,7 +157,7 @@ fn configured_project_paths(cwd: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
     Ok(Some((cwd, root)))
 }
 
-fn ensure_project_path(path: &Path, root: &Path) -> Result<()> {
+pub(crate) fn ensure_project_path(path: &Path, root: &Path) -> Result<()> {
     if !path.starts_with(root) {
         return Err(project_root_escape(path, root, "path is outside the root"));
     }

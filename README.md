@@ -311,6 +311,27 @@ Project sources that resolve outside the active Wiki root require
 unless the reviewed source is explicitly acknowledged with
 `--acknowledge-sensitive-source`.
 
+Each successful add also records the observed file path and its current
+immutable snapshot. Check only the sources relevant to the task before relying
+on file-backed evidence:
+
+```bash
+lwc source status 7 12
+```
+
+The command streams each live file through SHA-256 and reports path lineage
+(`current` or `superseded`) separately from filesystem state (`current`,
+`modified`, `missing`, `unreadable`, `oversized`, or `unstable`). It is
+read-only. Use `source status --all` only for explicit maintenance because its
+cost is proportional to the bytes in all tracked files. Re-run `source add` on
+a modified path to capture the new immutable revision; an A -> B -> A sequence
+remains three path observations even though content A reuses its original
+source ID. External paths require `--allow-external-source` again when checked.
+Sources migrated from older stores remain explicitly untracked because LWC does
+not guess historical paths; re-add the intended file once to establish its
+first tracked revision. If a file or path head changes during the check, LWC
+returns `source_status_unstable`; retry instead of trusting a mixed-time result.
+
 For a curated atomic import, paths in a JSON manifest resolve from the
 manifest's directory:
 
@@ -490,7 +511,9 @@ Notes:
 `lwc checkpoint restore <NAME>`; LWC first creates a `pre-restore-*` safety
 checkpoint and then rebuilds the projection. Use `source remove <ID>` and
 `page remove <SLUG>` for guarded deletion: sources with citations and pages
-with inbound links are refused.
+with inbound links are refused. Removing the current source for a tracked path
+stops tracking that path instead of silently exposing an older revision as
+current.
 
 For an external filesystem backup, stop active `lwc` commands and copy the
 complete `.lwc/` directory. Do not copy only `wiki.db` while a writer may still

@@ -278,6 +278,23 @@ SHA-256 去重。
 `--allow-external-source`。检测到高置信度凭证特征时默认拒绝；只有确认不可变
 快照安全后，才能传入 `--acknowledge-sensitive-source`。
 
+每次成功加入来源时，LWC 还会记录本次观察到的文件路径及其当前不可变快照。
+依赖文件证据前，只检查本次任务真正相关的来源：
+
+```bash
+lwc source status 7 12
+```
+
+该只读命令会流式计算实时文件的 SHA-256，并分别返回路径版本状态（`current` 或
+`superseded`）与文件系统状态（`current`、`modified`、`missing`、`unreadable`、
+`oversized` 或 `unstable`）。`source status --all` 的成本与所有被跟踪文件的总字节数
+成正比，只应在明确的维护任务中使用。文件变更后再次执行 `source add` 即可保存新
+版本；即使内容从 A 变为 B 后又回到 A，LWC 仍保留三次路径观察，只复用 A 原有的
+source ID。检查外部路径时必须再次显式传入 `--allow-external-source`。
+旧版数据库迁移后，原有来源会明确显示为未跟踪；LWC 不会猜测历史路径。对目标文件
+重新执行一次 `source add`，即可建立第一条路径版本记录。如果检查期间文件或路径头
+版本发生变化，LWC 会返回 `source_status_unstable`；应重试，不要采信跨时点结果。
+
 需要原子导入经过筛选的一组来源时，可使用相对 manifest 所在目录解析的 JSON：
 
 ```json
@@ -446,7 +463,8 @@ lwc log --limit 20
 `lwc checkpoint create <NAME>` 使用 SQLite 在线备份 API。执行
 `lwc checkpoint restore <NAME>` 时，LWC 会先创建 `pre-restore-*` 安全
 checkpoint，再恢复数据库并重建投影。受保护删除使用 `source remove <ID>` 和
-`page remove <SLUG>`：仍被页面引用的来源、仍有入链的页面都会被拒绝删除。
+`page remove <SLUG>`：仍被页面引用的来源、仍有入链的页面都会被拒绝删除。删除某
+路径的当前来源时，该路径会明确停止跟踪，不会把旧版本悄悄恢复成“当前版本”。
 
 需要文件系统级外部备份时，应先停止正在运行的 `lwc` 命令并复制完整 `.lwc/`
 目录；写入进程可能仍在使用 WAL 文件时，不要只复制 `wiki.db`。

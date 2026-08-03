@@ -25,7 +25,7 @@ cat > "$mock_bin/lwc" <<'MOCK_LWC'
 #!/bin/sh
 case "$*" in
   "--version")
-    printf 'lwc 0.4.0\n'
+    printf 'lwc %s\n' "${MOCK_LWC_VERSION:-0.5.0}"
     ;;
   "init --help")
     printf '%s\n' '--scope'
@@ -33,7 +33,7 @@ case "$*" in
   "--help")
     printf '%s\n' 'Set LWC_PROJECT_ROOT to bound project discovery.'
     ;;
-  "checkpoint --help"|"source add-manifest --help")
+  "checkpoint --help"|"source add-manifest --help"|"source status --help")
     ;;
   "page put --help")
     printf '%s\n' '--provenance'
@@ -113,4 +113,17 @@ if (
   fail "bootstrap accepted the home directory as LWC_PROJECT_ROOT"
 fi
 
-printf 'using-lwc bootstrap tests: 4 passed\n'
+if (
+  cd "$project"
+  HOME="$home" \
+    PATH="$mock_bin:$PATH" \
+    TMPDIR="$runtime_tmp" \
+    MOCK_LWC_VERSION=0.4.0 \
+    LWC_AUTO_INSTALL=0 \
+    LWC_PROJECT_ROOT="$project" \
+    sh "$bootstrap"
+) >"$test_root/legacy.out" 2>"$test_root/legacy.err"; then
+  fail "bootstrap accepted lwc v0.4.0 without source freshness support"
+fi
+
+printf 'using-lwc bootstrap tests: 5 passed\n'

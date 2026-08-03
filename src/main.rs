@@ -10,20 +10,36 @@ use clap::{Parser, Subcommand, ValueEnum};
 use error::{AppError, Result};
 use import::collect_documents;
 use scope::{
-    Scope, StorePath, ensure_scope_supported, init_store_path, resolve_read_store_paths,
-    resolve_store_path,
+    Scope, StorePath, ensure_project_path, ensure_scope_supported, init_store_path,
+    resolve_read_store_paths, resolve_store_path,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::{self, Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command as ProcessCommand,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use store::{PagePutInput, SearchMode, SearchOptions, SourceAddInput, Store};
 
 const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+const LIVE_SOURCE_NONBLOCK: i32 = 0o4000;
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+const LIVE_SOURCE_NONBLOCK: i32 = 0x0004;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +52,63 @@ struct SourceManifest {
 struct SourceManifestEntry {
     path: PathBuf,
     title: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SourceStatusResponse {
+    scope: String,
+    database: String,
+    checked_at_unix_ms: u128,
+    checks: Vec<SourceStatusCheck>,
+    untracked_source_ids: Vec<i64>,
+}
+
+#[derive(Serialize)]
+struct SourceStatusCheck {
+    requested_source_id: i64,
+    tracked_path: String,
+    head_source_id: i64,
+    head_revision: i64,
+    lineage_state: &'static str,
+    filesystem_state: &'static str,
+    head_content_hash: String,
+    live_content_hash: Option<String>,
+    live_bytes: Option<u64>,
+    message: Option<String>,
+}
+
+struct LiveSourceStatus {
+    state: &'static str,
+    content_hash: Option<String>,
+    bytes: Option<u64>,
+    message: Option<String>,
+}
+
+enum PreparedLiveSource {
+    Ready {
+        path: PathBuf,
+        file: fs::File,
+        before: FileFingerprint,
+    },
+    Terminal {
+        path: PathBuf,
+        observed: Option<FileFingerprint>,
+        status: LiveSourceStatus,
+    },
+}
+
+#[derive(PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
 }
 
 #[derive(Parser)]
@@ -111,7 +184,7 @@ enum Command {
     /// Add, inspect, and trace immutable source snapshots.
     #[command(
         long_about = "Manage immutable evidence. Adding a source stores a content-addressed snapshot, indexes its raw text, records provenance, and creates a pending ingest job; it does not create synthesized Wiki knowledge.",
-        after_help = "When to use:\n  Use `add` for one curated source, `add-manifest` for an atomic reviewed set, and `add-dir` for a deterministic UTF-8 text corpus. Use `show` when an Agent needs exact evidence, and `refs` to find every Wiki page citing it.\n\nNext action:\n  Claim returned manifest IDs with `lwc ingest claim`; otherwise use `lwc ingest next`. Do not treat a pending job as integrated knowledge."
+        after_help = "When to use:\n  Use `add` for one curated source, `add-manifest` for an atomic reviewed set, and `add-dir` for a deterministic UTF-8 text corpus. Use targeted `status` before relying on tracked live files, `show` for exact immutable evidence, and `refs` to find every citing Wiki page.\n\nNext action:\n  Claim returned manifest IDs with `lwc ingest claim`; otherwise use `lwc ingest next`. Do not treat a pending job as integrated knowledge."
     )]
     Source {
         #[command(subcommand)]
@@ -323,6 +396,22 @@ Read sources, limit, offset, and has_more from the JSON response. When has_more=
         /// Zero-based source offset.
         #[arg(long, default_value_t = 0)]
         offset: usize,
+    },
+    /// Compare tracked files with their latest immutable snapshots.
+    #[command(
+        long_about = "Read-only exact freshness check. For selected source IDs, report every tracked path where each source appeared, the current path head, and a streaming SHA-256 comparison with the live file. Use --all only for explicit maintenance.",
+        after_help = "Examples:\n  lwc source status 7 12\n  lwc source status --all\n  lwc source status 7 --allow-external-source"
+    )]
+    Status {
+        /// Source IDs to check; repeat positionally for a targeted batch.
+        #[arg(value_name = "SOURCE_ID", num_args = 1.., required_unless_present = "all", conflicts_with = "all")]
+        source_ids: Vec<i64>,
+        /// Check every currently tracked path.
+        #[arg(long)]
+        all: bool,
+        /// Permit reading a tracked project source outside the active project root.
+        #[arg(long)]
+        allow_external_source: bool,
     },
     /// Return a resumable Unicode-safe window of one immutable source.
     #[command(
@@ -693,40 +782,55 @@ fn run(cli: Cli) -> Result<Value> {
                     acknowledge_sensitive_source,
                 } => {
                     validate_source_scope(&store_path, &directory, allow_external_source)?;
-                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                     let files = collect_documents(&directory).map_err(|error| {
                         AppError::new("invalid_source_directory", error.to_string())
                     })?;
                     let discovered = files.len();
-                    let mut created = 0usize;
-                    let mut duplicates = 0usize;
                     let mut skipped_files = Vec::new();
-                    for file in files {
-                        let content = match read_utf8(&file, false) {
+                    let inputs = files.into_iter().map(|file| {
+                        let resolved = match validate_source_scope(
+                            &store_path,
+                            &file,
+                            allow_external_source,
+                        ) {
+                            Ok(path) => path,
+                            Err(error) if error.code == "io_error" => {
+                                skipped_files.push(file.display().to_string());
+                                return Ok(None);
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        let content = match read_utf8(&resolved, false) {
                             Ok(content) if !content.trim().is_empty() => content,
                             _ => {
                                 skipped_files.push(file.display().to_string());
-                                continue;
+                                return Ok(None);
                             }
                         };
-                        validate_sensitive_source(&file, &content, acknowledge_sensitive_source)?;
+                        validate_sensitive_source(
+                            &resolved,
+                            &content,
+                            acknowledge_sensitive_source,
+                        )?;
                         let title = file
                             .strip_prefix(&directory)
                             .unwrap_or(&file)
                             .to_string_lossy()
                             .replace('\\', "/");
-                        let response = store.source_add(SourceAddInput {
+                        Ok(Some(SourceAddInput {
                             title: Some(title),
                             origin: file.display().to_string(),
+                            tracked_path: Some(tracked_source_path(&store_path, &resolved)?),
                             content,
-                        })?;
-                        if response.created {
-                            created += 1;
-                        } else {
-                            duplicates += 1;
-                        }
+                        }))
+                    });
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let responses = store.source_add_stream(inputs)?;
+                    let created = responses.iter().filter(|response| response.created).count();
+                    let duplicates = responses.len() - created;
+                    if !responses.is_empty() {
+                        store.materialize()?;
                     }
-                    store.materialize()?;
                     if !skipped_files.is_empty() {
                         let examples = skipped_files
                             .iter()
@@ -812,6 +916,83 @@ fn run(cli: Cli) -> Result<Value> {
                     validate_limit(limit)?;
                     validate_offset(offset)?;
                     to_json(store.source_list(limit, offset)?)
+                }
+                SourceCommand::Status {
+                    source_ids,
+                    all,
+                    allow_external_source,
+                } => {
+                    let mut store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    let selected = store.source_status_targets(source_ids.clone(), all)?;
+                    let mut resolved = BTreeMap::new();
+                    for target in &selected.targets {
+                        if !resolved.contains_key(&target.tracked_path) {
+                            resolved.insert(
+                                target.tracked_path.clone(),
+                                resolve_tracked_source_path(
+                                    &store_path,
+                                    &target.tracked_path,
+                                    allow_external_source,
+                                )?,
+                            );
+                        }
+                    }
+                    let mut live = BTreeMap::new();
+                    for (tracked_path, path) in resolved {
+                        let source = prepare_live_source(&store_path, path, allow_external_source)?;
+                        live.insert(tracked_path, inspect_prepared_source(source));
+                    }
+                    let current = store.source_status_targets(source_ids, all)?;
+                    ensure_source_status_unchanged(&selected, &current)?;
+                    let checks = selected
+                        .targets
+                        .into_iter()
+                        .map(|target| {
+                            let live = live
+                                .get(&target.tracked_path)
+                                .expect("every preflighted path is inspected");
+                            let filesystem_state = if live.state == "hashed" {
+                                if live.content_hash.as_deref()
+                                    == Some(target.head_content_hash.as_str())
+                                {
+                                    "current"
+                                } else {
+                                    "modified"
+                                }
+                            } else {
+                                live.state
+                            };
+                            SourceStatusCheck {
+                                requested_source_id: target.requested_source_id,
+                                tracked_path: target.tracked_path,
+                                head_source_id: target.head_source_id,
+                                head_revision: target.head_revision,
+                                lineage_state: if target.requested_source_id
+                                    == target.head_source_id
+                                {
+                                    "current"
+                                } else {
+                                    "superseded"
+                                },
+                                filesystem_state,
+                                head_content_hash: target.head_content_hash,
+                                live_content_hash: live.content_hash.clone(),
+                                live_bytes: live.bytes,
+                                message: live.message.clone(),
+                            }
+                        })
+                        .collect();
+                    to_json(SourceStatusResponse {
+                        scope: scope_name(store_path.scope).to_string(),
+                        database: store_path.path.display().to_string(),
+                        checked_at_unix_ms: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|error| AppError::new("system_time_error", error.to_string()))?
+                            .as_millis(),
+                        checks,
+                        untracked_source_ids: selected.untracked_source_ids,
+                    })
                 }
                 SourceCommand::Show {
                     id,
@@ -1209,8 +1390,352 @@ fn prepare_source_input(
     Ok(SourceAddInput {
         title,
         origin: path.display().to_string(),
+        tracked_path: Some(tracked_source_path(store_path, &resolved)?),
         content,
     })
+}
+
+fn tracked_source_path(store_path: &StorePath, resolved: &Path) -> Result<String> {
+    let tracked = if store_path.scope == Scope::Project {
+        let project_root = project_root(store_path)?;
+        resolved.strip_prefix(&project_root).unwrap_or(resolved)
+    } else {
+        resolved
+    };
+    tracked
+        .to_str()
+        .map(|path| path.replace('\\', "/"))
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            AppError::new(
+                "invalid_source_path",
+                format!("source path is not valid UTF-8: {}", resolved.display()),
+            )
+        })
+}
+
+fn ensure_source_status_unchanged(
+    before: &store::SourceStatusTargets,
+    after: &store::SourceStatusTargets,
+) -> Result<()> {
+    if before != after {
+        return Err(AppError::new(
+            "source_status_unstable",
+            "source path revisions changed during the status check; retry",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_tracked_source_path(
+    store_path: &StorePath,
+    tracked_path: &str,
+    allow_external_source: bool,
+) -> Result<PathBuf> {
+    let tracked = Path::new(tracked_path);
+    if tracked.is_absolute() {
+        if store_path.scope == Scope::Project {
+            let root = project_root(store_path)?;
+            if ensure_project_path(tracked, &root).is_err() && !allow_external_source {
+                return Err(AppError::new(
+                    "external_source_requires_acknowledgement",
+                    format!(
+                        "tracked source {} is outside project root {}; retry with --allow-external-source only with current authorization",
+                        tracked.display(),
+                        root.display()
+                    ),
+                ));
+            }
+        }
+        return Ok(tracked.to_path_buf());
+    }
+    if store_path.scope != Scope::Project
+        || tracked.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(AppError::new(
+            "corrupt_store",
+            format!("invalid tracked source path: {tracked_path}"),
+        ));
+    }
+    let root = project_root(store_path)?;
+    let path = root.join(tracked);
+    if let Err(error) = ensure_project_path(&path, &root)
+        && !allow_external_source
+    {
+        return Err(AppError::new(
+            "external_source_requires_acknowledgement",
+            format!(
+                "tracked source {} escapes project root {}; retry with --allow-external-source only with current authorization: {error}",
+                path.display(),
+                root.display()
+            ),
+        ));
+    }
+    Ok(path)
+}
+
+fn prepare_live_source(
+    store_path: &StorePath,
+    path: PathBuf,
+    allow_external_source: bool,
+) -> Result<PreparedLiveSource> {
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Ok(PreparedLiveSource::Terminal {
+                observed: None,
+                path,
+                status: LiveSourceStatus {
+                    state: if error.kind() == io::ErrorKind::NotFound {
+                        "missing"
+                    } else {
+                        "unreadable"
+                    },
+                    content_hash: None,
+                    bytes: None,
+                    message: Some(error.to_string()),
+                },
+            });
+        }
+    };
+    let before = file_fingerprint(&metadata);
+    if !metadata.is_file() {
+        return Ok(PreparedLiveSource::Terminal {
+            path,
+            observed: Some(before),
+            status: LiveSourceStatus {
+                state: "unreadable",
+                content_hash: None,
+                bytes: None,
+                message: Some("tracked source is not a regular file".to_string()),
+            },
+        });
+    }
+    if before.len > MAX_INPUT_BYTES {
+        let bytes = before.len;
+        return Ok(PreparedLiveSource::Terminal {
+            path,
+            observed: Some(before),
+            status: LiveSourceStatus {
+                state: "oversized",
+                content_hash: None,
+                bytes: Some(bytes),
+                message: Some(format!(
+                    "tracked source is {} bytes; maximum supported input is {MAX_INPUT_BYTES} bytes",
+                    bytes
+                )),
+            },
+        });
+    }
+    let file = match open_live_source(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            return Ok(PreparedLiveSource::Terminal {
+                observed: Some(before),
+                path,
+                status: LiveSourceStatus {
+                    state: if error.kind() == io::ErrorKind::NotFound {
+                        "missing"
+                    } else {
+                        "unreadable"
+                    },
+                    content_hash: None,
+                    bytes: None,
+                    message: Some(error.to_string()),
+                },
+            });
+        }
+    };
+    if file
+        .metadata()
+        .ok()
+        .map(|metadata| file_fingerprint(&metadata))
+        .as_ref()
+        != Some(&before)
+    {
+        return Ok(PreparedLiveSource::Terminal {
+            path,
+            observed: None,
+            status: LiveSourceStatus {
+                state: "unstable",
+                content_hash: None,
+                bytes: None,
+                message: Some("tracked source changed while it was being opened".to_string()),
+            },
+        });
+    }
+    if store_path.scope == Scope::Project && !allow_external_source {
+        let root = project_root(store_path)?;
+        let resolved = fs::canonicalize(&path).map_err(|error| {
+            AppError::new(
+                "source_status_unstable",
+                format!(
+                    "tracked source {} changed during authorization: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        if !resolved.starts_with(&root) {
+            return Err(AppError::new(
+                "external_source_requires_acknowledgement",
+                format!(
+                    "tracked source {} resolves outside project root {}; retry with --allow-external-source only with current authorization",
+                    path.display(),
+                    root.display()
+                ),
+            ));
+        }
+    }
+    if fs::metadata(&path)
+        .ok()
+        .map(|metadata| file_fingerprint(&metadata))
+        .as_ref()
+        != Some(&before)
+    {
+        return Ok(PreparedLiveSource::Terminal {
+            path,
+            observed: None,
+            status: LiveSourceStatus {
+                state: "unstable",
+                content_hash: None,
+                bytes: None,
+                message: Some("tracked source changed during authorization".to_string()),
+            },
+        });
+    }
+    Ok(PreparedLiveSource::Ready { path, file, before })
+}
+
+fn open_live_source(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    options.custom_flags(LIVE_SOURCE_NONBLOCK);
+    options.open(path)
+}
+
+fn inspect_prepared_source(prepared: PreparedLiveSource) -> LiveSourceStatus {
+    let (path, mut file, before) = match prepared {
+        PreparedLiveSource::Ready { path, file, before } => (path, file, before),
+        PreparedLiveSource::Terminal {
+            path,
+            observed,
+            status,
+        } => {
+            let current = fs::metadata(path)
+                .ok()
+                .map(|metadata| file_fingerprint(&metadata));
+            if current != observed {
+                return LiveSourceStatus {
+                    state: "unstable",
+                    content_hash: None,
+                    bytes: current.as_ref().map(|fingerprint| fingerprint.len),
+                    message: Some("tracked source changed during status preflight".to_string()),
+                };
+            }
+            return status;
+        }
+    };
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut bytes = 0u64;
+    loop {
+        let read = match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) => {
+                return LiveSourceStatus {
+                    state: "unreadable",
+                    content_hash: None,
+                    bytes: Some(bytes),
+                    message: Some(error.to_string()),
+                };
+            }
+        };
+        bytes += read as u64;
+        if bytes > MAX_INPUT_BYTES {
+            return LiveSourceStatus {
+                state: "oversized",
+                content_hash: None,
+                bytes: Some(bytes),
+                message: Some(format!(
+                    "tracked source exceeded the {MAX_INPUT_BYTES}-byte input limit while reading"
+                )),
+            };
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    let after_handle = file
+        .metadata()
+        .ok()
+        .map(|metadata| file_fingerprint(&metadata));
+    let after_path = fs::metadata(path)
+        .ok()
+        .map(|metadata| file_fingerprint(&metadata));
+    let content_hash = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if after_handle.as_ref() != Some(&before) || after_path.as_ref() != Some(&before) {
+        return LiveSourceStatus {
+            state: "unstable",
+            content_hash: None,
+            bytes: Some(bytes),
+            message: Some("tracked source changed while it was being hashed".to_string()),
+        };
+    }
+    LiveSourceStatus {
+        state: "hashed",
+        content_hash: Some(content_hash),
+        bytes: Some(bytes),
+        message: None,
+    }
+}
+
+fn file_fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
+    FileFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        changed_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
+fn project_root(store_path: &StorePath) -> Result<PathBuf> {
+    let root = store_path
+        .path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            AppError::new(
+                "invalid_store_path",
+                "project Wiki path has no project root",
+            )
+        })?;
+    Ok(fs::canonicalize(root)?)
 }
 
 fn validate_source_scope(
@@ -1220,17 +1745,7 @@ fn validate_source_scope(
 ) -> Result<PathBuf> {
     let resolved = fs::canonicalize(path)?;
     if store_path.scope == Scope::Project && !allow_external_source {
-        let project_root = store_path
-            .path
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| {
-                AppError::new(
-                    "invalid_store_path",
-                    "project Wiki path has no project root",
-                )
-            })?;
-        let project_root = fs::canonicalize(project_root)?;
+        let project_root = project_root(store_path)?;
         if !resolved.starts_with(&project_root) {
             return Err(AppError::new(
                 "external_source_requires_acknowledgement",
@@ -1475,7 +1990,11 @@ fn to_json<T: Serialize>(value: T) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::read_file_bounded;
+    use super::{
+        Scope, StorePath, ensure_source_status_unchanged, file_fingerprint,
+        inspect_prepared_source, open_live_source, prepare_live_source, read_file_bounded,
+    };
+    use crate::store::{SourceStatusTarget, SourceStatusTargets};
 
     #[test]
     fn bounded_file_read_rejects_oversized_input() {
@@ -1486,5 +2005,91 @@ mod tests {
         let error = read_file_bounded(&path, 4).unwrap_err();
 
         assert_eq!(error.code, "input_too_large");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_fingerprint_detects_same_size_path_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let tracked = temp.path().join("tracked.txt");
+        let replacement = temp.path().join("replacement.txt");
+        std::fs::write(&tracked, b"alpha").unwrap();
+        std::fs::write(&replacement, b"bravo").unwrap();
+        let before = file_fingerprint(&std::fs::metadata(&tracked).unwrap());
+
+        std::fs::rename(&replacement, &tracked).unwrap();
+        let after = file_fingerprint(&std::fs::metadata(&tracked).unwrap());
+
+        assert!(before != after);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_source_rejects_path_replacement_before_hashing() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let tracked = temp.path().join("tracked.txt");
+        let external_dir = tempfile::tempdir().unwrap();
+        let external = external_dir.path().join("external.txt");
+        std::fs::write(&tracked, b"inside").unwrap();
+        std::fs::write(&external, b"outside").unwrap();
+        let store_path = StorePath {
+            scope: Scope::Project,
+            path: temp.path().join(".lwc/wiki.db"),
+        };
+        let prepared = prepare_live_source(&store_path, tracked.clone(), false).unwrap();
+
+        std::fs::remove_file(&tracked).unwrap();
+        symlink(&external, &tracked).unwrap();
+        let status = inspect_prepared_source(prepared);
+
+        assert_eq!(status.state, "unstable");
+        assert!(status.content_hash.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_source_open_does_not_block_on_a_fifo() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let temp = tempfile::tempdir().unwrap();
+        let fifo = temp.path().join("source.fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || sender.send(open_live_source(&fifo)).unwrap());
+
+        let file = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("opening a FIFO must not block")
+            .unwrap();
+        assert!(!file.metadata().unwrap().is_file());
+    }
+
+    #[test]
+    fn source_status_rejects_a_head_change_during_live_hashing() {
+        let targets =
+            |head_source_id, head_revision, head_content_hash: &str| SourceStatusTargets {
+                targets: vec![SourceStatusTarget {
+                    requested_source_id: 1,
+                    tracked_path: "docs/source.md".to_string(),
+                    head_source_id,
+                    head_revision,
+                    head_content_hash: head_content_hash.to_string(),
+                }],
+                untracked_source_ids: Vec::new(),
+            };
+        let before = targets(1, 1, "hash-a");
+        let after = targets(2, 2, "hash-b");
+
+        let error = ensure_source_status_unchanged(&before, &after).unwrap_err();
+
+        assert_eq!(error.code, "source_status_unstable");
     }
 }

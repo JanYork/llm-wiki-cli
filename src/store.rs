@@ -8,19 +8,24 @@ use rusqlite::{
     Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
     backup::Backup, ffi, params,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::CStr,
     fs,
+    io::{BufReader, BufWriter, Seek, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const COMPOUND_WIKI_VERSION: i32 = 6;
-const USER_VERSION: i32 = 7;
+const PAGE_PROVENANCE_VERSION: i32 = 7;
+const USER_VERSION: i32 = 8;
 const SEARCH_INDEX_VERSION: i32 = 4;
 const INGEST_WORKFLOW_VERSION: i32 = 5;
 const TOKENIZER_ID: &str = "cjk-bigram@1/bounded-terms";
@@ -28,6 +33,7 @@ const SOURCE_GROUNDED: &str = "source-grounded";
 const EXPLICIT_PROVENANCE: [&str; 3] = ["user-provided", "agent-observed", "hypothesis"];
 const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 const TIMESTAMP_SQL: &str = "STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')";
+static SOURCE_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub const DEFAULT_SCHEMA: &str = r#"# Wiki Schema
 
 ## Page types
@@ -176,10 +182,11 @@ pub struct Store {
     conn: Connection,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SourceAddInput {
     pub title: Option<String>,
     pub origin: String,
+    pub tracked_path: Option<String>,
     pub content: String,
 }
 
@@ -242,6 +249,8 @@ pub struct SourceRemoveResponse {
     pub database: String,
     pub source_id: i64,
     pub removed: bool,
+    pub removed_path_revisions: usize,
+    pub untracked_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -252,6 +261,21 @@ pub struct SourceListResponse {
     pub limit: usize,
     pub offset: usize,
     pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SourceStatusTarget {
+    pub requested_source_id: i64,
+    pub tracked_path: String,
+    pub head_source_id: i64,
+    pub head_revision: i64,
+    pub head_content_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SourceStatusTargets {
+    pub targets: Vec<SourceStatusTarget>,
+    pub untracked_source_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -714,12 +738,58 @@ impl Store {
                 "at least one source is required",
             ));
         }
+        self.source_add_prepared(inputs.into_iter().map(Ok))
+    }
+
+    pub(crate) fn source_add_stream<I>(&mut self, inputs: I) -> Result<Vec<SourceAddResponse>>
+    where
+        I: IntoIterator<Item = Result<Option<SourceAddInput>>>,
+    {
+        let (mut stage, stage_path) = create_source_stage(&self.database)?;
+        let result = (|| {
+            let mut count = 0usize;
+            {
+                let mut writer = BufWriter::new(&mut stage);
+                for input in inputs {
+                    if let Some(input) = input? {
+                        serde_json::to_writer(&mut writer, &input)
+                            .map_err(|error| AppError::new("staging_error", error.to_string()))?;
+                        writer.write_all(b"\n")?;
+                        count += 1;
+                    }
+                }
+                writer.flush()?;
+            }
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            stage.rewind()?;
+            let inputs = serde_json::Deserializer::from_reader(BufReader::new(&mut stage))
+                .into_iter::<SourceAddInput>()
+                .map(|input| {
+                    input.map_err(|error| AppError::new("staging_error", error.to_string()))
+                });
+            self.source_add_prepared(inputs)
+        })();
+        drop(stage);
+        match fs::remove_file(stage_path) {
+            Ok(()) => result,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => result,
+            Err(_) if result.is_err() => result,
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn source_add_prepared<I>(&mut self, inputs: I) -> Result<Vec<SourceAddResponse>>
+    where
+        I: IntoIterator<Item = Result<SourceAddInput>>,
+    {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut inserted = Vec::with_capacity(inputs.len());
-        for input in &inputs {
-            inserted.push(insert_source(&tx, input)?);
+        let mut inserted = Vec::new();
+        for input in inputs {
+            inserted.push(insert_source(&tx, &input?)?);
         }
         tx.commit()?;
 
@@ -760,6 +830,103 @@ impl Store {
             limit,
             offset,
             has_more,
+        })
+    }
+
+    pub fn source_status_targets(
+        &mut self,
+        source_ids: Vec<i64>,
+        all: bool,
+    ) -> Result<SourceStatusTargets> {
+        let source_ids = dedupe_i64(source_ids);
+        if !all && source_ids.is_empty() {
+            return Err(AppError::new(
+                "invalid_input",
+                "source status requires at least one source ID or --all",
+            ));
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let mut targets = Vec::new();
+        let mut untracked_source_ids = Vec::new();
+        if all {
+            let mut statement = tx.prepare(
+                "SELECT r.source_id, r.tracked_path, r.source_id, r.revision,
+                        s.content_hash
+                 FROM source_path_revisions r
+                 JOIN sources s ON s.id = r.source_id
+                 WHERE r.revision = (
+                     SELECT MAX(head.revision)
+                     FROM source_path_revisions head
+                     WHERE head.tracked_path = r.tracked_path
+                 )
+                 ORDER BY r.tracked_path",
+            )?;
+            targets = statement
+                .query_map([], read_source_status_target)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut untracked = tx.prepare(
+                "SELECT s.id
+                 FROM sources s
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM source_path_revisions r WHERE r.source_id = s.id
+                 )
+                 ORDER BY s.id",
+            )?;
+            untracked_source_ids = untracked
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+        } else {
+            for source_id in source_ids {
+                let exists = tx
+                    .query_row(
+                        "SELECT 1 FROM sources WHERE id = ?1",
+                        params![source_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !exists {
+                    return Err(AppError::new(
+                        "source_not_found",
+                        format!("source not found: {source_id}"),
+                    ));
+                }
+                let mut statement = tx.prepare(
+                    "SELECT ?1, paths.tracked_path, head.source_id, head.revision,
+                            s.content_hash
+                     FROM (
+                         SELECT DISTINCT tracked_path
+                         FROM source_path_revisions
+                         WHERE source_id = ?1
+                     ) paths
+                     JOIN source_path_revisions head
+                       ON head.tracked_path = paths.tracked_path
+                      AND head.revision = (
+                          SELECT MAX(latest.revision)
+                          FROM source_path_revisions latest
+                          WHERE latest.tracked_path = paths.tracked_path
+                      )
+                     JOIN sources s ON s.id = head.source_id
+                     ORDER BY paths.tracked_path",
+                )?;
+                let source_targets = statement
+                    .query_map(params![source_id], read_source_status_target)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if source_targets.is_empty() {
+                    untracked_source_ids.push(source_id);
+                } else {
+                    targets.extend(source_targets);
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(SourceStatusTargets {
+            targets,
+            untracked_source_ids,
         })
     }
 
@@ -837,18 +1004,68 @@ impl Store {
                 format!("source {id} is cited by {references} Wiki page(s)"),
             ));
         }
+        let paths = {
+            let mut statement = tx.prepare(
+                "SELECT paths.tracked_path, head.source_id
+                 FROM (
+                     SELECT DISTINCT tracked_path
+                     FROM source_path_revisions
+                     WHERE source_id = ?1
+                 ) paths
+                 JOIN source_path_revisions head
+                   ON head.tracked_path = paths.tracked_path
+                  AND head.revision = (
+                      SELECT MAX(latest.revision)
+                      FROM source_path_revisions latest
+                      WHERE latest.tracked_path = paths.tracked_path
+                  )
+                 ORDER BY paths.tracked_path",
+            )?;
+            statement
+                .query_map(params![id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut removed_path_revisions = 0;
+        let mut untracked_paths = Vec::new();
+        for (tracked_path, head_source_id) in paths {
+            if head_source_id == id {
+                removed_path_revisions += tx.execute(
+                    "DELETE FROM source_path_revisions WHERE tracked_path = ?1",
+                    params![&tracked_path],
+                )?;
+                untracked_paths.push(tracked_path);
+            } else {
+                removed_path_revisions += tx.execute(
+                    "DELETE FROM source_path_revisions
+                     WHERE tracked_path = ?1 AND source_id = ?2",
+                    params![&tracked_path, id],
+                )?;
+            }
+        }
         tx.execute(
             "DELETE FROM search_fts WHERE doc_type = 'source' AND identifier = ?1",
             params![id.to_string()],
         )?;
         tx.execute("DELETE FROM sources WHERE id = ?1", params![id])?;
-        record_operation(&tx, "source_remove", &id.to_string(), &json!({}))?;
+        record_operation(
+            &tx,
+            "source_remove",
+            &id.to_string(),
+            &json!({
+                "removed_path_revisions": removed_path_revisions,
+                "untracked_paths": untracked_paths,
+            }),
+        )?;
         tx.commit()?;
         Ok(SourceRemoveResponse {
             scope: self.scope.clone(),
             database: self.database_string(),
             source_id: id,
             removed: true,
+            removed_path_revisions,
+            untracked_paths,
         })
     }
 
@@ -2326,6 +2543,10 @@ fn prepare_store(conn: &mut Connection, allow_create: bool) -> Result<bool> {
         migrate_page_provenance(conn)?;
         version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     }
+    if version == PAGE_PROVENANCE_VERSION {
+        migrate_source_path_revisions(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
     if version != USER_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
@@ -2422,7 +2643,7 @@ fn migrate_compound_wiki(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match current {
-        COMPOUND_WIKI_VERSION | USER_VERSION => {
+        COMPOUND_WIKI_VERSION..=USER_VERSION => {
             tx.commit()?;
             return Ok(());
         }
@@ -2467,7 +2688,7 @@ fn migrate_page_provenance(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match current {
-        USER_VERSION => {
+        PAGE_PROVENANCE_VERSION..=USER_VERSION => {
             tx.commit()?;
             return Ok(());
         }
@@ -2493,15 +2714,64 @@ fn migrate_page_provenance(conn: &mut Connection) -> Result<()> {
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![PAGE_PROVENANCE_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", PAGE_PROVENANCE_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to commit v{PAGE_PROVENANCE_VERSION} provenance migration: {error}"),
+        )
+    })
+}
+
+fn migrate_source_path_revisions(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match current {
+        USER_VERSION => {
+            tx.commit()?;
+            return Ok(());
+        }
+        PAGE_PROVENANCE_VERSION => {}
+        other => {
+            return Err(AppError::new(
+                "unsupported_store_version",
+                format!("cannot migrate wiki database version {other} to {USER_VERSION}"),
+            ));
+        }
+    }
+
+    create_source_path_revisions(&tx)?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![USER_VERSION.to_string()],
     )?;
     tx.pragma_update(None, "user_version", USER_VERSION)?;
     tx.commit().map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to commit v{USER_VERSION} provenance migration: {error}"),
+            format!("failed to commit v{USER_VERSION} source path migration: {error}"),
         )
     })
+}
+
+fn create_source_path_revisions(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE source_path_revisions(
+            tracked_path TEXT NOT NULL CHECK(TRIM(tracked_path) <> ''),
+            revision INTEGER NOT NULL CHECK(revision >= 1),
+            source_id INTEGER NOT NULL,
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY(tracked_path, revision),
+            FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX source_path_revisions_source
+        ON source_path_revisions(source_id, tracked_path, revision);",
+    )?;
+    Ok(())
 }
 
 fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
@@ -2585,6 +2855,18 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
 
         CREATE INDEX ingest_jobs_status_source
         ON ingest_jobs(status, source_id);
+
+        CREATE TABLE source_path_revisions(
+            tracked_path TEXT NOT NULL CHECK(TRIM(tracked_path) <> ''),
+            revision INTEGER NOT NULL CHECK(revision >= 1),
+            source_id INTEGER NOT NULL,
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY(tracked_path, revision),
+            FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX source_path_revisions_source
+        ON source_path_revisions(source_id, tracked_path, revision);
 
         CREATE VIRTUAL TABLE search_fts USING fts5(
             doc_type UNINDEXED,
@@ -2732,6 +3014,7 @@ fn validate_store(conn: &Connection) -> Result<()> {
         "SELECT from_slug, to_slug FROM links LIMIT 0",
         "SELECT action, target, detail_json, created_at FROM operations LIMIT 0",
         "SELECT source_id, status, attempts, analysis, last_error, no_derived_pages_reason, updated_at FROM ingest_jobs LIMIT 0",
+        "SELECT tracked_path, revision, source_id, observed_at FROM source_path_revisions LIMIT 0",
         "SELECT rowid, doc_type, identifier, title_terms, summary_terms, body_terms FROM search_fts LIMIT 0",
     ] {
         conn.prepare(sql).map_err(|error| {
@@ -2780,6 +3063,32 @@ fn validate_store(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn create_source_stage(database: &Path) -> Result<(fs::File, PathBuf)> {
+    let directory = database
+        .parent()
+        .ok_or_else(|| AppError::new("io_error", "Wiki database has no parent directory"))?;
+    for _ in 0..100 {
+        let sequence = SOURCE_STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!(
+            ".source-add-stage-{}-{sequence}.jsonl",
+            std::process::id()
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(AppError::new(
+        "io_error",
+        "could not allocate a unique source staging file",
+    ))
+}
+
 fn insert_source(tx: &Transaction<'_>, input: &SourceAddInput) -> Result<(i64, bool)> {
     let content_hash = hash_content(&input.content);
     let title = input
@@ -2810,13 +3119,62 @@ fn insert_source(tx: &Transaction<'_>, input: &SourceAddInput) -> Result<(i64, b
         ),
         params![source_id],
     )?;
+    let path_revision = input
+        .tracked_path
+        .as_deref()
+        .map(|path| record_source_path_revision(tx, path, source_id))
+        .transpose()?;
     record_operation(
         tx,
         "source_add",
         &input.origin,
-        &json!({ "source_id": source_id, "created": created }),
+        &json!({
+            "source_id": source_id,
+            "created": created,
+            "tracked_path": input.tracked_path,
+            "path_revision": path_revision.map(|value| value.0),
+            "path_advanced": path_revision.map(|value| value.1),
+        }),
     )?;
     Ok((source_id, created))
+}
+
+fn record_source_path_revision(
+    tx: &Transaction<'_>,
+    tracked_path: &str,
+    source_id: i64,
+) -> Result<(i64, bool)> {
+    if tracked_path.trim().is_empty() {
+        return Err(AppError::new(
+            "invalid_input",
+            "tracked source path must not be empty",
+        ));
+    }
+    let latest = tx
+        .query_row(
+            "SELECT revision, source_id
+             FROM source_path_revisions
+             WHERE tracked_path = ?1
+             ORDER BY revision DESC
+             LIMIT 1",
+            params![tracked_path],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    if let Some((revision, latest_source_id)) = latest
+        && latest_source_id == source_id
+    {
+        return Ok((revision, false));
+    }
+    let revision = latest.map_or(1, |(revision, _)| revision + 1);
+    tx.execute(
+        &format!(
+            "INSERT INTO source_path_revisions(tracked_path, revision, source_id, observed_at)
+             VALUES (?1, ?2, ?3, {TIMESTAMP_SQL})"
+        ),
+        params![tracked_path, revision, source_id],
+    )?;
+    Ok((revision, true))
 }
 
 fn record_operation(
@@ -2894,6 +3252,16 @@ fn read_source_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceSummar
         content_hash: row.get(3)?,
         bytes: row.get(4)?,
         created_at: row.get(5)?,
+    })
+}
+
+fn read_source_status_target(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceStatusTarget> {
+    Ok(SourceStatusTarget {
+        requested_source_id: row.get(0)?,
+        tracked_path: row.get(1)?,
+        head_source_id: row.get(2)?,
+        head_revision: row.get(3)?,
+        head_content_hash: row.get(4)?,
     })
 }
 
@@ -3387,6 +3755,7 @@ mod tests {
             .source_add(SourceAddInput {
                 title: Some("First".to_string()),
                 origin: "/tmp/first.md".to_string(),
+                tracked_path: None,
                 content: "same bytes".to_string(),
             })
             .unwrap();
@@ -3394,6 +3763,7 @@ mod tests {
             .source_add(SourceAddInput {
                 title: Some("Second".to_string()),
                 origin: "/tmp/second.md".to_string(),
+                tracked_path: None,
                 content: "same bytes".to_string(),
             })
             .unwrap();
@@ -3416,6 +3786,119 @@ mod tests {
     }
 
     #[test]
+    fn streamed_source_add_rolls_back_on_a_late_input_error() {
+        let mut store = test_store();
+        let tables = ["sources", "source_path_revisions", "operations"];
+        let before = tables.map(|table| {
+            store
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        });
+        let inputs = std::iter::once(Ok(Some(SourceAddInput {
+            title: Some("Safe".to_string()),
+            origin: "docs/safe.md".to_string(),
+            tracked_path: Some("docs/safe.md".to_string()),
+            content: "safe evidence".to_string(),
+        })))
+        .chain(std::iter::once(Err(AppError::new(
+            "possible_secret_detected",
+            "late validation failure",
+        ))));
+
+        let error = store.source_add_stream(inputs).unwrap_err();
+
+        assert_eq!(error.code, "possible_secret_detected");
+        for (table, expected) in tables.into_iter().zip(before) {
+            let count: i64 = store
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, expected, "{table} must roll back with the batch");
+        }
+    }
+
+    #[test]
+    fn streamed_source_add_does_not_lock_the_database_while_consuming_inputs() {
+        let mut store = test_store();
+        let probe = Connection::open(&store.database).unwrap();
+        probe.busy_timeout(Duration::from_millis(25)).unwrap();
+        let inputs = std::iter::once_with(move || {
+            probe
+                .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+                .map_err(|error| AppError::new("writer_probe_failed", error.to_string()))?;
+            Ok(None)
+        });
+
+        let responses = store.source_add_stream(inputs).unwrap();
+
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn source_path_revisions_preserve_a_b_a_observations_with_content_deduplication() {
+        let mut store = test_store();
+        let path = "docs/source.md";
+
+        let first = store
+            .source_add(SourceAddInput {
+                title: Some("Source".to_string()),
+                origin: path.to_string(),
+                tracked_path: Some(path.to_string()),
+                content: "A".to_string(),
+            })
+            .unwrap();
+        let second = store
+            .source_add(SourceAddInput {
+                title: Some("Source".to_string()),
+                origin: path.to_string(),
+                tracked_path: Some(path.to_string()),
+                content: "B".to_string(),
+            })
+            .unwrap();
+        let third = store
+            .source_add(SourceAddInput {
+                title: Some("Source".to_string()),
+                origin: path.to_string(),
+                tracked_path: Some(path.to_string()),
+                content: "A".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(first.source.id, third.source.id);
+        assert_ne!(first.source.id, second.source.id);
+
+        let revisions = store
+            .conn
+            .prepare(
+                "SELECT revision, source_id
+                 FROM source_path_revisions
+                 WHERE tracked_path = ?1
+                 ORDER BY revision",
+            )
+            .unwrap()
+            .query_map(params![path], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(
+            revisions,
+            vec![
+                (1, first.source.id),
+                (2, second.source.id),
+                (3, first.source.id),
+            ]
+        );
+    }
+
+    #[test]
     fn title_token_coverage_bridges_query_separators() {
         let query = "系统设置 支付渠道管理";
         let rank = comparable_rank(
@@ -3433,12 +3916,59 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_source_adds_serialize_revisions_for_one_path() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join(".lwc/wiki.db");
+        drop(Store::initialize("project", &database).unwrap().0);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            for content in ["A", "B"] {
+                let database = database.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    let mut store = Store::open("project", database).unwrap();
+                    barrier.wait();
+                    store
+                        .source_add(SourceAddInput {
+                            title: Some("Concurrent source".to_string()),
+                            origin: "docs/concurrent.md".to_string(),
+                            tracked_path: Some("docs/concurrent.md".to_string()),
+                            content: content.to_string(),
+                        })
+                        .unwrap();
+                });
+            }
+        });
+
+        let store = Store::open("project", database).unwrap();
+        let revisions = store
+            .conn
+            .prepare(
+                "SELECT revision, source_id
+                 FROM source_path_revisions
+                 WHERE tracked_path = 'docs/concurrent.md'
+                 ORDER BY revision",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].0, 1);
+        assert_eq!(revisions[1].0, 2);
+        assert_ne!(revisions[0].1, revisions[1].1);
+    }
+
+    #[test]
     fn page_put_deduplicates_repeated_links_and_source_ids() {
         let mut store = test_store();
         let source = store
             .source_add(SourceAddInput {
                 title: Some("Evidence".to_string()),
                 origin: "/tmp/evidence.md".to_string(),
+                tracked_path: None,
                 content: "page evidence".to_string(),
             })
             .unwrap();
@@ -3500,6 +4030,7 @@ mod tests {
             .source_add(SourceAddInput {
                 title: Some("Evidence".to_string()),
                 origin: "/tmp/evidence.md".to_string(),
+                tracked_path: None,
                 content: "page evidence".to_string(),
             })
             .unwrap();
@@ -3611,6 +4142,7 @@ mod tests {
         let conn = Connection::open(&database).unwrap();
         conn.execute_batch(
             "DROP TABLE search_fts;
+             DROP TABLE source_path_revisions;
              DROP TABLE page_provenance;
              DROP TABLE ingest_jobs;
              CREATE VIRTUAL TABLE source_fts USING fts5(

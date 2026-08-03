@@ -97,6 +97,14 @@ authorization; memory work never initiates the change.
   `ingest next --source-max-chars 100000`. When `source_window.has_more=true`,
   continue from `next_offset_chars` with `source show` until the source is
   complete.
+- Before trusting an existing source whose tracked file matters to the current
+  task, run targeted `source status <SOURCE_IDS...>`. Do not run `--all` during
+  bootstrap or ordinary session recall. If a path is modified, add that same
+  path again, ingest the returned source ID, and revise affected pages. Treat
+  missing, unreadable, oversized, or unstable files as unresolved evidence.
+  Re-authorize every external-path check with `--allow-external-source` only
+  when the current task permits that read. Retry `source_status_unstable`
+  because it means the file or tracked head changed during the check.
 - Before `ingest complete`, write a cited `kind=source` page and integrate the
   contribution into at least one cited non-source page. If no shared page
   should change, persist a specific `--no-derived-pages-reason`.

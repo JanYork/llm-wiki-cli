@@ -225,6 +225,28 @@ available as files. Keep operational instructions as policy and write compiled
 answers directly as Wiki pages. Add such a file as a source only when the user
 explicitly identifies an independently authoritative artifact.
 
+When current work depends on an already-ingested file, check only the relevant
+source IDs before relying on their claims:
+
+```bash
+"$LWC" source status <SOURCE_ID> [<SOURCE_ID> ...]
+```
+
+`lineage_state=superseded` means that tracked path has a newer observed
+snapshot. `filesystem_state=modified` means the live bytes differ from the
+current head; run `source add` on the same path, ingest the returned source ID,
+and update every affected page. Missing, unreadable, oversized, and unstable
+files need review before their claims are treated as current. The status check
+is exact and read-only, but hashes every selected file, so never run `--all` at
+bootstrap or as a routine session tax. Reserve it for an explicit maintenance
+scan. An external path requires current read authorization and
+`--allow-external-source` on every check; previous source-add permission is not
+a standing grant.
+If a migrated legacy source is returned in `untracked_source_ids`, do not infer
+its old origin as a live path. Re-add the intended file once to establish the
+first tracked revision. Retry `source_status_unstable`; never treat a
+mixed-time file or path-head observation as current evidence.
+
 For each meaningful safe source:
 
 ```bash

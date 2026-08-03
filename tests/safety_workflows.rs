@@ -165,6 +165,15 @@ fn removals_preserve_referenced_sources_and_linked_pages() {
             .unwrap()
             .is_empty()
     );
+    assert_eq!(
+        Connection::open(world.database())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM source_path_revisions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
 
     let source = world.write("evidence.md", "referenced evidence");
     let source_id = world.ok(&["source", "add", as_str(&source)])["source"]["id"]
@@ -219,6 +228,57 @@ fn removals_preserve_referenced_sources_and_linked_pages() {
             .as_array()
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn source_remove_never_rolls_a_tracked_path_back_to_stale_content() {
+    let world = TestWorld::new();
+    world.init();
+
+    let head_path = world.write("head.md", "head-a");
+    let head_a = world.ok(&["source", "add", as_str(&head_path)])["source"]["id"]
+        .as_i64()
+        .unwrap();
+    fs::write(&head_path, "head-b").unwrap();
+    let head_b = world.ok(&["source", "add", as_str(&head_path)])["source"]["id"]
+        .as_i64()
+        .unwrap();
+
+    let history_path = world.write("history.md", "history-a");
+    let history_a = world.ok(&["source", "add", as_str(&history_path)])["source"]["id"]
+        .as_i64()
+        .unwrap();
+    fs::write(&history_path, "history-b").unwrap();
+    let history_b = world.ok(&["source", "add", as_str(&history_path)])["source"]["id"]
+        .as_i64()
+        .unwrap();
+
+    let historical = world.ok(&["source", "remove", &history_a.to_string()]);
+    assert_eq!(historical["removed_path_revisions"], 1);
+    assert!(historical["untracked_paths"].as_array().unwrap().is_empty());
+    let still_current = world.ok(&["source", "status", &history_b.to_string()]);
+    assert_eq!(still_current["checks"][0]["head_revision"], 2);
+    assert_eq!(still_current["checks"][0]["filesystem_state"], "current");
+
+    let current_head = world.ok(&["source", "remove", &head_b.to_string()]);
+    assert_eq!(current_head["removed_path_revisions"], 2);
+    assert_eq!(current_head["untracked_paths"], json!(["head.md"]));
+    let previous = world.ok(&["source", "status", &head_a.to_string()]);
+    assert!(previous["checks"].as_array().unwrap().is_empty());
+    assert_eq!(previous["untracked_source_ids"], json!([head_a]));
+
+    let conn = Connection::open(world.database()).unwrap();
+    let head_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM source_path_revisions WHERE tracked_path = 'head.md'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        head_rows, 0,
+        "deleting a head must not reveal an older head"
     );
 }
 
@@ -352,6 +412,13 @@ fn manifest_paths_are_relative_and_preflight_is_atomic() {
             .unwrap()
             .is_empty()
     );
+    let revision_count: i64 = Connection::open(world.database())
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM source_path_revisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(revision_count, 0, "failed preflight must not track paths");
 
     let added = world.ok(&[
         "source",
@@ -362,6 +429,35 @@ fn manifest_paths_are_relative_and_preflight_is_atomic() {
     assert_eq!(added["created"], 2);
     assert_eq!(added["duplicates"], 0);
     assert_eq!(added["sources"].as_array().unwrap().len(), 2);
+    let status = world.ok(&["source", "status", "--all"]);
+    assert_eq!(status["checks"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn directory_sensitive_preflight_fails_before_sources_or_paths_are_committed() {
+    let world = TestWorld::new();
+    world.init();
+    world.write("batch/a-safe.md", "safe evidence");
+    world.write(
+        "batch/z-sensitive.md",
+        "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----",
+    );
+
+    let error = world.err(&["source", "add-dir", as_str(&world.project.join("batch"))]);
+    assert_eq!(error["error"]["code"], "possible_secret_detected");
+    assert!(
+        world.ok(&["source", "list"])["sources"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let revisions: i64 = Connection::open(world.database())
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM source_path_revisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(revisions, 0);
 }
 
 #[test]

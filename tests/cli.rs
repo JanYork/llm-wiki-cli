@@ -3,7 +3,9 @@ use serde_json::Value;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 
@@ -170,6 +172,10 @@ fn help_documents_the_agent_workflow_and_command_side_effects() {
             vec!["JSON", "relative", "--acknowledge-sensitive-source"],
         ),
         (
+            vec!["source", "status", "--help"],
+            vec!["Read-only", "streaming SHA-256", "--allow-external-source"],
+        ),
+        (
             vec!["page", "put", "--help"],
             vec![
                 "kind=source",
@@ -258,6 +264,7 @@ fn every_public_command_exposes_renderable_help() {
         "source add-dir",
         "source add-manifest",
         "source list",
+        "source status",
         "source show",
         "source refs",
         "source remove",
@@ -655,6 +662,7 @@ fn read_commands_transparently_migrate_a_writable_v5_store() {
          DROP TABLE IF EXISTS search_fts_content;
          DROP TABLE IF EXISTS search_fts_docsize;
          DROP TABLE IF EXISTS search_fts_config;
+         DROP TABLE source_path_revisions;
          DROP TABLE page_provenance;
          CREATE VIRTUAL TABLE search_fts USING fts5(
              doc_type UNINDEXED,
@@ -677,7 +685,7 @@ fn read_commands_transparently_migrate_a_writable_v5_store() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7, "context should migrate a writable legacy store");
+    assert_eq!(version, 8, "context should migrate a writable legacy store");
 }
 
 #[test]
@@ -709,7 +717,8 @@ fn read_commands_migrate_v6_store_to_structured_provenance() {
     let database = world.project.join(".lwc/wiki.db");
     let conn = Connection::open(&database).unwrap();
     conn.execute_batch(
-        "DROP TABLE IF EXISTS page_provenance;
+        "DROP TABLE source_path_revisions;
+         DROP TABLE IF EXISTS page_provenance;
          UPDATE meta SET value = '6' WHERE key = 'format_version';
          PRAGMA user_version = 6;",
     )
@@ -726,9 +735,47 @@ fn read_commands_migrate_v6_store_to_structured_provenance() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     conn.prepare("SELECT page_slug, provenance FROM page_provenance LIMIT 0")
         .unwrap();
+}
+
+#[test]
+fn read_commands_migrate_v7_without_guessing_source_path_history() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let source = world.write("legacy-source.md", "legacy evidence");
+    let added = world.ok(&world.project, &["source", "add", as_str(&source)]);
+
+    let database = world.project.join(".lwc/wiki.db");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "DROP TABLE source_path_revisions;
+         UPDATE meta SET value = '7' WHERE key = 'format_version';
+         PRAGMA user_version = 7;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let listed = world.ok(&world.project, &["source", "list"]);
+    assert_eq!(listed["sources"][0]["id"], added["source"]["id"]);
+
+    let conn = Connection::open(database).unwrap();
+    let version: i32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    let tracked: i64 = conn
+        .query_row("SELECT COUNT(*) FROM source_path_revisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 8);
+    assert_eq!(tracked, 0, "migration must not guess a legacy path head");
+
+    let source_id = added["source"]["id"].as_i64().unwrap().to_string();
+    let status = world.ok(&world.project, &["source", "status", &source_id]);
+    assert!(status["checks"].as_array().unwrap().is_empty());
+    assert_eq!(status["untracked_source_ids"], serde_json::json!([1]));
 }
 
 #[test]
@@ -970,6 +1017,282 @@ fn source_add_without_title_uses_a_deterministic_origin_based_title() {
 
     let shown = world.ok(&world.project, &["source", "show", "1"]);
     assert_eq!(shown["source"]["title"], title);
+}
+
+#[test]
+fn source_add_tracks_canonical_project_paths_without_breaking_content_deduplication() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+
+    world.write("raw/source.md", "same tracked bytes");
+    let nested = world.project.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let first_output = world.command_in_project_root(
+        &nested,
+        &world.project,
+        &["source", "add", "../raw/source.md"],
+    );
+    assert!(
+        first_output.status.success(),
+        "source add failed: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    let first = stdout_json(&first_output);
+
+    let duplicate = world.write("alias/same.md", "same tracked bytes");
+    let second = world.ok(&world.project, &["source", "add", as_str(&duplicate)]);
+    assert_eq!(first["source"]["id"], second["source"]["id"]);
+
+    let conn = Connection::open(world.project.join(".lwc/wiki.db")).unwrap();
+    let revisions = conn
+        .prepare(
+            "SELECT tracked_path, revision, source_id
+             FROM source_path_revisions
+             ORDER BY tracked_path, revision",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+
+    assert_eq!(
+        revisions,
+        vec![
+            ("alias/same.md".to_string(), 1, 1),
+            ("raw/source.md".to_string(), 1, 1),
+        ]
+    );
+}
+
+#[test]
+fn source_status_detects_same_size_changes_without_recording_an_operation() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let source = world.write("raw/status.md", "alpha");
+    let added = world.ok(&world.project, &["source", "add", as_str(&source)]);
+    let source_id = added["source"]["id"].as_i64().unwrap().to_string();
+
+    let before = world.ok(&world.project, &["log", "--limit", "100"]);
+    let current = world.ok(&world.project, &["source", "status", &source_id]);
+    assert_eq!(current["checks"][0]["tracked_path"], "raw/status.md");
+    assert_eq!(current["checks"][0]["lineage_state"], "current");
+    assert_eq!(current["checks"][0]["filesystem_state"], "current");
+    assert_eq!(
+        current["checks"][0]["head_content_hash"],
+        current["checks"][0]["live_content_hash"]
+    );
+
+    fs::write(&source, "bravo").unwrap();
+    let modified = world.ok(&world.project, &["source", "status", &source_id]);
+    assert_eq!(modified["checks"][0]["lineage_state"], "current");
+    assert_eq!(modified["checks"][0]["filesystem_state"], "modified");
+    assert_ne!(
+        modified["checks"][0]["head_content_hash"],
+        modified["checks"][0]["live_content_hash"]
+    );
+
+    fs::remove_file(&source).unwrap();
+    let missing = world.ok(&world.project, &["source", "status", &source_id]);
+    assert_eq!(missing["checks"][0]["filesystem_state"], "missing");
+    assert!(missing["checks"][0]["live_content_hash"].is_null());
+
+    let oversized = fs::File::create(&source).unwrap();
+    oversized.set_len(64 * 1024 * 1024 + 1).unwrap();
+    let oversized = world.ok(&world.project, &["source", "status", &source_id]);
+    assert_eq!(oversized["checks"][0]["filesystem_state"], "oversized");
+    assert!(oversized["checks"][0]["live_content_hash"].is_null());
+
+    let unknown = world.err(&world.project, &["source", "status", "999"]);
+    assert_eq!(unknown["error"]["code"], "source_not_found");
+
+    let after = world.ok(&world.project, &["log", "--limit", "100"]);
+    assert_eq!(before["operations"], after["operations"]);
+}
+
+#[test]
+fn source_status_reports_a_b_a_lineage_per_path_and_all_current_heads() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let source = world.write("raw/lineage.md", "alpha");
+    let alpha = world.ok(&world.project, &["source", "add", as_str(&source)]);
+    let alpha_id = alpha["source"]["id"].as_i64().unwrap().to_string();
+
+    fs::write(&source, "bravo").unwrap();
+    let bravo = world.ok(&world.project, &["source", "add", as_str(&source)]);
+    let bravo_id = bravo["source"]["id"].as_i64().unwrap().to_string();
+
+    fs::write(&source, "alpha").unwrap();
+    let alpha_again = world.ok(&world.project, &["source", "add", as_str(&source)]);
+    assert_eq!(alpha_again["source"]["id"], alpha["source"]["id"]);
+    let alias = world.write("alias/lineage.md", "alpha");
+    world.ok(&world.project, &["source", "add", as_str(&alias)]);
+
+    let superseded = world.ok(&world.project, &["source", "status", &bravo_id]);
+    assert_eq!(superseded["checks"].as_array().unwrap().len(), 1);
+    assert_eq!(superseded["checks"][0]["tracked_path"], "raw/lineage.md");
+    assert_eq!(superseded["checks"][0]["head_revision"], 3);
+    assert_eq!(
+        superseded["checks"][0]["head_source_id"],
+        alpha["source"]["id"]
+    );
+    assert_eq!(superseded["checks"][0]["lineage_state"], "superseded");
+    assert_eq!(superseded["checks"][0]["filesystem_state"], "current");
+
+    let current = world.ok(&world.project, &["source", "status", &alpha_id]);
+    assert_eq!(current["checks"].as_array().unwrap().len(), 2);
+    assert_eq!(current["checks"][0]["tracked_path"], "alias/lineage.md");
+    assert_eq!(current["checks"][0]["head_revision"], 1);
+    assert_eq!(current["checks"][1]["tracked_path"], "raw/lineage.md");
+    assert_eq!(current["checks"][1]["head_revision"], 3);
+
+    let combined = world.ok(&world.project, &["source", "status", &alpha_id, &bravo_id]);
+    let raw_path_checks = combined["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|check| check["tracked_path"] == "raw/lineage.md")
+        .collect::<Vec<_>>();
+    assert_eq!(raw_path_checks.len(), 2);
+    assert!(
+        raw_path_checks
+            .iter()
+            .all(|check| check["head_source_id"] == alpha["source"]["id"])
+    );
+
+    let all = world.ok(&world.project, &["source", "status", "--all"]);
+    assert_eq!(all["checks"].as_array().unwrap().len(), 2);
+    assert!(all["checks"].as_array().unwrap().iter().all(|check| {
+        check["requested_source_id"] == alpha["source"]["id"]
+            && check["lineage_state"] == "current"
+            && check["filesystem_state"] == "current"
+    }));
+    assert!(all["untracked_source_ids"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn source_status_requires_current_external_read_authorization() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let external = world.project.parent().unwrap().join("external-source.md");
+    fs::write(&external, "external evidence").unwrap();
+    let added = world.ok(
+        &world.project,
+        &[
+            "source",
+            "add",
+            as_str(&external),
+            "--allow-external-source",
+        ],
+    );
+    let source_id = added["source"]["id"].as_i64().unwrap().to_string();
+
+    let blocked = world.err(&world.project, &["source", "status", &source_id]);
+    assert_eq!(
+        blocked["error"]["code"],
+        "external_source_requires_acknowledgement"
+    );
+    let allowed = world.ok(
+        &world.project,
+        &["source", "status", &source_id, "--allow-external-source"],
+    );
+    assert_eq!(allowed["checks"][0]["filesystem_state"], "current");
+
+    let blocked_all = world.err(&world.project, &["source", "status", "--all"]);
+    assert_eq!(
+        blocked_all["error"]["code"],
+        "external_source_requires_acknowledgement"
+    );
+
+    world.ok(&world.project, &["--scope", "global", "init"]);
+    let global = world.ok(
+        &world.project,
+        &["--scope", "global", "source", "add", as_str(&external)],
+    );
+    let global_id = global["source"]["id"].as_i64().unwrap().to_string();
+    let global_status = world.ok(
+        &world.project,
+        &["--scope", "global", "source", "status", &global_id],
+    );
+    assert_eq!(global_status["checks"][0]["filesystem_state"], "current");
+}
+
+#[cfg(unix)]
+#[test]
+fn source_status_blocks_a_tracked_path_that_now_escapes_through_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let tracked = world.write("raw/symlink.md", "inside evidence");
+    let added = world.ok(&world.project, &["source", "add", as_str(&tracked)]);
+    let source_id = added["source"]["id"].as_i64().unwrap().to_string();
+    let external = world.project.parent().unwrap().join("symlink-target.md");
+    fs::write(&external, "outside evidence").unwrap();
+    fs::remove_file(&tracked).unwrap();
+    symlink(&external, &tracked).unwrap();
+
+    let blocked = world.err(&world.project, &["source", "status", &source_id]);
+    assert_eq!(
+        blocked["error"]["code"],
+        "external_source_requires_acknowledgement"
+    );
+    let allowed = world.ok(
+        &world.project,
+        &["source", "status", &source_id, "--allow-external-source"],
+    );
+    assert_eq!(allowed["checks"][0]["filesystem_state"], "modified");
+}
+
+#[cfg(unix)]
+#[test]
+fn source_status_rejects_a_fifo_without_blocking() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let tracked = world.write("raw/fifo.md", "regular evidence");
+    let added = world.ok(&world.project, &["source", "add", as_str(&tracked)]);
+    let source_id = added["source"]["id"].as_i64().unwrap().to_string();
+    fs::remove_file(&tracked).unwrap();
+    assert!(
+        Command::new("mkfifo")
+            .arg(&tracked)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lwc"))
+        .current_dir(&world.project)
+        .env("HOME", &world.home)
+        .args(["source", "status", &source_id])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("source status blocked while opening a FIFO");
+    }
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "source status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = stdout_json(&output);
+    assert_eq!(status["checks"][0]["filesystem_state"], "unreadable");
 }
 
 #[test]

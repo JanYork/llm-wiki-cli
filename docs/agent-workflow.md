@@ -18,6 +18,8 @@ Use `lwc` as durable external memory. The database stores evidence and compiled 
    migrated transactionally once before the requested read.
 9. Project initialization locally excludes `.lwc/` from Git unless
    `--no-git-exclude` is explicit.
+10. File-path revision history is observational. Content remains globally
+    deduplicated, so one source ID may appear at multiple paths or revisions.
 
 ## Start a session
 
@@ -45,6 +47,23 @@ Project sources outside the active Wiki root require
 `--allow-external-source`. Do not use
 `--acknowledge-sensitive-source` merely to bypass a warning: inspect or redact
 the source first, and acknowledge only a safe immutable snapshot.
+
+Before relying on file-backed evidence, check the selected source IDs:
+
+```bash
+lwc source status 12 18
+```
+
+Treat `lineage_state=superseded` as a newer observed snapshot for that path.
+Treat any `filesystem_state` other than `current` as requiring review. For
+`modified`, run `source add` on the same path, then ingest the returned source
+ID and revise affected pages. `source status` is read-only and hashes live files
+exactly; `--all` is an explicit maintenance scan, not a session-start default.
+External tracked paths require `--allow-external-source` again for each check.
+Migrated legacy sources may be returned in `untracked_source_ids`; re-add the
+intended file once because migration deliberately does not infer old paths.
+Retry `source_status_unstable`; it means the live file or database head changed
+during the bounded check, so no mixed-time result was accepted.
 
 `ingest next` atomically claims one task and returns the immutable source,
 purpose, schema, and bounded page index. If `source_window.has_more` is true,
@@ -229,7 +248,9 @@ lwc checkpoint create before-architecture-refresh
 backup API, and rebuilds raw and Markdown projections.
 
 Use `source remove <ID>` and `page remove <SLUG>` instead of editing SQLite.
-Removal refuses a cited source or a page with inbound links.
+Removal refuses a cited source or a page with inbound links. If a removed source
+is the current revision of a path, LWC removes that path's revision series so an
+older snapshot cannot become current by accident.
 
 ## Development-only benchmark
 
