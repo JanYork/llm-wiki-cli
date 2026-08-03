@@ -1,6 +1,7 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -96,6 +97,53 @@ fn operation_count(database: &Path) -> i64 {
         .unwrap()
         .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
         .unwrap()
+}
+
+fn snapshot_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else if !path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("wiki.db")
+            {
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+
+    let mut files = BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}
+
+fn knowledge_counts(database: &Path) -> Vec<i64> {
+    let connection =
+        Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    [
+        "sources",
+        "source_path_revisions",
+        "pages",
+        "page_sources",
+        "operations",
+    ]
+    .into_iter()
+    .map(|table| {
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    })
+    .collect()
 }
 
 #[test]
@@ -380,6 +428,120 @@ fn external_and_sensitive_sources_require_explicit_acknowledgement() {
         "-----BEGIN CERTIFICATE-----\nnot-a-real-certificate\n-----END CERTIFICATE-----",
     );
     world.ok(&["source", "add", as_str(&public_certificate)]);
+}
+
+#[test]
+fn source_diff_requires_both_external_and_sensitive_acknowledgements() {
+    let world = TestWorld::new();
+    world.init();
+    let external = world.write_outside("review.md", "public evidence\n");
+    let added = world.ok(&[
+        "source",
+        "add",
+        as_str(&external),
+        "--allow-external-source",
+    ]);
+    let source_id = added["source"]["id"].as_i64().unwrap().to_string();
+    let sensitive = "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n";
+    fs::write(&external, sensitive).unwrap();
+    let before = operation_count(&world.database());
+
+    let no_flags = world.err(&["source", "diff", &source_id]);
+    assert_eq!(
+        no_flags["error"]["code"],
+        "external_source_requires_acknowledgement"
+    );
+
+    let external_only = world.err(&["source", "diff", &source_id, "--allow-external-source"]);
+    assert_eq!(external_only["error"]["code"], "possible_secret_detected");
+    assert!(!external_only.to_string().contains("not-a-real-key"));
+
+    let sensitive_only = world.err(&[
+        "source",
+        "diff",
+        &source_id,
+        "--acknowledge-sensitive-source",
+    ]);
+    assert_eq!(
+        sensitive_only["error"]["code"],
+        "external_source_requires_acknowledgement"
+    );
+
+    let allowed = world.ok(&[
+        "source",
+        "diff",
+        &source_id,
+        "--allow-external-source",
+        "--acknowledge-sensitive-source",
+    ]);
+    assert_eq!(allowed["changed"], true);
+    assert_eq!(
+        allowed["to"]["tracked_path"],
+        fs::canonicalize(&external).unwrap().to_str().unwrap()
+    );
+    assert!(
+        allowed["diff"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not-a-real-key")
+    );
+    assert_eq!(operation_count(&world.database()), before);
+}
+
+#[test]
+fn source_status_diff_and_refs_leave_current_wiki_state_unchanged() {
+    let world = TestWorld::new();
+    world.init();
+    let source = world.write("evidence.md", "limit=3\n");
+    let added = world.ok(&["source", "add", as_str(&source)]);
+    let source_id = added["source"]["id"].as_i64().unwrap().to_string();
+    let page = world.write("page.md", "The configured limit is three.");
+    world.ok(&[
+        "page",
+        "put",
+        "limit",
+        "--title",
+        "Limit",
+        "--file",
+        as_str(&page),
+        "--source",
+        &source_id,
+    ]);
+    fs::write(&source, "limit=4\n").unwrap();
+
+    let database = world.database();
+    let wal = PathBuf::from(format!("{}-wal", database.display()));
+    let before_counts = knowledge_counts(&database);
+    let before_files = snapshot_files(&world.project.join(".lwc"));
+    let before_database = fs::read(&database).unwrap();
+    let before_wal = fs::read(&wal).ok();
+
+    assert_eq!(
+        world.ok(&["source", "status", &source_id])["checks"][0]["filesystem_state"],
+        "modified"
+    );
+    assert_eq!(world.ok(&["source", "diff", &source_id])["changed"], true);
+    assert_eq!(
+        world.ok(&["source", "refs", &source_id, "--limit", "1000"])["pages"][0]["slug"],
+        "limit"
+    );
+
+    let after_database = fs::read(&database).unwrap();
+    let after_wal = fs::read(&wal).ok();
+    assert!(
+        after_database == before_database,
+        "database bytes changed: {} -> {}",
+        before_database.len(),
+        after_database.len()
+    );
+    assert!(
+        after_wal == before_wal,
+        "WAL bytes changed: {:?} -> {:?}",
+        before_wal.as_ref().map(Vec::len),
+        after_wal.as_ref().map(Vec::len)
+    );
+    assert_eq!(knowledge_counts(&database), before_counts);
+    assert_eq!(snapshot_files(&world.project.join(".lwc")), before_files);
 }
 
 #[test]

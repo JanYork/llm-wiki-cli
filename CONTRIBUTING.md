@@ -26,6 +26,29 @@ cargo build --locked --release
 - Include reproduction and verification steps for bug fixes.
 - Keep JSON output contracts and documented CLI behavior explicit when changed.
 
+## Releases
+
+- Update `Cargo.toml` and `Cargo.lock`, then pass every local check before tagging.
+- Create an annotated `vX.Y.Z` tag. Its body is the GitHub Release description;
+  lightweight tags and blank annotation bodies are rejected by the release job.
+- Write the annotation for users, with a short summary followed by `Highlights`,
+  `Safety and compatibility`, `Verification`, and `Upgrade` sections as relevant.
+  Include behavior and limits, not only commit titles or a changelog link.
+- Never move a published tag. Ship a corrective version instead.
+
+Example:
+
+```bash
+git tag -a v0.6.0 -m "lwc v0.6.0" -m "Highlights
+- Explain the user-visible change.
+
+Verification
+- List the release gates that passed.
+
+Upgrade
+- Note compatibility or required action."
+```
+
 ## Issues
 
 - Use the bug report for reproducible defects.

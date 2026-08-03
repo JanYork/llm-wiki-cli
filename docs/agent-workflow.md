@@ -56,10 +56,28 @@ lwc source status 12 18
 
 Treat `lineage_state=superseded` as a newer observed snapshot for that path.
 Treat any `filesystem_state` other than `current` as requiring review. For
-`modified`, run `source add` on the same path, then ingest the returned source
-ID and revise affected pages. `source status` is read-only and hashes live files
-exactly; `--all` is an explicit maintenance scan, not a session-start default.
+`modified`, inspect the exact change and its direct citation candidates first:
+
+```bash
+lwc source diff 12
+lwc source refs 12 --limit 1000 --offset 0
+```
+
+If more than one tracked path is reported, repeat diff with the exact `--path`.
+If `diff.truncated=true`, retry up to `--max-chars 100000` and keep the review
+explicitly incomplete if it is still truncated. A single refs query with
+`has_more=false` is a complete point-in-time list of direct citers. A paginated
+scan must be de-duplicated and labelled non-atomic and potentially incomplete.
+These are review candidates, not automatically affected pages. The Agent must
+decide whether the edit changes meaning; only then run `source add` on the same
+path, ingest the new source, and revise the claims that changed.
+
+`source status`, `source diff`, and `source refs` are read-only. Status hashes
+live files exactly; `--all` is an explicit maintenance scan, not a session-start default.
 External tracked paths require `--allow-external-source` again for each check.
+Diff additionally requires `--acknowledge-sensitive-source` before returning
+flagged live text. Snapshot-to-snapshot review uses
+`source diff <OLD_ID> --to-source <NEW_ID>` without a live file.
 Migrated legacy sources may be returned in `untracked_source_ids`; re-add the
 intended file once because migration deliberately does not infer old paths.
 Retry `source_status_unstable`; it means the live file or database head changed

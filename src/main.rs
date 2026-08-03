@@ -3,6 +3,7 @@ mod error;
 mod graph;
 mod import;
 mod scope;
+mod source_diff;
 mod store;
 mod tokenize;
 
@@ -16,6 +17,9 @@ use scope::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use source_diff::{
+    DEFAULT_DIFF_OUTPUT_CHARS, MAX_DIFF_INPUT_BYTES, MAX_DIFF_OUTPUT_CHARS, render_diff,
+};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::{
@@ -412,6 +416,34 @@ Read sources, limit, offset, and has_more from the JSON response. When has_more=
         /// Permit reading a tracked project source outside the active project root.
         #[arg(long)]
         allow_external_source: bool,
+    },
+    /// Compare an immutable source with its live file or another snapshot.
+    #[command(
+        long_about = "Read-only bounded text comparison. By default, compare SOURCE_ID with its current tracked file. If the source has multiple tracked paths, select one exactly with --path. Use --to-source to compare two immutable snapshots without reading the filesystem.",
+        after_help = "Examples:\n  lwc source diff 7\n  lwc source diff 7 --path docs/design.md\n  lwc source diff 7 --to-source 21\n  lwc source diff 7 --max-chars 100000\n\nThe unified diff is limited to 8 MiB and 200000 lines per side, three context lines, and a Unicode-safe output preview. This command never changes sources, pages, citations, or the operation log."
+    )]
+    Diff {
+        /// Immutable source ID used as the old side.
+        id: i64,
+        /// Exact tracked path when the source has more than one.
+        #[arg(long)]
+        path: Option<String>,
+        /// Compare with another immutable source instead of a live file.
+        #[arg(
+            long,
+            value_name = "SOURCE_ID",
+            conflicts_with_all = ["path", "allow_external_source", "acknowledge_sensitive_source"]
+        )]
+        to_source: Option<i64>,
+        /// Maximum Unicode characters returned (1..=100000).
+        #[arg(long, default_value_t = DEFAULT_DIFF_OUTPUT_CHARS)]
+        max_chars: usize,
+        /// Permit reading a tracked project source outside the active project root.
+        #[arg(long)]
+        allow_external_source: bool,
+        /// Confirm that a flagged live source is safe to reveal in the diff.
+        #[arg(long)]
+        acknowledge_sensitive_source: bool,
     },
     /// Return a resumable Unicode-safe window of one immutable source.
     #[command(
@@ -940,7 +972,12 @@ fn run(cli: Cli) -> Result<Value> {
                     }
                     let mut live = BTreeMap::new();
                     for (tracked_path, path) in resolved {
-                        let source = prepare_live_source(&store_path, path, allow_external_source)?;
+                        let source = prepare_live_source(
+                            &store_path,
+                            path,
+                            allow_external_source,
+                            MAX_INPUT_BYTES,
+                        )?;
                         live.insert(tracked_path, inspect_prepared_source(source));
                     }
                     let current = store.source_status_targets(source_ids, all)?;
@@ -994,6 +1031,22 @@ fn run(cli: Cli) -> Result<Value> {
                         untracked_source_ids: selected.untracked_source_ids,
                     })
                 }
+                SourceCommand::Diff {
+                    id,
+                    path,
+                    to_source,
+                    max_chars,
+                    allow_external_source,
+                    acknowledge_sensitive_source,
+                } => run_source_diff(
+                    &store_path,
+                    id,
+                    path.as_deref(),
+                    to_source,
+                    max_chars,
+                    allow_external_source,
+                    acknowledge_sensitive_source,
+                ),
                 SourceCommand::Show {
                     id,
                     offset_chars,
@@ -1427,6 +1480,204 @@ fn ensure_source_status_unchanged(
     Ok(())
 }
 
+fn run_source_diff(
+    store_path: &StorePath,
+    source_id: i64,
+    tracked_path: Option<&str>,
+    to_source: Option<i64>,
+    max_chars: usize,
+    allow_external_source: bool,
+    acknowledge_sensitive_source: bool,
+) -> Result<Value> {
+    if !(1..=MAX_DIFF_OUTPUT_CHARS).contains(&max_chars) {
+        return Err(AppError::new(
+            "invalid_limit",
+            format!("max-chars must be between 1 and {MAX_DIFF_OUTPUT_CHARS}"),
+        ));
+    }
+    let mut store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+    let from = store.source_for_diff(source_id, MAX_DIFF_INPUT_BYTES)?;
+
+    if let Some(to_source_id) = to_source {
+        let to = store.source_for_diff(to_source_id, MAX_DIFF_INPUT_BYTES)?;
+        let changed = from.content_hash != to.content_hash;
+        let rendered = render_diff(
+            &from.content,
+            &to.content,
+            &format!("source:{}", from.id),
+            &format!("source:{}", to.id),
+            max_chars,
+        )?;
+        return Ok(json!({
+            "scope": scope_name(store_path.scope),
+            "database": store_path.path.display().to_string(),
+            "from": {
+                "kind": "source",
+                "source_id": from.id,
+                "content_hash": from.content_hash,
+                "bytes": from.content.len(),
+            },
+            "to": {
+                "kind": "source",
+                "source_id": to.id,
+                "content_hash": to.content_hash,
+                "bytes": to.content.len(),
+            },
+            "changed": changed,
+            "diff": rendered_diff_json(rendered),
+        }));
+    }
+
+    let selected = store.source_status_targets(vec![source_id], false)?;
+    let target = select_source_diff_target(&selected, tracked_path)?;
+    let resolved =
+        resolve_tracked_source_path(store_path, &target.tracked_path, allow_external_source)?;
+    let prepared = prepare_live_source(
+        store_path,
+        resolved.clone(),
+        allow_external_source,
+        MAX_DIFF_INPUT_BYTES as u64,
+    )?;
+    let (live, content) = read_prepared_source(prepared, MAX_DIFF_INPUT_BYTES as u64, true);
+    let current = store.source_status_targets(vec![source_id], false)?;
+    ensure_source_status_unchanged(&selected, &current)?;
+    if live.state == "unstable" {
+        return Err(AppError::new(
+            "source_status_unstable",
+            live.message
+                .unwrap_or_else(|| "tracked source changed during diff".to_string()),
+        ));
+    }
+    if live.state == "oversized" {
+        return Err(AppError::new(
+            "source_diff_too_large",
+            live.message
+                .unwrap_or_else(|| "live source exceeds the diff input limit".to_string()),
+        ));
+    }
+    if live.state != "hashed" {
+        return Err(AppError::new(
+            "source_diff_unavailable",
+            format!(
+                "tracked source {} is {}{}",
+                target.tracked_path,
+                live.state,
+                live.message
+                    .as_deref()
+                    .map(|message| format!(": {message}"))
+                    .unwrap_or_default()
+            ),
+        ));
+    }
+    let content = String::from_utf8(content.ok_or_else(|| {
+        AppError::new(
+            "source_diff_unavailable",
+            "live source content was not captured",
+        )
+    })?)
+    .map_err(|_| {
+        AppError::new(
+            "invalid_utf8",
+            format!("{} is not UTF-8", resolved.display()),
+        )
+    })?;
+    let live_hash = live
+        .content_hash
+        .expect("a successfully hashed live source has a hash");
+    let live_bytes = live
+        .bytes
+        .expect("a successfully hashed live source has a byte count");
+    let changed = from.content_hash != live_hash;
+    if changed {
+        validate_sensitive_source(&resolved, &content, acknowledge_sensitive_source)?;
+    }
+    let rendered = render_diff(
+        &from.content,
+        &content,
+        &format!("source:{}", from.id),
+        &format!("live:{}", target.tracked_path),
+        max_chars,
+    )?;
+    Ok(json!({
+        "scope": scope_name(store_path.scope),
+        "database": store_path.path.display().to_string(),
+        "from": {
+            "kind": "source",
+            "source_id": from.id,
+            "content_hash": from.content_hash,
+            "bytes": from.content.len(),
+        },
+        "to": {
+            "kind": "live",
+            "tracked_path": target.tracked_path,
+            "head_source_id": target.head_source_id,
+            "head_revision": target.head_revision,
+            "content_hash": live_hash,
+            "bytes": live_bytes,
+        },
+        "changed": changed,
+        "diff": rendered_diff_json(rendered),
+    }))
+}
+
+fn select_source_diff_target(
+    selected: &store::SourceStatusTargets,
+    tracked_path: Option<&str>,
+) -> Result<store::SourceStatusTarget> {
+    if selected.targets.is_empty() {
+        return Err(AppError::new(
+            "source_diff_untracked",
+            format!(
+                "source {} has no tracked path; use --to-source to compare immutable snapshots",
+                selected
+                    .untracked_source_ids
+                    .first()
+                    .copied()
+                    .unwrap_or_default()
+            ),
+        ));
+    }
+    if let Some(tracked_path) = tracked_path {
+        return selected
+            .targets
+            .iter()
+            .find(|target| target.tracked_path == tracked_path)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::new(
+                    "source_diff_path_not_found",
+                    format!("source was never observed at tracked path {tracked_path}"),
+                )
+            });
+    }
+    if selected.targets.len() > 1 {
+        return Err(AppError::new(
+            "source_diff_path_required",
+            format!(
+                "source has multiple tracked paths; retry with --path and one exact candidate: {}",
+                selected
+                    .targets
+                    .iter()
+                    .map(|target| target.tracked_path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    Ok(selected.targets[0].clone())
+}
+
+fn rendered_diff_json(rendered: source_diff::RenderedDiff) -> Value {
+    json!({
+        "format": "unified",
+        "context_lines": 3,
+        "text": rendered.text,
+        "returned_chars": rendered.returned_chars,
+        "total_chars": rendered.total_chars,
+        "truncated": rendered.truncated,
+    })
+}
+
 fn resolve_tracked_source_path(
     store_path: &StorePath,
     tracked_path: &str,
@@ -1483,6 +1734,7 @@ fn prepare_live_source(
     store_path: &StorePath,
     path: PathBuf,
     allow_external_source: bool,
+    max_bytes: u64,
 ) -> Result<PreparedLiveSource> {
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
@@ -1516,7 +1768,7 @@ fn prepare_live_source(
             },
         });
     }
-    if before.len > MAX_INPUT_BYTES {
+    if before.len > max_bytes {
         let bytes = before.len;
         return Ok(PreparedLiveSource::Terminal {
             path,
@@ -1526,8 +1778,7 @@ fn prepare_live_source(
                 content_hash: None,
                 bytes: Some(bytes),
                 message: Some(format!(
-                    "tracked source is {} bytes; maximum supported input is {MAX_INPUT_BYTES} bytes",
-                    bytes
+                    "tracked source is {bytes} bytes; maximum supported input is {max_bytes} bytes"
                 )),
             },
         });
@@ -1629,6 +1880,14 @@ fn open_live_source(path: &Path) -> io::Result<fs::File> {
 }
 
 fn inspect_prepared_source(prepared: PreparedLiveSource) -> LiveSourceStatus {
+    read_prepared_source(prepared, MAX_INPUT_BYTES, false).0
+}
+
+fn read_prepared_source(
+    prepared: PreparedLiveSource,
+    max_bytes: u64,
+    capture: bool,
+) -> (LiveSourceStatus, Option<Vec<u8>>) {
     let (path, mut file, before) = match prepared {
         PreparedLiveSource::Ready { path, file, before } => (path, file, before),
         PreparedLiveSource::Terminal {
@@ -1636,47 +1895,60 @@ fn inspect_prepared_source(prepared: PreparedLiveSource) -> LiveSourceStatus {
             observed,
             status,
         } => {
-            let current = fs::metadata(path)
+            let current = fs::metadata(&path)
                 .ok()
                 .map(|metadata| file_fingerprint(&metadata));
             if current != observed {
-                return LiveSourceStatus {
-                    state: "unstable",
-                    content_hash: None,
-                    bytes: current.as_ref().map(|fingerprint| fingerprint.len),
-                    message: Some("tracked source changed during status preflight".to_string()),
-                };
+                return (
+                    LiveSourceStatus {
+                        state: "unstable",
+                        content_hash: None,
+                        bytes: current.as_ref().map(|fingerprint| fingerprint.len),
+                        message: Some("tracked source changed during status preflight".to_string()),
+                    },
+                    None,
+                );
             }
-            return status;
+            return (status, None);
         }
     };
 
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut bytes = 0u64;
+    let mut content = capture.then(|| Vec::with_capacity(before.len as usize));
     loop {
         let read = match file.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => read,
             Err(error) => {
-                return LiveSourceStatus {
-                    state: "unreadable",
-                    content_hash: None,
-                    bytes: Some(bytes),
-                    message: Some(error.to_string()),
-                };
+                return (
+                    LiveSourceStatus {
+                        state: "unreadable",
+                        content_hash: None,
+                        bytes: Some(bytes),
+                        message: Some(error.to_string()),
+                    },
+                    None,
+                );
             }
         };
         bytes += read as u64;
-        if bytes > MAX_INPUT_BYTES {
-            return LiveSourceStatus {
-                state: "oversized",
-                content_hash: None,
-                bytes: Some(bytes),
-                message: Some(format!(
-                    "tracked source exceeded the {MAX_INPUT_BYTES}-byte input limit while reading"
-                )),
-            };
+        if bytes > max_bytes {
+            return (
+                LiveSourceStatus {
+                    state: "oversized",
+                    content_hash: None,
+                    bytes: Some(bytes),
+                    message: Some(format!(
+                        "tracked source exceeded the {max_bytes}-byte input limit while reading"
+                    )),
+                },
+                None,
+            );
+        }
+        if let Some(content) = content.as_mut() {
+            content.extend_from_slice(&buffer[..read]);
         }
         hasher.update(&buffer[..read]);
     }
@@ -1694,19 +1966,25 @@ fn inspect_prepared_source(prepared: PreparedLiveSource) -> LiveSourceStatus {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     if after_handle.as_ref() != Some(&before) || after_path.as_ref() != Some(&before) {
-        return LiveSourceStatus {
-            state: "unstable",
-            content_hash: None,
+        return (
+            LiveSourceStatus {
+                state: "unstable",
+                content_hash: None,
+                bytes: Some(bytes),
+                message: Some("tracked source changed while it was being hashed".to_string()),
+            },
+            None,
+        );
+    }
+    (
+        LiveSourceStatus {
+            state: "hashed",
+            content_hash: Some(content_hash),
             bytes: Some(bytes),
-            message: Some("tracked source changed while it was being hashed".to_string()),
-        };
-    }
-    LiveSourceStatus {
-        state: "hashed",
-        content_hash: Some(content_hash),
-        bytes: Some(bytes),
-        message: None,
-    }
+            message: None,
+        },
+        content,
+    )
 }
 
 fn file_fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
@@ -1991,7 +2269,7 @@ fn to_json<T: Serialize>(value: T) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Scope, StorePath, ensure_source_status_unchanged, file_fingerprint,
+        MAX_INPUT_BYTES, Scope, StorePath, ensure_source_status_unchanged, file_fingerprint,
         inspect_prepared_source, open_live_source, prepare_live_source, read_file_bounded,
     };
     use crate::store::{SourceStatusTarget, SourceStatusTargets};
@@ -2038,7 +2316,8 @@ mod tests {
             scope: Scope::Project,
             path: temp.path().join(".lwc/wiki.db"),
         };
-        let prepared = prepare_live_source(&store_path, tracked.clone(), false).unwrap();
+        let prepared =
+            prepare_live_source(&store_path, tracked.clone(), false, MAX_INPUT_BYTES).unwrap();
 
         std::fs::remove_file(&tracked).unwrap();
         symlink(&external, &tracked).unwrap();

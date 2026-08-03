@@ -132,12 +132,21 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
           pattern: lwc-*
           path: release-assets
           merge-multiple: true
+
+      - name: Validate annotated release notes
+        shell: bash
+        run: |
+          test "$(git cat-file -t "${GITHUB_REF_NAME}")" = "tag"
+          notes="$(git for-each-ref --format='%(contents:body)' "refs/tags/${GITHUB_REF_NAME}")"
+          test -n "$(printf '%s' "$notes" | tr -d '[:space:]')"
 
       - name: Publish release assets
         env:
@@ -147,7 +156,7 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
             --title "lwc ${GITHUB_REF_NAME}" \
-            --generate-notes \
+            --notes-from-tag \
             release-assets/*.tar.gz \
             release-assets/*.zip \
             release-assets/SHA256SUMS \

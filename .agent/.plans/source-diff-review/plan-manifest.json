@@ -1,0 +1,103 @@
+{
+  "plan_id": "source-diff-review",
+  "title": "Bounded Source Diff and Direct Citation Review",
+  "status": "in_progress",
+  "version": 2,
+  "updated_at": "2026-08-03T18:52:00+08:00",
+  "source_documents": [
+    {"path": "user-request", "kind": "requirement", "verified": true},
+    {"path": "src/main.rs", "kind": "code", "verified": true},
+    {"path": "src/store.rs", "kind": "code-schema", "verified": true},
+    {"path": "tests/cli.rs", "kind": "test", "verified": true},
+    {"path": "tests/safety_workflows.rs", "kind": "test", "verified": true},
+    {"path": "tests/core_parity.rs", "kind": "test", "verified": true},
+    {"path": "docs/agent-workflow.md", "kind": "workflow", "verified": true},
+    {"path": "skills/using-lwc/SKILL.md", "kind": "agent-policy", "verified": true},
+    {"path": "skills/using-lwc/references/memory-policy.md", "kind": "agent-policy", "verified": true},
+    {"path": "CONTRIBUTING.md", "kind": "repository-policy", "verified": true},
+    {"path": ".github/workflows/ci.yml", "kind": "ci-policy", "verified": true},
+    {"path": ".github/workflows/release.yml", "kind": "release-policy", "verified": true},
+    {"path": "benchmarks/README.md", "kind": "benchmark-policy", "verified": true},
+    {"path": ".local-benchmarks/lwc-regression-review/README.md", "kind": "local-benchmark-evidence", "verified": true},
+    {"path": ".local-benchmarks/lwc-source-freshness/README.md", "kind": "local-benchmark-evidence", "verified": true},
+    {"path": "https://docs.rs/similar/3.1.1/similar/", "kind": "official-dependency-documentation", "verified": true}
+  ],
+  "requirements": [
+    {"id": "REQ-001", "summary": "Compare one immutable source with one current tracked live file and expose one-character changes.", "status": "confirmed", "source": "user-request"},
+    {"id": "REQ-002", "summary": "Compare two immutable source snapshots without a live path.", "status": "confirmed", "source": "user-request"},
+    {"id": "REQ-003", "summary": "List direct citation candidates; claim completeness only for one has_more=false query and label multi-call pagination potentially incomplete.", "status": "confirmed", "source": "user-request+pagination-review"},
+    {"id": "REQ-004", "summary": "Preserve scope, sensitive-content, path ambiguity, file type, and race safety.", "status": "confirmed", "source": "user-request+current-safety-contract"},
+    {"id": "REQ-005", "summary": "Bound diff inputs, computation, and Agent-facing output.", "status": "confirmed", "source": "user-request+performance-review"},
+    {"id": "REQ-006", "summary": "Keep review read-only and backward compatible without schema change.", "status": "confirmed", "source": "current-read-contract"},
+    {"id": "REQ-007", "summary": "Use TDD and update bilingual docs and using-lwc with local-only Skill validation.", "status": "confirmed", "source": "user-request+repository-policy"},
+    {"id": "REQ-008", "summary": "Prove feature performance and absence of regressions on the exact frozen release candidate with retained uncommitted datasets.", "status": "confirmed", "source": "user-request+benchmark-policy"}
+  ],
+  "traceability": [
+    {"requirement": "REQ-001", "architecture": ["ARCH-001", "ARCH-002", "ARCH-003"], "logic": ["FLOW-001", "RULE-001", "RULE-006", "RULE-008"], "tasks": ["TASK-001", "TASK-002", "TASK-003"], "acceptance": ["AC-001"], "tests": ["TEST-001", "TEST-002", "TEST-003", "TEST-004"], "antipatterns": ["ANTI-001", "ANTI-010", "ANTI-017", "ANTI-018", "ANTI-020", "ANTI-021"]},
+    {"requirement": "REQ-002", "architecture": ["ARCH-001", "ARCH-002", "ARCH-005"], "logic": ["FLOW-002", "RULE-001", "RULE-003"], "tasks": ["TASK-001", "TASK-002", "TASK-003"], "acceptance": ["AC-002"], "tests": ["TEST-005", "TEST-006"], "antipatterns": ["ANTI-001", "ANTI-010", "ANTI-017", "ANTI-018"]},
+    {"requirement": "REQ-003", "architecture": ["ARCH-004", "ARCH-006"], "logic": ["FLOW-003", "RULE-011", "RULE-012"], "tasks": ["TASK-001", "TASK-004"], "acceptance": ["AC-003"], "tests": ["TEST-007", "TEST-008"], "antipatterns": ["ANTI-002", "ANTI-010", "ANTI-016", "ANTI-019"]},
+    {"requirement": "REQ-004", "architecture": ["ARCH-003", "ARCH-005"], "logic": ["FLOW-001", "FLOW-004", "RULE-002", "RULE-004", "RULE-005", "RULE-014"], "tasks": ["TASK-001", "TASK-003"], "acceptance": ["AC-004"], "tests": ["TEST-006", "TEST-009", "TEST-010", "TEST-011", "TEST-012", "TEST-013", "TEST-014", "TEST-015"], "antipatterns": ["ANTI-003", "ANTI-004", "ANTI-013", "ANTI-021"]},
+    {"requirement": "REQ-005", "architecture": ["ARCH-002", "ARCH-007"], "logic": ["FLOW-005", "RULE-007", "RULE-008", "RULE-009", "RULE-010"], "tasks": ["TASK-002", "TASK-005"], "acceptance": ["AC-005"], "tests": ["TEST-016", "TEST-017", "TEST-018", "TEST-019", "TEST-020", "TEST-027"], "antipatterns": ["ANTI-005", "ANTI-010", "ANTI-015", "ANTI-018", "ANTI-020"]},
+    {"requirement": "REQ-006", "architecture": ["ARCH-005"], "logic": ["FLOW-004", "RULE-013", "RULE-015"], "tasks": ["TASK-003", "TASK-005"], "acceptance": ["AC-006"], "tests": ["TEST-021", "TEST-022", "TEST-023", "TEST-028", "TEST-029", "TEST-030"], "antipatterns": ["ANTI-006", "ANTI-007", "ANTI-011", "ANTI-014"]},
+    {"requirement": "REQ-007", "architecture": ["ARCH-006"], "logic": ["FLOW-003", "FLOW-006", "RULE-016"], "tasks": ["TASK-001", "TASK-002", "TASK-003", "TASK-004", "TASK-005", "TASK-006"], "acceptance": ["AC-007"], "tests": ["TEST-024", "TEST-025", "TEST-026", "TEST-031"], "antipatterns": ["ANTI-008", "ANTI-010", "ANTI-012"]},
+    {"requirement": "REQ-008", "architecture": ["ARCH-007"], "logic": ["FLOW-006", "RULE-017"], "tasks": ["TASK-005", "TASK-006"], "acceptance": ["AC-008"], "tests": ["TEST-027", "TEST-028", "TEST-029", "TEST-030", "TEST-031"], "antipatterns": ["ANTI-009", "ANTI-010", "ANTI-015", "ANTI-022"]}
+  ],
+  "assumptions": [
+    {"id": "ASM-001", "summary": "8 MiB and 200000 lines cover the first Agent text-review workload.", "validation": "TEST-016, TEST-017, TEST-027"},
+    {"id": "ASM-002", "summary": "20000 default and 100000 maximum output characters are sufficient for v0.6.", "validation": "TEST-018, TEST-019 and retained benchmark review"},
+    {"id": "ASM-003", "summary": "similar 3.1.1 is compatible with every supported release target.", "validation": "locked local checks and six-target TEST-031"}
+  ],
+  "unknowns": [],
+  "risks": [
+    {"id": "RISK-001", "summary": "Pathological inputs can consume CPU or memory.", "mitigation": "fixed input, line, deadline, output and benchmark caps"},
+    {"id": "RISK-002", "summary": "Shared live-read refactor can regress status.", "mitigation": "hash-only status mode plus retained freshness suite"},
+    {"id": "RISK-003", "summary": "Deadline output can be non-minimal.", "mitigation": "require complete valid difference only when untruncated; truncated output is explicitly a preview"},
+    {"id": "RISK-004", "summary": "Truncated output can be mistaken for complete.", "mitigation": "exact counts, explicit flag, Skill warning"},
+    {"id": "RISK-005", "summary": "Direct refs can be misrepresented as semantic impact.", "mitigation": "separate command, terminology and negative tests"},
+    {"id": "RISK-006", "summary": "New dependency can break a target.", "mitigation": "locked checks and six-target release gate"},
+    {"id": "RISK-007", "summary": "Citation rows can change between offset-paginated CLI calls.", "mitigation": "prefer one <=1000-row query; otherwise label the observed de-duplicated scan non-atomic and potentially incomplete"},
+    {"id": "RISK-008", "summary": "A retained runner can silently benchmark an old hard-coded candidate binary.", "mitigation": "freeze candidate commit and use a matrix wrapper to verify executable and runner SHA-256 values before and after every child"}
+  ],
+  "decisions": [
+    {"id": "DEC-001", "summary": "Use existing source refs separately; no combined source review response.", "status": "accepted"},
+    {"id": "DEC-002", "summary": "Use similar 3.1.1 rather than shelling out or implementing a diff algorithm.", "status": "accepted"},
+    {"id": "DEC-003", "summary": "Require exact path only when old source has multiple tracked paths.", "status": "accepted"},
+    {"id": "DEC-004", "summary": "Use fixed line Myers, three context lines, and one-second deadline.", "status": "accepted"},
+    {"id": "DEC-005", "summary": "No schema, cache, semantic impact, automatic write, or hunk pagination in v0.6.", "status": "accepted"},
+    {"id": "DEC-006", "summary": "Scan live diff content for secrets and require explicit sensitive acknowledgement.", "status": "accepted"},
+    {"id": "DEC-007", "summary": "Only one has_more=false refs query is complete; multi-call pagination remains an explicitly incomplete observation.", "status": "accepted"},
+    {"id": "DEC-008", "summary": "Freeze and commit v0.6.0 before the final matrix; any later tracked edit invalidates all final evidence.", "status": "accepted"}
+  ],
+  "documents": [
+    {"path": "00-requirements.md", "owner": "requirements", "supersedes": null},
+    {"path": "01-architecture.md", "owner": "architecture", "supersedes": null},
+    {"path": "02-logic-design.md", "owner": "logic", "supersedes": null},
+    {"path": "03-implementation-plan.md", "owner": "execution", "supersedes": null},
+    {"path": "04-constraints.md", "owner": "constraints", "supersedes": null},
+    {"path": "05-acceptance-plan.md", "owner": "acceptance", "supersedes": null},
+    {"path": "06-handoff.md", "owner": "continuity", "supersedes": null},
+    {"path": "07-antipatterns.md", "owner": "negative-boundaries", "supersedes": null}
+  ],
+  "current_phase": "TASK-005-candidate-ready",
+  "next_action": "Create the focused v0.6.0 candidate commit, build that exact HEAD, and run the complete checksum-bound local benchmark matrix without further tracked edits.",
+  "blockers": [],
+  "last_verification": {
+    "at": "2026-08-03T18:52:00+08:00",
+    "evidence": [
+      "git HEAD fdce470 on main at v0.5.0",
+      "installed lwc 0.5.0 project bootstrap in authorized root",
+      "repository code/tests/docs/workflows inspected",
+      "official similar 3.1.1 API and license inspected",
+      "retained local benchmark assets and hard-coded runner binary paths inspected",
+      "independent adversarial plan review completed and findings resolved",
+      "v0.5.0 tag, binary version, and SHA-256 baseline reverified",
+      "full debug and release product suites, installer checks, and local-only Skill checks passed",
+      "raw, compiled, provenance, and v0.5-v0.6 freshness preflights passed without regression",
+      "fixed 12-scenario source diff feature benchmark and both harness self-tests passed",
+      "release workflow YAML and annotated-tag note preflight passed",
+      "fixed 1001-citer stable/changing policy transcripts now exercise de-duplication and incomplete pagination labels",
+      "renderer characterization now proves insertion deletion replacement and untruncated CJK-emoji visibility",
+      "pre-freeze independent rereview found no remaining blocker or high finding"
+    ]
+  }
+}

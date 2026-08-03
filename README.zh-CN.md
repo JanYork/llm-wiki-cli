@@ -288,9 +288,23 @@ lwc source status 7 12
 该只读命令会流式计算实时文件的 SHA-256，并分别返回路径版本状态（`current` 或
 `superseded`）与文件系统状态（`current`、`modified`、`missing`、`unreadable`、
 `oversized` 或 `unstable`）。`source status --all` 的成本与所有被跟踪文件的总字节数
-成正比，只应在明确的维护任务中使用。文件变更后再次执行 `source add` 即可保存新
-版本；即使内容从 A 变为 B 后又回到 A，LWC 仍保留三次路径观察，只复用 A 原有的
-source ID。检查外部路径时必须再次显式传入 `--allow-external-source`。
+成正比，只应在明确的维护任务中使用。发现文件变化后先检查差异和直接引用者：
+
+```bash
+lwc source diff 7
+lwc source refs 7 --limit 1000
+```
+
+`source diff` 默认比较不可变来源与当前文件，也可用 `--to-source` 比较两个不可变
+版本。每侧最多 8 MiB、200,000 行；默认返回 20,000 个 Unicode 字符，
+`--max-chars` 最高 100,000。一个来源对应多个路径时必须用 `--path` 精确选择；
+`truncated=true` 只代表不完整预览。`source refs` 返回的是直接引用旧来源、需要复核
+的候选页面，不代表这些页面一定受到了语义影响。确认变化有实际含义后，才对同一路径
+再次执行 `source add`、完成 ingest，并按判断更新相关声明。即使内容从 A 变为 B 后
+又回到 A，LWC 仍保留三次路径观察，只复用 A 原有的 source ID。检查外部路径时必须
+再次传入 `--allow-external-source`；实时内容触发敏感信息检查时，还必须在人工检查后
+传入 `--acknowledge-sensitive-source`。
+
 旧版数据库迁移后，原有来源会明确显示为未跟踪；LWC 不会猜测历史路径。对目标文件
 重新执行一次 `source add`，即可建立第一条路径版本记录。如果检查期间文件或路径头
 版本发生变化，LWC 会返回 `source_status_unstable`；应重试，不要采信跨时点结果。

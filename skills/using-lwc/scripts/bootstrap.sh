@@ -37,10 +37,10 @@ supported_lwc_version() {
   [ "$#" -eq 3 ] || return 1
   case "$1$2$3" in *[!0-9]*|'') return 1 ;; esac
 
-  [ "$1" -gt 0 ] || [ "$2" -ge 5 ]
+  [ "$1" -gt 0 ] || [ "$2" -ge 6 ]
 }
 
-# v0.5.0 adds targeted source freshness checks required by this Skill.
+# v0.6.0 adds bounded source diffs required by this Skill's review flow.
 usable_lwc() {
   candidate="$1"
   candidate_version="$("$candidate" --version 2>/dev/null || true)"
@@ -52,6 +52,7 @@ usable_lwc() {
   "$candidate" checkpoint --help >/dev/null 2>&1
   "$candidate" source add-manifest --help >/dev/null 2>&1
   "$candidate" source status --help >/dev/null 2>&1
+  "$candidate" source diff --help >/dev/null 2>&1
   "$candidate" page put --help 2>&1 | grep -q -- '--provenance'
 }
 

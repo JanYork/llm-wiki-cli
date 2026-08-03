@@ -945,6 +945,20 @@ impl Store {
         })
     }
 
+    pub fn source_for_diff(&self, id: i64, max_bytes: usize) -> Result<SourceRecord> {
+        let summary = self.load_source_summary(id)?;
+        if summary.bytes < 0 || summary.bytes as usize > max_bytes {
+            return Err(AppError::new(
+                "source_diff_too_large",
+                format!(
+                    "source {id} is {} bytes; maximum source diff input is {max_bytes} bytes",
+                    summary.bytes
+                ),
+            ));
+        }
+        self.load_source(id)
+    }
+
     pub fn source_refs(&self, id: i64, limit: usize, offset: usize) -> Result<SourceRefsResponse> {
         let source = self.load_source_summary(id)?;
         let mut statement = self.conn.prepare(

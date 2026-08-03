@@ -234,14 +234,38 @@ source IDs before relying on their claims:
 
 `lineage_state=superseded` means that tracked path has a newer observed
 snapshot. `filesystem_state=modified` means the live bytes differ from the
-current head; run `source add` on the same path, ingest the returned source ID,
-and update every affected page. Missing, unreadable, oversized, and unstable
-files need review before their claims are treated as current. The status check
-is exact and read-only, but hashes every selected file, so never run `--all` at
-bootstrap or as a routine session tax. Reserve it for an explicit maintenance
-scan. An external path requires current read authorization and
-`--allow-external-source` on every check; previous source-add permission is not
-a standing grant.
+current head. Inspect the change before writing anything:
+
+```bash
+"$LWC" source diff <OLD_SOURCE_ID>
+"$LWC" source refs <OLD_SOURCE_ID> --limit 1000 --offset 0
+```
+
+When the old source has multiple tracked paths, choose one exact candidate with
+`--path`. To compare immutable revisions without a live file, use
+`source diff <OLD_SOURCE_ID> --to-source <NEW_SOURCE_ID>`. Diff is read-only,
+uses three context lines, accepts at most 8 MiB and 200,000 lines per side, and
+returns at most 20,000 Unicode characters by default. If `diff.truncated=true`,
+retry with `--max-chars 100000`; if it remains truncated, label the review
+incomplete and do not infer unchanged claims from the preview.
+
+`source refs` returns direct citations, not semantic impact. With
+`has_more=false`, one `--limit 1000` query is a complete point-in-time candidate
+set. If `has_more=true`, collect one offset-ordered scan, de-duplicate slugs, and
+explicitly label it non-atomic and potentially incomplete; repeated scans do not
+prove completeness. Call every result a review candidate, not an affected page.
+For a non-semantic edit, preserve pages and record the reason when useful. For a
+semantic edit, run `source add` on the same path, ingest the returned source ID,
+and deliberately revise only claims that changed.
+
+Missing, unreadable, oversized, invalid UTF-8, and unstable files need review
+before their claims are treated as current. Status and diff are exact and
+read-only, but they read the selected live bytes, so never run `status --all` at
+bootstrap or as a routine session tax. An external path requires current read
+authorization and `--allow-external-source` on each live check; previous
+source-add permission is not a standing grant. A live diff that triggers the
+secret scanner additionally requires `--acknowledge-sensitive-source` after
+inspection; neither flag substitutes for the other.
 If a migrated legacy source is returned in `untracked_source_ids`, do not infer
 its old origin as a live path. Re-add the intended file once to establish the
 first tracked revision. Retry `source_status_unstable`; never treat a

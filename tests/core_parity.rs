@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::{
     fs,
@@ -395,4 +395,50 @@ fn graph_navigation_exposes_backlinks_missing_links_and_source_refs() {
     assert_eq!(refs["pages"].as_array().unwrap().len(), 2);
     assert_eq!(refs["pages"][0]["slug"], "alpha");
     assert_eq!(refs["pages"][1]["slug"], "beta");
+}
+
+#[test]
+fn source_refs_returns_1000_direct_citers_in_one_complete_snapshot() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let evidence = world.write("evidence.md", "traceable evidence");
+    let source = world.ok(&["source", "add", as_str(&evidence)]);
+    let source_id = source["source"]["id"].as_i64().unwrap();
+    let database = PathBuf::from(initialized["database"].as_str().unwrap());
+    let mut connection = Connection::open(database).unwrap();
+    let transaction = connection.transaction().unwrap();
+    for index in 0..1000 {
+        let slug = format!("citer-{index:04}");
+        transaction
+            .execute(
+                "INSERT INTO pages(slug, title, kind, summary, body, created_at, updated_at)
+                 VALUES (?1, ?1, 'concept', '', '', '2026-01-01', '2026-01-01')",
+                params![slug],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO page_sources(page_slug, source_id) VALUES (?1, ?2)",
+                params![slug, source_id],
+            )
+            .unwrap();
+    }
+    transaction
+        .execute(
+            "INSERT INTO pages(slug, title, kind, summary, body, created_at, updated_at)
+             VALUES ('indirect', 'indirect', 'concept', '', '[[citer-0000]]', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let source_id = source_id.to_string();
+    let refs = world.ok(&["source", "refs", &source_id, "--limit", "1000"]);
+    let pages = refs["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 1000);
+    assert_eq!(pages.first().unwrap()["slug"], "citer-0000");
+    assert_eq!(pages.last().unwrap()["slug"], "citer-0999");
+    assert_eq!(refs["has_more"], false);
+    assert!(!pages.iter().any(|page| page["slug"] == "indirect"));
 }

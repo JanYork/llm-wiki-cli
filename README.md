@@ -323,10 +323,26 @@ The command streams each live file through SHA-256 and reports path lineage
 (`current` or `superseded`) separately from filesystem state (`current`,
 `modified`, `missing`, `unreadable`, `oversized`, or `unstable`). It is
 read-only. Use `source status --all` only for explicit maintenance because its
-cost is proportional to the bytes in all tracked files. Re-run `source add` on
-a modified path to capture the new immutable revision; an A -> B -> A sequence
-remains three path observations even though content A reuses its original
-source ID. External paths require `--allow-external-source` again when checked.
+cost is proportional to the bytes in all tracked files. Inspect a modified path
+before updating knowledge:
+
+```bash
+lwc source diff 7
+lwc source refs 7 --limit 1000
+```
+
+`source diff` compares the immutable source with its live file, or with another
+snapshot via `--to-source`. It returns a bounded unified diff: at most 8 MiB and
+200,000 lines per side, 20,000 Unicode output characters by default, and
+100,000 with `--max-chars`. If one source was observed at multiple paths, select
+an exact `--path`. A truncated diff is only a preview. `source refs` lists
+directly citing review candidates; it does not prove which pages are
+semantically affected. Re-run `source add` only after review when the same path
+contains a meaningful new revision. An A -> B -> A sequence remains three path
+observations even though content A reuses its original source ID. External live
+paths require `--allow-external-source` again; flagged live text also requires
+`--acknowledge-sensitive-source` after inspection.
+
 Sources migrated from older stores remain explicitly untracked because LWC does
 not guess historical paths; re-add the intended file once to establish its
 first tracked revision. If a file or path head changes during the check, LWC

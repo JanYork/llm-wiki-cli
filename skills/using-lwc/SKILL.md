@@ -99,12 +99,24 @@ authorization; memory work never initiates the change.
   complete.
 - Before trusting an existing source whose tracked file matters to the current
   task, run targeted `source status <SOURCE_IDS...>`. Do not run `--all` during
-  bootstrap or ordinary session recall. If a path is modified, add that same
-  path again, ingest the returned source ID, and revise affected pages. Treat
-  missing, unreadable, oversized, or unstable files as unresolved evidence.
-  Re-authorize every external-path check with `--allow-external-source` only
-  when the current task permits that read. Retry `source_status_unstable`
-  because it means the file or tracked head changed during the check.
+  bootstrap or ordinary session recall. If a path is modified, run
+  `source diff <OLD_SOURCE_ID>` before deciding what knowledge changed. Supply
+  the exact `--path` when LWC reports more than one candidate. If the preview is
+  truncated, retry with `--max-chars 100000`; a still-truncated result is
+  incomplete. Re-authorize external reads with `--allow-external-source`, and
+  reveal flagged live text only after review with
+  `--acknowledge-sensitive-source`.
+- After a modified-source diff, run
+  `source refs <OLD_SOURCE_ID> --limit 1000 --offset 0`. With
+  `has_more=false`, those pages are the complete direct-citation candidates for
+  that one query snapshot. If pagination is required, scan once in offset order,
+  de-duplicate by slug, and label the observed set non-atomic and potentially
+  incomplete. Call them review candidates, never automatically "affected".
+  Judge the change: preserve pages for a non-semantic edit; for a semantic edit,
+  add the same path again, ingest the new source, and deliberately revise only
+  claims that changed. Missing, unreadable, oversized, unstable, invalid UTF-8,
+  or unresolved truncation leaves the evidence unresolved. Retry
+  `source_status_unstable`; LWC accepted no mixed-time result.
 - Before `ingest complete`, write a cited `kind=source` page and integrate the
   contribution into at least one cited non-source page. If no shared page
   should change, persist a specific `--no-derived-pages-reason`.
