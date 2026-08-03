@@ -114,8 +114,8 @@ authorization; memory work never initiates the change.
 - Run lint in each changed scope after meaningful Wiki changes, then perform
   semantic maintenance when contradictions, staleness, or gaps appear. Lint is
   read-only unless `--record` is explicit.
-- After completing an ingest or changing the claims or retrieval wording of a
-  non-source page, run the local retrieval acceptance gate in
+- After completing an ingest or changing the claims or retrieval wording of any
+  page, run the local retrieval acceptance gate in
   `references/memory-policy.md` before calling the changed knowledge ready. A
   clean lint report is not retrieval proof. Reuse the same predeclared questions
   until every original and paraphrase retrieves its expected page in the top

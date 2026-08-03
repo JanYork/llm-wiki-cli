@@ -14,6 +14,9 @@ It is intentionally ignored in normal test runs.
 - `LWC_BENCH_BINARY`: optional `lwc` binary for before/after comparisons
   - default: the binary built by the current Cargo test run
 
+The runner explicitly allows the user-selected sanitized corpus as an external
+source because its temporary Wiki is created in a different directory.
+
 The benchmark imports only raw sources into a temporary project Wiki, runs the
 query set with the default `search --limit 10`, and prints one JSON report with:
 

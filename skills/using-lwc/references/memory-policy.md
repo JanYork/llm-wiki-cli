@@ -276,14 +276,15 @@ FTS search, or a single detached summary.
 
 A clean lint report proves structural consistency, not that users can retrieve
 the intended answer. After completing any ingest job or batch, or after changing
-the claims or retrieval wording of a non-source page, complete this local gate
-in each changed scope before calling the changed knowledge ready:
+the claims or retrieval wording of any page, complete this local gate in each
+changed scope before calling the changed knowledge ready:
 
-1. Before searching, select 3-5 representative questions from the current user
-   task and Wiki purpose, plus one natural paraphrase for each. If fewer than
-   three meaningful topics changed, cover every changed topic. Predeclare the
-   expected page and, for source-grounded claims, expected source IDs; otherwise
-   record the explicit provenance class.
+1. Before searching, cover every changed topic when one or two topics changed:
+   use one representative question plus one natural paraphrase per topic. When
+   three or more topics changed, select 3-5 representative questions plus one
+   natural paraphrase for each. Predeclare the expected page and, for
+   source-grounded claims, expected source IDs; otherwise record the explicit
+   provenance class.
 2. Set `LWC_SCOPE` to the changed `project` or `global` store, run
    scope-specific `lint`, then run both forms unchanged:
 

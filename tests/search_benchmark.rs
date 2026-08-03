@@ -105,7 +105,12 @@ fn search_benchmark_reports_json_for_local_corpus() {
     let imported_at = Instant::now();
     let imported = world.ok(
         &world.project,
-        &["source", "add-dir", corpus.to_str().unwrap()],
+        &[
+            "source",
+            "add-dir",
+            "--allow-external-source",
+            corpus.to_str().unwrap(),
+        ],
     );
     let import_ms = imported_at.elapsed().as_secs_f64() * 1000.0;
 
