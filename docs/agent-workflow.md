@@ -6,8 +6,10 @@ Use `lwc` as durable external memory. The database stores evidence and compiled 
 
 1. SQLite `source` records are immutable snapshots and the source of truth.
 2. SQLite `page` records are compiled knowledge maintained by agents.
-3. Every factual page should cite source IDs.
-4. Treat uncited or contradicted pages as hypotheses until verified against sources.
+3. Every page declares structured provenance. Source-grounded pages cite source
+   IDs; durable user statements, Agent observations, and hypotheses use the
+   matching explicit provenance class.
+4. Never invent a source ID for non-source knowledge.
 5. Never edit `.lwc/wiki.db` directly. Use the CLI so citations, links, FTS, and logs stay consistent.
 6. Split inputs larger than 64 MiB before ingestion.
 7. Treat `.lwc/raw`, `.lwc/wiki`, `.lwc/schema.md`, and `.lwc/purpose.md` as
@@ -85,8 +87,21 @@ lwc page put stable-concept \
 ```
 
 Use `[[stable-slug]]` links inside Markdown bodies. A page update atomically
-replaces its previous source IDs and extracted links, so always pass the
-complete current citation set.
+replaces its previous source IDs, explicit provenance, and extracted links, so
+read the page first and pass the complete current sets. Source IDs derive
+`source-grounded`; do not pass that value through `--provenance`.
+
+For durable non-source knowledge, repeat the explicit flag for mixed pages:
+
+```bash
+lwc page put accepted-direction \
+  --title "Accepted direction" \
+  --kind query \
+  --summary "User constraint and Agent verification state" \
+  --file decision.md \
+  --provenance user-provided \
+  --provenance agent-observed
+```
 
 Finish only after writing a cited source-summary page and at least one cited
 non-source page:

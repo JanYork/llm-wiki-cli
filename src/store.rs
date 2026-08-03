@@ -19,10 +19,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const USER_VERSION: i32 = 6;
+const COMPOUND_WIKI_VERSION: i32 = 6;
+const USER_VERSION: i32 = 7;
 const SEARCH_INDEX_VERSION: i32 = 4;
 const INGEST_WORKFLOW_VERSION: i32 = 5;
 const TOKENIZER_ID: &str = "cjk-bigram@1/bounded-terms";
+const SOURCE_GROUNDED: &str = "source-grounded";
+const EXPLICIT_PROVENANCE: [&str; 3] = ["user-provided", "agent-observed", "hypothesis"];
 const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 const TIMESTAMP_SQL: &str = "STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')";
 pub const DEFAULT_SCHEMA: &str = r#"# Wiki Schema
@@ -38,7 +41,9 @@ pub const DEFAULT_SCHEMA: &str = r#"# Wiki Schema
 
 ## Rules
 
-- Every factual page cites source IDs.
+- Every page declares provenance. Source-grounded pages cite source IDs;
+  user-provided facts, Agent observations, and hypotheses use explicit
+  provenance classes.
 - Use `[[stable-slug]]` for cross-references.
 - Read an existing page before replacing it and preserve still-valid knowledge.
 - Record contradictions instead of silently choosing one source.
@@ -95,10 +100,15 @@ WITH issues(code, page, target, message) AS (
       )
     UNION ALL
     SELECT
-        'uncited_page', p.slug, NULL, 'page has no cited sources'
+        'uncited_page', p.slug, NULL,
+        'page has neither cited sources nor explicit provenance'
     FROM pages p
-    LEFT JOIN page_sources ps ON ps.page_slug = p.slug
-    WHERE ps.page_slug IS NULL
+    WHERE NOT EXISTS (
+        SELECT 1 FROM page_sources ps WHERE ps.page_slug = p.slug
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM page_provenance pp WHERE pp.page_slug = p.slug
+    )
     UNION ALL
     SELECT
         'orphan_page', p.slug, NULL, 'page has no inbound wikilinks'
@@ -181,6 +191,7 @@ pub struct PagePutInput {
     pub summary: Option<String>,
     pub body: String,
     pub source_ids: Vec<i64>,
+    pub provenance: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -268,6 +279,7 @@ pub struct PageRecord {
     pub summary: Option<String>,
     pub body: String,
     pub source_ids: Vec<i64>,
+    pub provenance: Vec<String>,
     pub links: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -279,6 +291,7 @@ pub struct PageSummary {
     pub title: String,
     pub kind: Option<String>,
     pub summary: Option<String>,
+    pub provenance: Vec<String>,
     pub updated_at: String,
 }
 
@@ -305,6 +318,7 @@ pub struct PageWriteRecord {
     pub kind: Option<String>,
     pub summary: Option<String>,
     pub source_ids: Vec<i64>,
+    pub provenance: Vec<String>,
     pub links: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -357,6 +371,7 @@ pub struct SearchResult {
     pub title: Option<String>,
     pub kind: Option<String>,
     pub summary: Option<String>,
+    pub provenance: Option<Vec<String>>,
     pub snippet: String,
     pub rank: f64,
     #[serde(skip)]
@@ -766,7 +781,15 @@ impl Store {
     pub fn source_refs(&self, id: i64, limit: usize, offset: usize) -> Result<SourceRefsResponse> {
         let source = self.load_source_summary(id)?;
         let mut statement = self.conn.prepare(
-            "SELECT p.slug, p.title, p.kind, p.summary, p.updated_at
+            "SELECT p.slug, p.title, p.kind, p.summary, p.updated_at,
+                    EXISTS(
+                        SELECT 1 FROM page_sources cited WHERE cited.page_slug = p.slug
+                    ),
+                    (
+                        SELECT GROUP_CONCAT(pp.provenance, ',')
+                        FROM page_provenance pp
+                        WHERE pp.page_slug = p.slug
+                    )
              FROM page_sources ps
              JOIN pages p ON p.slug = ps.page_slug
              WHERE ps.source_id = ?1
@@ -781,6 +804,7 @@ impl Store {
                     kind: row.get(2)?,
                     summary: row.get(3)?,
                     updated_at: row.get(4)?,
+                    provenance: provenance_from_parts(row.get::<_, i64>(5)? != 0, row.get(6)?),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -831,6 +855,7 @@ impl Store {
     pub fn page_put(&mut self, input: PagePutInput) -> Result<PagePutResponse> {
         validate_page_slug(&input.slug)?;
         let source_ids = dedupe_i64(input.source_ids);
+        let explicit_provenance = normalize_explicit_provenance(input.provenance)?;
         let links = extract_links(&input.body);
         let tx = self
             .conn
@@ -885,6 +910,17 @@ impl Store {
             tx.execute(
                 "INSERT INTO page_sources(page_slug, source_id) VALUES (?1, ?2)",
                 params![&input.slug, source_id],
+            )?;
+        }
+
+        tx.execute(
+            "DELETE FROM page_provenance WHERE page_slug = ?1",
+            params![&input.slug],
+        )?;
+        for provenance in &explicit_provenance {
+            tx.execute(
+                "INSERT INTO page_provenance(page_slug, provenance) VALUES (?1, ?2)",
+                params![&input.slug, provenance],
             )?;
         }
 
@@ -1103,6 +1139,7 @@ impl Store {
                 .then_with(|| left.identifier.cmp(&right.identifier))
         });
         results.truncate(limit);
+        load_search_provenance(&self.conn, &mut results)?;
 
         Ok(SearchResponse { results })
     }
@@ -1817,6 +1854,7 @@ impl Store {
             .ok_or_else(|| AppError::new("page_not_found", format!("page not found: {slug}")))?;
 
         let source_ids = self.load_page_source_ids(slug)?;
+        let provenance = self.load_page_provenance(slug, !source_ids.is_empty())?;
         let links = self.load_page_links(slug)?;
         Ok(PageRecord {
             slug: base.0,
@@ -1825,6 +1863,7 @@ impl Store {
             summary: base.3,
             body: base.4,
             source_ids,
+            provenance,
             links,
             created_at: base.5,
             updated_at: base.6,
@@ -1852,12 +1891,15 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| AppError::new("page_not_found", format!("page not found: {slug}")))?;
+        let source_ids = self.load_page_source_ids(slug)?;
+        let provenance = self.load_page_provenance(slug, !source_ids.is_empty())?;
         Ok(PageWriteRecord {
             slug: base.0,
             title: base.1,
             kind: base.2,
             summary: base.3,
-            source_ids: self.load_page_source_ids(slug)?,
+            source_ids,
+            provenance,
             links: self.load_page_links(slug)?,
             created_at: base.4,
             updated_at: base.5,
@@ -1866,9 +1908,17 @@ impl Store {
 
     fn load_page_summaries(&self, limit: usize, offset: usize) -> Result<Vec<PageSummary>> {
         let mut statement = self.conn.prepare(
-            "SELECT slug, title, kind, summary, updated_at
-             FROM pages
-             ORDER BY slug ASC
+            "SELECT p.slug, p.title, p.kind, p.summary, p.updated_at,
+                    EXISTS(
+                        SELECT 1 FROM page_sources ps WHERE ps.page_slug = p.slug
+                    ),
+                    (
+                        SELECT GROUP_CONCAT(pp.provenance, ',')
+                        FROM page_provenance pp
+                        WHERE pp.page_slug = p.slug
+                    )
+             FROM pages p
+             ORDER BY p.slug ASC
              LIMIT ?1 OFFSET ?2",
         )?;
         statement
@@ -1879,6 +1929,7 @@ impl Store {
                     kind: row.get(2)?,
                     summary: row.get(3)?,
                     updated_at: row.get(4)?,
+                    provenance: provenance_from_parts(row.get::<_, i64>(5)? != 0, row.get(6)?),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -1896,6 +1947,17 @@ impl Store {
             .query_map(params![slug], |row| row.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    fn load_page_provenance(&self, slug: &str, has_sources: bool) -> Result<Vec<String>> {
+        let explicit = self.conn.query_row(
+            "SELECT GROUP_CONCAT(provenance, ',')
+             FROM page_provenance
+             WHERE page_slug = ?1",
+            params![slug],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
+        Ok(provenance_from_parts(has_sources, explicit))
     }
 
     fn load_page_links(&self, slug: &str) -> Result<Vec<String>> {
@@ -2105,9 +2167,17 @@ fn artifact_snapshot(
 
     let pages = {
         let mut statement = tx.prepare(
-            "SELECT slug, title, kind, summary, body, created_at, updated_at
-             FROM pages
-             ORDER BY slug",
+            "SELECT p.slug, p.title, p.kind, p.summary, p.body, p.created_at, p.updated_at,
+                    EXISTS(
+                        SELECT 1 FROM page_sources ps WHERE ps.page_slug = p.slug
+                    ),
+                    (
+                        SELECT GROUP_CONCAT(pp.provenance, ',')
+                        FROM page_provenance pp
+                        WHERE pp.page_slug = p.slug
+                    )
+             FROM pages p
+             ORDER BY p.slug",
         )?;
         statement
             .query_map([], |row| {
@@ -2119,6 +2189,7 @@ fn artifact_snapshot(
                     kind: row.get(2)?,
                     summary: row.get(3)?,
                     body: row.get(4)?,
+                    provenance: provenance_from_parts(row.get::<_, i64>(7)? != 0, row.get(8)?),
                     created: row.get(5)?,
                     updated: row.get(6)?,
                 })
@@ -2251,6 +2322,10 @@ fn prepare_store(conn: &mut Connection, allow_create: bool) -> Result<bool> {
         migrate_compound_wiki(conn)?;
         version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     }
+    if version == COMPOUND_WIKI_VERSION {
+        migrate_page_provenance(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
     if version != USER_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
@@ -2286,7 +2361,7 @@ fn migrate_ingest_workflow(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match current {
-        INGEST_WORKFLOW_VERSION | USER_VERSION => {
+        INGEST_WORKFLOW_VERSION..=USER_VERSION => {
             tx.commit()?;
             return Ok(());
         }
@@ -2347,7 +2422,7 @@ fn migrate_compound_wiki(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match current {
-        USER_VERSION => {
+        COMPOUND_WIKI_VERSION | USER_VERSION => {
             tx.commit()?;
             return Ok(());
         }
@@ -2371,9 +2446,50 @@ fn migrate_compound_wiki(conn: &mut Connection) -> Result<()> {
     rebuild_search_index(&tx).map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to prepare v{USER_VERSION} compact search index: {error}"),
+            format!("failed to prepare v{COMPOUND_WIKI_VERSION} compact search index: {error}"),
         )
     })?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![COMPOUND_WIKI_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", COMPOUND_WIKI_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to commit v{COMPOUND_WIKI_VERSION} Wiki migration: {error}"),
+        )
+    })
+}
+
+fn migrate_page_provenance(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match current {
+        USER_VERSION => {
+            tx.commit()?;
+            return Ok(());
+        }
+        COMPOUND_WIKI_VERSION => {}
+        other => {
+            return Err(AppError::new(
+                "unsupported_store_version",
+                format!("cannot migrate wiki database version {other} to {USER_VERSION}"),
+            ));
+        }
+    }
+
+    tx.execute_batch(
+        "CREATE TABLE page_provenance(
+            page_slug TEXT NOT NULL,
+            provenance TEXT NOT NULL CHECK(
+                provenance IN ('user-provided', 'agent-observed', 'hypothesis')
+            ),
+            PRIMARY KEY(page_slug, provenance),
+            FOREIGN KEY(page_slug) REFERENCES pages(slug) ON DELETE CASCADE
+        );",
+    )?;
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -2383,7 +2499,7 @@ fn migrate_compound_wiki(conn: &mut Connection) -> Result<()> {
     tx.commit().map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to commit v{USER_VERSION} Wiki migration: {error}"),
+            format!("failed to commit v{USER_VERSION} provenance migration: {error}"),
         )
     })
 }
@@ -2428,6 +2544,15 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
             PRIMARY KEY(page_slug, source_id),
             FOREIGN KEY(page_slug) REFERENCES pages(slug) ON DELETE CASCADE,
             FOREIGN KEY(source_id) REFERENCES sources(id)
+        );
+
+        CREATE TABLE page_provenance(
+            page_slug TEXT NOT NULL,
+            provenance TEXT NOT NULL CHECK(
+                provenance IN ('user-provided', 'agent-observed', 'hypothesis')
+            ),
+            PRIMARY KEY(page_slug, provenance),
+            FOREIGN KEY(page_slug) REFERENCES pages(slug) ON DELETE CASCADE
         );
 
         CREATE TABLE links(
@@ -2603,6 +2728,7 @@ fn validate_store(conn: &Connection) -> Result<()> {
         "SELECT id, content_hash, title, origin, content, created_at FROM sources LIMIT 0",
         "SELECT slug, title, kind, summary, body, created_at, updated_at FROM pages LIMIT 0",
         "SELECT page_slug, source_id FROM page_sources LIMIT 0",
+        "SELECT page_slug, provenance FROM page_provenance LIMIT 0",
         "SELECT from_slug, to_slug FROM links LIMIT 0",
         "SELECT action, target, detail_json, created_at FROM operations LIMIT 0",
         "SELECT source_id, status, attempts, analysis, last_error, no_derived_pages_reason, updated_at FROM ingest_jobs LIMIT 0",
@@ -2902,6 +3028,45 @@ fn dedupe_i64(values: Vec<i64>) -> Vec<i64> {
         .collect()
 }
 
+fn normalize_explicit_provenance(values: Vec<String>) -> Result<Vec<String>> {
+    let values = values.into_iter().collect::<BTreeSet<_>>();
+    if let Some(value) = values
+        .iter()
+        .find(|value| !EXPLICIT_PROVENANCE.contains(&value.as_str()))
+    {
+        return Err(AppError::new(
+            "invalid_provenance",
+            format!(
+                "unsupported provenance {value:?}; use user-provided, agent-observed, or hypothesis"
+            ),
+        ));
+    }
+    Ok(EXPLICIT_PROVENANCE
+        .iter()
+        .filter(|value| values.contains(**value))
+        .map(|value| (*value).to_string())
+        .collect())
+}
+
+fn provenance_from_parts(has_sources: bool, explicit: Option<String>) -> Vec<String> {
+    let explicit = explicit
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .collect::<BTreeSet<_>>();
+    let mut provenance = Vec::with_capacity(EXPLICIT_PROVENANCE.len() + usize::from(has_sources));
+    if has_sources {
+        provenance.push(SOURCE_GROUNDED.to_string());
+    }
+    provenance.extend(
+        EXPLICIT_PROVENANCE
+            .iter()
+            .filter(|value| explicit.contains(**value))
+            .map(|value| (*value).to_string()),
+    );
+    provenance
+}
+
 fn extract_links(body: &str) -> Vec<String> {
     let mut links = BTreeSet::new();
     let mut rest = body;
@@ -3088,9 +3253,10 @@ fn search_index(
                             .collect()
                     })
                     .unwrap_or_default();
+                let result_type = row.get::<_, String>(0)?;
                 Ok(SearchResult {
                     scope: scope.to_string(),
-                    result_type: row.get(0)?,
+                    result_type,
                     identifier: row.get(1)?,
                     rank: comparable_rank(
                         title.as_deref(),
@@ -3102,6 +3268,7 @@ fn search_index(
                     title,
                     kind: row.get(3)?,
                     summary: row.get(4)?,
+                    provenance: None,
                     snippet: row.get(5)?,
                     paired_source_ids,
                 })
@@ -3109,6 +3276,51 @@ fn search_index(
         )?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+fn load_search_provenance(conn: &Connection, results: &mut [SearchResult]) -> Result<()> {
+    let slugs = results
+        .iter()
+        .filter(|result| result.result_type == "page")
+        .map(|result| result.identifier.clone())
+        .collect::<BTreeSet<_>>();
+    if slugs.is_empty() {
+        return Ok(());
+    }
+
+    let placeholders = std::iter::repeat_n("?", slugs.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT p.slug,
+                EXISTS(SELECT 1 FROM page_sources ps WHERE ps.page_slug = p.slug),
+                (SELECT GROUP_CONCAT(pp.provenance, ',')
+                 FROM page_provenance pp WHERE pp.page_slug = p.slug)
+         FROM pages p
+         WHERE p.slug IN ({placeholders})"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let provenance = statement
+        .query_map(rusqlite::params_from_iter(slugs.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                provenance_from_parts(row.get::<_, i64>(1)? != 0, row.get(2)?),
+            ))
+        })?
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+
+    for result in results
+        .iter_mut()
+        .filter(|result| result.result_type == "page")
+    {
+        result.provenance = Some(
+            provenance
+                .get(&result.identifier)
+                .cloned()
+                .unwrap_or_default(),
+        );
+    }
+    Ok(())
 }
 
 fn search_type_priority(result: &SearchResult, mode: SearchMode) -> u8 {
@@ -3239,10 +3451,23 @@ mod tests {
                 summary: Some("Alpha summary".to_string()),
                 body: "See [[beta]] and [[beta]] and [[gamma]].".to_string(),
                 source_ids: vec![source.source.id, source.source.id],
+                provenance: vec![
+                    "hypothesis".to_string(),
+                    "agent-observed".to_string(),
+                    "hypothesis".to_string(),
+                ],
             })
             .unwrap();
 
         assert_eq!(page.page.source_ids, vec![source.source.id]);
+        assert_eq!(
+            page.page.provenance,
+            vec![
+                "source-grounded".to_string(),
+                "agent-observed".to_string(),
+                "hypothesis".to_string(),
+            ]
+        );
         assert_eq!(
             page.page.links,
             vec!["beta".to_string(), "gamma".to_string()]
@@ -3287,6 +3512,7 @@ mod tests {
                 summary: Some("summary".to_string()),
                 body: "oldterm with [[beta]]".to_string(),
                 source_ids: vec![source.source.id],
+                provenance: vec!["agent-observed".to_string()],
             })
             .unwrap();
 
@@ -3307,6 +3533,7 @@ mod tests {
                 summary: Some("replacement".to_string()),
                 body: "newterm with [[gamma]]".to_string(),
                 source_ids: vec![9_999],
+                provenance: vec!["hypothesis".to_string()],
             })
             .unwrap_err();
         assert_eq!(error.code, "source_not_found");
@@ -3315,6 +3542,10 @@ mod tests {
         assert_eq!(page.title, "Alpha");
         assert_eq!(page.links, vec!["beta".to_string()]);
         assert_eq!(page.source_ids, vec![source.source.id]);
+        assert_eq!(
+            page.provenance,
+            vec!["source-grounded".to_string(), "agent-observed".to_string()]
+        );
 
         let old_search = store.search("oldterm", 10).unwrap();
         assert_eq!(old_search.results.len(), 1);
@@ -3372,6 +3603,7 @@ mod tests {
                 summary: None,
                 body: "注意力机制帮助模型聚焦关键信号。".to_string(),
                 source_ids: Vec::new(),
+                provenance: Vec::new(),
             })
             .unwrap();
         drop(store);
@@ -3379,6 +3611,7 @@ mod tests {
         let conn = Connection::open(&database).unwrap();
         conn.execute_batch(
             "DROP TABLE search_fts;
+             DROP TABLE page_provenance;
              DROP TABLE ingest_jobs;
              CREATE VIRTUAL TABLE source_fts USING fts5(
                  source_id UNINDEXED, title, content
@@ -3427,6 +3660,27 @@ mod tests {
     }
 
     #[test]
+    fn stale_ingest_migration_step_accepts_a_newer_intermediate_version() {
+        let mut store = test_store();
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE page_provenance;
+                 UPDATE meta SET value = '6' WHERE key = 'format_version';
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+
+        migrate_ingest_workflow(&mut store.conn).unwrap();
+
+        let version: i32 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, COMPOUND_WIKI_VERSION);
+    }
+
+    #[test]
     fn lint_reports_missing_orphaned_and_duplicate_search_rows() {
         let mut store = test_store();
         for slug in ["missing", "duplicate"] {
@@ -3438,6 +3692,7 @@ mod tests {
                     summary: None,
                     body: format!("{slug} body"),
                     source_ids: Vec::new(),
+                    provenance: Vec::new(),
                 })
                 .unwrap();
         }

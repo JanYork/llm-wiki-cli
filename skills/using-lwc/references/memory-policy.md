@@ -190,18 +190,23 @@ printf '%s' "$body" |
     --title "Durable title" \
     --kind query \
     --summary "One-line retrieval summary" \
-    --file -
+    --file - \
+    --provenance agent-observed
 ```
 
 Use `kind=query` for a durable answer and the matching concept, entity,
 comparison, source, or synthesis kind for other pages. Choose `--scope global`
 only under the scope policy. Use `[[stable-slug]]` for related concepts. When
 replacing a page, repeat `--source ID` for every value returned in
-`.page.source_ids`; page updates replace the citation set.
+`.page.source_ids` and repeat every still-valid non-source value from
+`.page.provenance`; page updates replace both sets. Never pass
+`source-grounded` through `--provenance`: citations derive it automatically.
 
 User statements, session decisions, and Agent observations may lack immutable
 source IDs. If genuinely durable, store them with an explicit provenance and
-date; never invent a citation. Label hypotheses and verification state.
+date; never invent a citation. Repeat `--provenance user-provided`,
+`--provenance agent-observed`, or `--provenance hypothesis` when more than one
+class applies. Label hypotheses and verification state.
 
 ## Source integration
 
@@ -316,6 +321,9 @@ repository's raw-source benchmark for compiled-Wiki usability.
 
 - Distinguish source-grounded claims, user-provided facts, Agent observations,
   and hypotheses.
+- Treat page provenance as a set: citations derive `source-grounded`; the
+  repeatable `--provenance` flag stores only `user-provided`,
+  `agent-observed`, and `hypothesis`.
 - Cite immutable sources whenever available.
 - Never store passwords, API tokens, private keys, cookies, authentication
   headers, or secret-bearing command output.

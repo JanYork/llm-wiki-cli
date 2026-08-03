@@ -171,7 +171,12 @@ fn help_documents_the_agent_workflow_and_command_side_effects() {
         ),
         (
             vec!["page", "put", "--help"],
-            vec!["kind=source", "[[slug]]", "--source <SOURCE_IDS>"],
+            vec![
+                "kind=source",
+                "[[slug]]",
+                "--source <SOURCE_IDS>",
+                "--provenance <PROVENANCE>",
+            ],
         ),
         (
             vec!["ingest", "complete", "--help"],
@@ -451,6 +456,131 @@ fn project_flow_preserves_sources_and_rolls_back_failed_page_updates() {
 }
 
 #[test]
+fn page_provenance_is_structured_on_every_read_surface_and_replaced() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+
+    let source = world.write("evidence.md", "immutable evidence");
+    let added = world.ok(&world.project, &["source", "add", as_str(&source)]);
+    let source_id = added["source"]["id"].as_i64().unwrap().to_string();
+    let page = world.write("mixed.md", "provenanceterm mixed knowledge");
+    let expected = serde_json::json!([
+        "source-grounded",
+        "user-provided",
+        "agent-observed",
+        "hypothesis"
+    ]);
+
+    let put = world.ok(
+        &world.project,
+        &[
+            "page",
+            "put",
+            "mixed-provenance",
+            "--title",
+            "Mixed provenance",
+            "--summary",
+            "Structured provenance test",
+            "--file",
+            as_str(&page),
+            "--source",
+            &source_id,
+            "--provenance",
+            "hypothesis",
+            "--provenance",
+            "agent-observed",
+            "--provenance",
+            "user-provided",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    assert_eq!(put["page"]["provenance"], expected);
+
+    let shown = world.ok(&world.project, &["page", "show", "mixed-provenance"]);
+    assert_eq!(shown["page"]["provenance"], expected);
+
+    let listed = world.ok(&world.project, &["page", "list"]);
+    assert_eq!(listed["pages"][0]["provenance"], expected);
+
+    let context = world.ok(&world.project, &["context", "--limit", "10"]);
+    assert_eq!(context["stores"][0]["pages"][0]["provenance"], expected);
+
+    let search = world.ok(&world.project, &["search", "provenanceterm"]);
+    let page_hit = search["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["type"] == "page")
+        .unwrap();
+    assert_eq!(page_hit["provenance"], expected);
+
+    let refs = world.ok(&world.project, &["source", "refs", &source_id]);
+    assert_eq!(refs["pages"][0]["provenance"], expected);
+
+    let replacement = world.write("replacement.md", "replacement body");
+    let replaced = world.ok(
+        &world.project,
+        &[
+            "page",
+            "put",
+            "mixed-provenance",
+            "--title",
+            "Mixed provenance",
+            "--summary",
+            "Structured provenance test",
+            "--file",
+            as_str(&replacement),
+            "--source",
+            &source_id,
+        ],
+    );
+    assert_eq!(
+        replaced["page"]["provenance"],
+        serde_json::json!(["source-grounded"])
+    );
+}
+
+#[test]
+fn lint_accepts_explicit_provenance_but_reports_unclassified_pages() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+
+    for (slug, provenance) in [
+        ("classified", Some("agent-observed")),
+        ("unclassified", None),
+    ] {
+        let page = world.write(&format!("{slug}.md"), &format!("{slug} body"));
+        let mut args = vec![
+            "page",
+            "put",
+            slug,
+            "--title",
+            slug,
+            "--summary",
+            "summary",
+            "--file",
+            as_str(&page),
+        ];
+        if let Some(value) = provenance {
+            args.extend(["--provenance", value]);
+        }
+        world.ok(&world.project, &args);
+    }
+
+    let lint = world.ok(&world.project, &["lint"]);
+    let uncited = lint["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["code"] == "uncited_page")
+        .map(|issue| issue["page"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(!uncited.contains(&"classified"));
+    assert!(uncited.contains(&"unclassified"));
+}
+
+#[test]
 fn nearest_project_is_discovered_from_nested_directories() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
@@ -525,6 +655,7 @@ fn read_commands_transparently_migrate_a_writable_v5_store() {
          DROP TABLE IF EXISTS search_fts_content;
          DROP TABLE IF EXISTS search_fts_docsize;
          DROP TABLE IF EXISTS search_fts_config;
+         DROP TABLE page_provenance;
          CREATE VIRTUAL TABLE search_fts USING fts5(
              doc_type UNINDEXED,
              identifier UNINDEXED,
@@ -546,7 +677,58 @@ fn read_commands_transparently_migrate_a_writable_v5_store() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6, "context should migrate a writable legacy store");
+    assert_eq!(version, 7, "context should migrate a writable legacy store");
+}
+
+#[test]
+fn read_commands_migrate_v6_store_to_structured_provenance() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+
+    let source = world.write("migration-source.md", "migration evidence");
+    let added = world.ok(&world.project, &["source", "add", as_str(&source)]);
+    let source_id = added["source"]["id"].as_i64().unwrap().to_string();
+    let body = world.write("migration-page.md", "migration page body");
+    world.ok(
+        &world.project,
+        &[
+            "page",
+            "put",
+            "migration-page",
+            "--title",
+            "Migration page",
+            "--summary",
+            "Migration summary",
+            "--file",
+            as_str(&body),
+            "--source",
+            &source_id,
+        ],
+    );
+
+    let database = world.project.join(".lwc/wiki.db");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS page_provenance;
+         UPDATE meta SET value = '6' WHERE key = 'format_version';
+         PRAGMA user_version = 6;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let context = world.ok(&world.project, &["context", "--limit", "5"]);
+    assert_eq!(
+        context["stores"][0]["pages"][0]["provenance"],
+        serde_json::json!(["source-grounded"])
+    );
+
+    let conn = Connection::open(database).unwrap();
+    let version: i32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 7);
+    conn.prepare("SELECT page_slug, provenance FROM page_provenance LIMIT 0")
+        .unwrap();
 }
 
 #[test]

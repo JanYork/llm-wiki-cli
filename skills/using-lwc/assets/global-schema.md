@@ -6,7 +6,8 @@
 - Prefer kinds such as `preference`, `practice`, `tool`, `concept`, and
   `synthesis`.
 - State provenance as user-provided, source-grounded, Agent-observed, or
-  hypothesis.
+  hypothesis. Source citations derive source-grounded; use explicit non-source
+  provenance for the other classes.
 - Cite immutable source IDs whenever a claim comes from stored material.
 - Label uncertainty and preserve contradictions instead of silently choosing.
 - Link related pages with `[[stable-slug]]`.

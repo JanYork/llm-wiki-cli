@@ -168,7 +168,7 @@ Skill 与别名路径、全局 Wiki 路径、修改过的 Hook/配置文件、�
 | 层 | 内容 | 约束 |
 | --- | --- | --- |
 | Raw sources | 经过筛选的输入内容的不可变快照 | 通过 `source` 加入，不改写来源事实。 |
-| Wiki | Agent 维护的页面、引用和链接 | 通过 `page` 更新，让事实声明有来源依据。 |
+| Wiki | Agent 维护的页面、引用、链接和来源类型 | 通过 `page` 更新；引用来源，并分类需要长期保留的非来源知识。 |
 | Schema and purpose | 维护规则与项目目标 | 约束后续每一次 ingest 和修订。 |
 
 SQLite 是唯一的规范事实源。Markdown 树是供人和 Obsidian 等工具使用的可重建
@@ -257,7 +257,7 @@ CLI 本身不绑定具体运行时：任何能够执行 CLI，并加载或适配
 ```bash
 cd your-project
 lwc init
-printf '# Schema\nEvery factual page cites sources.\n' | lwc schema set -
+printf '# Schema\nEvery page declares provenance; source-grounded claims cite sources.\n' | lwc schema set -
 printf '# Purpose\nBuild a durable project Wiki.\n' | lwc purpose set -
 ```
 
@@ -338,6 +338,24 @@ lwc ingest complete 1
 lwc ingest complete 1 \
   --no-derived-pages-reason "Duplicate evidence; existing synthesis already covers every supported claim"
 ```
+
+页面只要带 `--source` 引用，就会自动得到 `source-grounded`。如果长期知识来自
+用户陈述、Agent 观察或明确的假设，不要伪造来源；按需重复传入 `--provenance`：
+
+```bash
+lwc page put architecture-decision \
+  --title "Architecture decision" \
+  --kind query \
+  --summary "Accepted constraint and remaining uncertainty" \
+  --file decision.md \
+  --provenance user-provided \
+  --provenance hypothesis
+```
+
+`page put` 会整体替换引用集合和显式 provenance 集合。更新前先读取旧页面，再重复
+传入所有仍有效的 `--source`，以及非来源类的 `--provenance`。不要显式传
+`source-grounded`，它由引用自动推导。页面读取、context、search、source refs 和
+Markdown 投影都会返回 provenance，但 provenance 不参与搜索排序。
 
 ### 4. 查询已沉淀的 Wiki
 

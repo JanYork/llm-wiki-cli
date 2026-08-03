@@ -24,6 +24,12 @@ const SOURCE_ID_MAX: usize = 48;
 const BASENAME_MAX: usize = 120;
 const SLUG_SEGMENT_MAX: usize = 80;
 const REL_PATH_MAX: usize = 240;
+const PROVENANCE_ORDER: [&str; 4] = [
+    "source-grounded",
+    "user-provided",
+    "agent-observed",
+    "hypothesis",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -50,6 +56,7 @@ pub struct Page {
     pub summary: Option<String>,
     pub body: String,
     pub source_artifact_paths: Vec<String>,
+    pub provenance: Vec<String>,
     pub created: String,
     pub updated: String,
 }
@@ -150,6 +157,7 @@ struct PlannedPage {
     summary: Option<String>,
     body: String,
     sources: Vec<String>,
+    provenance: Vec<String>,
     created: String,
     updated: String,
 }
@@ -204,6 +212,7 @@ fn plan_pages(pages: &[Page]) -> Result<Vec<PlannedPage>, Error> {
         for source in &sources {
             validate_raw_ref(source)?;
         }
+        let provenance = normalize_provenance(&page.provenance)?;
         out.push(PlannedPage {
             path,
             folder,
@@ -212,6 +221,7 @@ fn plan_pages(pages: &[Page]) -> Result<Vec<PlannedPage>, Error> {
             summary: trimmed(page.summary.as_deref()),
             body: text(&page.body),
             sources,
+            provenance,
             created: page.created.trim().to_string(),
             updated: page.updated.trim().to_string(),
         });
@@ -408,6 +418,14 @@ fn render_page(page: &PlannedPage) -> String {
     } else {
         for source in &page.sources {
             out.push(format!("  - {}", yaml(source)));
+        }
+    }
+    out.push("provenance:".to_string());
+    if page.provenance.is_empty() {
+        out.push("  []".to_string());
+    } else {
+        for provenance in &page.provenance {
+            out.push(format!("  - {}", yaml(provenance)));
         }
     }
     out.push(format!("created: {}", yaml(&page.created)));
@@ -657,6 +675,21 @@ fn normalize_kind(kind: Option<&str>) -> String {
     }
 }
 
+fn normalize_provenance(values: &[String]) -> Result<Vec<String>, Error> {
+    let values = values.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    if let Some(value) = values
+        .iter()
+        .find(|value| !PROVENANCE_ORDER.contains(value))
+    {
+        return Err(Error(format!("unsupported page provenance: {value}")));
+    }
+    Ok(PROVENANCE_ORDER
+        .iter()
+        .filter(|value| values.contains(**value))
+        .map(|value| (*value).to_string())
+        .collect())
+}
+
 fn folder_for(kind: Option<&str>) -> &'static str {
     match normalize_kind(kind).as_str() {
         "entity" | "entities" => "entities",
@@ -785,6 +818,7 @@ mod tests {
                 kind: Some("concept".into()),
                 summary: Some("Line 1\nLine 2".into()),
                 body: "# Attention\n\nBody".into(),
+                provenance: vec!["source-grounded".into(), "agent-observed".into()],
                 source_artifact_paths: vec![source_path.clone()],
                 created: "2026-07-28".into(),
                 updated: "2026-07-29".into(),
@@ -802,6 +836,7 @@ mod tests {
         let concept =
             fs::read_to_string(root.join("wiki/concepts/attention/mechanism.md")).unwrap();
         assert!(concept.contains("sources:\n  - \"raw/sources/source-1--Attention-Paper.pdf\""));
+        assert!(concept.contains("provenance:\n  - \"source-grounded\"\n  - \"agent-observed\""));
         assert!(concept.contains("title: \"Attention\\nMechanism\""));
         assert_eq!(
             fs::read_to_string(root.join("raw/sources/source-1--Attention-Paper.pdf")).unwrap(),
@@ -838,6 +873,7 @@ mod tests {
                 kind: Some("concept".into()),
                 summary: None,
                 body: "Body".into(),
+                provenance: Vec::new(),
                 source_artifact_paths: Vec::new(),
                 created: "2026-07-28".into(),
                 updated: "2026-07-29".into(),
@@ -857,6 +893,7 @@ mod tests {
                 kind: Some("entity".into()),
                 summary: None,
                 body: "Body".into(),
+                provenance: Vec::new(),
                 source_artifact_paths: Vec::new(),
                 created: "2026-07-28".into(),
                 updated: "2026-07-29".into(),
@@ -922,6 +959,7 @@ mod tests {
                 kind: Some("concept".into()),
                 summary: Some("first summary".into()),
                 body: "Body v1".into(),
+                provenance: Vec::new(),
                 source_artifact_paths: vec!["raw/sources/source-1--source.txt".into()],
                 created: "2026-07-28".into(),
                 updated: "2026-07-29".into(),
@@ -950,6 +988,7 @@ mod tests {
                 kind: Some("concept".into()),
                 summary: Some("second summary".into()),
                 body: "Body v2".into(),
+                provenance: Vec::new(),
                 source_artifact_paths: vec!["raw/sources/source-1--source.txt".into()],
                 created: "2026-07-28".into(),
                 updated: "2026-07-30".into(),
@@ -1000,6 +1039,7 @@ mod tests {
                 kind: Some("concept".into()),
                 summary: None,
                 body: "Body".into(),
+                provenance: Vec::new(),
                 source_artifact_paths: Vec::new(),
                 created: "2026-07-29".into(),
                 updated: "2026-07-29".into(),
@@ -1032,6 +1072,7 @@ mod tests {
                 kind: Some("concept".into()),
                 summary: None,
                 body: "Body".into(),
+                provenance: Vec::new(),
                 source_artifact_paths: Vec::new(),
                 created: "2026-07-29".into(),
                 updated: "2026-07-29".into(),

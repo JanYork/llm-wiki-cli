@@ -240,6 +240,8 @@ fn purpose_and_markdown_projection_preserve_the_three_layer_architecture() {
         as_str(&page),
         "--source",
         &source_id,
+        "--provenance",
+        "agent-observed",
     ]);
     world.ok(&["maintenance", "materialize"]);
 
@@ -249,6 +251,7 @@ fn purpose_and_markdown_projection_preserve_the_three_layer_architecture() {
     assert!(projected.contains("type: \"concept\""));
     assert!(projected.contains("title: \"Architecture\""));
     assert!(projected.contains("sources:\n  - \"raw/sources/"));
+    assert!(projected.contains("provenance:\n  - \"source-grounded\"\n  - \"agent-observed\""));
     assert!(projected.contains("Body with [[other-page]]."));
 
     let index = fs::read_to_string(world.project.join(".lwc/wiki/index.md")).unwrap();

@@ -81,6 +81,9 @@ authorization; memory work never initiates the change.
   unless the current task explicitly authorizes another host-permitted root.
   Block the mutation on mismatch.
 - Search before repeating investigation or writing a page.
+- Before replacing a page, read it and repeat every still-valid source ID and
+  explicit non-source provenance value. Page writes replace both sets;
+  `source-grounded` is derived from citations and is never passed explicitly.
 - Before a multi-source ingest or broad replacement of existing pages, create a
   named `checkpoint`; restore only through LWC so it first preserves the current
   state.

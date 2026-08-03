@@ -514,12 +514,29 @@ enum SearchTarget {
     All,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ProvenanceArg {
+    UserProvided,
+    AgentObserved,
+    Hypothesis,
+}
+
+impl ProvenanceArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UserProvided => "user-provided",
+            Self::AgentObserved => "agent-observed",
+            Self::Hypothesis => "hypothesis",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum PageCommand {
     /// Create or replace one Agent-owned Wiki page.
     #[command(
         long_about = "Create or replace a persistent Wiki page, its source citations, wikilinks, FTS row, operation record, and Markdown projection in one logical update.\n\n\
-Use [[slug]] in the Markdown body to create graph edges. Repeat --source for every immutable source supporting the page. \
+Use [[slug]] in the Markdown body to create graph edges. Repeat --source for every immutable source supporting the page; source citations automatically add source-grounded provenance. Repeat --provenance for user-provided facts, Agent observations, or hypotheses. \
 Typical kinds are source, concept, entity, query, comparison, and synthesis. Every completed ingest requires a cited kind=source summary plus a cited non-source page, unless completion records a specific no-derived-pages reason.",
         after_help = "Examples:\n  lwc page put source-42 --title \"Paper summary\" --kind source --summary \"Main findings\" --file summary.md --source 42\n  lwc page put attention --title \"Attention\" --kind concept --summary \"Attention mechanisms\" --file concept.md --source 42 --source 57\n  lwc page put durable-answer --title \"Architecture decision\" --kind query --file answer.md --source 42"
     )]
@@ -541,6 +558,9 @@ Typical kinds are source, concept, entity, query, comparison, and synthesis. Eve
         /// Supporting source ID; repeat this option for multiple citations.
         #[arg(long = "source")]
         source_ids: Vec<i64>,
+        /// Explicit non-source provenance; repeat for mixed pages. Page replacement also replaces this set.
+        #[arg(long = "provenance")]
+        provenance: Vec<ProvenanceArg>,
     },
     /// List page metadata without returning full Markdown bodies.
     #[command(
@@ -835,6 +855,7 @@ fn run(cli: Cli) -> Result<Value> {
                     summary,
                     file,
                     source_ids,
+                    provenance,
                 } => {
                     let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                     require_text("slug", &slug)?;
@@ -849,6 +870,10 @@ fn run(cli: Cli) -> Result<Value> {
                         summary: Some(summary),
                         body,
                         source_ids,
+                        provenance: provenance
+                            .into_iter()
+                            .map(|value| value.as_str().to_string())
+                            .collect(),
                     })?;
                     store.materialize_wiki()?;
                     to_json(response)

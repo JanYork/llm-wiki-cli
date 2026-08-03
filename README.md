@@ -192,7 +192,7 @@ The persistent knowledge model has three logical layers:
 | Layer | Contents | Contract |
 | --- | --- | --- |
 | Raw sources | Immutable snapshots of curated input | Add through `source`; never rewrite source truth. |
-| Wiki | Agent-maintained pages, citations, and links | Update through `page`; keep claims source-grounded. |
+| Wiki | Agent-maintained pages, citations, links, and provenance | Update through `page`; cite sources and classify durable non-source knowledge. |
 | Schema and purpose | Maintenance rules and project intent | Guide every future ingest and revision. |
 
 SQLite is canonical. The Markdown tree is a rebuildable projection for people
@@ -290,7 +290,7 @@ need to run these commands during normal use.
 ```bash
 cd your-project
 lwc init
-printf '# Schema\nEvery factual page cites sources.\n' | lwc schema set -
+printf '# Schema\nEvery page declares provenance; source-grounded claims cite sources.\n' | lwc schema set -
 printf '# Purpose\nBuild a durable project Wiki.\n' | lwc purpose set -
 ```
 
@@ -373,6 +373,27 @@ shared page, complete it with a specific audited explanation:
 lwc ingest complete 1 \
   --no-derived-pages-reason "Duplicate evidence; existing synthesis already covers every supported claim"
 ```
+
+Source citations automatically expose `source-grounded` provenance. For
+durable knowledge that comes from the user, an Agent observation, or an
+explicit hypothesis, repeat `--provenance` as needed instead of inventing a
+source:
+
+```bash
+lwc page put architecture-decision \
+  --title "Architecture decision" \
+  --kind query \
+  --summary "Accepted constraint and remaining uncertainty" \
+  --file decision.md \
+  --provenance user-provided \
+  --provenance hypothesis
+```
+
+`page put` replaces the complete citation and explicit-provenance sets. Read
+the existing page first, then repeat every still-valid `--source` and
+non-source `--provenance` value. Do not pass `source-grounded` explicitly; it is
+derived from citations. Provenance is returned by page reads, context, search,
+source references, and Markdown projection, but does not change search ranking.
 
 ### 4. Query the accumulated Wiki
 
