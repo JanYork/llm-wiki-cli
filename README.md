@@ -17,6 +17,122 @@ The agent reasons and synthesizes; `lwc` preserves sources, pages, citations,
 links, indexes, and history so knowledge compounds instead of being rediscovered
 from raw chunks on every query.
 
+## LWC Is Agent Memory, Not RAG
+
+RAG and LWC can both help an LLM work with external documents, but they keep
+state in different places. A typical RAG request retrieves raw chunks and builds
+one answer at query time:
+
+```text
+query -> retrieve chunks -> generate answer
+```
+
+LWC keeps the useful work between requests:
+
+```text
+task -> recall maintained Wiki -> reason from sources and prior synthesis
+     -> write durable improvements back
+```
+
+Retrieval is one operation inside LWC, not its organizing principle. The durable
+artifact is a source-grounded Wiki whose pages, citations, links,
+contradictions, and history are revised as knowledge changes. LWC therefore
+does not require embeddings or a vector database, and it does not discard each
+synthesis after answering. It can complement RAG, but it is not query-time RAG.
+
+### The Agent operates LWC
+
+`lwc` is a machine interface for Agents, not a human-facing note-taking app. In
+normal use, a human selects sources, states goals, asks questions, and reviews
+answers or the projected Markdown. The Agent runs the CLI, manages scope,
+integrates sources, maintains citations and links, and decides what is worth
+recalling or writing back.
+
+Do not manually drive the routine `lwc` workflow unless you are developing or
+debugging the tool. Ask your Agent to activate the bundled `using-lwc` Skill
+instead—usually as `$using-lwc`. The setup below also registers `$using-wiki`
+where the Agent runtime supports named Skill commands.
+
+## Recommended: Ask Your Agent to Set Up LWC
+
+Paste this prompt into the Agent you use. It uses that Agent's own native
+settings to install the CLI and user-level Skills, initialize global memory,
+and add a minimal session-start reminder when Hooks are available—all without
+overwriting existing configuration.
+
+<details>
+<summary><strong>Copy the complete setup prompt</strong></summary>
+
+```text
+Configure LWC completely for the current user and the Agent runtime executing
+this prompt. Perform the work and verify it; do not merely describe commands
+for me to run.
+
+Source of truth:
+- https://github.com/JanYork/llm-wiki-cli
+- https://github.com/JanYork/llm-wiki-cli/tree/main/skills/using-lwc
+
+Requirements:
+1. Read the repository README, SECURITY.md, the complete
+   skills/using-lwc/SKILL.md, and every directly required script/reference
+   before executing it. Record the source commit SHA used for installation.
+2. Use your own native user-level locations and mechanisms for Skills, global
+   instructions, and lifecycle Hooks. Do not ask the user to identify your
+   configuration files, assume another Agent's filenames, or configure other
+   installed Agent runtimes unless explicitly requested.
+3. Preserve all existing user configuration. Before changing an existing file
+   or Skill, create a timestamped backup; make every edit idempotent and do not
+   duplicate blocks when this prompt is run again.
+4. Install or update `skills/using-lwc` as the canonical user-level Skill. If
+   the runtime supports named Skill commands, register `$using-lwc` from that
+   canonical Skill and `$using-wiki` as a thin alias that delegates to it. Do
+   not copy the implementation into two independently maintained Skills. If the
+   runtime uses different invocation syntax, expose the closest native aliases
+   and report their exact names. Verify both entry points when supported.
+5. From the current host-authorized workspace root, run the canonical Skill's
+   bootstrap exactly as its instructions require. Let it install the official
+   SHA-256-verified LWC release when needed and initialize ~/.lwc global memory.
+   Validate the returned JSON, the absolute lwc path, `lwc --version`, and the
+   global Wiki. Do not initialize any project Wiki unless the user explicitly
+   requests it for that project; never use global memory as a fallback for
+   project-specific writes.
+6. Apply the smallest complementary integration through your own native
+   configuration:
+   - Add a concise LWC routing rule to your additive user-level global
+     system/developer instructions. Do not replace your built-in prompt.
+   - Merge one LWC section into your user-level global instruction file,
+     whatever that file is named. Enclose it with the exact comments
+     `<!-- LWC_START -->` and `<!-- LWC_END -->`. On later runs, replace only
+     the content inside those markers and leave every user-owned line outside
+     them untouched. If only one marker exists, stop rather than guessing where
+     user content ends. The section should require use of the canonical LWC
+     Skill for substantive project, research, planning, debugging, decision,
+     or document-ingest work; recall before re-deriving; write back durable
+     findings; keep project and global scopes separate; respect the authorized
+     workspace boundary; and never store secrets, raw chain-of-thought,
+     transient logs, or unsupported guesses.
+   - When you support lifecycle Hooks, create or merge one native user-level
+     session-start Hook. It should only add a brief reminder to evaluate and use
+     the LWC Skill at suitable times. The Hook must not read, initialize, or
+     mutate a project Wiki itself. Do not add a per-prompt Hook, replace
+     unrelated Hooks, or bypass Hook trust review. If you do not support Hooks,
+     rely on the global instructions and report that limitation instead of
+     inventing a mechanism.
+7. Keep the Skill, global instructions, and Hook short and complementary instead
+   of repeating the full policy. The canonical Skill remains authoritative.
+8. Validate every changed config file and Hook executable, confirm existing
+   config is preserved, and run the smallest safe smoke checks. Use only your
+   native supported configuration rather than inventing keys or filenames.
+
+Finish with a concise report containing: detected Agent runtime, installed LWC
+version and path, source commit, installed Skill and alias paths, global Wiki
+path, Hook/config files changed, backup paths, validation performed, unsupported
+integrations, and anything that requires a new Agent session or normal Hook
+trust approval.
+```
+
+</details>
+
 ## Origin and Acknowledgements
 
 `lwc` implements the [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
@@ -88,16 +204,11 @@ Read commands keep current-format stores read-only. When an older writable
 store is opened by a newer CLI, its schema is migrated transactionally once
 before the read proceeds.
 
-## Why This Is Not Just RAG
-
-Traditional RAG retrieves raw chunks and reconstructs an answer for every query.
-`lwc` instead maintains a persistent Wiki: sources remain immutable, useful
-synthesis becomes durable pages, contradictions and links survive across
-sessions, and better answers can be written back into the knowledge base.
-
-The result is accumulated knowledge, not only retrieval.
-
 ## Installation
+
+Most users should use the Agent setup prompt above. The manual commands below
+are for maintainers, debugging, or Agent environments that cannot install the
+companion Skill.
 
 Install from GitHub:
 
@@ -131,13 +242,17 @@ cargo install --locked --path .
 ## Companion Agent Skill
 
 The repository includes [`skills/using-lwc`](skills/using-lwc), an Agent Skill
-that makes `lwc` a proactive memory layer for substantive sessions. From a
-local checkout, install it for Codex with:
+that makes `lwc` a proactive memory layer for substantive sessions. Install it
+in the current Agent runtime's user-level Skills directory. For Codex, from a
+local checkout:
 
 ```bash
 mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
 cp -R skills/using-lwc "${CODEX_HOME:-$HOME/.codex}/skills/"
 ```
+
+The canonical invocation is `$using-lwc`. The setup prompt above also creates
+the optional `$using-wiki` alias without duplicating the Skill implementation.
 
 When triggered, the Skill:
 
@@ -160,11 +275,15 @@ downloaded archive against `SHA256SUMS`; the checksum is integrity protection,
 not publisher code signing. Release binaries cover x86_64/aarch64 macOS, glibc
 Linux, and Windows through Git Bash. `SKILL.md` follows the Agent Skills
 resource layout, while
-`agents/openai.yaml` supplies OpenAI/Codex metadata. Other Agent harnesses may
-load the Skill when they support that layout, but universal compatibility is
-not assumed.
+`agents/openai.yaml` supplies OpenAI/Codex metadata. The CLI itself is
+runtime-neutral: any Agent that can execute it and load or adapt the Skill's
+instructions can use LWC. Skill commands, global instructions, and Hooks remain
+runtime-specific, so the setup prompt detects and configures the current host.
 
 ## Quick Start
+
+This section documents the CLI protocol that the Agent executes. Humans do not
+need to run these commands during normal use.
 
 ### 1. Initialize a project Wiki
 
