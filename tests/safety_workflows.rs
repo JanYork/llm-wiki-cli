@@ -477,7 +477,10 @@ fn source_diff_requires_both_external_and_sensitive_acknowledgements() {
     assert_eq!(allowed["changed"], true);
     assert_eq!(
         allowed["to"]["tracked_path"],
-        fs::canonicalize(&external).unwrap().to_str().unwrap()
+        fs::canonicalize(&external)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/")
     );
     assert!(
         allowed["diff"]["text"]

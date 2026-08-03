@@ -2268,10 +2268,12 @@ fn to_json<T: Serialize>(value: T) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::{
-        MAX_INPUT_BYTES, Scope, StorePath, ensure_source_status_unchanged, file_fingerprint,
-        inspect_prepared_source, open_live_source, prepare_live_source, read_file_bounded,
+        MAX_INPUT_BYTES, Scope, StorePath, file_fingerprint, inspect_prepared_source,
+        open_live_source, prepare_live_source,
     };
+    use super::{ensure_source_status_unchanged, read_file_bounded};
     use crate::store::{SourceStatusTarget, SourceStatusTargets};
 
     #[test]

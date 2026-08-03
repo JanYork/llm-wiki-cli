@@ -2,23 +2,22 @@
 
 Plan ID: `source-diff-review`
 Status: `in_progress`
-Version: `2`
-Updated: `2026-08-03T18:52:00+08:00`
+Version: `3`
+Updated: `2026-08-03T21:15:48+08:00`
 Dependencies: all sibling documents and `plan-manifest.json`.
 
 ## Current Status
 
-Phase: `TASK-005-candidate-ready`. The bounded diff command, shared live-read
-safety, public/safety tests, bilingual docs, canonical Skill policy, v0.6
-capability probe, and release-note workflow are implemented. All pre-freeze
-product, installer, local-only Skill, feature-benchmark, and retained-regression
-gates pass. No release candidate commit or final frozen-candidate matrix exists
-yet.
+Phase: `TASK-005-corrective-candidate-ready`. The complete v0.6.0 candidate and
+local frozen-candidate matrix passed, but its immutable release run failed only
+on Windows because one new test compared slash-normalized CLI output with a
+native backslash path. The product path contract is unchanged; the assertion is
+now platform-neutral, Windows cross-compilation is warning-free, and the package
+version is v0.6.1.
 
-This plan bundle is finalized for the release-candidate commit. Add and freeze
-it with the complete tracked v0.6.0 change; after that commit, write measured
-evidence only below the ignored `.local-benchmarks/` tree and in the final user
-report. Any later tracked edit invalidates the frozen matrix.
+This bundle is finalized for the corrective v0.6.1 candidate commit. After that
+commit, write measured evidence only below the ignored `.local-benchmarks/` tree
+and in the final user report. Any later tracked edit invalidates the matrix.
 
 ## Goal and Non-goals
 
@@ -139,13 +138,18 @@ combined review engine.
   live bytes was rejected: `FLOW-001` returns an empty diff before live text is
   exposed, matching the locked content-reveal boundary. Changed flagged live
   content still requires the explicit acknowledgement and remains tested.
+- The immutable v0.6.0 release run passed all four Unix targets but failed both
+  Windows targets in the Test step. The deterministic cause was the external
+  source test comparing normalized `/` output with Windows-native `\` output.
+  The test expectation is now normalized, the v0.6.0 tag remains unmoved, and
+  v0.6.1 is the corrective release candidate.
 
 ## Next Action
 
-Create the focused v0.6.0 release-candidate commit, require a clean tracked
-worktree, build from that exact HEAD, copy the checksum-verified binary into all
-documented candidate slots, and run the complete checksum-bound local matrix.
-Any tracked correction restarts the full matrix.
+Create the focused v0.6.1 corrective release-candidate commit, require a clean
+tracked worktree, build from that exact HEAD, copy the checksum-verified binary
+into all documented candidate slots, and run the complete checksum-bound local
+matrix. Any tracked correction restarts the full matrix.
 
 ## Resume Commands
 
@@ -193,3 +197,6 @@ step; do not rerun an earlier phase unless a tracked correction is required.
 - `DEC-008` 2026-08-03: finish and commit v0.6.0 before final verification;
   benchmarks and release must use that exact commit/binary, and any tracked edit
   forces the whole final matrix to rerun.
+- `DEC-009` 2026-08-03: never move the failed v0.6.0 tag. Normalize the incorrect
+  Windows test expectation, keep the portable `/` product contract, and publish
+  the corrective candidate as v0.6.1 only after the full matrix reruns.

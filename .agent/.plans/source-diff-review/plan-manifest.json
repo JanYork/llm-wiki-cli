@@ -2,8 +2,8 @@
   "plan_id": "source-diff-review",
   "title": "Bounded Source Diff and Direct Citation Review",
   "status": "in_progress",
-  "version": 2,
-  "updated_at": "2026-08-03T18:52:00+08:00",
+  "version": 3,
+  "updated_at": "2026-08-03T21:15:48+08:00",
   "source_documents": [
     {"path": "user-request", "kind": "requirement", "verified": true},
     {"path": "src/main.rs", "kind": "code", "verified": true},
@@ -66,7 +66,8 @@
     {"id": "DEC-005", "summary": "No schema, cache, semantic impact, automatic write, or hunk pagination in v0.6.", "status": "accepted"},
     {"id": "DEC-006", "summary": "Scan live diff content for secrets and require explicit sensitive acknowledgement.", "status": "accepted"},
     {"id": "DEC-007", "summary": "Only one has_more=false refs query is complete; multi-call pagination remains an explicitly incomplete observation.", "status": "accepted"},
-    {"id": "DEC-008", "summary": "Freeze and commit v0.6.0 before the final matrix; any later tracked edit invalidates all final evidence.", "status": "accepted"}
+    {"id": "DEC-008", "summary": "Freeze and commit v0.6.0 before the final matrix; any later tracked edit invalidates all final evidence.", "status": "accepted"},
+    {"id": "DEC-009", "summary": "Keep the failed v0.6.0 tag immutable, correct the Windows-only test expectation, and ship the rerun candidate as v0.6.1.", "status": "accepted"}
   ],
   "documents": [
     {"path": "00-requirements.md", "owner": "requirements", "supersedes": null},
@@ -78,14 +79,16 @@
     {"path": "06-handoff.md", "owner": "continuity", "supersedes": null},
     {"path": "07-antipatterns.md", "owner": "negative-boundaries", "supersedes": null}
   ],
-  "current_phase": "TASK-005-candidate-ready",
-  "next_action": "Create the focused v0.6.0 candidate commit, build that exact HEAD, and run the complete checksum-bound local benchmark matrix without further tracked edits.",
+  "current_phase": "TASK-005-corrective-candidate-ready",
+  "next_action": "Create the focused v0.6.1 corrective candidate commit, build that exact HEAD, and rerun the complete checksum-bound local benchmark matrix without further tracked edits.",
   "blockers": [],
   "last_verification": {
-    "at": "2026-08-03T18:52:00+08:00",
+    "at": "2026-08-03T21:15:48+08:00",
     "evidence": [
-      "git HEAD fdce470 on main at v0.5.0",
-      "installed lwc 0.5.0 project bootstrap in authorized root",
+      "git HEAD fd9f62a on main at immutable v0.6.0 tag",
+      "v0.6.0 frozen local matrix passed before the release attempt",
+      "release run 30815853302 passed four Unix targets and failed both Windows Test jobs",
+      "Windows-only slash-normalization assertion root cause corrected for v0.6.1",
       "repository code/tests/docs/workflows inspected",
       "official similar 3.1.1 API and license inspected",
       "retained local benchmark assets and hard-coded runner binary paths inspected",
