@@ -44,6 +44,9 @@ jobs:
       - name: Test release installer
         run: ./tests/install_script.sh
 
+      - name: Validate release workflow contract
+        run: ./tests/release_workflow.sh
+
       # Companion Agent Skill checks are local-only; do not add them to repository CI.
 
       - name: Build release binary

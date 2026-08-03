@@ -147,6 +147,7 @@ jobs:
           test "$(git cat-file -t "${GITHUB_REF_NAME}")" = "tag"
           notes="$(git for-each-ref --format='%(contents:body)' "refs/tags/${GITHUB_REF_NAME}")"
           test -n "$(printf '%s' "$notes" | tr -d '[:space:]')"
+          printf '%s\n' "$notes" > "${RUNNER_TEMP}/release-notes.md"
 
       - name: Publish release assets
         env:
@@ -156,7 +157,7 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
             --title "lwc ${GITHUB_REF_NAME}" \
-            --notes-from-tag \
+            --notes-file "${RUNNER_TEMP}/release-notes.md" \
             release-assets/*.tar.gz \
             release-assets/*.zip \
             release-assets/SHA256SUMS \

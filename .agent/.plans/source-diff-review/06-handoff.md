@@ -2,20 +2,20 @@
 
 Plan ID: `source-diff-review`
 Status: `in_progress`
-Version: `3`
-Updated: `2026-08-03T21:15:48+08:00`
+Version: `4`
+Updated: `2026-08-03T13:45:43Z`
 Dependencies: all sibling documents and `plan-manifest.json`.
 
 ## Current Status
 
-Phase: `TASK-005-corrective-candidate-ready`. The complete v0.6.0 candidate and
-local frozen-candidate matrix passed, but its immutable release run failed only
-on Windows because one new test compared slash-normalized CLI output with a
-native backslash path. The product path contract is unchanged; the assertion is
-now platform-neutral, Windows cross-compilation is warning-free, and the package
-version is v0.6.1.
+Phase: `TASK-005-release-workflow-corrective-candidate-ready`. The immutable
+v0.6.1 release run passed all six target builds and combined checksums, then the
+publish step failed before any API mutation. GitHub CLI explicitly rejects
+`--notes-from-tag` together with `--repo`; the workflow now persists the already
+validated annotated-tag body and publishes that exact file with `--notes-file`.
+The package version is v0.6.2.
 
-This bundle is finalized for the corrective v0.6.1 candidate commit. After that
+This bundle is finalized for the corrective v0.6.2 candidate commit. After that
 commit, write measured evidence only below the ignored `.local-benchmarks/` tree
 and in the final user report. Any later tracked edit invalidates the matrix.
 
@@ -108,7 +108,8 @@ combined review engine.
 - Release audit proved every historical Release body was generated with
   `--generate-notes` and, without associated PRs, collapsed to a Full Changelog
   link even though annotated tags had useful text. The workflow now requires an
-  annotated tag with a nonblank body and publishes it with `--notes-from-tag`;
+  annotated tag with a nonblank body and publishes that validated body with
+  `--notes-file`;
   `CONTRIBUTING.md` defines the user-facing section contract.
 - Widest pre-freeze gates passed: `cargo fmt --check`, strict all-target Clippy,
   debug and release all-target tests, release build, installer tests, and both
@@ -143,10 +144,15 @@ combined review engine.
   source test comparing normalized `/` output with Windows-native `\` output.
   The test expectation is now normalized, the v0.6.0 tag remains unmoved, and
   v0.6.1 is the corrective release candidate.
+- The immutable v0.6.1 release run passed all six target builds and combined
+  checksums. Its publish command failed before calling the Release API because
+  GitHub CLI rejects `--notes-from-tag` together with `--repo`. The new local
+  workflow-contract test failed before the fix and passes after the workflow
+  writes the validated annotation once and publishes it via `--notes-file`.
 
 ## Next Action
 
-Create the focused v0.6.1 corrective release-candidate commit, require a clean
+Create the focused v0.6.2 corrective release-candidate commit, require a clean
 tracked worktree, build from that exact HEAD, copy the checksum-verified binary
 into all documented candidate slots, and run the complete checksum-bound local
 matrix. Any tracked correction restarts the full matrix.
@@ -200,3 +206,6 @@ step; do not rerun an earlier phase unless a tracked correction is required.
 - `DEC-009` 2026-08-03: never move the failed v0.6.0 tag. Normalize the incorrect
   Windows test expectation, keep the portable `/` product contract, and publish
   the corrective candidate as v0.6.1 only after the full matrix reruns.
+- `DEC-010` 2026-08-03: never move the failed v0.6.1 tag. Publish the exact
+  annotated-tag body already validated by Git using `--notes-file`, retain the
+  explicit repository target, and ship the workflow correction as v0.6.2.

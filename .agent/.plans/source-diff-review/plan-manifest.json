@@ -2,8 +2,8 @@
   "plan_id": "source-diff-review",
   "title": "Bounded Source Diff and Direct Citation Review",
   "status": "in_progress",
-  "version": 3,
-  "updated_at": "2026-08-03T21:15:48+08:00",
+  "version": 4,
+  "updated_at": "2026-08-03T13:45:43Z",
   "source_documents": [
     {"path": "user-request", "kind": "requirement", "verified": true},
     {"path": "src/main.rs", "kind": "code", "verified": true},
@@ -67,7 +67,8 @@
     {"id": "DEC-006", "summary": "Scan live diff content for secrets and require explicit sensitive acknowledgement.", "status": "accepted"},
     {"id": "DEC-007", "summary": "Only one has_more=false refs query is complete; multi-call pagination remains an explicitly incomplete observation.", "status": "accepted"},
     {"id": "DEC-008", "summary": "Freeze and commit v0.6.0 before the final matrix; any later tracked edit invalidates all final evidence.", "status": "accepted"},
-    {"id": "DEC-009", "summary": "Keep the failed v0.6.0 tag immutable, correct the Windows-only test expectation, and ship the rerun candidate as v0.6.1.", "status": "accepted"}
+    {"id": "DEC-009", "summary": "Keep the failed v0.6.0 tag immutable, correct the Windows-only test expectation, and ship the rerun candidate as v0.6.1.", "status": "accepted"},
+    {"id": "DEC-010", "summary": "Keep the failed v0.6.1 tag immutable and publish the exact validated tag annotation via notes-file in v0.6.2.", "status": "accepted"}
   ],
   "documents": [
     {"path": "00-requirements.md", "owner": "requirements", "supersedes": null},
@@ -79,13 +80,13 @@
     {"path": "06-handoff.md", "owner": "continuity", "supersedes": null},
     {"path": "07-antipatterns.md", "owner": "negative-boundaries", "supersedes": null}
   ],
-  "current_phase": "TASK-005-corrective-candidate-ready",
-  "next_action": "Create the focused v0.6.1 corrective candidate commit, build that exact HEAD, and rerun the complete checksum-bound local benchmark matrix without further tracked edits.",
+  "current_phase": "TASK-005-release-workflow-corrective-candidate-ready",
+  "next_action": "Create the focused v0.6.2 corrective candidate commit, build that exact HEAD, and rerun the complete checksum-bound local benchmark matrix without further tracked edits.",
   "blockers": [],
   "last_verification": {
-    "at": "2026-08-03T21:15:48+08:00",
+    "at": "2026-08-03T13:45:43Z",
     "evidence": [
-      "git HEAD fd9f62a on main at immutable v0.6.0 tag",
+      "git HEAD 8ef5dbc on main at immutable v0.6.1 tag before the v0.6.2 workflow correction",
       "v0.6.0 frozen local matrix passed before the release attempt",
       "release run 30815853302 passed four Unix targets and failed both Windows Test jobs",
       "Windows-only slash-normalization assertion root cause corrected for v0.6.1",
@@ -100,7 +101,9 @@
       "release workflow YAML and annotated-tag note preflight passed",
       "fixed 1001-citer stable/changing policy transcripts now exercise de-duplication and incomplete pagination labels",
       "renderer characterization now proves insertion deletion replacement and untruncated CJK-emoji visibility",
-      "pre-freeze independent rereview found no remaining blocker or high finding"
+      "pre-freeze independent rereview found no remaining blocker or high finding",
+      "v0.6.1 release run passed six target builds and checksums, then exposed the documented gh notes-from-tag plus repo flag conflict",
+      "release workflow contract test failed before the notes-file fix and passes after it"
     ]
   }
 }
