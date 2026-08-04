@@ -221,6 +221,15 @@ enum Command {
         #[command(subcommand)]
         command: GraphCommand,
     },
+    /// Apply explicit, bounded retrieval adjustments and query-specific feedback.
+    #[command(
+        long_about = "Manage project-local retrieval adjustments. Document weights affect only already-matching candidates; feedback applies only to the same token fingerprint. User-provided values override Agent-observed values without deleting either row.",
+        after_help = "Examples:\n  lwc weight set page payment-rules --value 2 --reason \"canonical specification\" --provenance agent-observed\n  lwc weight feedback page payment-rules --query \"payment rules\" --signal relevant --reason \"verified result\" --provenance user-provided\n  lwc weight list page payment-rules\n  lwc weight clear page payment-rules --provenance agent-observed"
+    )]
+    Weight {
+        #[command(subcommand)]
+        command: WeightCommand,
+    },
     /// Rebuild derived search or Markdown artifacts from SQLite.
     #[command(
         long_about = "Repair or compact derived artifacts without changing canonical source or page knowledge. SQLite remains authoritative.",
@@ -265,6 +274,9 @@ Combining --scope all with --record appends the query operation to each selected
         /// Persist the query; with scope=all, append it to each selected store.
         #[arg(long)]
         record: bool,
+        /// Include exact bounded score signals and arithmetic for every result.
+        #[arg(long)]
+        explain: bool,
     },
     /// Return Agent-ready schema, purpose, page index, and recent operations.
     #[command(
@@ -584,6 +596,105 @@ The result exposes each scoring signal so Agents can explain why pages are relat
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum WeightCommand {
+    /// Set or replace one bounded document adjustment.
+    Set {
+        #[arg(value_enum)]
+        target: WeightTargetArg,
+        identifier: String,
+        #[arg(long, allow_hyphen_values = true)]
+        value: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, value_enum)]
+        provenance: WeightProvenanceArg,
+    },
+    /// List both provenance rows and the effective document adjustment.
+    List {
+        #[arg(value_enum)]
+        target: WeightTargetArg,
+        identifier: String,
+    },
+    /// Clear one provenance row without changing the other.
+    Clear {
+        #[arg(value_enum)]
+        target: WeightTargetArg,
+        identifier: String,
+        #[arg(long, value_enum)]
+        provenance: WeightProvenanceArg,
+    },
+    /// Record an explicit query-specific relevant or irrelevant judgment.
+    Feedback {
+        #[arg(value_enum)]
+        target: WeightTargetArg,
+        identifier: String,
+        #[arg(long)]
+        query: String,
+        #[arg(long, value_enum)]
+        signal: FeedbackSignalArg,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, value_enum)]
+        provenance: WeightProvenanceArg,
+    },
+    /// Clear one query-specific feedback row.
+    FeedbackClear {
+        #[arg(value_enum)]
+        target: WeightTargetArg,
+        identifier: String,
+        #[arg(long)]
+        query: String,
+        #[arg(long, value_enum)]
+        provenance: WeightProvenanceArg,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WeightTargetArg {
+    Page,
+    Source,
+}
+
+impl WeightTargetArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Page => "page",
+            Self::Source => "source",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WeightProvenanceArg {
+    UserProvided,
+    AgentObserved,
+}
+
+impl WeightProvenanceArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UserProvided => "user-provided",
+            Self::AgentObserved => "agent-observed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum FeedbackSignalArg {
+    Relevant,
+    Irrelevant,
+}
+
+impl FeedbackSignalArg {
+    fn value(self) -> i32 {
+        match self {
+            Self::Relevant => 1,
+            Self::Irrelevant => -1,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -1233,6 +1344,88 @@ fn run(cli: Cli) -> Result<Value> {
                 }
             }
         }
+        Command::Weight { command } => {
+            ensure_scope_supported(cli.scope, false, "weight")?;
+            let store_path = resolve_store_path(cli.scope, &cwd)?;
+            match command {
+                WeightCommand::List { target, identifier } => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    to_json(store.retrieval_weight_list(target.as_str(), &identifier)?)
+                }
+                WeightCommand::Set {
+                    target,
+                    identifier,
+                    value,
+                    reason,
+                    provenance,
+                } => {
+                    let value = value.parse::<i32>().map_err(|_| {
+                        AppError::new("invalid_weight", "weight must be one of -2, -1, 1, or 2")
+                    })?;
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.retrieval_weight_set(
+                        target.as_str(),
+                        &identifier,
+                        value,
+                        &reason,
+                        provenance.as_str(),
+                    )?;
+                    store.materialize_wiki()?;
+                    to_json(response)
+                }
+                WeightCommand::Clear {
+                    target,
+                    identifier,
+                    provenance,
+                } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.retrieval_weight_clear(
+                        target.as_str(),
+                        &identifier,
+                        provenance.as_str(),
+                    )?;
+                    store.materialize_wiki()?;
+                    to_json(response)
+                }
+                WeightCommand::Feedback {
+                    target,
+                    identifier,
+                    query,
+                    signal,
+                    reason,
+                    provenance,
+                } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.retrieval_feedback_set(
+                        target.as_str(),
+                        &identifier,
+                        &query,
+                        signal.value(),
+                        &reason,
+                        provenance.as_str(),
+                    )?;
+                    store.materialize_wiki()?;
+                    to_json(response)
+                }
+                WeightCommand::FeedbackClear {
+                    target,
+                    identifier,
+                    query,
+                    provenance,
+                } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.retrieval_feedback_clear(
+                        target.as_str(),
+                        &identifier,
+                        &query,
+                        provenance.as_str(),
+                    )?;
+                    store.materialize_wiki()?;
+                    to_json(response)
+                }
+            }
+        }
         Command::Maintenance { command } => {
             ensure_scope_supported(cli.scope, false, "maintenance")?;
             let store_path = resolve_store_path(cli.scope, &cwd)?;
@@ -1275,6 +1468,7 @@ fn run(cli: Cli) -> Result<Value> {
             kinds,
             limit,
             record,
+            explain,
         } => {
             require_text("query", &query)?;
             validate_limit(limit)?;
@@ -1293,7 +1487,11 @@ fn run(cli: Cli) -> Result<Value> {
                 SearchTarget::Source => SearchMode::Source,
                 SearchTarget::All => SearchMode::All,
             };
-            let options = SearchOptions { mode, kinds };
+            let options = SearchOptions {
+                mode,
+                kinds,
+                explain,
+            };
             let paths = resolve_read_store_paths(cli.scope, &cwd, true)?;
             let mut stores = if record {
                 paths

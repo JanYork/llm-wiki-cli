@@ -162,6 +162,7 @@ then `lwc ingest retry 12`. Queue state and analysis survive process restarts.
 
 ```bash
 lwc search "question keywords" --type auto --limit 20
+lwc search "question keywords" --type auto --limit 20 --explain
 lwc page show relevant-slug
 lwc source show 12 --max-chars 100000
 lwc graph related relevant-slug
@@ -175,6 +176,38 @@ restrict page kinds.
 
 Low-level searches are private and read-only by default. Add `--record` only
 for a top-level query whose wording should appear in the durable operation log.
+
+Use `--explain` before changing retrieval state. It reports the exact
+lower-is-better score, bounded title/path/generic/graph signals, effective
+manual adjustment, and effective query feedback. It is read-only and does not
+imply that a high-ranked page is factually correct.
+
+Use a document weight only for durable, query-independent importance and use
+query feedback only after checking one concrete result:
+
+```bash
+lwc weight set page relevant-slug \
+  --value 1 \
+  --reason "Current canonical implementation guide" \
+  --provenance agent-observed
+lwc weight feedback page relevant-slug \
+  --query "question keywords" \
+  --signal relevant \
+  --reason "Expected page verified" \
+  --provenance agent-observed
+```
+
+Agents may create `agent-observed` rows when current evidence supports the
+judgment. Use `user-provided` only for the user's explicit judgment; it wins
+when both exist. Never infer weights from clicks, rank position, page length,
+directory depth, or a single unverified answer. Clear obsolete state instead
+of stacking compensating values. Document weights are limited to
+`-2,-1,1,2`; feedback is `relevant` or `irrelevant`, applies only to the same
+ordered-token fingerprint, and does not generalize to paraphrases. Both affect
+only lexical candidates. Feedback omits the raw query from SQLite and the
+operation log, but `--reason` is durable and must not repeat sensitive text.
+Run mutations in one explicit `project` or `global` scope; `--scope all` is
+read-only for this purpose.
 
 Synthesize the answer from the selected material. If it is likely to be useful again, save it:
 
@@ -207,6 +240,8 @@ semantic pass the CLI cannot perform:
 `untitled_source` identifies legacy rows that still need a readable title.
 `shallow_ingest` identifies completed legacy jobs with only a source summary
 and no explicit no-derived-pages reason.
+`retrieval_weight_orphan` and `retrieval_feedback_orphan` identify adjustments
+whose page or source was removed outside the guarded CLI workflow.
 
 Lint is read-only by default. Use `lwc lint --record` only when the validation
 event itself belongs in durable operation history.
@@ -234,7 +269,10 @@ lwc maintenance reindex
   alphanumeric tokens.
 - A lower numeric `rank` is more relevant.
 - `--scope all` globally merges project and global hits using the same fixed
-  title/summary/body scoring scale; project wins exact ties.
+  field, specificity, graph, manual, and feedback scale; project wins exact
+  ties.
+- `--explain` is the authority for score arithmetic. A document weight is
+  query-independent; feedback is keyed by the ordered tokenizer output.
 - Search is lexical. If no suitable hit exists, inspect the index and sources;
   do not treat an empty result as proof that the knowledge is absent.
 

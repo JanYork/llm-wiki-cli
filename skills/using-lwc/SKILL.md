@@ -81,6 +81,18 @@ authorization; memory work never initiates the change.
   unless the current task explicitly authorizes another host-permitted root.
   Block the mutation on mismatch.
 - Search before repeating investigation or writing a page.
+- Diagnose a surprising result with `search --explain` before changing
+  retrieval state. Use `weight set` only for evidence-backed, durable document
+  importance and `weight feedback` only after verifying one concrete query
+  result. Write Agent judgments as `agent-observed`; use `user-provided` only
+  when the user explicitly supplied that judgment. User rows take precedence
+  while both remain auditable. Never infer a weight from rank position, clicks,
+  page length, directory depth, or an unchecked answer. Clear obsolete state
+  instead of stacking compensating values. Weights and feedback only rerank
+  lexical candidates; feedback is exact-token-specific and does not learn a
+  paraphrase. It stores no raw query, but its durable `--reason` must not repeat
+  secrets or sensitive query text. Mutate one explicit `project` or `global`
+  scope; never use `--scope all` for retrieval-state changes.
 - Before replacing a page, read it and repeat every still-valid source ID and
   explicit non-source provenance value. Page writes replace both sets;
   `source-grounded` is derived from citations and is never passed explicitly.

@@ -115,6 +115,35 @@ fn chinese_subword_search_hits() {
 }
 
 #[test]
+fn canonical_source_path_is_searchable_even_with_an_unrelated_title() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let source = world.write(
+        "docs/reconciliation/channel-output-contract.md",
+        "This body deliberately omits the filename vocabulary.",
+    );
+    let added = world.ok(
+        &world.project,
+        &[
+            "source",
+            "add",
+            as_str(&source),
+            "--title",
+            "Opaque evidence record",
+        ],
+    );
+
+    let search = world.ok(
+        &world.project,
+        &["search", "channel output contract", "--type", "source"],
+    );
+    assert_eq!(
+        search["results"][0]["identifier"],
+        added["source"]["id"].as_i64().unwrap().to_string()
+    );
+}
+
+#[test]
 fn punctuation_queries_do_not_raise_fts_syntax_errors() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
@@ -487,6 +516,116 @@ fn concurrent_searches_page_puts_and_duplicate_sources_all_succeed() {
     );
     let pages = world.ok(&world.project, &["page", "list"]);
     assert_eq!(pages["pages"].as_array().unwrap().len(), WORKERS);
+}
+
+#[test]
+fn concurrent_weight_feedback_and_search_commands_serialize_cleanly() {
+    const WORKERS: usize = 8;
+
+    let world = TestWorld::new();
+    let initialized = world.ok(&world.project, &["init"]);
+    let body = world.write("weighted.md", "parallel-weight-query");
+    world.ok(
+        &world.project,
+        &[
+            "page",
+            "put",
+            "weighted",
+            "--title",
+            "Weighted",
+            "--file",
+            as_str(&body),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS * 3));
+    let bin = env!("CARGO_BIN_EXE_lwc").to_string();
+    let home = world.home.clone();
+    let cwd = world.project.clone();
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for index in 0..WORKERS {
+            for command in ["weight", "feedback", "search"] {
+                let barrier = barrier.clone();
+                let bin = bin.clone();
+                let home = home.clone();
+                let cwd = cwd.clone();
+                handles.push(scope.spawn(move || {
+                    barrier.wait();
+                    let value = if index % 2 == 0 { "1" } else { "-1" };
+                    let signal = if index % 2 == 0 {
+                        "relevant"
+                    } else {
+                        "irrelevant"
+                    };
+                    match command {
+                        "weight" => run_command(
+                            &bin,
+                            &home,
+                            &cwd,
+                            &[
+                                "weight",
+                                "set",
+                                "page",
+                                "weighted",
+                                "--value",
+                                value,
+                                "--reason",
+                                "concurrency fixture",
+                                "--provenance",
+                                "agent-observed",
+                            ],
+                        ),
+                        "feedback" => run_command(
+                            &bin,
+                            &home,
+                            &cwd,
+                            &[
+                                "weight",
+                                "feedback",
+                                "page",
+                                "weighted",
+                                "--query",
+                                "parallel-weight-query",
+                                "--signal",
+                                signal,
+                                "--reason",
+                                "concurrency fixture",
+                                "--provenance",
+                                "agent-observed",
+                            ],
+                        ),
+                        _ => run_command(
+                            &bin,
+                            &home,
+                            &cwd,
+                            &["search", "parallel-weight-query", "--explain"],
+                        ),
+                    }
+                }));
+            }
+        }
+        for handle in handles {
+            let status = handle.join().unwrap();
+            assert!(status.success(), "concurrent command failed with {status}");
+        }
+    });
+
+    let conn = Connection::open(initialized["database"].as_str().unwrap()).unwrap();
+    for table in ["retrieval_weights", "retrieval_feedback"] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "duplicate rows in {table}");
+    }
+    let integrity: String = conn
+        .pragma_query_value(None, "integrity_check", |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
 }
 
 #[test]

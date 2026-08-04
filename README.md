@@ -437,6 +437,7 @@ source references, and Markdown projection, but does not change search ranking.
 ```bash
 lwc context --limit 50
 lwc search "question keywords" --limit 20
+lwc search "question keywords" --limit 20 --explain
 lwc search "concept only" --type page --kind concept
 lwc search "exact evidence" --type source
 lwc page show source-1
@@ -494,9 +495,54 @@ Search is lexical and deterministic.
 - Multi-character CJK query terms use adjacent bigrams; the index also retains
   non-stopword unigrams so one-character queries remain searchable.
 - Latin text is tokenized into lowercased alphanumeric terms.
-- Ranking uses fixed title/summary/body weights so project and global results remain comparable under `--scope all`.
+- Ranking keeps title, source filename, path/slug, summary, and body evidence
+  distinct. Exact/partial title and path matches receive bounded boosts.
+- README/index/overview documents and explicit navigation hubs are
+  query-conditionally downweighted in favor of specific feature documents;
+  asking for the README or overview disables that penalty.
+- Page candidates may receive a bounded direct-link or shared-source graph
+  boost. Common-neighbor-only relationships cannot change search order, and a
+  broad navigation hub receives a bounded graph penalty.
+- `--explain` returns the exact score arithmetic, including lexical, generic,
+  graph, manual-weight, and query-feedback signals. It does not record the
+  query; `--record` remains the only search-history opt-in.
+- Fixed coefficients and lower-is-better ranks keep project and global results
+  comparable under `--scope all`.
 
 This is intentionally dictionary-free. The goal is stable behavior for product names, code names, mixed-language terms, and emerging vocabulary without depending on a word-segmentation dictionary.
+
+### Explicit retrieval weights and feedback
+
+Use a document weight for a durable, query-independent judgment about a page
+or source. Use feedback for one exact ordered-token query fingerprint:
+
+```bash
+lwc weight set page payment-rules \
+  --value 2 \
+  --reason "Canonical payment rules specification" \
+  --provenance agent-observed
+lwc weight list page payment-rules
+
+lwc weight feedback page payment-rules \
+  --query "payment reconciliation rules" \
+  --signal relevant \
+  --reason "Verified against the expected answer" \
+  --provenance agent-observed
+
+lwc weight feedback-clear page payment-rules \
+  --query "payment reconciliation rules" \
+  --provenance agent-observed
+lwc weight clear page payment-rules --provenance agent-observed
+```
+
+Document values are `-2`, `-1`, `1`, or `2`; use `clear` for zero. Both
+mechanisms only rerank lexical candidates and cannot make a nonmatching
+document appear. A `user-provided` row takes precedence over an
+`agent-observed` row while both remain auditable. Feedback stores the SHA-256
+fingerprint, not the raw query, and does not transfer to paraphrases with
+different tokens. Reasons and operation records are durable, so never copy a
+sensitive query into `--reason`. Mutations require an explicit `project` or
+`global` scope; `--scope all` is rejected.
 
 ## Maintenance and Projection
 

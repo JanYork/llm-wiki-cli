@@ -25,7 +25,8 @@ use std::{
 
 const COMPOUND_WIKI_VERSION: i32 = 6;
 const PAGE_PROVENANCE_VERSION: i32 = 7;
-const USER_VERSION: i32 = 8;
+const SOURCE_PATH_REVISIONS_VERSION: i32 = 8;
+const USER_VERSION: i32 = 9;
 const SEARCH_INDEX_VERSION: i32 = 4;
 const INGEST_WORKFLOW_VERSION: i32 = 5;
 const TOKENIZER_ID: &str = "cjk-bigram@1/bounded-terms";
@@ -33,6 +34,13 @@ const SOURCE_GROUNDED: &str = "source-grounded";
 const EXPLICIT_PROVENANCE: [&str; 3] = ["user-provided", "agent-observed", "hypothesis"];
 const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 const TIMESTAMP_SQL: &str = "STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')";
+const TITLE_WEIGHT: f64 = 32.0;
+const PATH_WEIGHT: f64 = 16.0;
+const GENERIC_WEIGHT: f64 = 8.0;
+const GRAPH_MATCH_WEIGHT: f64 = 0.25;
+const GRAPH_HUB_WEIGHT: f64 = 4.0;
+const MANUAL_WEIGHT: f64 = 2.0;
+const FEEDBACK_WEIGHT: f64 = 1.5;
 static SOURCE_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub const DEFAULT_SCHEMA: &str = r#"# Wiki Schema
 
@@ -172,6 +180,32 @@ WITH issues(code, page, target, message) AS (
         EXCEPT
         SELECT identifier FROM search_fts WHERE doc_type = 'source'
     )
+    UNION ALL
+    SELECT
+        'retrieval_weight_orphan',
+        CASE WHEN r.target_type = 'page' THEN r.target_identifier END,
+        r.target_type || ':' || r.target_identifier,
+        'retrieval weight target does not exist'
+    FROM retrieval_weights r
+    WHERE (r.target_type = 'page' AND NOT EXISTS (
+              SELECT 1 FROM pages p WHERE p.slug = r.target_identifier
+          ))
+       OR (r.target_type = 'source' AND NOT EXISTS (
+              SELECT 1 FROM sources s WHERE CAST(s.id AS TEXT) = r.target_identifier
+          ))
+    UNION ALL
+    SELECT
+        'retrieval_feedback_orphan',
+        CASE WHEN r.target_type = 'page' THEN r.target_identifier END,
+        r.target_type || ':' || r.target_identifier || ':' || SUBSTR(r.query_fingerprint, 1, 12),
+        'retrieval feedback target does not exist'
+    FROM retrieval_feedback r
+    WHERE (r.target_type = 'page' AND NOT EXISTS (
+              SELECT 1 FROM pages p WHERE p.slug = r.target_identifier
+          ))
+       OR (r.target_type = 'source' AND NOT EXISTS (
+              SELECT 1 FROM sources s WHERE CAST(s.id AS TEXT) = r.target_identifier
+          ))
 )
 "#;
 
@@ -398,8 +432,53 @@ pub struct SearchResult {
     pub provenance: Option<Vec<String>>,
     pub snippet: String,
     pub rank: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<SearchExplanation>,
     #[serde(skip)]
     paired_source_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SearchExplanation {
+    pub base_rank: f64,
+    pub signals: SearchSignals,
+    pub contributions: SearchContributions,
+    pub graph_seeds: Vec<GraphSeedEvidence>,
+    pub final_rank: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct SearchSignals {
+    pub title_match: f64,
+    pub path_match: f64,
+    pub generic_marker: f64,
+    pub graph_match: f64,
+    pub graph_hub_penalty: f64,
+    pub manual_adjustment: f64,
+    pub feedback_adjustment: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct SearchContributions {
+    pub title: f64,
+    pub path: f64,
+    pub generic: f64,
+    pub graph: f64,
+    pub manual: f64,
+    pub feedback: f64,
+}
+
+impl SearchContributions {
+    fn total(&self) -> f64 {
+        self.title + self.path + self.generic + self.graph + self.manual + self.feedback
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct GraphSeedEvidence {
+    pub slug: String,
+    pub raw_score: f64,
+    pub contribution: f64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -419,6 +498,52 @@ pub enum SearchMode {
 pub struct SearchOptions {
     pub mode: SearchMode,
     pub kinds: Vec<String>,
+    pub explain: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RetrievalAdjustment {
+    pub target_type: String,
+    pub target_identifier: String,
+    pub provenance: String,
+    pub weight: i32,
+    pub reason: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RetrievalWeightResponse {
+    pub scope: String,
+    pub database: String,
+    pub adjustment: RetrievalAdjustment,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RetrievalWeightListResponse {
+    pub scope: String,
+    pub database: String,
+    pub adjustments: Vec<RetrievalAdjustment>,
+    pub effective: Option<RetrievalAdjustment>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RetrievalClearResponse {
+    pub scope: String,
+    pub database: String,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RetrievalFeedbackResponse {
+    pub scope: String,
+    pub database: String,
+    pub query_fingerprint: String,
+    pub target_type: String,
+    pub target_identifier: String,
+    pub provenance: String,
+    pub signal: String,
+    pub reason: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1062,6 +1187,16 @@ impl Store {
             "DELETE FROM search_fts WHERE doc_type = 'source' AND identifier = ?1",
             params![id.to_string()],
         )?;
+        tx.execute(
+            "DELETE FROM retrieval_weights
+             WHERE target_type = 'source' AND target_identifier = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM retrieval_feedback
+             WHERE target_type = 'source' AND target_identifier = ?1",
+            params![id.to_string()],
+        )?;
         tx.execute("DELETE FROM sources WHERE id = ?1", params![id])?;
         record_operation(
             &tx,
@@ -1088,6 +1223,7 @@ impl Store {
         let source_ids = dedupe_i64(input.source_ids);
         let explicit_provenance = normalize_explicit_provenance(input.provenance)?;
         let links = extract_links(&input.body);
+        let structural_navigation = has_structural_navigation_marker(&input.body);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1106,7 +1242,8 @@ impl Store {
             tx.execute(
                 &format!(
                     "UPDATE pages
-                     SET title = ?2, kind = ?3, summary = ?4, body = ?5, updated_at = {TIMESTAMP_SQL}
+                     SET title = ?2, kind = ?3, summary = ?4, body = ?5,
+                         structural_navigation = ?6, updated_at = {TIMESTAMP_SQL}
                      WHERE slug = ?1"
                 ),
                 params![
@@ -1114,21 +1251,25 @@ impl Store {
                     &input.title,
                     input.kind.as_deref(),
                     input.summary.as_deref(),
-                    &input.body
+                    &input.body,
+                    structural_navigation
                 ],
             )?;
         } else {
             tx.execute(
                 &format!(
-                    "INSERT INTO pages(slug, title, kind, summary, body, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, {TIMESTAMP_SQL}, {TIMESTAMP_SQL})"
+                    "INSERT INTO pages(
+                        slug, title, kind, summary, body, structural_navigation,
+                        created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, {TIMESTAMP_SQL}, {TIMESTAMP_SQL})"
                 ),
                 params![
                     &input.slug,
                     &input.title,
                     input.kind.as_deref(),
                     input.summary.as_deref(),
-                    &input.body
+                    &input.body,
+                    structural_navigation
                 ],
             )?;
         }
@@ -1268,6 +1409,16 @@ impl Store {
             "DELETE FROM search_fts WHERE doc_type = 'page' AND identifier = ?1",
             params![slug],
         )?;
+        tx.execute(
+            "DELETE FROM retrieval_weights
+             WHERE target_type = 'page' AND target_identifier = ?1",
+            params![slug],
+        )?;
+        tx.execute(
+            "DELETE FROM retrieval_feedback
+             WHERE target_type = 'page' AND target_identifier = ?1",
+            params![slug],
+        )?;
         tx.execute("DELETE FROM pages WHERE slug = ?1", params![slug])?;
         record_operation(&tx, "page_remove", slug, &json!({}))?;
         tx.commit()?;
@@ -1287,6 +1438,7 @@ impl Store {
             &SearchOptions {
                 mode: SearchMode::All,
                 kinds: Vec::new(),
+                explain: false,
             },
         )
     }
@@ -1362,6 +1514,17 @@ impl Store {
             });
         }
 
+        apply_retrieval_state(&self.conn, &tokens, &mut results)?;
+
+        results.sort_by(|left, right| {
+            search_type_priority(left, options.mode)
+                .cmp(&search_type_priority(right, options.mode))
+                .then_with(|| left.rank.total_cmp(&right.rank))
+                .then_with(|| left.result_type.cmp(&right.result_type))
+                .then_with(|| left.identifier.cmp(&right.identifier))
+        });
+        self.apply_graph_reranking(&mut results)?;
+
         results.sort_by(|left, right| {
             search_type_priority(left, options.mode)
                 .cmp(&search_type_priority(right, options.mode))
@@ -1371,12 +1534,290 @@ impl Store {
         });
         results.truncate(limit);
         load_search_provenance(&self.conn, &mut results)?;
+        if !options.explain {
+            for result in &mut results {
+                result.explanation = None;
+            }
+        }
 
         Ok(SearchResponse { results })
     }
 
+    fn apply_graph_reranking(&self, results: &mut [SearchResult]) -> Result<()> {
+        let seed_slugs = results
+            .iter()
+            .filter(|result| result.result_type == "page")
+            .take(3)
+            .map(|result| result.identifier.clone())
+            .collect::<Vec<_>>();
+        if seed_slugs.is_empty() {
+            return Ok(());
+        }
+        let pages = self.load_graph_pages()?;
+        let pages_by_slug = pages
+            .iter()
+            .map(|page| (page.slug.as_str(), page))
+            .collect::<BTreeMap<_, _>>();
+        let mut evidence: BTreeMap<String, Vec<GraphSeedEvidence>> = BTreeMap::new();
+        for (position, seed_slug) in seed_slugs.iter().enumerate() {
+            let Some(seed) = pages_by_slug.get(seed_slug.as_str()) else {
+                continue;
+            };
+            let discount = 1.0 / (position as f64 + 1.0);
+            for related_page in related(seed, &pages, pages.len()) {
+                let search_score =
+                    related_page.direct_link_score + related_page.shared_source_score;
+                if search_score <= 0.0 {
+                    continue;
+                }
+                let contribution = search_score / (search_score + 4.0) * discount;
+                evidence
+                    .entry(related_page.slug)
+                    .or_default()
+                    .push(GraphSeedEvidence {
+                        slug: seed_slug.clone(),
+                        raw_score: search_score,
+                        contribution,
+                    });
+            }
+        }
+
+        for result in results
+            .iter_mut()
+            .filter(|result| result.result_type == "page")
+        {
+            let Some(explanation) = result.explanation.as_mut() else {
+                continue;
+            };
+            explanation.graph_seeds = evidence.remove(&result.identifier).unwrap_or_default();
+            explanation.signals.graph_match = explanation
+                .graph_seeds
+                .iter()
+                .map(|seed| seed.contribution)
+                .fold(0.0, f64::max)
+                .clamp(0.0, 1.0);
+            explanation.signals.graph_hub_penalty = pages_by_slug
+                .get(result.identifier.as_str())
+                .filter(|_| explanation.signals.generic_marker > 0.0)
+                .map(|page| {
+                    let degree = page.outlinks.len() as f64;
+                    degree / (degree + 4.0)
+                })
+                .unwrap_or(0.0);
+            explanation.contributions.graph = -GRAPH_MATCH_WEIGHT * explanation.signals.graph_match
+                + GRAPH_HUB_WEIGHT * explanation.signals.graph_hub_penalty;
+            explanation.final_rank = explanation.base_rank + explanation.contributions.total();
+            result.rank = explanation.final_rank;
+        }
+        Ok(())
+    }
+
     pub fn record_search(&mut self, query: &str, limit: usize) -> Result<()> {
         self.record_top_level_operation("search", query, json!({ "limit": limit }))
+    }
+
+    pub fn retrieval_weight_set(
+        &mut self,
+        target_type: &str,
+        target_identifier: &str,
+        weight: i32,
+        reason: &str,
+        provenance: &str,
+    ) -> Result<RetrievalWeightResponse> {
+        validate_retrieval_weight(weight)?;
+        validate_retrieval_provenance(provenance)?;
+        validate_nonempty_reason(reason)?;
+        let identifier = normalize_retrieval_target(&self.conn, target_type, target_identifier)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            &format!(
+                "INSERT INTO retrieval_weights(
+                    target_type, target_identifier, provenance, weight, reason, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, {TIMESTAMP_SQL})
+                 ON CONFLICT(target_type, target_identifier, provenance)
+                 DO UPDATE SET weight = excluded.weight,
+                               reason = excluded.reason,
+                               updated_at = excluded.updated_at"
+            ),
+            params![target_type, &identifier, provenance, weight, reason.trim()],
+        )?;
+        record_operation(
+            &tx,
+            "weight_set",
+            &format!("{target_type}:{identifier}"),
+            &json!({"provenance": provenance, "weight": weight, "reason": reason.trim()}),
+        )?;
+        tx.commit()?;
+        Ok(RetrievalWeightResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            adjustment: self.load_retrieval_adjustment(target_type, &identifier, provenance)?,
+        })
+    }
+
+    pub fn retrieval_weight_list(
+        &self,
+        target_type: &str,
+        target_identifier: &str,
+    ) -> Result<RetrievalWeightListResponse> {
+        let identifier = normalize_retrieval_target(&self.conn, target_type, target_identifier)?;
+        let mut statement = self.conn.prepare(
+            "SELECT target_type, target_identifier, provenance, weight, reason, updated_at
+             FROM retrieval_weights
+             WHERE target_type = ?1 AND target_identifier = ?2
+             ORDER BY CASE provenance WHEN 'user-provided' THEN 0 ELSE 1 END",
+        )?;
+        let adjustments = statement
+            .query_map(params![target_type, &identifier], read_retrieval_adjustment)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(RetrievalWeightListResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            effective: adjustments.first().cloned(),
+            adjustments,
+        })
+    }
+
+    pub fn retrieval_weight_clear(
+        &mut self,
+        target_type: &str,
+        target_identifier: &str,
+        provenance: &str,
+    ) -> Result<RetrievalClearResponse> {
+        validate_retrieval_provenance(provenance)?;
+        let identifier = normalize_retrieval_target(&self.conn, target_type, target_identifier)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = tx.execute(
+            "DELETE FROM retrieval_weights
+             WHERE target_type = ?1 AND target_identifier = ?2 AND provenance = ?3",
+            params![target_type, &identifier, provenance],
+        )? > 0;
+        record_operation(
+            &tx,
+            "weight_clear",
+            &format!("{target_type}:{identifier}"),
+            &json!({"provenance": provenance, "removed": removed}),
+        )?;
+        tx.commit()?;
+        Ok(RetrievalClearResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            removed,
+        })
+    }
+
+    pub fn retrieval_feedback_set(
+        &mut self,
+        target_type: &str,
+        target_identifier: &str,
+        query: &str,
+        signal: i32,
+        reason: &str,
+        provenance: &str,
+    ) -> Result<RetrievalFeedbackResponse> {
+        if !matches!(signal, -1 | 1) {
+            return Err(AppError::new(
+                "invalid_feedback",
+                "feedback signal must be relevant or irrelevant",
+            ));
+        }
+        validate_retrieval_provenance(provenance)?;
+        validate_nonempty_reason(reason)?;
+        let tokens = tokenize_for_query(query);
+        if tokens.is_empty() {
+            return Err(AppError::new(
+                "invalid_query",
+                "feedback query must contain searchable terms",
+            ));
+        }
+        let fingerprint = query_fingerprint(&tokens);
+        let identifier = normalize_retrieval_target(&self.conn, target_type, target_identifier)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            &format!(
+                "INSERT INTO retrieval_feedback(
+                    query_fingerprint, target_type, target_identifier, provenance,
+                    signal, reason, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, {TIMESTAMP_SQL})
+                 ON CONFLICT(query_fingerprint, target_type, target_identifier, provenance)
+                 DO UPDATE SET signal = excluded.signal,
+                               reason = excluded.reason,
+                               updated_at = excluded.updated_at"
+            ),
+            params![
+                &fingerprint,
+                target_type,
+                &identifier,
+                provenance,
+                signal,
+                reason.trim()
+            ],
+        )?;
+        record_operation(
+            &tx,
+            "weight_feedback",
+            &format!("{target_type}:{identifier}"),
+            &json!({
+                "query_fingerprint": fingerprint,
+                "provenance": provenance,
+                "signal": signal,
+                "reason": reason.trim()
+            }),
+        )?;
+        tx.commit()?;
+        self.load_retrieval_feedback(&fingerprint, target_type, &identifier, provenance)
+    }
+
+    pub fn retrieval_feedback_clear(
+        &mut self,
+        target_type: &str,
+        target_identifier: &str,
+        query: &str,
+        provenance: &str,
+    ) -> Result<RetrievalClearResponse> {
+        validate_retrieval_provenance(provenance)?;
+        let tokens = tokenize_for_query(query);
+        if tokens.is_empty() {
+            return Err(AppError::new(
+                "invalid_query",
+                "feedback query must contain searchable terms",
+            ));
+        }
+        let fingerprint = query_fingerprint(&tokens);
+        let identifier = normalize_retrieval_target(&self.conn, target_type, target_identifier)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = tx.execute(
+            "DELETE FROM retrieval_feedback
+             WHERE query_fingerprint = ?1
+               AND target_type = ?2
+               AND target_identifier = ?3
+               AND provenance = ?4",
+            params![&fingerprint, target_type, &identifier, provenance],
+        )? > 0;
+        record_operation(
+            &tx,
+            "weight_feedback_clear",
+            &format!("{target_type}:{identifier}"),
+            &json!({
+                "query_fingerprint": fingerprint,
+                "provenance": provenance,
+                "removed": removed
+            }),
+        )?;
+        tx.commit()?;
+        Ok(RetrievalClearResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            removed,
+        })
     }
 
     pub fn ingest_list(
@@ -1989,6 +2430,59 @@ impl Store {
         })
     }
 
+    fn load_retrieval_adjustment(
+        &self,
+        target_type: &str,
+        identifier: &str,
+        provenance: &str,
+    ) -> Result<RetrievalAdjustment> {
+        self.conn
+            .query_row(
+                "SELECT target_type, target_identifier, provenance, weight, reason, updated_at
+                 FROM retrieval_weights
+                 WHERE target_type = ?1 AND target_identifier = ?2 AND provenance = ?3",
+                params![target_type, identifier, provenance],
+                read_retrieval_adjustment,
+            )
+            .map_err(Into::into)
+    }
+
+    fn load_retrieval_feedback(
+        &self,
+        fingerprint: &str,
+        target_type: &str,
+        identifier: &str,
+        provenance: &str,
+    ) -> Result<RetrievalFeedbackResponse> {
+        let (signal, reason, updated_at) = self.conn.query_row(
+            "SELECT signal, reason, updated_at
+             FROM retrieval_feedback
+             WHERE query_fingerprint = ?1
+               AND target_type = ?2
+               AND target_identifier = ?3
+               AND provenance = ?4",
+            params![fingerprint, target_type, identifier, provenance],
+            |row| {
+                Ok((
+                    row.get::<_, i32>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        Ok(RetrievalFeedbackResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            query_fingerprint: fingerprint.to_string(),
+            target_type: target_type.to_string(),
+            target_identifier: identifier.to_string(),
+            provenance: provenance.to_string(),
+            signal: if signal > 0 { "relevant" } else { "irrelevant" }.to_string(),
+            reason,
+            updated_at,
+        })
+    }
+
     fn load_graph_pages(&self) -> Result<Vec<GraphPage>> {
         let mut source_ids: BTreeMap<String, Vec<i64>> = BTreeMap::new();
         {
@@ -2561,6 +3055,10 @@ fn prepare_store(conn: &mut Connection, allow_create: bool) -> Result<bool> {
         migrate_source_path_revisions(conn)?;
         version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     }
+    if version == SOURCE_PATH_REVISIONS_VERSION {
+        migrate_retrieval_weighting(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
     if version != USER_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
@@ -2743,7 +3241,7 @@ fn migrate_source_path_revisions(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match current {
-        USER_VERSION => {
+        SOURCE_PATH_REVISIONS_VERSION..=USER_VERSION => {
             tx.commit()?;
             return Ok(());
         }
@@ -2760,15 +3258,92 @@ fn migrate_source_path_revisions(conn: &mut Connection) -> Result<()> {
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![SOURCE_PATH_REVISIONS_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", SOURCE_PATH_REVISIONS_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!(
+                "failed to commit v{SOURCE_PATH_REVISIONS_VERSION} source path migration: {error}"
+            ),
+        )
+    })
+}
+
+fn migrate_retrieval_weighting(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match current {
+        USER_VERSION => {
+            tx.commit()?;
+            return Ok(());
+        }
+        SOURCE_PATH_REVISIONS_VERSION => {}
+        other => {
+            return Err(AppError::new(
+                "unsupported_store_version",
+                format!("cannot migrate wiki database version {other} to {USER_VERSION}"),
+            ));
+        }
+    }
+
+    add_structural_navigation_state(&tx).map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to prepare v{USER_VERSION} retrieval features: {error}"),
+        )
+    })?;
+    create_retrieval_state(&tx).map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to prepare v{USER_VERSION} retrieval state: {error}"),
+        )
+    })?;
+    rebuild_search_index(&tx).map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to prepare v{USER_VERSION} weighted search index: {error}"),
+        )
+    })?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![USER_VERSION.to_string()],
     )?;
     tx.pragma_update(None, "user_version", USER_VERSION)?;
     tx.commit().map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to commit v{USER_VERSION} source path migration: {error}"),
+            format!("failed to commit v{USER_VERSION} retrieval migration: {error}"),
         )
     })
+}
+
+fn add_structural_navigation_state(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "ALTER TABLE sources ADD COLUMN structural_navigation INTEGER NOT NULL DEFAULT 0
+             CHECK(structural_navigation IN (0, 1));
+         ALTER TABLE pages ADD COLUMN structural_navigation INTEGER NOT NULL DEFAULT 0
+             CHECK(structural_navigation IN (0, 1));
+         UPDATE sources
+         SET structural_navigation = CASE
+             WHEN INSTR(LOWER(content), '总览文档') > 0
+               OR INSTR(LOWER(content), '文档目录') > 0
+               OR INSTR(LOWER(content), 'table of contents') > 0
+               OR INSTR(LOWER(content), 'navigation index') > 0
+               OR INSTR(LOWER(content), 'document index') > 0
+             THEN 1 ELSE 0 END;
+         UPDATE pages
+         SET structural_navigation = CASE
+             WHEN INSTR(LOWER(body), '总览文档') > 0
+               OR INSTR(LOWER(body), '文档目录') > 0
+               OR INSTR(LOWER(body), 'table of contents') > 0
+               OR INSTR(LOWER(body), 'navigation index') > 0
+               OR INSTR(LOWER(body), 'document index') > 0
+             THEN 1 ELSE 0 END;",
+    )?;
+    Ok(())
 }
 
 fn create_source_path_revisions(tx: &Transaction<'_>) -> Result<()> {
@@ -2785,6 +3360,35 @@ fn create_source_path_revisions(tx: &Transaction<'_>) -> Result<()> {
         CREATE INDEX source_path_revisions_source
         ON source_path_revisions(source_id, tracked_path, revision);",
     )?;
+    Ok(())
+}
+
+fn create_retrieval_state(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(&format!(
+        "CREATE TABLE retrieval_weights(
+            target_type TEXT NOT NULL CHECK(target_type IN ('page', 'source')),
+            target_identifier TEXT NOT NULL CHECK(TRIM(target_identifier) <> ''),
+            provenance TEXT NOT NULL CHECK(provenance IN ('user-provided', 'agent-observed')),
+            weight INTEGER NOT NULL CHECK(weight IN (-2, -1, 1, 2)),
+            reason TEXT NOT NULL CHECK(TRIM(reason) <> ''),
+            updated_at TEXT NOT NULL DEFAULT ({TIMESTAMP_SQL}),
+            PRIMARY KEY(target_type, target_identifier, provenance)
+        );
+
+        CREATE TABLE retrieval_feedback(
+            query_fingerprint TEXT NOT NULL CHECK(LENGTH(query_fingerprint) = 64),
+            target_type TEXT NOT NULL CHECK(target_type IN ('page', 'source')),
+            target_identifier TEXT NOT NULL CHECK(TRIM(target_identifier) <> ''),
+            provenance TEXT NOT NULL CHECK(provenance IN ('user-provided', 'agent-observed')),
+            signal INTEGER NOT NULL CHECK(signal IN (-1, 1)),
+            reason TEXT NOT NULL CHECK(TRIM(reason) <> ''),
+            updated_at TEXT NOT NULL DEFAULT ({TIMESTAMP_SQL}),
+            PRIMARY KEY(query_fingerprint, target_type, target_identifier, provenance)
+        );
+
+        CREATE INDEX retrieval_feedback_target
+        ON retrieval_feedback(target_type, target_identifier, query_fingerprint);"
+    ))?;
     Ok(())
 }
 
@@ -2809,6 +3413,8 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
             title TEXT,
             origin TEXT NOT NULL,
             content TEXT NOT NULL,
+            structural_navigation INTEGER NOT NULL DEFAULT 0
+                CHECK(structural_navigation IN (0, 1)),
             created_at TEXT NOT NULL DEFAULT ({TIMESTAMP_SQL})
         );
 
@@ -2818,6 +3424,8 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
             kind TEXT,
             summary TEXT,
             body TEXT NOT NULL,
+            structural_navigation INTEGER NOT NULL DEFAULT 0
+                CHECK(structural_navigation IN (0, 1)),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -2882,10 +3490,35 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
         CREATE INDEX source_path_revisions_source
         ON source_path_revisions(source_id, tracked_path, revision);
 
+        CREATE TABLE retrieval_weights(
+            target_type TEXT NOT NULL CHECK(target_type IN ('page', 'source')),
+            target_identifier TEXT NOT NULL CHECK(TRIM(target_identifier) <> ''),
+            provenance TEXT NOT NULL CHECK(provenance IN ('user-provided', 'agent-observed')),
+            weight INTEGER NOT NULL CHECK(weight IN (-2, -1, 1, 2)),
+            reason TEXT NOT NULL CHECK(TRIM(reason) <> ''),
+            updated_at TEXT NOT NULL DEFAULT ({TIMESTAMP_SQL}),
+            PRIMARY KEY(target_type, target_identifier, provenance)
+        );
+
+        CREATE TABLE retrieval_feedback(
+            query_fingerprint TEXT NOT NULL CHECK(LENGTH(query_fingerprint) = 64),
+            target_type TEXT NOT NULL CHECK(target_type IN ('page', 'source')),
+            target_identifier TEXT NOT NULL CHECK(TRIM(target_identifier) <> ''),
+            provenance TEXT NOT NULL CHECK(provenance IN ('user-provided', 'agent-observed')),
+            signal INTEGER NOT NULL CHECK(signal IN (-1, 1)),
+            reason TEXT NOT NULL CHECK(TRIM(reason) <> ''),
+            updated_at TEXT NOT NULL DEFAULT ({TIMESTAMP_SQL}),
+            PRIMARY KEY(query_fingerprint, target_type, target_identifier, provenance)
+        );
+
+        CREATE INDEX retrieval_feedback_target
+        ON retrieval_feedback(target_type, target_identifier, query_fingerprint);
+
         CREATE VIRTUAL TABLE search_fts USING fts5(
             doc_type UNINDEXED,
             identifier UNINDEXED,
             title_terms,
+            path_terms,
             summary_terms,
             body_terms,
             content='',
@@ -2971,6 +3604,7 @@ fn rebuild_search_index(tx: &Transaction<'_>) -> Result<(usize, usize)> {
             doc_type UNINDEXED,
             identifier UNINDEXED,
             title_terms,
+            path_terms,
             summary_terms,
             body_terms,
             content='',
@@ -2982,17 +3616,19 @@ fn rebuild_search_index(tx: &Transaction<'_>) -> Result<(usize, usize)> {
 
     let mut source_count = 0usize;
     {
-        let mut statement = tx.prepare("SELECT id, title, content FROM sources ORDER BY id")?;
+        let mut statement =
+            tx.prepare("SELECT id, title, origin, content FROM sources ORDER BY id")?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         for row in rows {
-            let (id, title, content) = row?;
-            index_source(tx, id, title.as_deref(), &content)?;
+            let (id, title, origin, content) = row?;
+            index_source(tx, id, title.as_deref(), &origin, &content)?;
             source_count += 1;
         }
     }
@@ -3021,15 +3657,17 @@ fn rebuild_search_index(tx: &Transaction<'_>) -> Result<(usize, usize)> {
 fn validate_store(conn: &Connection) -> Result<()> {
     for sql in [
         "SELECT key, value FROM meta LIMIT 0",
-        "SELECT id, content_hash, title, origin, content, created_at FROM sources LIMIT 0",
-        "SELECT slug, title, kind, summary, body, created_at, updated_at FROM pages LIMIT 0",
+        "SELECT id, content_hash, title, origin, content, structural_navigation, created_at FROM sources LIMIT 0",
+        "SELECT slug, title, kind, summary, body, structural_navigation, created_at, updated_at FROM pages LIMIT 0",
         "SELECT page_slug, source_id FROM page_sources LIMIT 0",
         "SELECT page_slug, provenance FROM page_provenance LIMIT 0",
         "SELECT from_slug, to_slug FROM links LIMIT 0",
         "SELECT action, target, detail_json, created_at FROM operations LIMIT 0",
         "SELECT source_id, status, attempts, analysis, last_error, no_derived_pages_reason, updated_at FROM ingest_jobs LIMIT 0",
         "SELECT tracked_path, revision, source_id, observed_at FROM source_path_revisions LIMIT 0",
-        "SELECT rowid, doc_type, identifier, title_terms, summary_terms, body_terms FROM search_fts LIMIT 0",
+        "SELECT target_type, target_identifier, provenance, weight, reason, updated_at FROM retrieval_weights LIMIT 0",
+        "SELECT query_fingerprint, target_type, target_identifier, provenance, signal, reason, updated_at FROM retrieval_feedback LIMIT 0",
+        "SELECT rowid, doc_type, identifier, title_terms, path_terms, summary_terms, body_terms FROM search_fts LIMIT 0",
     ] {
         conn.prepare(sql).map_err(|error| {
             AppError::new(
@@ -3113,10 +3751,17 @@ fn insert_source(tx: &Transaction<'_>, input: &SourceAddInput) -> Result<(i64, b
         .to_string();
     let created = tx.execute(
         &format!(
-            "INSERT OR IGNORE INTO sources(content_hash, title, origin, content, created_at)
-             VALUES (?1, ?2, ?3, ?4, {TIMESTAMP_SQL})"
+            "INSERT OR IGNORE INTO sources(
+                content_hash, title, origin, content, structural_navigation, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, {TIMESTAMP_SQL})"
         ),
-        params![&content_hash, &title, &input.origin, &input.content],
+        params![
+            &content_hash,
+            &title,
+            &input.origin,
+            &input.content,
+            has_structural_navigation_marker(&input.content)
+        ],
     )? == 1;
     let source_id = tx.query_row(
         "SELECT id FROM sources WHERE content_hash = ?1",
@@ -3124,7 +3769,13 @@ fn insert_source(tx: &Transaction<'_>, input: &SourceAddInput) -> Result<(i64, b
         |row| row.get::<_, i64>(0),
     )?;
     if created {
-        index_source(tx, source_id, Some(&title), input.content.as_str())?;
+        index_source(
+            tx,
+            source_id,
+            Some(&title),
+            &input.origin,
+            input.content.as_str(),
+        )?;
     }
     tx.execute(
         &format!(
@@ -3304,6 +3955,105 @@ fn read_operation_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationR
     })
 }
 
+fn read_retrieval_adjustment(row: &rusqlite::Row<'_>) -> rusqlite::Result<RetrievalAdjustment> {
+    Ok(RetrievalAdjustment {
+        target_type: row.get(0)?,
+        target_identifier: row.get(1)?,
+        provenance: row.get(2)?,
+        weight: row.get(3)?,
+        reason: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn validate_retrieval_weight(weight: i32) -> Result<()> {
+    if matches!(weight, -2 | -1 | 1 | 2) {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            "invalid_weight",
+            "weight must be one of -2, -1, 1, or 2",
+        ))
+    }
+}
+
+fn validate_retrieval_provenance(provenance: &str) -> Result<()> {
+    if matches!(provenance, "user-provided" | "agent-observed") {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            "invalid_provenance",
+            "retrieval provenance must be user-provided or agent-observed",
+        ))
+    }
+}
+
+fn validate_nonempty_reason(reason: &str) -> Result<()> {
+    if reason.trim().is_empty() {
+        Err(AppError::new(
+            "invalid_input",
+            "retrieval adjustment reason must not be empty",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn normalize_retrieval_target(
+    conn: &Connection,
+    target_type: &str,
+    identifier: &str,
+) -> Result<String> {
+    match target_type {
+        "page" => {
+            let exists = conn
+                .query_row(
+                    "SELECT 1 FROM pages WHERE slug = ?1",
+                    params![identifier],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if exists {
+                Ok(identifier.to_string())
+            } else {
+                Err(AppError::new(
+                    "page_not_found",
+                    format!("page not found: {identifier}"),
+                ))
+            }
+        }
+        "source" => {
+            let source_id = identifier.parse::<i64>().map_err(|_| {
+                AppError::new(
+                    "invalid_input",
+                    format!("source identifier must be an integer: {identifier}"),
+                )
+            })?;
+            let exists = conn
+                .query_row(
+                    "SELECT 1 FROM sources WHERE id = ?1",
+                    params![source_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if exists {
+                Ok(source_id.to_string())
+            } else {
+                Err(AppError::new(
+                    "source_not_found",
+                    format!("source not found: {source_id}"),
+                ))
+            }
+        }
+        _ => Err(AppError::new(
+            "invalid_input",
+            "retrieval target type must be page or source",
+        )),
+    }
+}
+
 fn validate_ingest_status(status: &str) -> Result<()> {
     if matches!(
         status,
@@ -3480,6 +4230,7 @@ fn index_source(
     tx: &Transaction<'_>,
     source_id: i64,
     title: Option<&str>,
+    origin: &str,
     content: &str,
 ) -> Result<()> {
     tx.execute(
@@ -3488,11 +4239,12 @@ fn index_source(
     )?;
     tx.execute(
         "INSERT INTO search_fts(
-            doc_type, identifier, title_terms, summary_terms, body_terms
-         ) VALUES ('source', ?1, ?2, '', ?3)",
+            doc_type, identifier, title_terms, path_terms, summary_terms, body_terms
+         ) VALUES ('source', ?1, ?2, ?3, '', ?4)",
         params![
             source_id.to_string(),
-            joined_terms(title.unwrap_or("")),
+            source_title_terms(title.unwrap_or(""), origin),
+            joined_terms(source_parent(origin)),
             joined_terms(content)
         ],
     )?;
@@ -3512,16 +4264,55 @@ fn index_page(
     )?;
     tx.execute(
         "INSERT INTO search_fts(
-            doc_type, identifier, title_terms, summary_terms, body_terms
-         ) VALUES ('page', ?1, ?2, ?3, ?4)",
+            doc_type, identifier, title_terms, path_terms, summary_terms, body_terms
+         ) VALUES ('page', ?1, ?2, ?3, ?4, ?5)",
         params![
             slug,
             joined_terms(title),
+            joined_terms(slug),
             joined_terms(summary.unwrap_or("")),
             joined_terms(body)
         ],
     )?;
     Ok(())
+}
+
+fn source_title_terms(title: &str, origin: &str) -> String {
+    let leaf = source_leaf(origin);
+    if normalized_text(title) == normalized_text(origin)
+        || normalized_text(title) == normalized_text(leaf)
+    {
+        joined_terms(leaf)
+    } else {
+        joined_terms(&format!("{title} {leaf}"))
+    }
+}
+
+fn source_leaf(origin: &str) -> &str {
+    Path::new(origin)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(origin)
+}
+
+fn source_parent(origin: &str) -> &str {
+    Path::new(origin)
+        .parent()
+        .and_then(Path::to_str)
+        .unwrap_or("")
+}
+
+fn has_structural_navigation_marker(body: &str) -> bool {
+    let body = body.to_lowercase();
+    [
+        "总览文档",
+        "文档目录",
+        "table of contents",
+        "navigation index",
+        "document index",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
 }
 
 fn joined_terms(text: &str) -> String {
@@ -3576,7 +4367,15 @@ fn search_index(
                     WHEN 'page' THEN p.body
                     ELSE s.content
                 END AS body,
-                bm25(search_fts, 0.0, 0.0, 8.0, 4.0, 1.0) AS fts_rank
+                CASE search_fts.doc_type
+                    WHEN 'page' THEN p.slug
+                    ELSE s.origin
+                END AS path,
+                CASE search_fts.doc_type
+                    WHEN 'page' THEN p.structural_navigation
+                    ELSE s.structural_navigation
+                END AS structural_navigation,
+                bm25(search_fts, 0.0, 0.0, 8.0, 6.0, 4.0, 1.0) AS fts_rank
             FROM search_fts
             LEFT JOIN pages p
                 ON search_fts.doc_type = 'page'
@@ -3594,6 +4393,7 @@ fn search_index(
             title,
             kind,
             summary,
+            path,
             CASE
                 WHEN INSTR(LOWER(body), LOWER(?3)) > 0 THEN
                     SUBSTR(body, MAX(INSTR(LOWER(body), LOWER(?3)) - 60, 1), 180)
@@ -3601,13 +4401,6 @@ fn search_index(
                     SUBSTR(body, MAX(INSTR(LOWER(body), LOWER(?4)) - 60, 1), 180)
                 ELSE SUBSTR(body, 1, 180)
             END AS snippet,
-            CASE
-                WHEN LENGTH(?3) = 0 THEN 0
-                ELSE (
-                    LENGTH(LOWER(body))
-                    - LENGTH(REPLACE(LOWER(body), LOWER(?3), ''))
-                ) / LENGTH(?3)
-            END AS phrase_count,
             fts_rank,
             CASE
                 WHEN doc_type = 'page' AND LOWER(COALESCE(kind, '')) = 'source'
@@ -3617,7 +4410,8 @@ fn search_index(
                     WHERE ps.page_slug = identifier
                 )
                 ELSE NULL
-            END AS paired_source_ids
+            END AS paired_source_ids,
+            structural_navigation
         FROM ranked";
     let mut statement = conn.prepare(sql)?;
     statement
@@ -3625,7 +4419,8 @@ fn search_index(
             params![match_query, limit as i64, query, first_token],
             |row| {
                 let title = row.get::<_, Option<String>>(2)?;
-                let phrase_count = row.get::<_, i64>(6)?;
+                let result_type = row.get::<_, String>(0)?;
+                let path = row.get::<_, String>(5)?;
                 let fts_rank = row.get::<_, f64>(7)?;
                 let paired_source_ids = row
                     .get::<_, Option<String>>(8)?
@@ -3635,29 +4430,118 @@ fn search_index(
                             .collect()
                     })
                     .unwrap_or_default();
-                let result_type = row.get::<_, String>(0)?;
+                let explanation = lexical_explanation(
+                    &result_type,
+                    title.as_deref(),
+                    &path,
+                    query,
+                    tokens,
+                    fts_rank,
+                    row.get::<_, i64>(9)? != 0,
+                );
                 Ok(SearchResult {
                     scope: scope.to_string(),
                     result_type,
                     identifier: row.get(1)?,
-                    rank: comparable_rank(
-                        title.as_deref(),
-                        query,
-                        phrase_count,
-                        fts_rank,
-                        tokens.len(),
-                    ),
+                    rank: explanation.final_rank,
                     title,
                     kind: row.get(3)?,
                     summary: row.get(4)?,
                     provenance: None,
-                    snippet: row.get(5)?,
+                    snippet: row.get(6)?,
+                    explanation: Some(explanation),
                     paired_source_ids,
                 })
             },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+fn apply_retrieval_state(
+    conn: &Connection,
+    query_tokens: &[String],
+    results: &mut [SearchResult],
+) -> Result<()> {
+    let weights = load_effective_weights(conn)?;
+    let feedback = load_effective_feedback(conn, &query_fingerprint(query_tokens))?;
+    for result in results {
+        let key = (result.result_type.clone(), result.identifier.clone());
+        let Some(explanation) = result.explanation.as_mut() else {
+            continue;
+        };
+        explanation.signals.manual_adjustment =
+            weights.get(&key).map_or(0.0, |weight| *weight as f64 / 2.0);
+        explanation.signals.feedback_adjustment =
+            feedback.get(&key).copied().unwrap_or_default() as f64;
+        explanation.contributions.manual = -MANUAL_WEIGHT * explanation.signals.manual_adjustment;
+        explanation.contributions.feedback =
+            -FEEDBACK_WEIGHT * explanation.signals.feedback_adjustment;
+        explanation.final_rank = explanation.base_rank + explanation.contributions.total();
+        result.rank = explanation.final_rank;
+    }
+    Ok(())
+}
+
+fn load_effective_weights(conn: &Connection) -> Result<BTreeMap<(String, String), i32>> {
+    let mut statement = conn.prepare(
+        "SELECT target_type, target_identifier, weight
+         FROM retrieval_weights
+         ORDER BY target_type, target_identifier,
+                  CASE provenance WHEN 'user-provided' THEN 0 ELSE 1 END",
+    )?;
+    let mut effective = BTreeMap::new();
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i32>(2)?,
+        ))
+    })? {
+        let (target_type, identifier, weight) = row?;
+        effective.entry((target_type, identifier)).or_insert(weight);
+    }
+    Ok(effective)
+}
+
+fn load_effective_feedback(
+    conn: &Connection,
+    fingerprint: &str,
+) -> Result<BTreeMap<(String, String), i32>> {
+    let mut statement = conn.prepare(
+        "SELECT target_type, target_identifier, signal
+         FROM retrieval_feedback
+         WHERE query_fingerprint = ?1
+         ORDER BY target_type, target_identifier,
+                  CASE provenance WHEN 'user-provided' THEN 0 ELSE 1 END",
+    )?;
+    let mut effective = BTreeMap::new();
+    for row in statement.query_map(params![fingerprint], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i32>(2)?,
+        ))
+    })? {
+        let (target_type, identifier, signal) = row?;
+        effective.entry((target_type, identifier)).or_insert(signal);
+    }
+    Ok(effective)
+}
+
+fn query_fingerprint(tokens: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if index > 0 {
+            hasher.update([0x1f]);
+        }
+        hasher.update(token.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn load_search_provenance(conn: &Connection, results: &mut [SearchResult]) -> Result<()> {
@@ -3713,39 +4597,109 @@ fn search_type_priority(result: &SearchResult, mode: SearchMode) -> u8 {
     }
 }
 
-fn comparable_rank(
+fn lexical_explanation(
+    result_type: &str,
     title: Option<&str>,
+    path: &str,
     query: &str,
-    phrase_count: i64,
-    fts_rank: f64,
-    token_count: usize,
-) -> f64 {
-    let normalized_query = query.to_lowercase();
-    let normalized_title = title.unwrap_or("").to_lowercase();
-    let query_terms = tokenize_for_query(query);
-    let title_terms = tokenize_for_query(title.unwrap_or(""))
+    tokens: &[String],
+    base_rank: f64,
+    structural_navigation: bool,
+) -> SearchExplanation {
+    let title_match = if result_type == "source" {
+        field_match(title.unwrap_or(""), query, tokens).max(field_match(
+            source_leaf(path),
+            query,
+            tokens,
+        ))
+    } else {
+        field_match(title.unwrap_or(""), query, tokens)
+    };
+    let path_field = if result_type == "source" {
+        source_parent(path)
+    } else {
+        path
+    };
+    let path_match = field_match(path_field, query, tokens);
+    let generic_marker = generic_marker(title.unwrap_or(""), path, query, structural_navigation);
+    let signals = SearchSignals {
+        title_match,
+        path_match,
+        generic_marker,
+        ..SearchSignals::default()
+    };
+    let contributions = SearchContributions {
+        title: -TITLE_WEIGHT * title_match,
+        path: -PATH_WEIGHT * path_match,
+        generic: GENERIC_WEIGHT * generic_marker,
+        ..SearchContributions::default()
+    };
+    SearchExplanation {
+        base_rank,
+        final_rank: base_rank + contributions.total(),
+        signals,
+        contributions,
+        graph_seeds: Vec::new(),
+    }
+}
+
+fn field_match(field: &str, query: &str, tokens: &[String]) -> f64 {
+    if field.trim().is_empty() || tokens.is_empty() {
+        return 0.0;
+    }
+    let normalized_field = normalized_text(field);
+    let normalized_query = normalized_text(query);
+    if !normalized_query.is_empty() && normalized_field == normalized_query {
+        return 1.0;
+    }
+    if tokens.len() > 1
+        && !normalized_query.is_empty()
+        && normalized_field.contains(&normalized_query)
+    {
+        return 0.9;
+    }
+    let field_terms = tokenize_for_query(field)
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let title_covers_query =
-        query_terms.len() > 1 && query_terms.iter().all(|term| title_terms.contains(term));
-    let title_score = if !normalized_query.is_empty() && normalized_title == normalized_query {
-        1_000.0
-    } else if token_count > 1
-        && !normalized_query.is_empty()
-        && normalized_title.contains(&normalized_query)
+    tokens
+        .iter()
+        .filter(|term| field_terms.contains(*term))
+        .count() as f64
+        / tokens.len() as f64
+}
+
+fn normalized_text(text: &str) -> String {
+    let mut normalized = String::new();
+    let mut separated = true;
+    for ch in text.to_lowercase().chars() {
+        if ch.is_alphanumeric()
+            || matches!(ch, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}' | '\u{20000}'..='\u{323af}')
+        {
+            normalized.push(ch);
+            separated = false;
+        } else if !separated {
+            normalized.push(' ');
+            separated = true;
+        }
+    }
+    normalized.trim().to_string()
+}
+
+fn generic_marker(title: &str, path: &str, query: &str, structural_navigation: bool) -> f64 {
+    const MARKERS: [&str; 10] = [
+        "readme", "index", "summary", "toc", "overview", "导航", "总览", "索引", "目录", "归档",
+    ];
+    let candidate = format!("{} {}", normalized_text(title), normalized_text(path));
+    let normalized_query = normalized_text(query);
+    if (structural_navigation || MARKERS.iter().any(|marker| candidate.contains(marker)))
+        && !MARKERS
+            .iter()
+            .any(|marker| normalized_query.contains(marker))
     {
-        500.0
-    } else if title_covers_query {
-        300.0
+        1.0
     } else {
         0.0
-    };
-    let phrase_score = if token_count > 1 {
-        phrase_count.clamp(0, 10_000) as f64 * 10.0
-    } else {
-        0.0
-    };
-    fts_rank - title_score - phrase_score
+    }
 }
 
 #[cfg(test)]
@@ -3915,18 +4869,18 @@ mod tests {
     #[test]
     fn title_token_coverage_bridges_query_separators() {
         let query = "系统设置 支付渠道管理";
-        let rank = comparable_rank(
+        let explanation = lexical_explanation(
+            "page",
             Some("01-系统设置-支付渠道管理.md"),
+            "unrelated-slug",
             query,
-            0,
+            &tokenize_for_query(query),
             0.0,
-            tokenize_for_query(query).len(),
+            false,
         );
 
-        assert!(
-            rank <= -250.0,
-            "all title terms should receive a strong title boost despite separator differences"
-        );
+        assert_eq!(explanation.signals.title_match, 0.9);
+        assert_eq!(explanation.contributions.title, -TITLE_WEIGHT * 0.9);
     }
 
     #[test]
@@ -4156,9 +5110,13 @@ mod tests {
         let conn = Connection::open(&database).unwrap();
         conn.execute_batch(
             "DROP TABLE search_fts;
+             DROP TABLE retrieval_feedback;
+             DROP TABLE retrieval_weights;
              DROP TABLE source_path_revisions;
              DROP TABLE page_provenance;
              DROP TABLE ingest_jobs;
+             ALTER TABLE sources DROP COLUMN structural_navigation;
+             ALTER TABLE pages DROP COLUMN structural_navigation;
              CREATE VIRTUAL TABLE source_fts USING fts5(
                  source_id UNINDEXED, title, content
              );

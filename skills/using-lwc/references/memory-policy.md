@@ -8,6 +8,7 @@
 - Scope decisions
 - Recall and write-back
 - Source integration
+- Retrieval weighting
 - Retrieval acceptance
 - Provenance and safety
 - Maintenance
@@ -63,6 +64,9 @@ project command so CLI discovery cannot cross either boundary.
    immutable evidence is required, `--type page` for compiled knowledge, and
    repeat `--kind` to restrict page kinds. Use `--type all` only when auditing
    both layers.
+
+   Add `--explain` when the order is surprising. It is read-only and exposes
+   exact score arithmetic; it is not evidence that a returned claim is true.
 
 4. Work from current evidence. Inspect cited pages and sources when accuracy
    depends on them.
@@ -322,6 +326,45 @@ specific audited exception:
 
 One source may legitimately update many pages. Do not stop after `source add`,
 FTS search, or a single detached summary.
+
+## Retrieval weighting
+
+Retrieval state is explicit project/global Wiki data, not passive behavior
+tracking. Diagnose first:
+
+```bash
+"$LWC" --scope project search "question keywords" --type auto --limit 20 --explain
+```
+
+Use a document weight only when the judgment should apply across queries. Use
+query feedback only after inspecting the result for that exact question:
+
+```bash
+"$LWC" --scope project weight set page relevant-slug \
+  --value 1 \
+  --reason "Current canonical guide" \
+  --provenance agent-observed
+"$LWC" --scope project weight feedback page relevant-slug \
+  --query "question keywords" \
+  --signal relevant \
+  --reason "Expected page and evidence verified" \
+  --provenance agent-observed
+```
+
+- Document values are `-2`, `-1`, `1`, and `2`; `clear` represents zero.
+- `user-provided` is reserved for explicit user judgment and overrides an
+  `agent-observed` row without deleting it.
+- Agent observations require current evidence. Rank position, clicks, page
+  length, directory depth, and an unchecked answer are not evidence.
+- Both layers rerank only lexical candidates. Feedback is keyed by the ordered
+  tokenizer fingerprint and does not transfer to paraphrases.
+- Feedback stores no raw query. Reasons and operation records are durable, so
+  do not repeat secret or sensitive query text in `--reason`.
+- Clear obsolete state rather than adding compensating rows. Page/source
+  deletion clears its state transactionally; lint reports any orphan left by
+  unsupported direct database edits.
+- Mutate one explicit `project` or `global` scope. Never use `--scope all` for
+  weight or feedback mutations.
 
 ## Retrieval acceptance
 

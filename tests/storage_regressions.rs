@@ -115,6 +115,37 @@ fn new_store_uses_contentless_search_fts_and_keeps_identifiers_readable() {
         normalized.contains("contentless_unindexed=1"),
         "search_fts should keep UNINDEXED identifiers readable\n{create_sql}"
     );
+    assert!(
+        normalized.contains("path_terms"),
+        "search_fts should index canonical paths separately\n{create_sql}"
+    );
+
+    let version: i32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 9);
+    for table in ["retrieval_weights", "retrieval_feedback"] {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "missing retrieval state table {table}");
+    }
+    for table in ["sources", "pages"] {
+        let columns: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'structural_navigation'"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 1, "missing derived retrieval feature on {table}");
+    }
 
     let rows = {
         let mut statement = conn
@@ -140,6 +171,65 @@ fn new_store_uses_contentless_search_fts_and_keeps_identifiers_readable() {
         rows.contains(&("source".to_string(), source_id)),
         "source identifier should stay readable from search_fts: {rows:?}"
     );
+}
+
+#[test]
+fn source_origin_and_page_slug_are_rebuilt_into_path_terms() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+
+    let source_file = world.write(
+        "docs/payment/reconciliation-rules.md",
+        "shared evidence term",
+    );
+    let source = world.ok(&[
+        "source",
+        "add",
+        as_str(&source_file),
+        "--title",
+        "Unrelated explicit source title",
+    ]);
+    let source_id = source["source"]["id"].as_i64().unwrap().to_string();
+    let page_file = world.write("page.md", "shared evidence term");
+    world.ok(&[
+        "page",
+        "put",
+        "payment-reconciliation-guide",
+        "--title",
+        "Unrelated explicit page title",
+        "--file",
+        as_str(&page_file),
+    ]);
+
+    let before = world.ok(&["search", "reconciliation", "--type", "all"]);
+    assert!(
+        before["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["type"] == "source" && row["identifier"] == source_id })
+    );
+    assert!(before["results"].as_array().unwrap().iter().any(|row| {
+        row["type"] == "page" && row["identifier"] == "payment-reconciliation-guide"
+    }));
+
+    world.ok(&["maintenance", "reindex"]);
+    let after = world.ok(&["search", "reconciliation", "--type", "all"]);
+    assert_eq!(before["results"], after["results"]);
+
+    let conn = Connection::open(database).unwrap();
+    conn.execute_batch("CREATE VIRTUAL TABLE search_vocab USING fts5vocab(search_fts, col);")
+        .unwrap();
+    let non_empty: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT term) FROM search_vocab WHERE col = 'path_terms'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(non_empty > 0, "expected indexed path vocabulary");
+    conn.execute_batch("DROP TABLE search_vocab;").unwrap();
 }
 
 #[test]

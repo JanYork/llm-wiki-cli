@@ -135,6 +135,33 @@ fn prepare_generating_source_with_summary_only(world: &TestWorld, term: &str) ->
     source_id
 }
 
+fn put_page(world: &TestWorld, slug: &str, title: &str, body: &str) {
+    let file = world.write(&format!("pages/{slug}.md"), body);
+    world.ok(
+        &world.project,
+        &[
+            "page",
+            "put",
+            slug,
+            "--title",
+            title,
+            "--file",
+            as_str(&file),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+}
+
+fn find_result<'a>(search: &'a Value, identifier: &str) -> &'a Value {
+    search["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["identifier"] == identifier)
+        .unwrap_or_else(|| panic!("missing result {identifier}: {search}"))
+}
+
 #[test]
 fn help_documents_the_agent_workflow_and_command_side_effects() {
     let world = TestWorld::new();
@@ -258,6 +285,797 @@ fn help_documents_the_agent_workflow_and_command_side_effects() {
                 "help command {args:?} should contain {text:?}\n{help}"
             );
         }
+    }
+}
+
+#[test]
+fn explain_reports_exact_bounded_lexical_and_specificity_arithmetic() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    put_page(
+        &world,
+        "payment-overview-readme",
+        "Payment Overview README",
+        "payment reconciliation matching rules evidence",
+    );
+    put_page(
+        &world,
+        "payment-reconciliation-matching-rules",
+        "Payment Reconciliation Matching Rules",
+        "payment reconciliation matching rules evidence",
+    );
+    put_page(
+        &world,
+        "payment-catalog",
+        "Payment Configuration",
+        "payment reconciliation matching rules\n\n## 使用导航\n总览文档只保留模块边界",
+    );
+    put_page(
+        &world,
+        "payment-procedure",
+        "Payment Procedure",
+        "payment reconciliation matching rules\n\n## 使用导航\n按步骤完成具体业务操作",
+    );
+
+    let default_search = world.ok(
+        &world.project,
+        &[
+            "search",
+            "payment reconciliation matching rules",
+            "--type",
+            "page",
+        ],
+    );
+    assert!(default_search["results"][0].get("explanation").is_none());
+    assert_eq!(
+        default_search["results"][0]["identifier"],
+        "payment-reconciliation-matching-rules"
+    );
+
+    let explained = world.ok(
+        &world.project,
+        &[
+            "search",
+            "payment reconciliation matching rules",
+            "--type",
+            "page",
+            "--explain",
+        ],
+    );
+    let direct = find_result(&explained, "payment-reconciliation-matching-rules");
+    let overview = find_result(&explained, "payment-overview-readme");
+    let catalog = find_result(&explained, "payment-catalog");
+    let procedure = find_result(&explained, "payment-procedure");
+    assert!(
+        direct["explanation"]["signals"]["title_match"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(
+        direct["explanation"]["signals"]["path_match"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert_eq!(overview["explanation"]["signals"]["generic_marker"], 1.0);
+    assert_eq!(catalog["explanation"]["signals"]["generic_marker"], 1.0);
+    assert_eq!(procedure["explanation"]["signals"]["generic_marker"], 0.0);
+    for result in explained["results"].as_array().unwrap() {
+        let explanation = &result["explanation"];
+        let reconstructed = explanation["base_rank"].as_f64().unwrap()
+            + explanation["contributions"]
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|value| value.as_f64().unwrap())
+                .sum::<f64>();
+        let final_rank = explanation["final_rank"].as_f64().unwrap();
+        assert!((reconstructed - final_rank).abs() < 1e-9, "{explanation}");
+        assert!((result["rank"].as_f64().unwrap() - final_rank).abs() < 1e-9);
+    }
+
+    let explicit_overview = world.ok(
+        &world.project,
+        &[
+            "search",
+            "payment overview README",
+            "--type",
+            "page",
+            "--explain",
+        ],
+    );
+    let overview = find_result(&explicit_overview, "payment-overview-readme");
+    assert_eq!(overview["explanation"]["signals"]["generic_marker"], 0.0);
+}
+
+#[test]
+fn source_generic_detection_preserves_structural_body_signals() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let source = world.write(
+        "payment-reconciliation-guide.md",
+        "payment reconciliation rules\n\n文档目录",
+    );
+    let added = world.ok(
+        &world.project,
+        &[
+            "source",
+            "add",
+            as_str(&source),
+            "--title",
+            "Payment Reconciliation Guide",
+        ],
+    );
+    let identifier = added["source"]["id"].to_string();
+    let search = world.ok(
+        &world.project,
+        &[
+            "search",
+            "payment reconciliation rules",
+            "--type",
+            "source",
+            "--explain",
+        ],
+    );
+    let source = find_result(&search, &identifier);
+    assert_eq!(source["explanation"]["signals"]["generic_marker"], 1.0);
+}
+
+#[test]
+fn document_weights_are_bounded_reversible_precedence_aware_and_candidate_only() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    put_page(&world, "alpha", "Alpha", "calibration candidate sharedterm");
+    put_page(&world, "beta", "Beta", "calibration candidate sharedterm");
+    put_page(&world, "absent", "Absent", "different vocabulary only");
+
+    let mut ranks = Vec::new();
+    for value in [-2, -1, 1, 2] {
+        let value_text = value.to_string();
+        world.ok(
+            &world.project,
+            &[
+                "weight",
+                "set",
+                "page",
+                "alpha",
+                "--value",
+                &value_text,
+                "--reason",
+                "monotonic calibration",
+                "--provenance",
+                "agent-observed",
+            ],
+        );
+        let search = world.ok(
+            &world.project,
+            &[
+                "search",
+                "calibration candidate sharedterm",
+                "--type",
+                "page",
+                "--explain",
+            ],
+        );
+        let alpha = find_result(&search, "alpha");
+        assert_eq!(
+            alpha["explanation"]["signals"]["manual_adjustment"],
+            value as f64 / 2.0
+        );
+        ranks.push(alpha["rank"].as_f64().unwrap());
+    }
+    assert!(ranks.windows(2).all(|pair| pair[0] > pair[1]), "{ranks:?}");
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "clear",
+            "page",
+            "alpha",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "set",
+            "page",
+            "beta",
+            "--value",
+            "2",
+            "--reason",
+            "verified canonical page",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let boosted = world.ok(
+        &world.project,
+        &[
+            "search",
+            "calibration candidate sharedterm",
+            "--type",
+            "page",
+            "--explain",
+        ],
+    );
+    assert_eq!(boosted["results"][0]["identifier"], "beta");
+    assert_eq!(
+        find_result(&boosted, "beta")["explanation"]["signals"]["manual_adjustment"],
+        1.0
+    );
+
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "set",
+            "page",
+            "beta",
+            "--value",
+            "-1",
+            "--reason",
+            "user says this page is secondary",
+            "--provenance",
+            "user-provided",
+        ],
+    );
+    let listed = world.ok(&world.project, &["weight", "list", "page", "beta"]);
+    assert_eq!(listed["adjustments"].as_array().unwrap().len(), 2);
+    assert_eq!(listed["effective"]["provenance"], "user-provided");
+    assert_eq!(listed["effective"]["weight"], -1);
+
+    for invalid in ["-3", "0", "3", "1.5"] {
+        let error = world.err(
+            &world.project,
+            &[
+                "weight",
+                "set",
+                "page",
+                "alpha",
+                "--value",
+                invalid,
+                "--reason",
+                "invalid bound",
+                "--provenance",
+                "agent-observed",
+            ],
+        );
+        assert_eq!(error["error"]["code"], "invalid_weight");
+    }
+    let empty_reason = world.err(
+        &world.project,
+        &[
+            "weight",
+            "set",
+            "page",
+            "alpha",
+            "--value",
+            "1",
+            "--reason",
+            " ",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    assert_eq!(empty_reason["error"]["code"], "invalid_input");
+
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "set",
+            "page",
+            "absent",
+            "--value",
+            "2",
+            "--reason",
+            "must not create a lexical candidate",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let search = world.ok(
+        &world.project,
+        &["search", "calibration candidate sharedterm"],
+    );
+    assert!(
+        search["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["identifier"] != "absent")
+    );
+
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "clear",
+            "page",
+            "beta",
+            "--provenance",
+            "user-provided",
+        ],
+    );
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "clear",
+            "page",
+            "beta",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let already_cleared = world.ok(
+        &world.project,
+        &[
+            "weight",
+            "clear",
+            "page",
+            "beta",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    assert_eq!(already_cleared["removed"], false);
+    let cleared = world.ok(&world.project, &["weight", "list", "page", "beta"]);
+    assert!(cleared["adjustments"].as_array().unwrap().is_empty());
+    assert!(cleared["effective"].is_null());
+}
+
+#[test]
+fn explicit_feedback_is_query_specific_private_precedence_aware_and_reversible() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&world.project, &["init"]);
+    let database = initialized["database"].as_str().unwrap();
+    put_page(
+        &world,
+        "preferred",
+        "Preferred",
+        "private feedback retrievalterm",
+    );
+    put_page(&world, "other", "Other", "private feedback retrievalterm");
+    let distinctive_query = "retrievalterm, private feedback 7f4a9";
+
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "feedback",
+            "page",
+            "preferred",
+            "--query",
+            distinctive_query,
+            "--signal",
+            "relevant",
+            "--reason",
+            "explicit result judgment",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "feedback",
+            "page",
+            "preferred",
+            "--query",
+            distinctive_query,
+            "--signal",
+            "irrelevant",
+            "--reason",
+            "replacement judgment",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "feedback",
+            "page",
+            "preferred",
+            "--query",
+            distinctive_query,
+            "--signal",
+            "relevant",
+            "--reason",
+            "final agent judgment",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let empty_query = world.err(
+        &world.project,
+        &[
+            "weight",
+            "feedback",
+            "page",
+            "preferred",
+            "--query",
+            "?!",
+            "--signal",
+            "relevant",
+            "--reason",
+            "invalid query fixture",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    assert_eq!(empty_query["error"]["code"], "invalid_query");
+    let equivalent = world.ok(
+        &world.project,
+        &[
+            "search",
+            "retrievalterm private feedback 7f4a9!",
+            "--type",
+            "page",
+            "--explain",
+        ],
+    );
+    assert_eq!(
+        find_result(&equivalent, "preferred")["explanation"]["signals"]["feedback_adjustment"],
+        1.0
+    );
+    let paraphrase = world.ok(
+        &world.project,
+        &[
+            "search",
+            "private retrieval feedback changed words",
+            "--type",
+            "page",
+            "--explain",
+        ],
+    );
+    assert_eq!(
+        find_result(&paraphrase, "preferred")["explanation"]["signals"]["feedback_adjustment"],
+        0.0
+    );
+
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "feedback",
+            "page",
+            "preferred",
+            "--query",
+            distinctive_query,
+            "--signal",
+            "irrelevant",
+            "--reason",
+            "user overrides agent judgment",
+            "--provenance",
+            "user-provided",
+        ],
+    );
+    let overridden = world.ok(
+        &world.project,
+        &["search", distinctive_query, "--type", "page", "--explain"],
+    );
+    assert_eq!(
+        find_result(&overridden, "preferred")["explanation"]["signals"]["feedback_adjustment"],
+        -1.0
+    );
+
+    let conn = Connection::open(database).unwrap();
+    let feedback_dump: String = conn
+        .query_row(
+            "SELECT GROUP_CONCAT(query_fingerprint || reason, '|') FROM retrieval_feedback",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let operation_dump: String = conn
+        .query_row(
+            "SELECT GROUP_CONCAT(detail_json, '|') FROM operations WHERE action LIKE 'weight_feedback%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let feedback_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM retrieval_feedback", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(feedback_rows, 2);
+    assert!(!feedback_dump.contains(distinctive_query));
+    assert!(!operation_dump.contains(distinctive_query));
+
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "feedback-clear",
+            "page",
+            "preferred",
+            "--query",
+            distinctive_query,
+            "--provenance",
+            "user-provided",
+        ],
+    );
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "feedback-clear",
+            "page",
+            "preferred",
+            "--query",
+            distinctive_query,
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let already_cleared = world.ok(
+        &world.project,
+        &[
+            "weight",
+            "feedback-clear",
+            "page",
+            "preferred",
+            "--query",
+            distinctive_query,
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    assert_eq!(already_cleared["removed"], false);
+    let cleared = world.ok(
+        &world.project,
+        &["search", distinctive_query, "--type", "page", "--explain"],
+    );
+    assert_eq!(
+        find_result(&cleared, "preferred")["explanation"]["signals"]["feedback_adjustment"],
+        0.0
+    );
+}
+
+#[test]
+fn retrieval_state_is_deleted_with_its_target_and_all_scope_mutations_are_rejected() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&world.project, &["init"]);
+    let database = initialized["database"].as_str().unwrap();
+    put_page(&world, "temporary", "Temporary", "cleanupterm");
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "set",
+            "page",
+            "temporary",
+            "--value",
+            "1",
+            "--reason",
+            "temporary",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "feedback",
+            "page",
+            "temporary",
+            "--query",
+            "cleanupterm",
+            "--signal",
+            "relevant",
+            "--reason",
+            "temporary",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+
+    let rejected = world.err(
+        &world.project,
+        &[
+            "--scope",
+            "all",
+            "weight",
+            "set",
+            "page",
+            "temporary",
+            "--value",
+            "1",
+            "--reason",
+            "must reject",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    assert_eq!(rejected["error"]["code"], "scope_not_supported");
+
+    world.ok(&world.project, &["page", "remove", "temporary"]);
+    let conn = Connection::open(database).unwrap();
+    for table in ["retrieval_weights", "retrieval_feedback"] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "orphaned rows in {table}");
+    }
+}
+
+#[test]
+fn lint_reports_orphaned_retrieval_state() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&world.project, &["init"]);
+    let database = initialized["database"].as_str().unwrap();
+    let conn = Connection::open(database).unwrap();
+    conn.execute(
+        "INSERT INTO retrieval_weights(
+            target_type, target_identifier, provenance, weight, reason
+         ) VALUES ('page', 'missing-page', 'agent-observed', 1, 'fixture')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO retrieval_feedback(
+            query_fingerprint, target_type, target_identifier, provenance, signal, reason
+         ) VALUES (?1, 'source', '999', 'agent-observed', 1, 'fixture')",
+        ["a".repeat(64)],
+    )
+    .unwrap();
+    drop(conn);
+
+    let lint = world.ok(&world.project, &["lint"]);
+    assert_eq!(lint["counts"]["retrieval_weight_orphan"], 1);
+    assert_eq!(lint["counts"]["retrieval_feedback_orphan"], 1);
+}
+
+#[test]
+fn graph_reranking_is_bounded_query_conditioned_and_does_not_promote_sources() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    put_page(
+        &world,
+        "seed",
+        "Graph calibration seed",
+        "graph calibration seedterm [[linked-candidate]]",
+    );
+    put_page(
+        &world,
+        "linked-candidate",
+        "Linked candidate",
+        "graph calibration seedterm",
+    );
+    put_page(
+        &world,
+        "unrelated-hub-readme",
+        "Unrelated Hub README",
+        "graph calibration seedterm [[x]] [[y]] [[z]] [[q]]",
+    );
+    let raw = world.write("raw.md", "graph calibration seedterm");
+    world.ok(
+        &world.project,
+        &["source", "add", as_str(&raw), "--title", "Raw graph source"],
+    );
+
+    let search = world.ok(
+        &world.project,
+        &[
+            "search",
+            "graph calibration seedterm",
+            "--type",
+            "all",
+            "--explain",
+        ],
+    );
+    let linked = find_result(&search, "linked-candidate");
+    let hub = find_result(&search, "unrelated-hub-readme");
+    assert!(
+        linked["explanation"]["signals"]["graph_match"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(
+        linked["explanation"]["signals"]["graph_match"]
+            .as_f64()
+            .unwrap()
+            <= 1.0
+    );
+    assert_eq!(hub["explanation"]["signals"]["graph_match"], 0.0);
+    let hub_penalty = hub["explanation"]["signals"]["graph_hub_penalty"]
+        .as_f64()
+        .unwrap();
+    assert!(hub_penalty > 0.0 && hub_penalty <= 1.0);
+    assert!(
+        hub["explanation"]["contributions"]["graph"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(
+        linked["explanation"]["contributions"]["graph"]
+            .as_f64()
+            .unwrap()
+            < 0.0
+    );
+    let raw_result = search["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["type"] == "source")
+        .unwrap();
+    assert_eq!(raw_result["explanation"]["signals"]["graph_match"], 0.0);
+
+    put_page(
+        &world,
+        "common-seed",
+        "Common seed",
+        "commononlyzeta [[shared-neighbor]]",
+    );
+    put_page(
+        &world,
+        "common-sibling",
+        "Common sibling",
+        "commononlyzeta [[shared-neighbor]]",
+    );
+    put_page(
+        &world,
+        "shared-neighbor",
+        "Shared neighbor",
+        "structural connector only",
+    );
+    let common = world.ok(
+        &world.project,
+        &["search", "commononlyzeta", "--type", "page", "--explain"],
+    );
+    for slug in ["common-seed", "common-sibling"] {
+        assert_eq!(
+            find_result(&common, slug)["explanation"]["signals"]["graph_match"],
+            0.0,
+            "common-neighbor-only evidence must not affect search ranking"
+        );
+    }
+
+    let shared_source = world.write("shared-graph-source.md", "shared graph evidence");
+    let added = world.ok(&world.project, &["source", "add", as_str(&shared_source)]);
+    let source_id = added["source"]["id"].as_i64().unwrap().to_string();
+    for slug in ["shared-source-a", "shared-source-b"] {
+        let body = world.write(&format!("pages/{slug}.md"), "sharedsourcezeta");
+        world.ok(
+            &world.project,
+            &[
+                "page",
+                "put",
+                slug,
+                "--title",
+                slug,
+                "--file",
+                as_str(&body),
+                "--source",
+                &source_id,
+            ],
+        );
+    }
+    let shared = world.ok(
+        &world.project,
+        &["search", "sharedsourcezeta", "--type", "page", "--explain"],
+    );
+    for slug in ["shared-source-a", "shared-source-b"] {
+        assert!(
+            find_result(&shared, slug)["explanation"]["signals"]["graph_match"]
+                .as_f64()
+                .unwrap()
+                > 0.0
+        );
     }
 }
 
@@ -643,8 +1461,12 @@ fn readonly_store_allows_unrecorded_search_but_rejects_recording() {
     fs::set_permissions(&db_path, fs::Permissions::from_mode(0o444)).unwrap();
     fs::set_permissions(&lwc_dir, fs::Permissions::from_mode(0o555)).unwrap();
 
-    let search = world.ok(&world.project, &["search", "readonly-query-term"]);
+    let search = world.ok(
+        &world.project,
+        &["search", "readonly-query-term", "--explain"],
+    );
     assert_eq!(search["results"][0]["identifier"], "readonly");
+    assert!(search["results"][0]["explanation"].is_object());
 
     let context = world.ok(&world.project, &["context", "--limit", "5"]);
     assert_eq!(context["stores"][0]["pages"][0]["slug"], "readonly");
@@ -678,6 +1500,10 @@ fn read_commands_transparently_migrate_a_writable_v5_store() {
          DROP TABLE IF EXISTS search_fts_config;
          DROP TABLE source_path_revisions;
          DROP TABLE page_provenance;
+         DROP TABLE retrieval_feedback;
+         DROP TABLE retrieval_weights;
+         ALTER TABLE sources DROP COLUMN structural_navigation;
+         ALTER TABLE pages DROP COLUMN structural_navigation;
          CREATE VIRTUAL TABLE search_fts USING fts5(
              doc_type UNINDEXED,
              identifier UNINDEXED,
@@ -699,7 +1525,7 @@ fn read_commands_transparently_migrate_a_writable_v5_store() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8, "context should migrate a writable legacy store");
+    assert_eq!(version, 9, "context should migrate a writable legacy store");
 }
 
 #[test]
@@ -731,7 +1557,11 @@ fn read_commands_migrate_v6_store_to_structured_provenance() {
     let database = world.project.join(".lwc/wiki.db");
     let conn = Connection::open(&database).unwrap();
     conn.execute_batch(
-        "DROP TABLE source_path_revisions;
+        "DROP TABLE retrieval_feedback;
+         DROP TABLE retrieval_weights;
+         ALTER TABLE sources DROP COLUMN structural_navigation;
+         ALTER TABLE pages DROP COLUMN structural_navigation;
+         DROP TABLE source_path_revisions;
          DROP TABLE IF EXISTS page_provenance;
          UPDATE meta SET value = '6' WHERE key = 'format_version';
          PRAGMA user_version = 6;",
@@ -749,7 +1579,7 @@ fn read_commands_migrate_v6_store_to_structured_provenance() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     conn.prepare("SELECT page_slug, provenance FROM page_provenance LIMIT 0")
         .unwrap();
 }
@@ -764,7 +1594,11 @@ fn read_commands_migrate_v7_without_guessing_source_path_history() {
     let database = world.project.join(".lwc/wiki.db");
     let conn = Connection::open(&database).unwrap();
     conn.execute_batch(
-        "DROP TABLE source_path_revisions;
+        "DROP TABLE retrieval_feedback;
+         DROP TABLE retrieval_weights;
+         ALTER TABLE sources DROP COLUMN structural_navigation;
+         ALTER TABLE pages DROP COLUMN structural_navigation;
+         DROP TABLE source_path_revisions;
          UPDATE meta SET value = '7' WHERE key = 'format_version';
          PRAGMA user_version = 7;",
     )
@@ -783,13 +1617,126 @@ fn read_commands_migrate_v7_without_guessing_source_path_history() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert_eq!(tracked, 0, "migration must not guess a legacy path head");
 
     let source_id = added["source"]["id"].as_i64().unwrap().to_string();
     let status = world.ok(&world.project, &["source", "status", &source_id]);
     assert!(status["checks"].as_array().unwrap().is_empty());
     assert_eq!(status["untracked_source_ids"], serde_json::json!([1]));
+}
+
+#[test]
+fn read_commands_atomically_migrate_a_v8_store_to_weighted_retrieval() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    put_page(
+        &world,
+        "v8-page",
+        "V8 page",
+        "v8 migration retrieval term\n\n文档目录",
+    );
+
+    let database = world.project.join(".lwc/wiki.db");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "DROP TABLE retrieval_feedback;
+         DROP TABLE retrieval_weights;
+         ALTER TABLE sources DROP COLUMN structural_navigation;
+         ALTER TABLE pages DROP COLUMN structural_navigation;
+         UPDATE meta SET value = '8' WHERE key = 'format_version';
+         PRAGMA user_version = 8;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let search = world.ok(
+        &world.project,
+        &["search", "v8 migration retrieval term", "--explain"],
+    );
+    assert_eq!(search["results"][0]["identifier"], "v8-page");
+    assert_eq!(
+        search["results"][0]["explanation"]["signals"]["generic_marker"],
+        1.0
+    );
+
+    let conn = Connection::open(database).unwrap();
+    let version: i32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 9);
+    conn.prepare("SELECT path_terms FROM search_fts LIMIT 0")
+        .unwrap();
+    conn.prepare("SELECT weight FROM retrieval_weights LIMIT 0")
+        .unwrap();
+    conn.prepare("SELECT signal FROM retrieval_feedback LIMIT 0")
+        .unwrap();
+    let structural_navigation: i64 = conn
+        .query_row(
+            "SELECT structural_navigation FROM pages WHERE slug = 'v8-page'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(structural_navigation, 1);
+}
+
+#[test]
+fn failed_v8_migration_leaves_version_and_schema_unchanged() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let database = world.project.join(".lwc/wiki.db");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "DROP TABLE retrieval_feedback;
+         DROP TABLE retrieval_weights;
+         ALTER TABLE sources DROP COLUMN structural_navigation;
+         ALTER TABLE pages DROP COLUMN structural_navigation;
+         CREATE TABLE retrieval_weights(sentinel TEXT NOT NULL);
+         UPDATE meta SET value = '8' WHERE key = 'format_version';
+         PRAGMA user_version = 8;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let error = world.err(&world.project, &["context", "--limit", "1"]);
+    assert_eq!(error["error"]["code"], "store_migration_failed");
+
+    let conn = Connection::open(database).unwrap();
+    let version: i32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    let format_version: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'format_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let feedback_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'retrieval_feedback'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 8);
+    assert_eq!(format_version, "8");
+    assert_eq!(feedback_exists, 0);
+    for table in ["sources", "pages"] {
+        let columns: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'structural_navigation'"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 0, "failed migration added a column to {table}");
+    }
+    conn.prepare("SELECT sentinel FROM retrieval_weights LIMIT 0")
+        .unwrap();
 }
 
 #[test]
@@ -876,6 +1823,106 @@ fn project_and_global_stores_are_isolated_and_combined_deterministically() {
 
     let unsupported = world.err(&world.project, &["--scope", "all", "schema", "show"]);
     assert_eq!(unsupported["error"]["code"], "scope_not_supported");
+}
+
+#[test]
+fn retrieval_state_for_the_same_identifier_never_crosses_scopes() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(&world.project, &["--scope", "global", "init"]);
+    let body = world.write("same-scope.md", "scope-isolation-query");
+    for scope in [None, Some("global")] {
+        let mut args = Vec::new();
+        if let Some(scope) = scope {
+            args.extend(["--scope", scope]);
+        }
+        args.extend([
+            "page",
+            "put",
+            "same-page",
+            "--title",
+            "Same page",
+            "--file",
+            as_str(&body),
+            "--provenance",
+            "agent-observed",
+        ]);
+        world.ok(&world.project, &args);
+    }
+
+    for (scope, value, signal) in [
+        (None, "2", "relevant"),
+        (Some("global"), "-2", "irrelevant"),
+    ] {
+        let mut prefix = Vec::new();
+        if let Some(scope) = scope {
+            prefix.extend(["--scope", scope]);
+        }
+        let mut weight = prefix.clone();
+        weight.extend([
+            "weight",
+            "set",
+            "page",
+            "same-page",
+            "--value",
+            value,
+            "--reason",
+            "scope fixture",
+            "--provenance",
+            "user-provided",
+        ]);
+        world.ok(&world.project, &weight);
+        let mut feedback = prefix;
+        feedback.extend([
+            "weight",
+            "feedback",
+            "page",
+            "same-page",
+            "--query",
+            "scope-isolation-query",
+            "--signal",
+            signal,
+            "--reason",
+            "scope fixture",
+            "--provenance",
+            "user-provided",
+        ]);
+        world.ok(&world.project, &feedback);
+    }
+
+    for (scope, expected) in [(None, 1.0), (Some("global"), -1.0)] {
+        let mut args = Vec::new();
+        if let Some(scope) = scope {
+            args.extend(["--scope", scope]);
+        }
+        args.extend(["search", "scope-isolation-query", "--explain"]);
+        let result = world.ok(&world.project, &args);
+        let explanation = &find_result(&result, "same-page")["explanation"];
+        assert_eq!(explanation["signals"]["manual_adjustment"], expected);
+        assert_eq!(explanation["signals"]["feedback_adjustment"], expected);
+    }
+
+    let combined = world.ok(
+        &world.project,
+        &[
+            "--scope",
+            "all",
+            "search",
+            "scope-isolation-query",
+            "--explain",
+        ],
+    );
+    let rows = combined["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["identifier"] == "same-page")
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2);
+    assert_ne!(
+        rows[0]["explanation"]["signals"]["manual_adjustment"],
+        rows[1]["explanation"]["signals"]["manual_adjustment"]
+    );
 }
 
 #[test]

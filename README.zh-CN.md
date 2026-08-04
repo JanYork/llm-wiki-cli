@@ -393,6 +393,7 @@ Markdown 投影都会返回 provenance，但 provenance 不参与搜索排序。
 ```bash
 lwc context --limit 50
 lwc search "question keywords" --limit 20
+lwc search "question keywords" --limit 20 --explain
 lwc search "concept only" --type page --kind concept
 lwc search "exact evidence" --type source
 lwc page show source-1
@@ -447,9 +448,49 @@ lwc --scope all context
   `--kind` 限定页面类型，例如 `--kind concept --kind synthesis`。
 - 多字 CJK 查询使用相邻 bigram；索引还会保留非停用单字，使单字查询仍可检索。
 - 拉丁文本会被切成小写的字母数字 token。
-- 排名使用固定的 title/summary/body 权重，因此在 `--scope all` 下，project 和 global 的结果仍可直接比较。
+- 排名会区分标题、来源文件名、路径/slug、摘要和正文；标题与路径的精确或部分匹配
+  使用有界加权。
+- README、index、overview 和明确的导航枢纽会按查询降权，让具体功能文档优先；
+  查询明确要求 README 或总览时不降权。
+- 页面候选可以获得有界的直接链接或共享来源加权。只有共同邻居、没有直接证据的
+  关系不会改变搜索顺序；宽泛导航枢纽会得到有界图惩罚。
+- `--explain` 返回可精确复算的词法、通用文档、图、人工权重与查询反馈信号。
+  它不会记录查询；只有显式 `--record` 才会写入搜索历史。
+- 固定系数和“数值越低越相关”的 rank 让 `--scope all` 中的 project/global 结果
+  保持可比。
 
 这里刻意不依赖词典分词。目标是在产品名、代号、混合语言术语和新出现词汇上保持稳定行为，而不依赖外部分词词典。
+
+### 显式检索权重与反馈
+
+文档权重用于长期、与具体查询无关的页面/来源判断；反馈只作用于同一个有序 token
+查询指纹：
+
+```bash
+lwc weight set page payment-rules \
+  --value 2 \
+  --reason "支付规则的权威规范" \
+  --provenance agent-observed
+lwc weight list page payment-rules
+
+lwc weight feedback page payment-rules \
+  --query "支付对账规则" \
+  --signal relevant \
+  --reason "已按预期答案核验" \
+  --provenance agent-observed
+
+lwc weight feedback-clear page payment-rules \
+  --query "支付对账规则" \
+  --provenance agent-observed
+lwc weight clear page payment-rules --provenance agent-observed
+```
+
+文档权重只能取 `-2`、`-1`、`1`、`2`，归零使用 `clear`。两种机制都只重排已经
+通过词法召回的候选，不会凭空召回不匹配文档。`user-provided` 优先于
+`agent-observed`，但两行都会保留供审计。反馈只保存 SHA-256 指纹，不保存原始
+查询，也不会泛化到 token 不同的改写。原因和操作记录会持久化，因此不要把敏感
+查询复制到 `--reason`。变更必须明确使用 `project` 或 `global`；`--scope all`
+会被拒绝。
 
 ## 维护与投影
 
