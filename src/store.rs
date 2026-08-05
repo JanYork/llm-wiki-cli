@@ -2,7 +2,7 @@ use crate::{
     artifacts,
     error::{AppError, Result},
     graph::{GraphPage, related},
-    tokenize::{tokenize_for_index, tokenize_for_query},
+    tokenize::{joined_index_terms, tokenize_for_query},
 };
 use rusqlite::{
     Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
@@ -26,7 +26,9 @@ use std::{
 const COMPOUND_WIKI_VERSION: i32 = 6;
 const PAGE_PROVENANCE_VERSION: i32 = 7;
 const SOURCE_PATH_REVISIONS_VERSION: i32 = 8;
-const USER_VERSION: i32 = 9;
+const RETRIEVAL_WEIGHTING_VERSION: i32 = 9;
+const USER_VERSION: i32 = 10;
+const CHANGESET_FREEZE_KEY: &str = "changeset_frozen";
 const SEARCH_INDEX_VERSION: i32 = 4;
 const INGEST_WORKFLOW_VERSION: i32 = 5;
 const TOKENIZER_ID: &str = "cjk-bigram@1/bounded-terms";
@@ -556,6 +558,86 @@ pub struct OperationRecord {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StoreIdentity {
+    pub store_id: String,
+    pub revision: String,
+    pub operation_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChangesetDraftState {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub base_revision: String,
+    pub base_operation_id: i64,
+    pub begin_operation_id: i64,
+    pub draft_revision: String,
+    pub draft_operation_id: i64,
+    pub staged_operation_count: usize,
+    pub action_counts: BTreeMap<String, usize>,
+    pub operations: Vec<OperationRecord>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChangesetPublishInput {
+    pub id: String,
+    pub name: String,
+    pub store_id: String,
+    pub base_revision: String,
+    pub draft_revision: String,
+    pub draft_operation_id: i64,
+    pub staged_operation_count: usize,
+    pub checkpoint: String,
+    pub lint_issues: usize,
+    pub lint_override_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChangesetCommitState {
+    pub changeset_id: String,
+    pub name: String,
+    pub base_revision: String,
+    pub post_revision: String,
+    pub checkpoint: String,
+    pub staged_operation_count: usize,
+    pub lint_issues: usize,
+    pub locked_publish_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangesetHistoryState {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub base_revision: String,
+    pub base_operation_id: i64,
+    pub begin_operation_id: i64,
+    pub pre_commit_checkpoint: Option<String>,
+    pub post_revision: Option<String>,
+    pub created_at: String,
+    pub committed_at: Option<String>,
+    pub rolled_back_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChangesetRollbackInput {
+    pub history: ChangesetHistoryState,
+    pub store_id: String,
+    pub pre_rollback_checkpoint: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChangesetRollbackState {
+    pub changeset_id: String,
+    pub name: String,
+    pub rollback_revision: String,
+    pub checkpoint: String,
+    pub locked_rollback_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ContextStore {
     pub scope: String,
     pub database: String,
@@ -800,6 +882,389 @@ impl Store {
             Err(error) if error.code == "unsupported_store_version" => Self::open(scope, database),
             Err(error) => Err(error),
         }
+    }
+
+    pub fn identity(&self) -> Result<StoreIdentity> {
+        store_identity(&self.conn)
+    }
+
+    pub fn snapshot_to(&self, path: &Path) -> Result<()> {
+        create_checkpoint(&self.conn, path)
+    }
+
+    pub fn changeset_begin(
+        &mut self,
+        name: &str,
+        base: &StoreIdentity,
+    ) -> Result<ChangesetDraftState> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let draft_identity = store_identity(&tx)?;
+        if draft_identity.store_id != base.store_id || draft_identity.revision != base.revision {
+            return Err(AppError::new(
+                "changeset_changed",
+                "draft snapshot does not match the captured live base",
+            ));
+        }
+        let id: String = tx.query_row("SELECT LOWER(HEX(RANDOMBLOB(32)))", [], |row| row.get(0))?;
+        record_operation(
+            &tx,
+            "changeset_begin",
+            &id,
+            &json!({"name": name, "base_revision": base.revision}),
+        )?;
+        let begin_operation_id = tx.last_insert_rowid();
+        tx.execute(
+            &format!(
+                "INSERT INTO changesets(
+                    id, name, status, base_revision, base_operation_id,
+                    begin_operation_id, created_at
+                 ) VALUES (?1, ?2, 'draft', ?3, ?4, ?5, {TIMESTAMP_SQL})"
+            ),
+            params![
+                &id,
+                name,
+                &base.revision,
+                base.operation_id,
+                begin_operation_id
+            ],
+        )?;
+        tx.commit()?;
+        self.changeset_draft(name, 50)
+    }
+
+    pub fn changeset_draft(&self, name: &str, limit: usize) -> Result<ChangesetDraftState> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, name, status, base_revision, base_operation_id,
+                        begin_operation_id, created_at
+                 FROM changesets
+                 WHERE name = ?1 AND status = 'draft'
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+                params![name],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                AppError::new(
+                    "changeset_not_found",
+                    format!("draft changeset not found: {name}"),
+                )
+            })?;
+        let identity = self.identity()?;
+        let staged_operation_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM operations WHERE id > ?1",
+            params![row.5],
+            |row| row.get(0),
+        )?;
+        let mut action_counts = BTreeMap::new();
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT action, COUNT(*)
+                 FROM operations
+                 WHERE id > ?1
+                 GROUP BY action
+                 ORDER BY action",
+            )?;
+            let rows = statement.query_map(params![row.5], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for value in rows {
+                let (action, count) = value?;
+                action_counts.insert(action, usize::try_from(count).unwrap_or(usize::MAX));
+            }
+        }
+        let operations = {
+            let mut statement = self.conn.prepare(
+                "SELECT id, action, target, detail_json, created_at
+                 FROM operations
+                 WHERE id > ?1
+                 ORDER BY id DESC
+                 LIMIT ?2",
+            )?;
+            statement
+                .query_map(params![row.5, limit as i64], read_operation_record)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(ChangesetDraftState {
+            id: row.0,
+            name: row.1,
+            status: row.2,
+            base_revision: row.3,
+            base_operation_id: row.4,
+            begin_operation_id: row.5,
+            draft_revision: identity.revision,
+            draft_operation_id: identity.operation_id,
+            staged_operation_count: usize::try_from(staged_operation_count).map_err(|_| {
+                AppError::new(
+                    "database_error",
+                    "changeset operation count is out of range",
+                )
+            })?,
+            action_counts,
+            operations,
+            created_at: row.6,
+        })
+    }
+
+    pub fn changeset_checkpoint_create(&self, changeset_id: &str) -> Result<CheckpointResponse> {
+        if changeset_id.len() != 64 || !changeset_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(AppError::new(
+                "changeset_corrupt",
+                "changeset id is not a 64-character hexadecimal value",
+            ));
+        }
+        let prefix = format!("pre-changeset-{}", &changeset_id[..12]);
+        let checkpoint = fresh_checkpoint_name(&self.database, &prefix)?;
+        let path = checkpoint_path(&self.database, &checkpoint)?;
+        create_checkpoint(&self.conn, &path)?;
+        Ok(CheckpointResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            checkpoint,
+            path: path.to_string_lossy().into_owned(),
+            safety_checkpoint: None,
+        })
+    }
+
+    pub fn changeset_freeze(
+        &mut self,
+        id: &str,
+        expected_revision: &str,
+        expected_operation_id: i64,
+        expected_operation_count: usize,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity = store_identity(&tx)?;
+        let begin_operation_id: i64 = tx
+            .query_row(
+                "SELECT begin_operation_id FROM changesets
+                 WHERE id = ?1 AND status = 'draft'",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                AppError::new("changeset_changed", "draft changeset is no longer writable")
+            })?;
+        let operation_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM operations WHERE id > ?1",
+            params![begin_operation_id],
+            |row| row.get(0),
+        )?;
+        if identity.revision != expected_revision
+            || identity.operation_id != expected_operation_id
+            || usize::try_from(operation_count).ok() != Some(expected_operation_count)
+        {
+            return Err(AppError::new(
+                "changeset_changed",
+                "draft changeset changed during commit preflight",
+            ));
+        }
+        let frozen: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![CHANGESET_FREEZE_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match frozen.as_deref() {
+            Some(value) if value != id => {
+                return Err(AppError::new(
+                    "changeset_corrupt",
+                    "draft freeze marker belongs to another changeset",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                tx.execute(
+                    "INSERT INTO meta(key, value) VALUES (?1, ?2)",
+                    params![CHANGESET_FREEZE_KEY, id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn changeset_publish(
+        &mut self,
+        draft_path: &Path,
+        input: &ChangesetPublishInput,
+    ) -> Result<ChangesetCommitState> {
+        self.conn.execute(
+            "ATTACH DATABASE ?1 AS candidate",
+            params![draft_path.to_string_lossy().as_ref()],
+        )?;
+        let result = publish_attached_changeset(&mut self.conn, input);
+        let _ = self.conn.execute("DETACH DATABASE candidate", []);
+        result
+    }
+
+    pub fn changeset_committed_by_id(&self, id: &str) -> Result<Option<ChangesetCommitState>> {
+        load_committed_changeset(&self.conn, id)
+    }
+
+    pub fn changeset_history_by_id(&self, id: &str) -> Result<Option<ChangesetHistoryState>> {
+        self.conn
+            .query_row(
+                "SELECT id, name, status, base_revision, base_operation_id,
+                        begin_operation_id, pre_commit_checkpoint, post_revision,
+                        created_at, committed_at, rolled_back_at
+                 FROM changesets WHERE id = ?1",
+                params![id],
+                read_changeset_history,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn changeset_rollback_checkpoint_create(
+        &self,
+        changeset_id: &str,
+    ) -> Result<CheckpointResponse> {
+        if changeset_id.len() != 64 || !changeset_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(AppError::new(
+                "changeset_corrupt",
+                "changeset id is not a 64-character hexadecimal value",
+            ));
+        }
+        let prefix = format!("pre-rollback-{}", &changeset_id[..12]);
+        let checkpoint = fresh_checkpoint_name(&self.database, &prefix)?;
+        let path = checkpoint_path(&self.database, &checkpoint)?;
+        create_checkpoint(&self.conn, &path)?;
+        Ok(CheckpointResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            checkpoint,
+            path: path.to_string_lossy().into_owned(),
+            safety_checkpoint: None,
+        })
+    }
+
+    pub fn changeset_rollback_checkpoint_validate(
+        &self,
+        history: &ChangesetHistoryState,
+        store_id: &str,
+    ) -> Result<()> {
+        let checkpoint = history.pre_commit_checkpoint.as_deref().ok_or_else(|| {
+            AppError::new(
+                "changeset_corrupt",
+                "committed changeset has no pre-commit checkpoint",
+            )
+        })?;
+        let path = checkpoint_path(&self.database, checkpoint)?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            AppError::new(
+                "changeset_corrupt",
+                format!("pre-commit checkpoint is unavailable: {error}"),
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(AppError::new(
+                "changeset_corrupt",
+                "pre-commit checkpoint is not a regular file",
+            ));
+        }
+        let checkpoint_store = Store::open_read_only(self.scope.clone(), &path)
+            .map_err(|error| AppError::new("changeset_corrupt", error.message))?;
+        if checkpoint_store.identity()?.store_id != store_id {
+            return Err(AppError::new(
+                "changeset_corrupt",
+                "pre-commit checkpoint belongs to another Wiki",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn changeset_rollback(
+        &mut self,
+        input: &ChangesetRollbackInput,
+    ) -> Result<ChangesetRollbackState> {
+        let checkpoint = input
+            .history
+            .pre_commit_checkpoint
+            .as_deref()
+            .ok_or_else(|| {
+                AppError::new(
+                    "changeset_corrupt",
+                    "committed changeset has no pre-commit checkpoint",
+                )
+            })?;
+        let path = checkpoint_path(&self.database, checkpoint)?;
+        self.changeset_rollback_checkpoint_validate(&input.history, &input.store_id)?;
+
+        self.conn.execute(
+            "ATTACH DATABASE ?1 AS candidate",
+            params![path.to_string_lossy().as_ref()],
+        )?;
+        let result = rollback_attached_changeset(&mut self.conn, input);
+        let _ = self.conn.execute("DETACH DATABASE candidate", []);
+        result
+    }
+
+    pub fn changeset_rollback_state_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<ChangesetRollbackState>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT c.name, o.detail_json
+                 FROM changesets c
+                 JOIN operations o
+                   ON o.action = 'changeset_rollback' AND o.target = c.id
+                 WHERE c.id = ?1 AND c.status = 'rolled_back'
+                 ORDER BY o.id DESC LIMIT 1",
+                params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((name, detail)) = row else {
+            return Ok(None);
+        };
+        let detail: Value = serde_json::from_str(&detail)
+            .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?;
+        let checkpoint = detail
+            .get("pre_rollback_checkpoint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AppError::new(
+                    "changeset_corrupt",
+                    "rollback operation lacks pre_rollback_checkpoint",
+                )
+            })?;
+        let rollback_revision = detail
+            .get("rollback_revision")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AppError::new(
+                    "changeset_corrupt",
+                    "rollback operation lacks rollback_revision",
+                )
+            })?;
+        Ok(Some(ChangesetRollbackState {
+            changeset_id: id.to_string(),
+            name,
+            rollback_revision: rollback_revision.to_string(),
+            checkpoint: checkpoint.to_string(),
+            locked_rollback_ms: 0,
+        }))
     }
 
     pub fn schema_set(&mut self, schema: &str) -> Result<SchemaResponse> {
@@ -1309,6 +1774,7 @@ impl Store {
 
         index_page(
             &tx,
+            None,
             &input.slug,
             &input.title,
             input.summary.as_deref(),
@@ -2110,15 +2576,7 @@ impl Store {
         )?;
         tx.commit()?;
 
-        let (busy, log_frames, checkpointed_frames) =
-            self.conn
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })?;
+        let (busy, log_frames, checkpointed_frames) = wal_checkpoint_truncate(&self.conn, true)?;
         let after_bytes = fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0);
         Ok(CompactResponse {
             scope: self.scope.clone(),
@@ -2129,6 +2587,10 @@ impl Store {
             before_bytes,
             after_bytes,
         })
+    }
+
+    pub fn checkpoint_wal_truncate(&self) -> Result<bool> {
+        Ok(wal_checkpoint_truncate(&self.conn, false)?.0 == 0)
     }
 
     pub fn checkpoint_create(&self, name: &str) -> Result<CheckpointResponse> {
@@ -2196,7 +2658,7 @@ impl Store {
         configure_read_only_connection(&source)?;
         prepare_store_read_only(&source)?;
 
-        let safety_checkpoint = fresh_safety_checkpoint_name(&self.database)?;
+        let safety_checkpoint = fresh_checkpoint_name(&self.database, "pre-restore")?;
         let safety_path = checkpoint_path(&self.database, &safety_checkpoint)?;
         create_checkpoint(&self.conn, &safety_path)?;
 
@@ -2804,16 +3266,17 @@ fn create_checkpoint(source: &Connection, path: &Path) -> Result<()> {
     result
 }
 
-fn fresh_safety_checkpoint_name(database: &Path) -> Result<String> {
+fn fresh_checkpoint_name(database: &Path, prefix: &str) -> Result<String> {
+    validate_checkpoint_name(prefix)?;
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| AppError::new("system_time_error", error.to_string()))?
         .as_millis();
     for suffix in 0..1000 {
         let name = if suffix == 0 {
-            format!("pre-restore-{millis}")
+            format!("{prefix}-{millis}")
         } else {
-            format!("pre-restore-{millis}-{suffix}")
+            format!("{prefix}-{millis}-{suffix}")
         };
         if !checkpoint_path(database, &name)?.exists() {
             return Ok(name);
@@ -3059,6 +3522,10 @@ fn prepare_store(conn: &mut Connection, allow_create: bool) -> Result<bool> {
         migrate_retrieval_weighting(conn)?;
         version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     }
+    if version == RETRIEVAL_WEIGHTING_VERSION {
+        migrate_changesets(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
     if version != USER_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
@@ -3275,7 +3742,7 @@ fn migrate_retrieval_weighting(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match current {
-        USER_VERSION => {
+        RETRIEVAL_WEIGHTING_VERSION..=USER_VERSION => {
             tx.commit()?;
             return Ok(());
         }
@@ -3291,21 +3758,66 @@ fn migrate_retrieval_weighting(conn: &mut Connection) -> Result<()> {
     add_structural_navigation_state(&tx).map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to prepare v{USER_VERSION} retrieval features: {error}"),
+            format!("failed to prepare v{RETRIEVAL_WEIGHTING_VERSION} retrieval features: {error}"),
         )
     })?;
     create_retrieval_state(&tx).map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to prepare v{USER_VERSION} retrieval state: {error}"),
+            format!("failed to prepare v{RETRIEVAL_WEIGHTING_VERSION} retrieval state: {error}"),
         )
     })?;
     rebuild_search_index(&tx).map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to prepare v{USER_VERSION} weighted search index: {error}"),
+            format!(
+                "failed to prepare v{RETRIEVAL_WEIGHTING_VERSION} weighted search index: {error}"
+            ),
         )
     })?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![RETRIEVAL_WEIGHTING_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", RETRIEVAL_WEIGHTING_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to commit v{RETRIEVAL_WEIGHTING_VERSION} retrieval migration: {error}"),
+        )
+    })
+}
+
+fn migrate_changesets(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match current {
+        USER_VERSION => {
+            tx.commit()?;
+            return Ok(());
+        }
+        RETRIEVAL_WEIGHTING_VERSION => {}
+        other => {
+            return Err(AppError::new(
+                "unsupported_store_version",
+                format!("cannot migrate wiki database version {other} to {USER_VERSION}"),
+            ));
+        }
+    }
+
+    create_changeset_state(&tx).map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to prepare v{USER_VERSION} changeset state: {error}"),
+        )
+    })?;
+    tx.execute_batch(
+        "INSERT OR IGNORE INTO meta(key, value)
+         VALUES ('store_id', LOWER(HEX(RANDOMBLOB(32))));
+         INSERT OR IGNORE INTO meta(key, value)
+         VALUES ('store_revision', LOWER(HEX(RANDOMBLOB(32))));",
+    )?;
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -3315,7 +3827,7 @@ fn migrate_retrieval_weighting(conn: &mut Connection) -> Result<()> {
     tx.commit().map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to commit v{USER_VERSION} retrieval migration: {error}"),
+            format!("failed to commit v{USER_VERSION} changeset migration: {error}"),
         )
     })
 }
@@ -3389,6 +3901,26 @@ fn create_retrieval_state(tx: &Transaction<'_>) -> Result<()> {
         CREATE INDEX retrieval_feedback_target
         ON retrieval_feedback(target_type, target_identifier, query_fingerprint);"
     ))?;
+    Ok(())
+}
+
+fn create_changeset_state(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS changesets(
+            id TEXT PRIMARY KEY CHECK(LENGTH(id) = 64),
+            name TEXT NOT NULL CHECK(TRIM(name) <> ''),
+            status TEXT NOT NULL CHECK(status IN ('draft', 'committed', 'rolled_back')),
+            base_revision TEXT NOT NULL CHECK(LENGTH(base_revision) = 64),
+            base_operation_id INTEGER NOT NULL CHECK(base_operation_id >= 0),
+            begin_operation_id INTEGER NOT NULL CHECK(begin_operation_id > base_operation_id),
+            pre_commit_checkpoint TEXT,
+            post_revision TEXT CHECK(post_revision IS NULL OR LENGTH(post_revision) = 64),
+            created_at TEXT NOT NULL,
+            committed_at TEXT,
+            rolled_back_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS changesets_name_created ON changesets(name, created_at);",
+    )?;
     Ok(())
 }
 
@@ -3528,9 +4060,12 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
 
         INSERT INTO meta(key, value) VALUES ('format_version', '{USER_VERSION}');
         INSERT INTO meta(key, value) VALUES ('tokenizer', '{TOKENIZER_ID}');
+        INSERT INTO meta(key, value) VALUES ('store_id', LOWER(HEX(RANDOMBLOB(32))));
+        INSERT INTO meta(key, value) VALUES ('store_revision', LOWER(HEX(RANDOMBLOB(32))));
         PRAGMA user_version = {USER_VERSION};
         "
     ))?;
+    create_changeset_state(&tx)?;
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('schema', ?1)",
         params![DEFAULT_SCHEMA],
@@ -3586,21 +4121,21 @@ fn migrate_search_index(conn: &mut Connection) -> Result<()> {
 fn rebuild_search_index(tx: &Transaction<'_>) -> Result<(usize, usize)> {
     tx.execute_batch(
         "
-        DROP TRIGGER IF EXISTS sources_ai;
-        DROP TRIGGER IF EXISTS sources_au;
-        DROP TRIGGER IF EXISTS sources_ad;
-        DROP TRIGGER IF EXISTS pages_ai;
-        DROP TRIGGER IF EXISTS pages_au;
-        DROP TRIGGER IF EXISTS pages_ad;
-        DROP TABLE IF EXISTS source_fts;
-        DROP TABLE IF EXISTS page_fts;
-        DROP TABLE IF EXISTS search_fts;
-        DROP TABLE IF EXISTS search_fts_data;
-        DROP TABLE IF EXISTS search_fts_idx;
-        DROP TABLE IF EXISTS search_fts_content;
-        DROP TABLE IF EXISTS search_fts_docsize;
-        DROP TABLE IF EXISTS search_fts_config;
-        CREATE VIRTUAL TABLE search_fts USING fts5(
+        DROP TRIGGER IF EXISTS main.sources_ai;
+        DROP TRIGGER IF EXISTS main.sources_au;
+        DROP TRIGGER IF EXISTS main.sources_ad;
+        DROP TRIGGER IF EXISTS main.pages_ai;
+        DROP TRIGGER IF EXISTS main.pages_au;
+        DROP TRIGGER IF EXISTS main.pages_ad;
+        DROP TABLE IF EXISTS main.source_fts;
+        DROP TABLE IF EXISTS main.page_fts;
+        DROP TABLE IF EXISTS main.search_fts;
+        DROP TABLE IF EXISTS main.search_fts_data;
+        DROP TABLE IF EXISTS main.search_fts_idx;
+        DROP TABLE IF EXISTS main.search_fts_content;
+        DROP TABLE IF EXISTS main.search_fts_docsize;
+        DROP TABLE IF EXISTS main.search_fts_config;
+        CREATE VIRTUAL TABLE main.search_fts USING fts5(
             doc_type UNINDEXED,
             identifier UNINDEXED,
             title_terms,
@@ -3628,7 +4163,7 @@ fn rebuild_search_index(tx: &Transaction<'_>) -> Result<(usize, usize)> {
         })?;
         for row in rows {
             let (id, title, origin, content) = row?;
-            index_source(tx, id, title.as_deref(), &origin, &content)?;
+            index_source(tx, None, id, title.as_deref(), &origin, &content)?;
             source_count += 1;
         }
     }
@@ -3647,7 +4182,7 @@ fn rebuild_search_index(tx: &Transaction<'_>) -> Result<(usize, usize)> {
         })?;
         for row in rows {
             let (slug, title, summary, body) = row?;
-            index_page(tx, &slug, &title, summary.as_deref(), &body)?;
+            index_page(tx, None, &slug, &title, summary.as_deref(), &body)?;
             page_count += 1;
         }
     }
@@ -3667,6 +4202,7 @@ fn validate_store(conn: &Connection) -> Result<()> {
         "SELECT tracked_path, revision, source_id, observed_at FROM source_path_revisions LIMIT 0",
         "SELECT target_type, target_identifier, provenance, weight, reason, updated_at FROM retrieval_weights LIMIT 0",
         "SELECT query_fingerprint, target_type, target_identifier, provenance, signal, reason, updated_at FROM retrieval_feedback LIMIT 0",
+        "SELECT id, name, status, base_revision, base_operation_id, begin_operation_id, pre_commit_checkpoint, post_revision, created_at, committed_at, rolled_back_at FROM changesets LIMIT 0",
         "SELECT rowid, doc_type, identifier, title_terms, path_terms, summary_terms, body_terms FROM search_fts LIMIT 0",
     ] {
         conn.prepare(sql).map_err(|error| {
@@ -3680,14 +4216,18 @@ fn validate_store(conn: &Connection) -> Result<()> {
         .query_row(
             "SELECT
                 MAX(CASE WHEN key = 'format_version' THEN value END),
-                MAX(CASE WHEN key = 'tokenizer' THEN value END)
+                MAX(CASE WHEN key = 'tokenizer' THEN value END),
+                MAX(CASE WHEN key = 'store_id' THEN value END),
+                MAX(CASE WHEN key = 'store_revision' THEN value END)
              FROM meta
-             WHERE key IN ('format_version', 'tokenizer')",
+             WHERE key IN ('format_version', 'tokenizer', 'store_id', 'store_revision')",
             [],
             |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             },
         )
@@ -3711,6 +4251,20 @@ fn validate_store(conn: &Connection) -> Result<()> {
                 metadata.1.as_deref().unwrap_or("unknown")
             ),
         ));
+    }
+    for (key, value) in [("store_id", metadata.2), ("store_revision", metadata.3)] {
+        let valid = value.as_deref().is_some_and(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+        if !valid {
+            return Err(AppError::new(
+                "corrupt_store",
+                format!("wiki {key} is missing or invalid"),
+            ));
+        }
     }
     Ok(())
 }
@@ -3771,6 +4325,7 @@ fn insert_source(tx: &Transaction<'_>, input: &SourceAddInput) -> Result<(i64, b
     if created {
         index_source(
             tx,
+            None,
             source_id,
             Some(&title),
             &input.origin,
@@ -3842,19 +4397,761 @@ fn record_source_path_revision(
     Ok((revision, true))
 }
 
+fn store_identity(conn: &Connection) -> Result<StoreIdentity> {
+    let (store_id, revision) = conn.query_row(
+        "SELECT
+            MAX(CASE WHEN key = 'store_id' THEN value END),
+            MAX(CASE WHEN key = 'store_revision' THEN value END)
+         FROM meta
+         WHERE key IN ('store_id', 'store_revision')",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    )?;
+    let operation_id =
+        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM operations", [], |row| {
+            row.get(0)
+        })?;
+    Ok(StoreIdentity {
+        store_id: store_id
+            .ok_or_else(|| AppError::new("corrupt_store", "wiki store_id metadata is missing"))?,
+        revision: revision.ok_or_else(|| {
+            AppError::new("corrupt_store", "wiki store_revision metadata is missing")
+        })?,
+        operation_id,
+    })
+}
+
+fn load_committed_changeset(conn: &Connection, id: &str) -> Result<Option<ChangesetCommitState>> {
+    let row = conn
+        .query_row(
+            "SELECT c.id, c.name, c.base_revision, c.post_revision,
+                c.pre_commit_checkpoint, o.detail_json
+         FROM changesets c
+         JOIN operations o ON o.action = 'changeset_commit' AND o.target = c.id
+         WHERE c.status = 'committed' AND c.id = ?1
+         ORDER BY c.rowid DESC
+         LIMIT 1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id, name, base_revision, post_revision, checkpoint, detail)) = row else {
+        return Ok(None);
+    };
+    let detail: Value = serde_json::from_str(&detail)
+        .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?;
+    let staged_operation_count = detail
+        .get("staged_operation_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            AppError::new(
+                "changeset_corrupt",
+                "changeset commit operation lacks staged_operation_count",
+            )
+        })?;
+    let lint_issues = detail
+        .get("lint_issues")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            AppError::new(
+                "changeset_corrupt",
+                "changeset commit operation lacks lint_issues",
+            )
+        })?;
+    Ok(Some(ChangesetCommitState {
+        changeset_id: id,
+        name,
+        base_revision,
+        post_revision,
+        checkpoint,
+        staged_operation_count,
+        lint_issues,
+        locked_publish_ms: 0,
+    }))
+}
+
+fn publish_attached_changeset(
+    conn: &mut Connection,
+    input: &ChangesetPublishInput,
+) -> Result<ChangesetCommitState> {
+    let locked_at = Instant::now();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    changeset_test_fault("after_lock")?;
+    validate_changeset_table_inventory(&tx, "main")?;
+    validate_changeset_table_inventory(&tx, "candidate")?;
+
+    let live = store_identity(&tx)?;
+    if live.store_id != input.store_id || live.revision != input.base_revision {
+        return Err(AppError::new(
+            "changeset_conflict",
+            "live Wiki changed after the changeset began",
+        ));
+    }
+
+    let candidate = attached_store_identity(&tx)?;
+    if candidate.store_id != input.store_id {
+        return Err(AppError::new(
+            "changeset_scope_mismatch",
+            "draft changeset is not bound to this live Wiki",
+        ));
+    }
+    if candidate.revision != input.draft_revision
+        || candidate.operation_id != input.draft_operation_id
+    {
+        return Err(AppError::new(
+            "changeset_changed",
+            "draft changeset changed during commit preflight",
+        ));
+    }
+
+    let (status, base_revision, begin_operation_id): (String, String, i64) = tx
+        .query_row(
+            "SELECT status, base_revision, begin_operation_id
+             FROM candidate.changesets
+             WHERE id = ?1 AND name = ?2",
+            params![&input.id, &input.name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            AppError::new(
+                "changeset_changed",
+                "draft changeset identity disappeared during commit",
+            )
+        })?;
+    if status != "draft" || base_revision != input.base_revision {
+        return Err(AppError::new(
+            "changeset_changed",
+            "draft changeset metadata changed during commit",
+        ));
+    }
+    let staged_operation_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM candidate.operations WHERE id > ?1",
+        params![begin_operation_id],
+        |row| row.get(0),
+    )?;
+    if usize::try_from(staged_operation_count).ok() != Some(input.staged_operation_count) {
+        return Err(AppError::new(
+            "changeset_changed",
+            "draft changeset operations changed during commit",
+        ));
+    }
+
+    let changed_search = changed_search_documents(&tx, "candidate")?;
+    replace_main_from_attached(&tx, "candidate")?;
+    refresh_changed_search_documents(&tx, changed_search)?;
+    changeset_test_fault("after_fts")?;
+    validate_database_integrity(&tx)?;
+    changeset_test_fault("after_integrity")?;
+
+    let post_revision = record_operation(
+        &tx,
+        "changeset_commit",
+        &input.id,
+        &json!({
+            "name": input.name,
+            "base_revision": input.base_revision,
+            "checkpoint": input.checkpoint,
+            "staged_operation_count": input.staged_operation_count,
+            "lint_issues": input.lint_issues,
+            "lint_override_reason": input.lint_override_reason,
+        }),
+    )?;
+    let updated = tx.execute(
+        &format!(
+            "UPDATE changesets
+             SET status = 'committed', pre_commit_checkpoint = ?1,
+                 post_revision = ?2, committed_at = {TIMESTAMP_SQL}
+             WHERE id = ?3 AND status = 'draft'"
+        ),
+        params![&input.checkpoint, &post_revision, &input.id],
+    )?;
+    if updated != 1 {
+        return Err(AppError::new(
+            "changeset_changed",
+            "draft changeset could not be marked committed",
+        ));
+    }
+    validate_store(&tx)?;
+    changeset_test_fault("before_commit")?;
+    changeset_test_crash("before_commit");
+    tx.commit()?;
+    let locked_publish_ms = elapsed_millis(locked_at);
+    changeset_test_crash("after_commit");
+    Ok(ChangesetCommitState {
+        changeset_id: input.id.clone(),
+        name: input.name.clone(),
+        base_revision: input.base_revision.clone(),
+        post_revision,
+        checkpoint: input.checkpoint.clone(),
+        staged_operation_count: input.staged_operation_count,
+        lint_issues: input.lint_issues,
+        locked_publish_ms,
+    })
+}
+
+fn rollback_attached_changeset(
+    conn: &mut Connection,
+    input: &ChangesetRollbackInput,
+) -> Result<ChangesetRollbackState> {
+    let expected_post_revision = input.history.post_revision.as_deref().ok_or_else(|| {
+        AppError::new(
+            "changeset_corrupt",
+            "committed changeset has no post revision",
+        )
+    })?;
+    let pre_commit_checkpoint =
+        input
+            .history
+            .pre_commit_checkpoint
+            .as_deref()
+            .ok_or_else(|| {
+                AppError::new(
+                    "changeset_corrupt",
+                    "committed changeset has no pre-commit checkpoint",
+                )
+            })?;
+    let locked_at = Instant::now();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_changeset_table_inventory(&tx, "main")?;
+    validate_changeset_table_inventory(&tx, "candidate")?;
+
+    let live = store_identity(&tx)?;
+    if live.store_id != input.store_id || live.revision != expected_post_revision {
+        return Err(AppError::new(
+            "changeset_rollback_conflict",
+            "live Wiki changed after this changeset committed",
+        ));
+    }
+    let current: Option<(String, Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT status, post_revision, pre_commit_checkpoint
+             FROM changesets WHERE id = ?1",
+            params![&input.history.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if current
+        != Some((
+            "committed".to_string(),
+            Some(expected_post_revision.to_string()),
+            Some(pre_commit_checkpoint.to_string()),
+        ))
+    {
+        return Err(AppError::new(
+            "changeset_rollback_conflict",
+            "changeset history changed before rollback",
+        ));
+    }
+
+    let checkpoint = attached_store_identity(&tx)?;
+    if checkpoint.store_id != input.store_id
+        || checkpoint.revision != input.history.base_revision
+        || checkpoint.operation_id != input.history.base_operation_id
+    {
+        return Err(AppError::new(
+            "changeset_corrupt",
+            "pre-commit checkpoint does not match the changeset base",
+        ));
+    }
+
+    let changed_search = changed_search_documents(&tx, "candidate")?;
+    replace_main_from_attached(&tx, "candidate")?;
+    refresh_changed_search_documents(&tx, changed_search)?;
+    tx.execute(
+        &format!(
+            "INSERT INTO changesets(
+                id, name, status, base_revision, base_operation_id,
+                begin_operation_id, pre_commit_checkpoint, post_revision,
+                created_at, committed_at, rolled_back_at
+             ) VALUES (
+                ?1, ?2, 'rolled_back', ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                {TIMESTAMP_SQL}
+             )"
+        ),
+        params![
+            &input.history.id,
+            &input.history.name,
+            &input.history.base_revision,
+            input.history.base_operation_id,
+            input.history.begin_operation_id,
+            pre_commit_checkpoint,
+            expected_post_revision,
+            &input.history.created_at,
+            input.history.committed_at.as_deref(),
+        ],
+    )?;
+    let mut rollback_detail = json!({
+        "name": input.history.name,
+        "pre_commit_checkpoint": pre_commit_checkpoint,
+        "committed_post_revision": expected_post_revision,
+        "pre_rollback_checkpoint": input.pre_rollback_checkpoint,
+    });
+    let rollback_revision = record_operation(
+        &tx,
+        "changeset_rollback",
+        &input.history.id,
+        &rollback_detail,
+    )?;
+    rollback_detail["rollback_revision"] = json!(&rollback_revision);
+    tx.execute(
+        "UPDATE operations SET detail_json = ?1 WHERE id = last_insert_rowid()",
+        params![
+            serde_json::to_string(&rollback_detail)
+                .map_err(|error| AppError::new("json_error", error.to_string()))?
+        ],
+    )?;
+    validate_database_integrity(&tx)?;
+    validate_store(&tx)?;
+    tx.commit()?;
+    Ok(ChangesetRollbackState {
+        changeset_id: input.history.id.clone(),
+        name: input.history.name.clone(),
+        rollback_revision,
+        checkpoint: input.pre_rollback_checkpoint.clone(),
+        locked_rollback_ms: elapsed_millis(locked_at),
+    })
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn attached_store_identity(conn: &Connection) -> Result<StoreIdentity> {
+    let (store_id, revision) = conn.query_row(
+        "SELECT
+            MAX(CASE WHEN key = 'store_id' THEN value END),
+            MAX(CASE WHEN key = 'store_revision' THEN value END)
+         FROM candidate.meta
+         WHERE key IN ('store_id', 'store_revision')",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    )?;
+    let operation_id = conn.query_row(
+        "SELECT COALESCE(MAX(id), 0) FROM candidate.operations",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(StoreIdentity {
+        store_id: store_id.ok_or_else(|| {
+            AppError::new("changeset_corrupt", "draft store_id metadata is missing")
+        })?,
+        revision: revision.ok_or_else(|| {
+            AppError::new(
+                "changeset_corrupt",
+                "draft store_revision metadata is missing",
+            )
+        })?,
+        operation_id,
+    })
+}
+
+fn validate_changeset_table_inventory(conn: &Connection, schema: &str) -> Result<()> {
+    const TABLES: [&str; 18] = [
+        "changesets",
+        "ingest_jobs",
+        "links",
+        "meta",
+        "operations",
+        "page_provenance",
+        "page_sources",
+        "pages",
+        "retrieval_feedback",
+        "retrieval_weights",
+        "search_fts",
+        "search_fts_config",
+        "search_fts_content",
+        "search_fts_data",
+        "search_fts_docsize",
+        "search_fts_idx",
+        "source_path_revisions",
+        "sources",
+    ];
+    let sql = format!(
+        "SELECT name FROM {schema}.sqlite_schema
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let actual = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if actual != TABLES {
+        return Err(AppError::new(
+            "changeset_corrupt",
+            format!("{schema} Wiki table inventory does not match store format v{USER_VERSION}"),
+        ));
+    }
+    Ok(())
+}
+
+type ChangedSearchDocuments = (Vec<(i64, Option<i64>)>, Vec<(String, Option<i64>)>);
+
+fn changed_search_documents(
+    conn: &Connection,
+    source_schema: &str,
+) -> Result<ChangedSearchDocuments> {
+    if source_schema != "candidate" {
+        return Err(AppError::new(
+            "changeset_corrupt",
+            "unsupported attached changeset schema",
+        ));
+    }
+    let mut source_statement = conn.prepare(
+        "WITH changed(id) AS (
+             SELECT live.id FROM main.sources live
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM candidate.sources draft
+                 WHERE draft.id = live.id
+                   AND draft.content_hash IS live.content_hash
+                   AND draft.title IS live.title
+                   AND draft.origin IS live.origin
+                   AND draft.content IS live.content
+                   AND draft.structural_navigation IS live.structural_navigation
+                   AND draft.created_at IS live.created_at
+             )
+             UNION
+             SELECT draft.id FROM candidate.sources draft
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM main.sources live
+                 WHERE live.id = draft.id
+                   AND live.content_hash IS draft.content_hash
+                   AND live.title IS draft.title
+                   AND live.origin IS draft.origin
+                   AND live.content IS draft.content
+                   AND live.structural_navigation IS draft.structural_navigation
+                   AND live.created_at IS draft.created_at
+             )
+         )
+         SELECT changed.id,
+                (SELECT rowid FROM candidate.search_fts
+                 WHERE doc_type = 'source'
+                   AND identifier = CAST(changed.id AS TEXT)
+                 LIMIT 1)
+         FROM changed ORDER BY changed.id",
+    )?;
+    let sources = source_statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut page_statement = conn.prepare(
+        "WITH changed(slug) AS (
+             SELECT live.slug FROM main.pages live
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM candidate.pages draft
+                 WHERE draft.slug = live.slug
+                   AND draft.title IS live.title
+                   AND draft.kind IS live.kind
+                   AND draft.summary IS live.summary
+                   AND draft.body IS live.body
+                   AND draft.structural_navigation IS live.structural_navigation
+                   AND draft.created_at IS live.created_at
+                   AND draft.updated_at IS live.updated_at
+             )
+             UNION
+             SELECT draft.slug FROM candidate.pages draft
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM main.pages live
+                 WHERE live.slug = draft.slug
+                   AND live.title IS draft.title
+                   AND live.kind IS draft.kind
+                   AND live.summary IS draft.summary
+                   AND live.body IS draft.body
+                   AND live.structural_navigation IS draft.structural_navigation
+                   AND live.created_at IS draft.created_at
+                   AND live.updated_at IS draft.updated_at
+             )
+         )
+         SELECT changed.slug,
+                (SELECT rowid FROM candidate.search_fts
+                 WHERE doc_type = 'page' AND identifier = changed.slug
+                 LIMIT 1)
+         FROM changed ORDER BY changed.slug",
+    )?;
+    let pages = page_statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((sources, pages))
+}
+
+fn refresh_changed_search_documents(
+    tx: &Transaction<'_>,
+    (sources, pages): ChangedSearchDocuments,
+) -> Result<()> {
+    for (source_id, _) in &sources {
+        tx.execute(
+            "DELETE FROM search_fts WHERE doc_type = 'source' AND identifier = ?1",
+            params![source_id.to_string()],
+        )?;
+    }
+    for (slug, _) in &pages {
+        tx.execute(
+            "DELETE FROM search_fts WHERE doc_type = 'page' AND identifier = ?1",
+            params![slug],
+        )?;
+    }
+
+    for (source_id, rowid) in sources {
+        let source = tx
+            .query_row(
+                "SELECT title, origin, content FROM sources WHERE id = ?1",
+                params![source_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match (source, rowid) {
+            (Some((title, origin, content)), Some(rowid)) => index_source(
+                tx,
+                Some(rowid),
+                source_id,
+                title.as_deref(),
+                &origin,
+                &content,
+            )?,
+            (None, None) => {}
+            _ => {
+                return Err(AppError::new(
+                    "changeset_corrupt",
+                    "candidate source and search index do not match",
+                ));
+            }
+        }
+    }
+    for (slug, rowid) in pages {
+        let page = tx
+            .query_row(
+                "SELECT title, summary, body FROM pages WHERE slug = ?1",
+                params![&slug],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match (page, rowid) {
+            (Some((title, summary, body)), Some(rowid)) => {
+                index_page(tx, Some(rowid), &slug, &title, summary.as_deref(), &body)?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(AppError::new(
+                    "changeset_corrupt",
+                    "candidate page and search index do not match",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn replace_main_from_attached(tx: &Transaction<'_>, source_schema: &str) -> Result<()> {
+    if source_schema != "candidate" {
+        return Err(AppError::new(
+            "changeset_corrupt",
+            "unsupported attached changeset schema",
+        ));
+    }
+    tx.execute_batch(
+        "DELETE FROM page_sources;
+         DELETE FROM page_provenance;
+         DELETE FROM links;
+         DELETE FROM ingest_jobs;
+         DELETE FROM source_path_revisions;
+         DELETE FROM retrieval_weights;
+         DELETE FROM retrieval_feedback;
+         DELETE FROM changesets;
+         DELETE FROM operations;
+         DELETE FROM pages;
+         DELETE FROM sources;
+         DELETE FROM meta;
+
+         INSERT INTO meta(key, value)
+         SELECT key, value FROM candidate.meta;
+         DELETE FROM meta WHERE key = 'changeset_frozen';
+         INSERT INTO sources(
+             id, content_hash, title, origin, content, structural_navigation, created_at
+         ) SELECT
+             id, content_hash, title, origin, content, structural_navigation, created_at
+           FROM candidate.sources;
+         INSERT INTO pages(
+             slug, title, kind, summary, body, structural_navigation, created_at, updated_at
+         ) SELECT
+             slug, title, kind, summary, body, structural_navigation, created_at, updated_at
+           FROM candidate.pages;",
+    )
+    .map_err(changeset_copy_error)?;
+    changeset_test_fault("mid_copy")?;
+    tx.execute_batch(
+        "
+         INSERT INTO page_sources(page_slug, source_id)
+         SELECT page_slug, source_id FROM candidate.page_sources;
+         INSERT INTO page_provenance(page_slug, provenance)
+         SELECT page_slug, provenance FROM candidate.page_provenance;
+         INSERT INTO links(from_slug, to_slug)
+         SELECT from_slug, to_slug FROM candidate.links;
+         INSERT INTO operations(id, action, target, detail_json, created_at)
+         SELECT id, action, target, detail_json, created_at FROM candidate.operations;
+         INSERT INTO ingest_jobs(
+             source_id, status, attempts, analysis, last_error,
+             no_derived_pages_reason, updated_at
+         ) SELECT
+             source_id, status, attempts, analysis, last_error,
+             no_derived_pages_reason, updated_at
+           FROM candidate.ingest_jobs;
+         INSERT INTO source_path_revisions(tracked_path, revision, source_id, observed_at)
+         SELECT tracked_path, revision, source_id, observed_at
+           FROM candidate.source_path_revisions;
+         INSERT INTO retrieval_weights(
+             target_type, target_identifier, provenance, weight, reason, updated_at
+         ) SELECT
+             target_type, target_identifier, provenance, weight, reason, updated_at
+           FROM candidate.retrieval_weights;
+         INSERT INTO retrieval_feedback(
+             query_fingerprint, target_type, target_identifier,
+             provenance, signal, reason, updated_at
+         ) SELECT
+             query_fingerprint, target_type, target_identifier,
+             provenance, signal, reason, updated_at
+           FROM candidate.retrieval_feedback;
+         INSERT INTO changesets(
+             id, name, status, base_revision, base_operation_id, begin_operation_id,
+             pre_commit_checkpoint, post_revision, created_at, committed_at, rolled_back_at
+         ) SELECT
+             id, name, status, base_revision, base_operation_id, begin_operation_id,
+             pre_commit_checkpoint, post_revision, created_at, committed_at, rolled_back_at
+           FROM candidate.changesets;",
+    )
+    .map_err(changeset_copy_error)?;
+    Ok(())
+}
+
+fn changeset_copy_error(error: rusqlite::Error) -> AppError {
+    AppError::new(
+        "changeset_corrupt",
+        format!("changeset canonical copy failed: {error}"),
+    )
+}
+
+fn wal_checkpoint_truncate(conn: &Connection, wait_for_readers: bool) -> Result<(i64, i64, i64)> {
+    if wait_for_readers {
+        return conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(Into::into);
+    }
+    conn.busy_timeout(Duration::ZERO)?;
+    let checkpoint = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    });
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    checkpoint.map_err(Into::into)
+}
+
+fn changeset_test_fault(point: &str) -> Result<()> {
+    if std::env::var("LWC_TEST_CHANGESET_FAULT").as_deref() == Ok(point) {
+        return Err(AppError::new(
+            "changeset_test_fault",
+            format!("injected changeset fault at {point}"),
+        ));
+    }
+    Ok(())
+}
+
+fn changeset_test_crash(point: &str) {
+    if std::env::var("LWC_TEST_CHANGESET_FAULT").as_deref() == Ok(format!("crash:{point}").as_str())
+    {
+        std::process::abort();
+    }
+}
+
+fn validate_database_integrity(conn: &Connection) -> Result<()> {
+    let mut foreign_keys = conn.prepare("PRAGMA foreign_key_check")?;
+    if foreign_keys.query([])?.next()?.is_some() {
+        return Err(AppError::new(
+            "changeset_corrupt",
+            "published changeset violates a foreign key",
+        ));
+    }
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(AppError::new(
+            "changeset_corrupt",
+            format!("published changeset failed integrity_check: {integrity}"),
+        ));
+    }
+    Ok(())
+}
+
 fn record_operation(
     tx: &Transaction<'_>,
     action: &str,
     target: &str,
     detail: &Value,
-) -> Result<()> {
+) -> Result<String> {
+    if tx
+        .query_row(
+            "SELECT 1 FROM meta WHERE key = ?1 LIMIT 1",
+            params![CHANGESET_FREEZE_KEY],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some()
+    {
+        return Err(AppError::new(
+            "changeset_frozen",
+            "changeset is frozen for commit; retry commit or discard it instead of staging more writes",
+        ));
+    }
     let detail_json = serde_json::to_string(detail)
         .map_err(|error| AppError::new("json_error", error.to_string()))?;
     tx.execute(
         "INSERT INTO operations(action, target, detail_json) VALUES (?1, ?2, ?3)",
         params![action, target, detail_json],
     )?;
-    Ok(())
+    let revision: String =
+        tx.query_row("SELECT LOWER(HEX(RANDOMBLOB(32)))", [], |row| row.get(0))?;
+    let updated = tx.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'store_revision'",
+        params![&revision],
+    )?;
+    if updated != 1 {
+        return Err(AppError::new(
+            "corrupt_store",
+            "wiki store_revision metadata is missing",
+        ));
+    }
+    Ok(revision)
 }
 
 fn read_source_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRecord> {
@@ -3952,6 +5249,22 @@ fn read_operation_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationR
         target: row.get(2)?,
         detail,
         created_at: row.get(4)?,
+    })
+}
+
+fn read_changeset_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangesetHistoryState> {
+    Ok(ChangesetHistoryState {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        status: row.get(2)?,
+        base_revision: row.get(3)?,
+        base_operation_id: row.get(4)?,
+        begin_operation_id: row.get(5)?,
+        pre_commit_checkpoint: row.get(6)?,
+        post_revision: row.get(7)?,
+        created_at: row.get(8)?,
+        committed_at: row.get(9)?,
+        rolled_back_at: row.get(10)?,
     })
 }
 
@@ -4113,7 +5426,7 @@ fn claim_ingest_job(tx: &Transaction<'_>, source_id: i64) -> Result<()> {
             format!("source {source_id} is not pending"),
         ));
     }
-    record_operation(tx, "ingest_claim", &source_id.to_string(), &json!({}))
+    record_operation(tx, "ingest_claim", &source_id.to_string(), &json!({})).map(|_| ())
 }
 
 fn validate_page_slug(slug: &str) -> Result<()> {
@@ -4228,6 +5541,7 @@ fn hash_content(content: &str) -> String {
 
 fn index_source(
     tx: &Transaction<'_>,
+    rowid: Option<i64>,
     source_id: i64,
     title: Option<&str>,
     origin: &str,
@@ -4239,9 +5553,10 @@ fn index_source(
     )?;
     tx.execute(
         "INSERT INTO search_fts(
-            doc_type, identifier, title_terms, path_terms, summary_terms, body_terms
-         ) VALUES ('source', ?1, ?2, ?3, '', ?4)",
+            rowid, doc_type, identifier, title_terms, path_terms, summary_terms, body_terms
+         ) VALUES (?1, 'source', ?2, ?3, ?4, '', ?5)",
         params![
+            rowid,
             source_id.to_string(),
             source_title_terms(title.unwrap_or(""), origin),
             joined_terms(source_parent(origin)),
@@ -4253,6 +5568,7 @@ fn index_source(
 
 fn index_page(
     tx: &Transaction<'_>,
+    rowid: Option<i64>,
     slug: &str,
     title: &str,
     summary: Option<&str>,
@@ -4264,9 +5580,10 @@ fn index_page(
     )?;
     tx.execute(
         "INSERT INTO search_fts(
-            doc_type, identifier, title_terms, path_terms, summary_terms, body_terms
-         ) VALUES ('page', ?1, ?2, ?3, ?4, ?5)",
+            rowid, doc_type, identifier, title_terms, path_terms, summary_terms, body_terms
+         ) VALUES (?1, 'page', ?2, ?3, ?4, ?5, ?6)",
         params![
+            rowid,
             slug,
             joined_terms(title),
             joined_terms(slug),
@@ -4316,13 +5633,7 @@ fn has_structural_navigation_marker(body: &str) -> bool {
 }
 
 fn joined_terms(text: &str) -> String {
-    let mut joined = String::new();
-    for token in tokenize_for_index(text) {
-        joined.push('\u{1e}');
-        joined.push_str(&token);
-        joined.push('\u{1f}');
-    }
-    joined
+    joined_index_terms(text)
 }
 
 fn search_index(
@@ -4881,6 +6192,57 @@ mod tests {
 
         assert_eq!(explanation.signals.title_match, 0.9);
         assert_eq!(explanation.contributions.title, -TITLE_WEIGHT * 0.9);
+    }
+
+    #[test]
+    fn changeset_search_refresh_targets_only_changed_documents() {
+        let mut live = test_store();
+        for (slug, body) in [("alpha", "old alpha"), ("beta", "unchanged beta")] {
+            live.page_put(PagePutInput {
+                slug: slug.to_string(),
+                title: slug.to_string(),
+                kind: None,
+                summary: None,
+                body: body.to_string(),
+                source_ids: Vec::new(),
+                provenance: vec!["agent-observed".to_string()],
+            })
+            .unwrap();
+        }
+
+        let temp = tempdir().unwrap();
+        let candidate_path = temp.path().join("candidate.db");
+        live.snapshot_to(&candidate_path).unwrap();
+        let mut candidate = Store::open("project", &candidate_path).unwrap();
+        candidate
+            .page_put(PagePutInput {
+                slug: "alpha".to_string(),
+                title: "alpha".to_string(),
+                kind: None,
+                summary: None,
+                body: "new alpha".to_string(),
+                source_ids: Vec::new(),
+                provenance: vec!["agent-observed".to_string()],
+            })
+            .unwrap();
+        drop(candidate);
+
+        live.conn
+            .execute(
+                "ATTACH DATABASE ?1 AS candidate",
+                params![candidate_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        let tx = live
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let (sources, pages) = changed_search_documents(&tx, "candidate").unwrap();
+
+        assert!(sources.is_empty());
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].0, "alpha");
+        assert!(pages[0].1.is_some());
     }
 
     #[test]

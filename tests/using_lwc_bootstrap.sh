@@ -32,8 +32,13 @@ case "$*" in
     ;;
   "--help")
     printf '%s\n' 'Set LWC_PROJECT_ROOT to bound project discovery.'
+    [ "${MOCK_NO_CHANGESET_SELECTOR:-0}" = 0 ] && printf '%s\n' '--changeset'
     ;;
   "checkpoint --help"|"source add-manifest --help"|"source status --help"|"source diff --help")
+    ;;
+  "changeset --help")
+    [ "${MOCK_NO_CHANGESET:-0}" = 0 ] || exit 1
+    printf '%s\n' '--changeset'
     ;;
   "page put --help")
     printf '%s\n' '--provenance'
@@ -126,4 +131,30 @@ if (
   fail "bootstrap accepted lwc v0.5.0 without bounded source diff support"
 fi
 
-printf 'using-lwc bootstrap tests: 5 passed\n'
+if (
+  cd "$project"
+  HOME="$home" \
+    PATH="$mock_bin:$PATH" \
+    TMPDIR="$runtime_tmp" \
+    MOCK_NO_CHANGESET=1 \
+    LWC_AUTO_INSTALL=0 \
+    LWC_PROJECT_ROOT="$project" \
+    sh "$bootstrap"
+) >"$test_root/no-changeset.out" 2>"$test_root/no-changeset.err"; then
+  fail "bootstrap accepted an lwc without atomic changeset support"
+fi
+
+if (
+  cd "$project"
+  HOME="$home" \
+    PATH="$mock_bin:$PATH" \
+    TMPDIR="$runtime_tmp" \
+    MOCK_NO_CHANGESET_SELECTOR=1 \
+    LWC_AUTO_INSTALL=0 \
+    LWC_PROJECT_ROOT="$project" \
+    sh "$bootstrap"
+) >"$test_root/no-selector.out" 2>"$test_root/no-selector.err"; then
+  fail "bootstrap accepted an lwc without the global changeset selector"
+fi
+
+printf 'using-lwc bootstrap tests: 7 passed\n'

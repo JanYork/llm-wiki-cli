@@ -40,20 +40,22 @@ supported_lwc_version() {
   [ "$1" -gt 0 ] || [ "$2" -ge 6 ]
 }
 
-# v0.6.0 adds bounded source diffs required by this Skill's review flow.
+# Version and capability probes prevent this Skill from driving an older CLI.
 usable_lwc() {
   candidate="$1"
   candidate_version="$("$candidate" --version 2>/dev/null || true)"
   printf '%s\n' "$candidate_version" |
     grep -Eq '^lwc [0-9]+\.[0-9]+\.[0-9]+' || return 1
   supported_lwc_version "$candidate_version" || return 1
-  "$candidate" init --help 2>&1 | grep -q -- '--scope'
-  "$candidate" --help 2>&1 | grep -q -- 'LWC_PROJECT_ROOT'
-  "$candidate" checkpoint --help >/dev/null 2>&1
-  "$candidate" source add-manifest --help >/dev/null 2>&1
-  "$candidate" source status --help >/dev/null 2>&1
-  "$candidate" source diff --help >/dev/null 2>&1
-  "$candidate" page put --help 2>&1 | grep -q -- '--provenance'
+  "$candidate" init --help 2>&1 | grep -q -- '--scope' || return 1
+  "$candidate" --help 2>&1 | grep -q -- 'LWC_PROJECT_ROOT' || return 1
+  "$candidate" --help 2>&1 | grep -q -- '--changeset' || return 1
+  "$candidate" checkpoint --help >/dev/null 2>&1 || return 1
+  "$candidate" source add-manifest --help >/dev/null 2>&1 || return 1
+  "$candidate" source status --help >/dev/null 2>&1 || return 1
+  "$candidate" source diff --help >/dev/null 2>&1 || return 1
+  "$candidate" changeset --help >/dev/null 2>&1 || return 1
+  "$candidate" page put --help 2>&1 | grep -q -- '--provenance' || return 1
 }
 
 managed_lwc_path() {

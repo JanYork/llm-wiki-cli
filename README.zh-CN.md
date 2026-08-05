@@ -137,7 +137,7 @@ Skill 与别名路径、全局 Wiki 路径、修改过的 Hook/配置文件、�
 +-----------------------------------------------------------------------+
 | clap command router                                                   |
 | init | schema | purpose | source | page | ingest | search | context   |
-| graph | lint | maintenance | checkpoint | log                         |
+| graph | lint | changeset | maintenance | checkpoint | log             |
 +-----------------------------------------------------------------------+
                                    |
                                    v
@@ -152,7 +152,7 @@ Skill 与别名路径、全局 Wiki 路径、修改过的 Hook/配置文件、�
 +-----------------------------------------------------------------------+
 | Canonical | WAL | foreign keys | transactions | migrations            |
 | meta | sources | pages | page_sources | links | ingest_jobs           |
-| operations | search_fts                                               |
+| operations | changesets | search_fts                                  |
 +-----------------------------------------------------------------------+
                                    |
                                    v
@@ -410,10 +410,48 @@ lwc page show source-1
 4. 先分析，再生成页面。
 5. 用显式 `--source` 引用写入或修订 source 摘要与共享知识页面。
 6. 只有两道整合门禁都通过，或明确记录无需更新共享页面的原因后，才能 complete。
-7. 用 `search`、`context`、`graph` 和 `lint` 持续维护 Wiki 的一致性。
+7. 多命令 ingest 或大范围修订放进一个 changeset；先验证草稿，再原子发布。
+8. 用 `search`、`context`、`graph` 和 `lint` 持续维护 Wiki 的一致性。
 
 完整操作约定见 [docs/agent-workflow.md](docs/agent-workflow.md)。
 运行 `lwc --help` 或 `lwc <command> --help`，可以查看面向 Agent 编写的前置条件、状态变化、副作用和下一步动作。
+
+## 原子化多命令变更
+
+单个 `source` 或 `page` 命令本身已有事务保护。当一个逻辑更新需要多条命令、又不能
+让使用者看到半成品 Wiki 时，使用 changeset：
+
+```bash
+lwc --scope project changeset begin architecture-refresh
+lwc --scope project --changeset architecture-refresh source add-manifest sources.json
+lwc --scope project --changeset architecture-refresh ingest claim 1
+# 使用同一个 selector 完成分析、引用页面写入和 ingest complete。
+lwc --scope project --changeset architecture-refresh lint
+lwc --scope project --changeset architecture-refresh search "expected answer" --limit 5
+lwc --scope project changeset show architecture-refresh
+lwc --scope project changeset commit architecture-refresh
+```
+
+草稿读取能看到同一批已暂存变更，而 live SQLite 与 Markdown 保持不变。
+`changeset show` 会报告暂存操作、lint、revision、冲突和可提交状态。空草稿、lint
+问题以及 live/draft revision 冲突都会阻止提交；没有强制提交或自动合并。只有经过
+审计、且并非本批变更新增的既有债务，才能使用
+`--allow-lint-issues --reason "reviewed pre-existing debt"`。提交后，还要用原先
+固定的检索问题在 live 状态复验。commit 会在发布前冻结已审查的草稿；此后的暂存
+写入会返回 `changeset_frozen`。此时只能重试同一次 commit 完成恢复，或在明确冲突
+后 discard，不能再向冻结草稿追加工作。
+
+```bash
+lwc --scope project changeset discard architecture-refresh
+lwc --scope project changeset rollback <CHANGESET_ID>
+```
+
+discard 只删除未提交草稿。commit 会自动创建提交前 checkpoint，并返回精确的回滚
+ID；rollback 只允许在下一次 live 变更之前执行，也会创建自己的安全 checkpoint。
+project 与 global changeset 相互独立；`--scope all` 无效；`init`、`maintenance`、
+`checkpoint` 和嵌套 changeset 命令都会拒绝 `--changeset`。草稿不会生成第二套
+Markdown 投影。如果结构化错误返回 `committed=true`，但仍有 cleanup 或
+materialization 工作，不要重复执行知识变更；应执行响应中给出的恢复动作。
 
 ## 作用域
 
@@ -520,6 +558,11 @@ lwc log --limit 20
 checkpoint，再恢复数据库并重建投影。受保护删除使用 `source remove <ID>` 和
 `page remove <SLUG>`：仍被页面引用的来源、仍有入链的页面都会被拒绝删除。删除某
 路径的当前来源时，该路径会明确停止跟踪，不会把旧版本悄悄恢复成“当前版本”。
+
+多来源 ingest 或大范围页面替换应优先使用 changeset，而不是手动 checkpoint：
+commit 成功时会自动备份，在一个事务中发布规范 SQLite，并只重建一次 live
+Markdown。若返回 `wal_checkpointed=false`，表示活跃 reader 阻止了 WAL 立即
+截断；规范数据仍已成功提交。
 
 需要文件系统级外部备份时，应先停止正在运行的 `lwc` 命令并复制完整 `.lwc/`
 目录；写入进程可能仍在使用 WAL 文件时，不要只复制 `wiki.db`。

@@ -1,4 +1,5 @@
 mod artifacts;
+mod changeset;
 mod error;
 mod graph;
 mod import;
@@ -12,7 +13,8 @@ use error::{AppError, Result};
 use import::collect_documents;
 use scope::{
     Scope, StorePath, ensure_project_path, ensure_scope_supported, init_store_path,
-    resolve_read_store_paths, resolve_store_path,
+    resolve_read_store_paths as resolve_live_read_store_paths,
+    resolve_store_path as resolve_live_store_path,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -141,6 +143,13 @@ Persistent workflow:\n  \
 6. lwc page put <SHARED-SLUG> --title ... --kind concept --file concept.md --source <SOURCE_ID>\n  \
 7. lwc ingest complete <SOURCE_ID>\n  \
 8. lwc search \"question\"\n\n\
+Atomic multi-command changes:\n  \
+1. lwc changeset begin <NAME>\n  \
+2. Route supported reads and writes with --changeset <NAME>.\n  \
+3. lwc --changeset <NAME> lint\n  \
+4. lwc changeset show <NAME>\n  \
+5. lwc changeset commit <NAME>\n  \
+Use changeset discard before commit, or rollback the exact returned ID before any later live write.\n\n\
 Scopes:\n  \
 project  Use the nearest ancestor .lwc/wiki.db (default).\n  \
          Set LWC_PROJECT_ROOT to cap discovery and initialization at an authorized root.\n  \
@@ -154,6 +163,10 @@ struct Cli {
     #[arg(long, value_enum, default_value = "project", global = true)]
     scope: Scope,
 
+    /// Run a supported command against an isolated draft changeset.
+    #[arg(long, global = true, value_name = "NAME")]
+    changeset: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -166,6 +179,11 @@ enum Command {
         /// Do not add the project .lwc directory to Git's local exclude file.
         #[arg(long)]
         no_git_exclude: bool,
+    },
+    /// Stage, inspect, publish, discard, or roll back an atomic Wiki changeset.
+    Changeset {
+        #[command(subcommand)]
+        command: ChangesetCommand,
     },
     /// Read or replace the durable instructions that govern Wiki maintenance.
     #[command(
@@ -313,6 +331,32 @@ counts and total describe the complete Wiki; limit and offset paginate only the 
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum ChangesetCommand {
+    /// Create an isolated draft from the current live Wiki.
+    Begin { name: String },
+    /// List isolated drafts for the selected Wiki.
+    List,
+    /// Inspect staged operations, lint, and conflict state.
+    Show {
+        name: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Atomically publish one isolated draft.
+    Commit {
+        name: String,
+        #[arg(long)]
+        allow_lint_issues: bool,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Delete one isolated draft without touching the live Wiki.
+    Discard { name: String },
+    /// Restore the exact pre-commit snapshot when no later live write exists.
+    Rollback { changeset_id: String },
 }
 
 #[derive(Subcommand)]
@@ -829,12 +873,13 @@ fn main() {
     match run(Cli::parse()) {
         Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap()),
         Err(error) => {
+            let mut payload = json!({"code": error.code, "message": error.message});
+            if let Some(details) = error.details {
+                payload["details"] = details;
+            }
             eprintln!(
                 "{}",
-                serde_json::to_string(&json!({
-                    "error": {"code": error.code, "message": error.message}
-                }))
-                .unwrap()
+                serde_json::to_string(&json!({"error": payload})).unwrap()
             );
             std::process::exit(1);
         }
@@ -843,8 +888,10 @@ fn main() {
 
 fn run(cli: Cli) -> Result<Value> {
     let cwd = env::current_dir()?;
+    let selected_changeset = cli.changeset.clone();
     match cli.command {
         Command::Init { no_git_exclude } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "init")?;
             ensure_scope_supported(cli.scope, false, "init")?;
             let store_path = init_store_path(cli.scope, &cwd)?;
             let git_exclude =
@@ -859,16 +906,44 @@ fn run(cli: Cli) -> Result<Value> {
                 "git_exclude": git_exclude
             }))
         }
+        Command::Changeset { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "changeset")?;
+            ensure_scope_supported(cli.scope, false, "changeset")?;
+            let live = resolve_live_store_path(cli.scope, &cwd)?;
+            match command {
+                ChangesetCommand::Begin { name } => to_json(changeset::begin(&live, &name)?),
+                ChangesetCommand::List => to_json(changeset::list(&live, 1000)?),
+                ChangesetCommand::Show { name, limit } => {
+                    validate_limit(limit)?;
+                    to_json(changeset::show(&live, &name, limit)?)
+                }
+                ChangesetCommand::Commit {
+                    name,
+                    allow_lint_issues,
+                    reason,
+                } => to_json(changeset::commit(
+                    &live,
+                    &name,
+                    allow_lint_issues,
+                    reason.as_deref(),
+                )?),
+                ChangesetCommand::Discard { name } => to_json(changeset::discard(&live, &name)?),
+                ChangesetCommand::Rollback { changeset_id } => {
+                    to_json(changeset::rollback(&live, &changeset_id)?)
+                }
+            }
+        }
         Command::Schema { command } => {
             ensure_scope_supported(cli.scope, false, "schema")?;
-            let store_path = resolve_store_path(cli.scope, &cwd)?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
             match command {
                 SchemaCommand::Set { file } => {
                     let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                     let schema = read_utf8(&file, true)?;
                     require_text("schema", &schema)?;
                     let response = store.schema_set(&schema)?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
                 SchemaCommand::Show => {
@@ -880,14 +955,15 @@ fn run(cli: Cli) -> Result<Value> {
         }
         Command::Purpose { command } => {
             ensure_scope_supported(cli.scope, false, "purpose")?;
-            let store_path = resolve_store_path(cli.scope, &cwd)?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
             match command {
                 PurposeCommand::Set { file } => {
                     let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                     let purpose = read_utf8(&file, true)?;
                     require_text("purpose", &purpose)?;
                     let response = store.purpose_set(&purpose)?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
                 PurposeCommand::Show => {
@@ -899,7 +975,8 @@ fn run(cli: Cli) -> Result<Value> {
         }
         Command::Source { command } => {
             ensure_scope_supported(cli.scope, false, "source")?;
-            let store_path = resolve_store_path(cli.scope, &cwd)?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
             match command {
                 SourceCommand::Add {
                     file,
@@ -916,7 +993,7 @@ fn run(cli: Cli) -> Result<Value> {
                     )?;
                     let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                     let response = store.source_add(input)?;
-                    store.materialize()?;
+                    materialize_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
                 SourceCommand::AddDir {
@@ -972,7 +1049,7 @@ fn run(cli: Cli) -> Result<Value> {
                     let created = responses.iter().filter(|response| response.created).count();
                     let duplicates = responses.len() - created;
                     if !responses.is_empty() {
-                        store.materialize()?;
+                        materialize_if_live(&mut store, selected_changeset.as_deref())?;
                     }
                     if !skipped_files.is_empty() {
                         let examples = skipped_files
@@ -1044,7 +1121,7 @@ fn run(cli: Cli) -> Result<Value> {
                             })
                         })
                         .collect::<Vec<_>>();
-                    store.materialize()?;
+                    materialize_if_live(&mut store, selected_changeset.as_deref())?;
                     Ok(json!({
                         "scope": scope_name(store_path.scope),
                         "database": store_path.path,
@@ -1184,14 +1261,15 @@ fn run(cli: Cli) -> Result<Value> {
                 SourceCommand::Remove { id } => {
                     let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                     let response = store.source_remove(id)?;
-                    store.materialize()?;
+                    materialize_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
             }
         }
         Command::Page { command } => {
             ensure_scope_supported(cli.scope, false, "page")?;
-            let store_path = resolve_store_path(cli.scope, &cwd)?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
             match command {
                 PageCommand::Put {
                     slug,
@@ -1220,7 +1298,7 @@ fn run(cli: Cli) -> Result<Value> {
                             .map(|value| value.as_str().to_string())
                             .collect(),
                     })?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
                 PageCommand::List { limit, offset } => {
@@ -1243,14 +1321,15 @@ fn run(cli: Cli) -> Result<Value> {
                 PageCommand::Remove { slug } => {
                     let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                     let response = store.page_remove(&slug)?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
             }
         }
         Command::Ingest { command } => {
             ensure_scope_supported(cli.scope, false, "ingest")?;
-            let store_path = resolve_store_path(cli.scope, &cwd)?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
             match command {
                 IngestCommand::List {
                     status,
@@ -1276,7 +1355,7 @@ fn run(cli: Cli) -> Result<Value> {
                         ));
                     }
                     let response = store.ingest_next(context_limit, source_max_chars)?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
                 IngestCommand::Claim {
@@ -1294,7 +1373,7 @@ fn run(cli: Cli) -> Result<Value> {
                     }
                     let response =
                         store.ingest_claim(source_id, context_limit, source_max_chars)?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
                 IngestCommand::Analyze { source_id, file } => {
@@ -1302,7 +1381,7 @@ fn run(cli: Cli) -> Result<Value> {
                     let analysis = read_utf8(&file, true)?;
                     require_text("analysis", &analysis)?;
                     let response = store.ingest_analyze(source_id, &analysis)?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
                 IngestCommand::Complete {
@@ -1315,27 +1394,28 @@ fn run(cli: Cli) -> Result<Value> {
                     }
                     let response =
                         store.ingest_complete(source_id, no_derived_pages_reason.as_deref())?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
                 IngestCommand::Fail { source_id, message } => {
                     let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                     require_text("message", &message)?;
                     let response = store.ingest_fail(source_id, &message)?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
                 IngestCommand::Retry { source_id } => {
                     let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                     let response = store.ingest_retry(source_id)?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
             }
         }
         Command::Graph { command } => {
             ensure_scope_supported(cli.scope, false, "graph")?;
-            let store_path = resolve_store_path(cli.scope, &cwd)?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
             let store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
             match command {
                 GraphCommand::Related { slug, limit } => {
@@ -1346,7 +1426,8 @@ fn run(cli: Cli) -> Result<Value> {
         }
         Command::Weight { command } => {
             ensure_scope_supported(cli.scope, false, "weight")?;
-            let store_path = resolve_store_path(cli.scope, &cwd)?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
             match command {
                 WeightCommand::List { target, identifier } => {
                     let store =
@@ -1371,7 +1452,7 @@ fn run(cli: Cli) -> Result<Value> {
                         &reason,
                         provenance.as_str(),
                     )?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
                 WeightCommand::Clear {
@@ -1385,7 +1466,7 @@ fn run(cli: Cli) -> Result<Value> {
                         &identifier,
                         provenance.as_str(),
                     )?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
                 WeightCommand::Feedback {
@@ -1405,7 +1486,7 @@ fn run(cli: Cli) -> Result<Value> {
                         &reason,
                         provenance.as_str(),
                     )?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
                 WeightCommand::FeedbackClear {
@@ -1421,14 +1502,15 @@ fn run(cli: Cli) -> Result<Value> {
                         &query,
                         provenance.as_str(),
                     )?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                     to_json(response)
                 }
             }
         }
         Command::Maintenance { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "maintenance")?;
             ensure_scope_supported(cli.scope, false, "maintenance")?;
-            let store_path = resolve_store_path(cli.scope, &cwd)?;
+            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
             let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
             match command {
                 MaintenanceCommand::Materialize => to_json(store.materialize()?),
@@ -1441,8 +1523,9 @@ fn run(cli: Cli) -> Result<Value> {
             }
         }
         Command::Checkpoint { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "checkpoint")?;
             ensure_scope_supported(cli.scope, false, "checkpoint")?;
-            let store_path = resolve_store_path(cli.scope, &cwd)?;
+            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
             match command {
                 CheckpointCommand::Create { name } => {
                     let store =
@@ -1492,7 +1575,8 @@ fn run(cli: Cli) -> Result<Value> {
                 kinds,
                 explain,
             };
-            let paths = resolve_read_store_paths(cli.scope, &cwd, true)?;
+            let paths =
+                resolve_effective_read_store_paths(cli.scope, &cwd, selected_changeset.as_deref())?;
             let mut stores = if record {
                 paths
                     .into_iter()
@@ -1513,7 +1597,7 @@ fn run(cli: Cli) -> Result<Value> {
             if record {
                 for store in &mut stores {
                     store.record_search(&query, limit)?;
-                    store.materialize_wiki()?;
+                    materialize_wiki_if_live(store, selected_changeset.as_deref())?;
                 }
             }
             results.sort_by(|left, right| {
@@ -1529,7 +1613,8 @@ fn run(cli: Cli) -> Result<Value> {
         }
         Command::Context { limit } => {
             validate_limit(limit)?;
-            let paths = resolve_read_store_paths(cli.scope, &cwd, true)?;
+            let paths =
+                resolve_effective_read_store_paths(cli.scope, &cwd, selected_changeset.as_deref())?;
             let mut stores = Vec::new();
             for store_path in paths {
                 let store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
@@ -1545,12 +1630,13 @@ fn run(cli: Cli) -> Result<Value> {
             ensure_scope_supported(cli.scope, false, "lint")?;
             validate_limit(limit)?;
             validate_offset(offset)?;
-            let store_path = resolve_store_path(cli.scope, &cwd)?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
             if record {
                 let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                 let response = store.lint(limit, offset)?;
                 store.record_lint(response.total)?;
-                store.materialize_wiki()?;
+                materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
                 to_json(response)
             } else {
                 let store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
@@ -1560,11 +1646,51 @@ fn run(cli: Cli) -> Result<Value> {
         Command::Log { limit } => {
             ensure_scope_supported(cli.scope, false, "log")?;
             validate_limit(limit)?;
-            let store_path = resolve_store_path(cli.scope, &cwd)?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
             let store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
             to_json(store.log(limit)?)
         }
     }
+}
+
+fn resolve_effective_store_path(
+    scope: Scope,
+    cwd: &Path,
+    selected_changeset: Option<&str>,
+) -> Result<StorePath> {
+    let live = resolve_live_store_path(scope, cwd)?;
+    changeset::resolve_effective(live, selected_changeset)
+}
+
+fn resolve_effective_read_store_paths(
+    scope: Scope,
+    cwd: &Path,
+    selected_changeset: Option<&str>,
+) -> Result<Vec<StorePath>> {
+    if selected_changeset.is_none() {
+        return resolve_live_read_store_paths(scope, cwd, true);
+    }
+    ensure_scope_supported(scope, false, "--changeset")?;
+    Ok(vec![resolve_effective_store_path(
+        scope,
+        cwd,
+        selected_changeset,
+    )?])
+}
+
+fn materialize_if_live(store: &mut Store, selected_changeset: Option<&str>) -> Result<()> {
+    if selected_changeset.is_none() {
+        store.materialize()?;
+    }
+    Ok(())
+}
+
+fn materialize_wiki_if_live(store: &mut Store, selected_changeset: Option<&str>) -> Result<()> {
+    if selected_changeset.is_none() {
+        store.materialize_wiki()?;
+    }
+    Ok(())
 }
 
 fn read_utf8(path: &Path, allow_stdin: bool) -> Result<String> {
@@ -2202,7 +2328,7 @@ fn file_fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
 
 fn project_root(store_path: &StorePath) -> Result<PathBuf> {
     let root = store_path
-        .path
+        .authority_path()
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| {
@@ -2512,10 +2638,7 @@ mod tests {
         let external = external_dir.path().join("external.txt");
         std::fs::write(&tracked, b"inside").unwrap();
         std::fs::write(&external, b"outside").unwrap();
-        let store_path = StorePath {
-            scope: Scope::Project,
-            path: temp.path().join(".lwc/wiki.db"),
-        };
+        let store_path = StorePath::new(Scope::Project, temp.path().join(".lwc/wiki.db"));
         let prepared =
             prepare_live_source(&store_path, tracked.clone(), false, MAX_INPUT_BYTES).unwrap();
 

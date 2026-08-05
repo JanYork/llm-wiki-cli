@@ -20,6 +20,9 @@ Use `lwc` as durable external memory. The database stores evidence and compiled 
    `--no-git-exclude` is explicit.
 10. File-path revision history is observational. Content remains globally
     deduplicated, so one source ID may appear at multiple paths or revisions.
+11. A multi-command knowledge update belongs in one changeset. The draft is a
+    private SQLite snapshot; live canonical state and live Markdown stay
+    unchanged until commit.
 
 ## Start a session
 
@@ -29,6 +32,59 @@ lwc context --limit 50
 
 This returns the purpose, schema, page index, and recent operations. Use
 `lwc --scope all context` only when shared global knowledge is relevant.
+
+## Atomic changesets
+
+Wrap one logical update that needs multiple mutations in a named changeset:
+
+```bash
+lwc changeset begin architecture-refresh
+lwc --changeset architecture-refresh source add-manifest sources.json
+lwc --changeset architecture-refresh ingest claim 1
+# analyze, write cited pages, and complete ingest with the same selector
+lwc --changeset architecture-refresh lint
+lwc --changeset architecture-refresh search "expected answer" --limit 5
+lwc changeset show architecture-refresh
+lwc changeset commit architecture-refresh
+```
+
+Every supported command with `--changeset <NAME>` reads or writes only the
+draft, so later commands see earlier staged work without exposing a partial
+Wiki. Draft writes do not materialize Markdown. `changeset show` reports the
+base and draft revisions, staged operations by action, lint total, empty and
+conflict state, and whether commit is currently allowed.
+
+Commit rejects an empty draft, a live/draft revision conflict, and lint issues.
+Repair new lint issues in the draft. Use
+`--allow-lint-issues --reason "specific reviewed pre-existing debt"` only when
+the remaining issues existed before this changeset and the reason is auditable.
+On `changeset_conflict` or `changeset_changed`, do not force or merge: preserve
+live work, inspect or discard the stale draft, begin a fresh changeset, and
+reapply the reviewed update.
+
+Commit freezes the reviewed draft before checkpoint/publication. After that
+point, every routed mutation fails transactionally with `changeset_frozen`,
+including when a committed draft remains only because WAL checkpoint or cleanup
+needs recovery. Retry the same commit, or discard after a reported conflict;
+never stage new work into a frozen draft.
+
+```bash
+lwc changeset discard architecture-refresh
+lwc changeset rollback <CHANGESET_ID>
+```
+
+Discard deletes only an uncommitted draft. Successful commit creates and
+records a pre-commit checkpoint, publishes canonical SQLite in one transaction,
+truncates WAL when no reader prevents it, removes owned draft files, and
+materializes live Markdown once. Rollback uses the exact returned ID and only
+succeeds while no later live mutation exists; it creates a pre-rollback
+checkpoint and has no force option. A committed cleanup or materialization
+error is not a database rollback—follow its structured recovery fields.
+
+Use one explicit `project` or `global` scope consistently for begin, routed
+commands, show, commit, discard, and rollback. `--scope all` is invalid, and
+`init`, `maintenance`, `checkpoint`, and nested changeset commands reject the
+selector.
 
 ## Ingest
 
@@ -258,6 +314,9 @@ lwc maintenance reindex
 - `--scope global`: `~/.lwc/wiki.db`.
 - `--scope all`: combined `search` and `context`; `search --record` appends the query operation to each selected store.
 - Citations and wikilinks belong to one store; cross-store relations are not created implicitly.
+- Changesets exist only in one explicit `project` or `global` store. Identical
+  names in different stores are unrelated, and `--scope all` cannot begin,
+  route, commit, discard, or roll back a changeset.
 
 ## Search contract
 
@@ -292,8 +351,10 @@ success from the command exit alone—inspect `busy` and `after_bytes`.
 
 ## Mutation recovery
 
-Before a multi-source ingest or broad replacement of existing pages, create a
-named checkpoint:
+Use a changeset for a multi-source ingest or broad replacement of existing
+pages. Its successful commit creates the pre-change checkpoint automatically.
+For a large one-command mutation or maintenance operation that cannot use a
+changeset, create a named checkpoint:
 
 ```bash
 lwc checkpoint create before-architecture-refresh
@@ -302,6 +363,11 @@ lwc checkpoint create before-architecture-refresh
 `checkpoint restore` validates the selected database, creates a
 `pre-restore-*` copy of the current state, restores through SQLite's online
 backup API, and rebuilds raw and Markdown projections.
+
+`changeset rollback <CHANGESET_ID>` is narrower than checkpoint restore: it is
+bound to one recorded commit and refuses once any later live operation changes
+the revision. Use this guarded path for an immediately mistaken batch; do not
+use checkpoint restore to bypass the rollback conflict.
 
 Use `source remove <ID>` and `page remove <SLUG>` instead of editing SQLite.
 Removal refuses a cited source or a page with inbound links. If a removed source
@@ -317,6 +383,10 @@ under the same conditions.
 
 ## Projection contract
 
+- Draft changeset mutations never write a second projection tree.
+- Successful changeset commit and rollback rebuild the live projection once;
+  structured post-commit errors distinguish committed SQLite from repairable
+  projection/cleanup work.
 - `lwc init`, source/page writes and removals, schema/purpose writes,
   checkpoint restores, and successful ingest completion refresh the Markdown
   projection.

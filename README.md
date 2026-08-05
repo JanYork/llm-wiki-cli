@@ -161,7 +161,7 @@ This project adapts those ideas into an agent-first Rust CLI backed by SQLite.
 +-----------------------------------------------------------------------+
 | clap command router                                                   |
 | init | schema | purpose | source | page | ingest | search | context   |
-| graph | lint | maintenance | checkpoint | log                         |
+| graph | lint | changeset | maintenance | checkpoint | log             |
 +-----------------------------------------------------------------------+
                                    |
                                    v
@@ -176,7 +176,7 @@ This project adapts those ideas into an agent-first Rust CLI backed by SQLite.
 +-----------------------------------------------------------------------+
 | Canonical | WAL | foreign keys | transactions | migrations            |
 | meta | sources | pages | page_sources | links | ingest_jobs           |
-| operations | search_fts                                               |
+| operations | changesets | search_fts                                  |
 +-----------------------------------------------------------------------+
                                    |
                                    v
@@ -454,11 +454,54 @@ The intended workflow is:
 4. Analyze before generating pages.
 5. Write or revise a source summary and shared durable pages with explicit `--source` citations.
 6. Complete only after both integration gates pass, or record why no shared page should change.
-7. Use `search`, `context`, `graph`, and `lint` to keep the Wiki coherent over time.
+7. Put a multi-command ingest or broad revision in one changeset, validate the
+   draft, then publish it atomically.
+8. Use `search`, `context`, `graph`, and `lint` to keep the Wiki coherent over time.
 
 See [docs/agent-workflow.md](docs/agent-workflow.md) for the full operating contract.
 Run `lwc --help` or `lwc <command> --help` for Agent-oriented preconditions,
 state transitions, side effects, and next actions.
+
+## Atomic Multi-command Changes
+
+A single `source` or `page` command is transactional. Use a changeset when one
+logical update needs several commands and must not expose a partial Wiki:
+
+```bash
+lwc --scope project changeset begin architecture-refresh
+lwc --scope project --changeset architecture-refresh source add-manifest sources.json
+lwc --scope project --changeset architecture-refresh ingest claim 1
+# Analyze, write cited pages, and complete ingest with the same selector.
+lwc --scope project --changeset architecture-refresh lint
+lwc --scope project --changeset architecture-refresh search "expected answer" --limit 5
+lwc --scope project changeset show architecture-refresh
+lwc --scope project changeset commit architecture-refresh
+```
+
+Draft reads see staged writes, while live SQLite and Markdown stay unchanged.
+`changeset show` reports staged operations, lint, revisions, conflicts, and
+readiness. Commit rejects empty drafts, lint issues, and any live/draft
+revision conflict; there is no force or automatic merge. Use
+`--allow-lint-issues --reason "reviewed pre-existing debt"` only for audited
+debt that the changeset did not introduce. After commit, rerun the same fixed
+retrieval checks against live state. Commit freezes the reviewed draft before
+publication; `changeset_frozen` blocks any later staged write. Retry the same
+commit for recovery, or discard after a reported conflict—never add more work
+to a frozen draft.
+
+```bash
+lwc --scope project changeset discard architecture-refresh
+lwc --scope project changeset rollback <CHANGESET_ID>
+```
+
+Discard touches only an uncommitted draft. Commit creates a pre-commit
+checkpoint and returns the exact rollback ID; rollback is allowed only before
+the next live mutation and creates its own safety checkpoint. Project and
+global changesets are separate, `--scope all` is invalid, and `init`,
+`maintenance`, `checkpoint`, and nested changeset commands reject
+`--changeset`. Drafts never create a second Markdown projection. If a structured
+error reports `committed=true` with cleanup or materialization work remaining,
+do not repeat the knowledge changes; run the returned recovery action.
 
 ## Scopes
 
@@ -576,6 +619,12 @@ checkpoint and then rebuilds the projection. Use `source remove <ID>` and
 with inbound links are refused. Removing the current source for a tracked path
 stops tracking that path instead of silently exposing an older revision as
 current.
+
+For a multi-source ingest or broad page replacement, prefer a changeset over a
+manual checkpoint: successful commit checkpoints automatically, publishes
+canonical SQLite in one transaction, and materializes live Markdown once. A
+returned `wal_checkpointed=false` means an active reader prevented immediate
+WAL truncation; the canonical commit still succeeded.
 
 For an external filesystem backup, stop active `lwc` commands and copy the
 complete `.lwc/` directory. Do not copy only `wiki.db` while a writer may still

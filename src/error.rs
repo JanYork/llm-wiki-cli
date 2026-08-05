@@ -1,3 +1,4 @@
+use serde_json::Value;
 use std::fmt;
 
 pub type Result<T> = std::result::Result<T, AppError>;
@@ -6,6 +7,7 @@ pub type Result<T> = std::result::Result<T, AppError>;
 pub struct AppError {
     pub code: &'static str,
     pub message: String,
+    pub details: Option<Value>,
 }
 
 impl AppError {
@@ -13,7 +15,13 @@ impl AppError {
         Self {
             code,
             message: message.into(),
+            details: None,
         }
+    }
+
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
     }
 }
 

@@ -123,8 +123,8 @@ fn new_store_uses_contentless_search_fts_and_keeps_identifiers_readable() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
-    for table in ["retrieval_weights", "retrieval_feedback"] {
+    assert_eq!(version, 10);
+    for table in ["retrieval_weights", "retrieval_feedback", "changesets"] {
         let exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -171,6 +171,56 @@ fn new_store_uses_contentless_search_fts_and_keeps_identifiers_readable() {
         rows.contains(&("source".to_string(), source_id)),
         "source identifier should stay readable from search_fts: {rows:?}"
     );
+}
+
+#[test]
+fn store_identity_is_stable_and_recorded_mutations_advance_revision() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+
+    let metadata = |key: &str| -> String {
+        Connection::open(&database)
+            .unwrap()
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    let store_id = metadata("store_id");
+    let initial_revision = metadata("store_revision");
+    assert_eq!(store_id.len(), 64);
+    assert_eq!(initial_revision.len(), 64);
+    assert!(store_id.chars().all(|value| value.is_ascii_hexdigit()));
+    assert!(
+        initial_revision
+            .chars()
+            .all(|value| value.is_ascii_hexdigit())
+    );
+
+    let shown = world.ok(&["schema", "show"]);
+    assert!(!shown["schema"].as_str().unwrap().is_empty());
+    assert_eq!(metadata("store_id"), store_id);
+    assert_eq!(metadata("store_revision"), initial_revision);
+
+    let page = world.write("revision.md", "revision contract");
+    world.ok(&[
+        "page",
+        "put",
+        "revision-contract",
+        "--title",
+        "Revision Contract",
+        "--file",
+        as_str(&page),
+        "--provenance",
+        "agent-observed",
+    ]);
+    let mutated_revision = metadata("store_revision");
+    assert_ne!(mutated_revision, initial_revision);
+    assert_eq!(mutated_revision.len(), 64);
+
+    world.ok(&["search", "revision contract"]);
+    assert_eq!(metadata("store_revision"), mutated_revision);
 }
 
 #[test]

@@ -15,59 +15,73 @@ pub fn tokenize_for_query(text: &str) -> Vec<String> {
     tokens
 }
 
+#[cfg(test)]
 pub fn tokenize_for_index(text: &str) -> Vec<String> {
     tokenize(text, true)
 }
 
+pub fn joined_index_terms(text: &str) -> String {
+    let mut joined = String::with_capacity(text.len());
+    tokenize_into(text, true, |token| {
+        joined.push('\u{1e}');
+        joined.push_str(&token);
+        joined.push('\u{1f}');
+    });
+    joined
+}
+
 fn tokenize(text: &str, include_cjk_unigrams: bool) -> Vec<String> {
     let mut tokens = Vec::new();
+    tokenize_into(text, include_cjk_unigrams, |token| tokens.push(token));
+    tokens
+}
+
+fn tokenize_into(text: &str, include_cjk_unigrams: bool, mut push_token: impl FnMut(String)) {
     let mut word = String::new();
     let mut cjk = Vec::new();
 
     for ch in text.to_lowercase().chars() {
         if is_cjk(ch) {
-            push_word(&mut tokens, &mut word);
+            push_word(&mut push_token, &mut word);
             cjk.push(ch);
         } else if ch.is_alphanumeric() {
-            push_cjk(&mut tokens, &mut cjk, include_cjk_unigrams);
+            push_cjk(&mut push_token, &mut cjk, include_cjk_unigrams);
             word.push(ch);
         } else {
-            push_word(&mut tokens, &mut word);
-            push_cjk(&mut tokens, &mut cjk, include_cjk_unigrams);
+            push_word(&mut push_token, &mut word);
+            push_cjk(&mut push_token, &mut cjk, include_cjk_unigrams);
         }
     }
-    push_word(&mut tokens, &mut word);
-    push_cjk(&mut tokens, &mut cjk, include_cjk_unigrams);
-
-    tokens
+    push_word(&mut push_token, &mut word);
+    push_cjk(&mut push_token, &mut cjk, include_cjk_unigrams);
 }
 
-fn push_word(tokens: &mut Vec<String>, word: &mut String) {
+fn push_word(push_token: &mut impl FnMut(String), word: &mut String) {
     if !word.is_empty() && !is_stop_word(word) {
-        tokens.push(std::mem::take(word));
+        push_token(std::mem::take(word));
     } else {
         word.clear();
     }
 }
 
-fn push_cjk(tokens: &mut Vec<String>, cjk: &mut Vec<char>, include_unigrams: bool) {
+fn push_cjk(push_token: &mut impl FnMut(String), cjk: &mut Vec<char>, include_unigrams: bool) {
     if cjk.len() == 1 {
         let token = cjk[0].to_string();
         if !is_stop_word(&token) {
-            tokens.push(token);
+            push_token(token);
         }
     } else {
         for pair in cjk.windows(2) {
             let token = pair.iter().collect::<String>();
             if !is_stop_word(&token) {
-                tokens.push(token);
+                push_token(token);
             }
         }
         if include_unigrams {
             for ch in cjk.iter() {
                 let token = ch.to_string();
                 if !is_stop_word(&token) {
-                    tokens.push(token);
+                    push_token(token);
                 }
             }
         }
@@ -91,7 +105,7 @@ fn is_cjk(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{tokenize_for_index, tokenize_for_query};
+    use super::{joined_index_terms, tokenize_for_index, tokenize_for_query};
 
     #[test]
     fn chinese_search_tokenizes_meaningful_terms() {
@@ -170,5 +184,22 @@ mod tests {
 
         assert_eq!(index_tokens, vec!["alpha".to_string(), "alpha".to_string()]);
         assert_eq!(query_tokens, vec!["alpha".to_string()]);
+    }
+
+    #[test]
+    fn joined_index_terms_are_byte_identical_to_the_token_stream() {
+        for text in [
+            "Rust tokenizer 和 SQLite search",
+            "南京市长江大桥",
+            "alpha alpha",
+            "注意力\nemoji 🧠 and punctuation!?",
+            "什么是 the API_2026 与 Graph-RAG",
+        ] {
+            let expected = tokenize_for_index(text)
+                .into_iter()
+                .map(|token| format!("\u{1e}{token}\u{1f}"))
+                .collect::<String>();
+            assert_eq!(joined_index_terms(text), expected, "input: {text:?}");
+        }
     }
 }

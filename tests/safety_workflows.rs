@@ -63,6 +63,17 @@ impl TestWorld {
         serde_json::from_slice(&output.stderr).unwrap()
     }
 
+    fn command_with_changeset_fault(&self, fault: &str, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_lwc"))
+            .current_dir(&self.project)
+            .env("HOME", &self.home)
+            .env("LWC_PROJECT_ROOT", &self.project)
+            .env("LWC_TEST_CHANGESET_FAULT", fault)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
     fn write(&self, relative: &str, content: &str) -> PathBuf {
         write_file(&self.project.join(relative), content)
     }
@@ -96,6 +107,17 @@ fn operation_count(database: &Path) -> i64 {
     Connection::open(database)
         .unwrap()
         .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn store_revision(database: &Path) -> String {
+    Connection::open(database)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'store_revision'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap()
 }
 
@@ -144,6 +166,64 @@ fn knowledge_counts(database: &Path) -> Vec<i64> {
             .unwrap()
     })
     .collect()
+}
+
+fn canonical_snapshot(database: &Path) -> BTreeMap<String, Vec<Vec<String>>> {
+    const TABLES: [&str; 13] = [
+        "changesets",
+        "ingest_jobs",
+        "links",
+        "meta",
+        "operations",
+        "page_provenance",
+        "page_sources",
+        "pages",
+        "retrieval_feedback",
+        "retrieval_weights",
+        "source_path_revisions",
+        "sources",
+        "sqlite_sequence",
+    ];
+    let connection =
+        Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    TABLES
+        .into_iter()
+        .map(|table| {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM {table}"))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|index| row.get_ref(index).map(|value| format!("{value:?}")))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows.sort();
+            (table.to_string(), rows)
+        })
+        .collect()
+}
+
+fn stage_single_page(world: &TestWorld, changeset: &str, slug: &str) {
+    world.ok(&["changeset", "begin", changeset]);
+    let body = world.write(&format!("{slug}.md"), &format!("draft body for {slug}"));
+    world.ok(&[
+        "--changeset",
+        changeset,
+        "page",
+        "put",
+        slug,
+        "--title",
+        slug,
+        "--file",
+        as_str(&body),
+        "--provenance",
+        "agent-observed",
+    ]);
 }
 
 #[test]
@@ -389,6 +469,256 @@ fn checkpoint_restore_recovers_the_database_and_keeps_a_safety_copy() {
     );
     let checkpoints = world.ok(&["checkpoint", "list"]);
     assert_eq!(checkpoints["checkpoints"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn changeset_copy_constraint_failure_rolls_back_every_live_table() {
+    let world = TestWorld::new();
+    world.init();
+    world.ok(&["changeset", "begin", "corrupt-copy"]);
+    let first = world.write("first.md", "first [[second]]");
+    let second = world.write("second.md", "second [[first]]");
+    for (slug, title, file) in [("first", "First", &first), ("second", "Second", &second)] {
+        world.ok(&[
+            "--changeset",
+            "corrupt-copy",
+            "page",
+            "put",
+            slug,
+            "--title",
+            title,
+            "--summary",
+            title,
+            "--file",
+            as_str(file),
+            "--provenance",
+            "agent-observed",
+        ]);
+    }
+
+    let live = world.database();
+    let before_revision = store_revision(&live);
+    let before_operations = operation_count(&live);
+    let before_projection = snapshot_files(&world.project.join(".lwc/wiki"));
+    let draft = world.project.join(".lwc/changesets/corrupt-copy.db");
+    let conn = Connection::open(&draft).unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO page_sources(page_slug, source_id) VALUES ('first', 999999);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let error = world.err(&["changeset", "commit", "corrupt-copy"]);
+    assert_eq!(error["error"]["code"], "changeset_corrupt");
+    assert_eq!(store_revision(&live), before_revision);
+    assert_eq!(operation_count(&live), before_operations);
+    assert_eq!(
+        snapshot_files(&world.project.join(".lwc/wiki")),
+        before_projection
+    );
+    assert!(draft.is_file());
+}
+
+#[test]
+fn changeset_rejects_foreign_metadata_and_unknown_schema_without_live_mutation() {
+    for (name, corruption, expected) in [
+        (
+            "foreign-store",
+            "UPDATE meta SET value = LOWER(HEX(RANDOMBLOB(32))) WHERE key = 'store_id'",
+            "changeset_scope_mismatch",
+        ),
+        (
+            "unknown-table",
+            "CREATE TABLE unexpected_candidate_state(id INTEGER PRIMARY KEY)",
+            "changeset_corrupt",
+        ),
+        (
+            "invalid-format",
+            "UPDATE meta SET value = '999' WHERE key = 'format_version'",
+            "corrupt_store",
+        ),
+    ] {
+        let world = TestWorld::new();
+        world.init();
+        stage_single_page(&world, name, &format!("{name}-page"));
+        let live = world.database();
+        let before = canonical_snapshot(&live);
+        let projection = snapshot_files(&world.project.join(".lwc/wiki"));
+        let draft = world.project.join(format!(".lwc/changesets/{name}.db"));
+        Connection::open(&draft)
+            .unwrap()
+            .execute_batch(corruption)
+            .unwrap();
+
+        let error = world.err(&[
+            "changeset",
+            "commit",
+            name,
+            "--allow-lint-issues",
+            "--reason",
+            "candidate corruption test",
+        ]);
+        assert_eq!(error["error"]["code"], expected, "{name}");
+        assert_eq!(canonical_snapshot(&live), before, "{name}");
+        assert_eq!(
+            snapshot_files(&world.project.join(".lwc/wiki")),
+            projection,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn changeset_transaction_faults_leave_every_live_canonical_row_and_projection_unchanged() {
+    for fault in [
+        "after_lock",
+        "mid_copy",
+        "after_fts",
+        "after_integrity",
+        "before_commit",
+    ] {
+        let world = TestWorld::new();
+        world.init();
+        stage_single_page(&world, "faulted", "faulted-page");
+        let database = world.database();
+        let before_database = canonical_snapshot(&database);
+        let before_projection = snapshot_files(&world.project.join(".lwc/wiki"));
+
+        let output = world.command_with_changeset_fault(
+            fault,
+            &[
+                "changeset",
+                "commit",
+                "faulted",
+                "--allow-lint-issues",
+                "--reason",
+                "deterministic transaction fault test",
+            ],
+        );
+        assert!(!output.status.success(), "fault {fault} did not fire");
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "changeset_test_fault");
+        assert_eq!(canonical_snapshot(&database), before_database, "{fault}");
+        assert_eq!(
+            snapshot_files(&world.project.join(".lwc/wiki")),
+            before_projection,
+            "{fault}"
+        );
+        assert!(world.project.join(".lwc/changesets/faulted.db").is_file());
+    }
+}
+
+#[test]
+fn changeset_subprocess_crashes_are_recoverable_before_and_after_database_commit() {
+    let before = TestWorld::new();
+    before.init();
+    stage_single_page(&before, "crash-before", "crash-before-page");
+    let before_database = canonical_snapshot(&before.database());
+    let output = before.command_with_changeset_fault(
+        "crash:before_commit",
+        &[
+            "changeset",
+            "commit",
+            "crash-before",
+            "--allow-lint-issues",
+            "--reason",
+            "pre-commit crash test",
+        ],
+    );
+    assert!(!output.status.success());
+    assert_eq!(canonical_snapshot(&before.database()), before_database);
+    assert!(
+        before
+            .project
+            .join(".lwc/changesets/crash-before.db")
+            .is_file()
+    );
+    before.ok(&[
+        "changeset",
+        "commit",
+        "crash-before",
+        "--allow-lint-issues",
+        "--reason",
+        "retry after pre-commit crash",
+    ]);
+
+    let after = TestWorld::new();
+    after.init();
+    stage_single_page(&after, "crash-after", "crash-after-page");
+    let output = after.command_with_changeset_fault(
+        "crash:after_commit",
+        &[
+            "changeset",
+            "commit",
+            "crash-after",
+            "--allow-lint-issues",
+            "--reason",
+            "post-commit crash test",
+        ],
+    );
+    assert!(!output.status.success());
+    assert_eq!(
+        after.ok(&["page", "show", "crash-after-page"])["page"]["title"],
+        "crash-after-page"
+    );
+    assert!(
+        after
+            .project
+            .join(".lwc/changesets/crash-after.db")
+            .is_file()
+    );
+    let recovered = after.ok(&["changeset", "commit", "crash-after"]);
+    assert_eq!(recovered["status"], "committed");
+    assert!(
+        !after
+            .project
+            .join(".lwc/changesets/crash-after.db")
+            .exists()
+    );
+    let commit_count: i64 = Connection::open(after.database())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM operations
+             WHERE action = 'changeset_commit' AND target = ?1",
+            [recovered["changeset_id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(commit_count, 1);
+}
+
+#[test]
+fn changeset_commit_is_seen_by_a_reader_as_one_before_or_after_snapshot() {
+    let world = TestWorld::new();
+    world.init();
+    stage_single_page(&world, "reader-snapshot", "reader-page");
+    let database = world.database();
+    let reader = Connection::open(&database).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let before: i64 = reader
+        .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(before, 0);
+
+    let committed = world.ok(&[
+        "changeset",
+        "commit",
+        "reader-snapshot",
+        "--allow-lint-issues",
+        "--reason",
+        "reader snapshot test",
+    ]);
+    assert_eq!(committed["wal_checkpointed"], false);
+    let during: i64 = reader
+        .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(during, before);
+    reader.execute_batch("COMMIT").unwrap();
+    let after: i64 = reader
+        .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after, 1);
 }
 
 #[test]

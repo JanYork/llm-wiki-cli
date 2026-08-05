@@ -153,6 +153,1236 @@ fn put_page(world: &TestWorld, slug: &str, title: &str, body: &str) {
     );
 }
 
+fn stage_clean_linked_pages(world: &TestWorld, changeset: &str, prefix: &str) {
+    world.ok(&world.project, &["changeset", "begin", changeset]);
+    let first_slug = format!("{prefix}-first");
+    let second_slug = format!("{prefix}-second");
+    for (slug, title, body) in [
+        (
+            first_slug.as_str(),
+            "First",
+            format!("first [[{second_slug}]]"),
+        ),
+        (
+            second_slug.as_str(),
+            "Second",
+            format!("second [[{first_slug}]]"),
+        ),
+    ] {
+        let file = world.write(&format!("{slug}.md"), &body);
+        world.ok(
+            &world.project,
+            &[
+                "--changeset",
+                changeset,
+                "page",
+                "put",
+                slug,
+                "--title",
+                title,
+                "--summary",
+                title,
+                "--file",
+                as_str(&file),
+                "--provenance",
+                "agent-observed",
+            ],
+        );
+    }
+}
+
+#[test]
+fn changeset_stages_reads_and_discard_without_touching_live_wiki() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let database = world.project.join(".lwc/wiki.db");
+    let before_operations: i64 = Connection::open(&database)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+        .unwrap();
+    let before_index = fs::read(world.project.join(".lwc/wiki/index.md")).unwrap();
+
+    let begun = world.ok(&world.project, &["changeset", "begin", "ingest-42"]);
+    assert_eq!(begun["status"], "draft");
+    assert_eq!(begun["name"], "ingest-42");
+    assert!(begun["duration_ms"].is_u64());
+    let listed = world.ok(&world.project, &["changeset", "list"]);
+    assert_eq!(listed["changesets"][0]["name"], "ingest-42");
+
+    let body = world.write("draft-page.md", "draft-only unique knowledge");
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "ingest-42",
+            "page",
+            "put",
+            "draft-only",
+            "--title",
+            "Draft Only",
+            "--file",
+            as_str(&body),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+
+    let live_missing = world.err(&world.project, &["page", "show", "draft-only"]);
+    assert_eq!(live_missing["error"]["code"], "page_not_found");
+    let staged = world.ok(
+        &world.project,
+        &["--changeset", "ingest-42", "page", "show", "draft-only"],
+    );
+    assert_eq!(staged["page"]["body"], "draft-only unique knowledge");
+
+    let shown = world.ok(&world.project, &["changeset", "show", "ingest-42"]);
+    assert_eq!(shown["status"], "draft");
+    assert_eq!(shown["empty"], false);
+    assert_eq!(shown["conflict"], false);
+    assert!(shown["staged_operation_count"].as_u64().unwrap() >= 1);
+
+    let after_operations: i64 = Connection::open(&database)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after_operations, before_operations);
+    assert_eq!(
+        fs::read(world.project.join(".lwc/wiki/index.md")).unwrap(),
+        before_index
+    );
+
+    let discarded = world.ok(&world.project, &["changeset", "discard", "ingest-42"]);
+    assert_eq!(discarded["status"], "discarded");
+    assert!(!world.project.join(".lwc/changesets/ingest-42.db").exists());
+}
+
+#[test]
+fn changeset_commit_is_atomic_conflict_aware_and_rollback_guarded() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(&world.project, &["changeset", "begin", "publish"]);
+
+    let draft_body = world.write("draft-commit.md", "candidate knowledge [[candidate-index]]");
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "publish",
+            "page",
+            "put",
+            "candidate-page",
+            "--title",
+            "Candidate Page",
+            "--summary",
+            "Candidate knowledge",
+            "--file",
+            as_str(&draft_body),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let index_body = world.write("draft-index.md", "[[candidate-page]]");
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "publish",
+            "page",
+            "put",
+            "candidate-index",
+            "--title",
+            "Candidate Index",
+            "--summary",
+            "Candidate navigation",
+            "--file",
+            as_str(&index_body),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+
+    let committed = world.ok(&world.project, &["changeset", "commit", "publish"]);
+    assert_eq!(committed["status"], "committed");
+    assert_eq!(committed["materialized"], true);
+    assert_eq!(committed["wal_checkpointed"], true);
+    for field in [
+        "duration_ms",
+        "checkpoint_ms",
+        "locked_publish_ms",
+        "cleanup_ms",
+        "materialization_ms",
+    ] {
+        assert!(committed[field].is_u64(), "missing commit timing {field}");
+    }
+    let changeset_id = committed["changeset_id"].as_str().unwrap().to_string();
+    let database = world.project.join(".lwc/wiki.db");
+    let wal = PathBuf::from(format!("{}-wal", database.display()));
+    assert_eq!(fs::metadata(&wal).map(|meta| meta.len()).unwrap_or(0), 0);
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "candidate-page"])["page"]["body"],
+        "candidate knowledge [[candidate-index]]"
+    );
+    let (status, checkpoint, post_revision): (String, String, String) = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT status, pre_commit_checkpoint, post_revision
+                 FROM changesets WHERE id = ?1",
+            [&changeset_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "committed");
+    assert_eq!(post_revision.len(), 64);
+    assert!(
+        world
+            .project
+            .join(".lwc/checkpoints")
+            .join(format!("{checkpoint}.db"))
+            .is_file()
+    );
+    assert!(!world.project.join(".lwc/changesets/publish.db").exists());
+    let retried = world.err(&world.project, &["changeset", "commit", "publish"]);
+    assert_eq!(retried["error"]["code"], "changeset_not_found");
+
+    let rolled_back = world.ok(&world.project, &["changeset", "rollback", &changeset_id]);
+    assert_eq!(rolled_back["status"], "rolled_back");
+    assert_eq!(rolled_back["wal_checkpointed"], true);
+    assert!(rolled_back["checkpoint"].as_str().is_some());
+    for field in [
+        "duration_ms",
+        "checkpoint_ms",
+        "locked_rollback_ms",
+        "materialization_ms",
+    ] {
+        assert!(
+            rolled_back[field].is_u64(),
+            "missing rollback timing {field}"
+        );
+    }
+    let rollback_revision = rolled_back["rollback_revision"].clone();
+    assert_eq!(fs::metadata(&wal).map(|meta| meta.len()).unwrap_or(0), 0);
+    assert_eq!(
+        world.err(&world.project, &["page", "show", "candidate-page"])["error"]["code"],
+        "page_not_found"
+    );
+    put_page(
+        &world,
+        "later-after-rollback",
+        "Later After Rollback",
+        "must survive an idempotent rollback retry",
+    );
+    let repeated = world.ok(&world.project, &["changeset", "rollback", &changeset_id]);
+    assert_eq!(repeated["status"], "rolled_back");
+    assert_eq!(repeated["changeset_id"], changeset_id);
+    assert_eq!(repeated["rollback_revision"], rollback_revision);
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "later-after-rollback"])["page"]["title"],
+        "Later After Rollback"
+    );
+
+    world.ok(&world.project, &["changeset", "begin", "stale"]);
+    let stale_body = world.write("stale.md", "stale draft");
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "stale",
+            "page",
+            "put",
+            "stale-page",
+            "--title",
+            "Stale Page",
+            "--file",
+            as_str(&stale_body),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    put_page(&world, "concurrent-live", "Concurrent Live", "live wins");
+    let conflict = world.err(&world.project, &["changeset", "commit", "stale"]);
+    assert_eq!(conflict["error"]["code"], "changeset_conflict");
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "concurrent-live"])["page"]["body"],
+        "live wins"
+    );
+}
+
+#[test]
+fn changeset_commit_does_not_fall_back_to_an_older_commit_with_a_reused_name() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    stage_clean_linked_pages(&world, "reused", "first-version");
+    let first = world.ok(&world.project, &["changeset", "commit", "reused"]);
+
+    stage_clean_linked_pages(&world, "reused", "second-version");
+    let second = world.ok(&world.project, &["changeset", "commit", "reused"]);
+    assert_ne!(first["changeset_id"], second["changeset_id"]);
+    world.ok(
+        &world.project,
+        &[
+            "changeset",
+            "rollback",
+            second["changeset_id"].as_str().unwrap(),
+        ],
+    );
+
+    let error = world.err(&world.project, &["changeset", "commit", "reused"]);
+    assert_eq!(error["error"]["code"], "changeset_not_found");
+}
+
+#[test]
+fn changeset_rollback_refuses_to_overwrite_a_later_live_write() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(&world.project, &["changeset", "begin", "rollback-conflict"]);
+    let first = world.write("rollback-first.md", "first [[rollback-second]]");
+    let second = world.write("rollback-second.md", "second [[rollback-first]]");
+    for (slug, title, summary, file) in [
+        ("rollback-first", "Rollback First", "First", &first),
+        ("rollback-second", "Rollback Second", "Second", &second),
+    ] {
+        world.ok(
+            &world.project,
+            &[
+                "--changeset",
+                "rollback-conflict",
+                "page",
+                "put",
+                slug,
+                "--title",
+                title,
+                "--summary",
+                summary,
+                "--file",
+                as_str(file),
+                "--provenance",
+                "agent-observed",
+            ],
+        );
+    }
+    let committed = world.ok(
+        &world.project,
+        &["changeset", "commit", "rollback-conflict"],
+    );
+    let id = committed["changeset_id"].as_str().unwrap();
+    put_page(&world, "later-live", "Later Live", "must survive");
+
+    let conflict = world.err(&world.project, &["changeset", "rollback", id]);
+    assert_eq!(conflict["error"]["code"], "changeset_rollback_conflict");
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "later-live"])["page"]["body"],
+        "must survive"
+    );
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "rollback-first"])["page"]["body"],
+        "first [[rollback-second]]"
+    );
+}
+
+#[test]
+fn changeset_rollback_rejects_an_invalid_checkpoint_without_any_live_side_effect() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    stage_clean_linked_pages(&world, "invalid-checkpoint", "checkpoint-page");
+    let committed = world.ok(
+        &world.project,
+        &["changeset", "commit", "invalid-checkpoint"],
+    );
+    let changeset_id = committed["changeset_id"].as_str().unwrap();
+    let checkpoint = committed["checkpoint"].as_str().unwrap();
+    let checkpoint_directory = world.project.join(".lwc/checkpoints");
+    let checkpoint_path = checkpoint_directory.join(format!("{checkpoint}.db"));
+    let saved = checkpoint_directory.join(format!("{checkpoint}.saved"));
+    fs::rename(&checkpoint_path, &saved).unwrap();
+    fs::write(&checkpoint_path, "not a SQLite database").unwrap();
+
+    let database = world.project.join(".lwc/wiki.db");
+    let before: (String, i64) = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT
+                (SELECT value FROM meta WHERE key = 'store_revision'),
+                (SELECT COUNT(*) FROM operations)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let before_checkpoints = fs::read_dir(&checkpoint_directory).unwrap().count();
+
+    let error = world.err(&world.project, &["changeset", "rollback", changeset_id]);
+    assert_eq!(error["error"]["code"], "changeset_corrupt");
+    let after: (String, i64) = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT
+                (SELECT value FROM meta WHERE key = 'store_revision'),
+                (SELECT COUNT(*) FROM operations)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(
+        fs::read_dir(&checkpoint_directory).unwrap().count(),
+        before_checkpoints
+    );
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "checkpoint-page-first"])["page"]["title"],
+        "First"
+    );
+}
+
+#[test]
+fn changeset_commit_rejects_empty_and_lint_failures_before_checkpointing() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let database = world.project.join(".lwc/wiki.db");
+    let live_revision = || {
+        Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'store_revision'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+
+    world.ok(&world.project, &["changeset", "begin", "empty"]);
+    let before = live_revision();
+    let empty = world.err(&world.project, &["changeset", "commit", "empty"]);
+    assert_eq!(empty["error"]["code"], "changeset_empty");
+    assert_eq!(live_revision(), before);
+    assert!(!world.project.join(".lwc/checkpoints").exists());
+
+    world.ok(&world.project, &["changeset", "begin", "lint-failing"]);
+    let bad_body = world.write("lint-failing.md", "uncited and orphaned");
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "lint-failing",
+            "page",
+            "put",
+            "lint-failing",
+            "--title",
+            "Lint failing",
+            "--file",
+            as_str(&bad_body),
+        ],
+    );
+    let lint = world.err(&world.project, &["changeset", "commit", "lint-failing"]);
+    assert_eq!(lint["error"]["code"], "changeset_lint_failed");
+    assert_eq!(live_revision(), before);
+    assert!(!world.project.join(".lwc/checkpoints").exists());
+
+    let missing_reason = world.err(
+        &world.project,
+        &["changeset", "commit", "lint-failing", "--allow-lint-issues"],
+    );
+    assert_eq!(
+        missing_reason["error"]["code"],
+        "changeset_lint_override_invalid"
+    );
+    let committed = world.ok(
+        &world.project,
+        &[
+            "changeset",
+            "commit",
+            "lint-failing",
+            "--allow-lint-issues",
+            "--reason",
+            "reviewed temporary navigation gap",
+        ],
+    );
+    assert_eq!(committed["status"], "committed");
+    let detail: String = Connection::open(database)
+        .unwrap()
+        .query_row(
+            "SELECT detail_json FROM operations
+             WHERE action = 'changeset_commit'
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let detail: Value = serde_json::from_str(&detail).unwrap();
+    assert!(detail["lint_issues"].as_u64().unwrap() > 0);
+    assert_eq!(
+        detail["lint_override_reason"],
+        "reviewed temporary navigation gap"
+    );
+}
+
+#[test]
+fn changeset_reports_a_committed_materialization_failure_and_repairs_it() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    stage_clean_linked_pages(&world, "projection-failure", "projection");
+
+    let wiki = world.project.join(".lwc/wiki");
+    let saved = world.project.join(".lwc/wiki-before-failure");
+    fs::rename(&wiki, &saved).unwrap();
+    fs::write(&wiki, "blocks directory creation").unwrap();
+    let error = world.err(
+        &world.project,
+        &["changeset", "commit", "projection-failure"],
+    );
+    assert_eq!(
+        error["error"]["code"],
+        "changeset_committed_materialization_failed"
+    );
+    assert_eq!(error["error"]["details"]["committed"], true);
+    assert_eq!(
+        error["error"]["details"]["recovery_command"],
+        "lwc maintenance materialize"
+    );
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "projection-first"])["page"]["title"],
+        "First"
+    );
+
+    fs::remove_file(&wiki).unwrap();
+    fs::rename(saved, &wiki).unwrap();
+    world.ok(&world.project, &["maintenance", "materialize"]);
+    assert!(
+        String::from_utf8(fs::read(wiki.join("index.md")).unwrap())
+            .unwrap()
+            .contains("projection-first")
+    );
+}
+
+#[test]
+fn changeset_reports_a_rolled_back_materialization_failure_and_retry_repairs_it() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    stage_clean_linked_pages(&world, "rollback-projection-failure", "rollback-projection");
+    let committed = world.ok(
+        &world.project,
+        &["changeset", "commit", "rollback-projection-failure"],
+    );
+    let changeset_id = committed["changeset_id"].as_str().unwrap();
+
+    let wiki = world.project.join(".lwc/wiki");
+    let saved = world.project.join(".lwc/wiki-before-rollback-failure");
+    fs::rename(&wiki, &saved).unwrap();
+    fs::write(&wiki, "blocks directory creation").unwrap();
+    let error = world.err(&world.project, &["changeset", "rollback", changeset_id]);
+    assert_eq!(
+        error["error"]["code"],
+        "changeset_rolled_back_materialization_failed"
+    );
+    assert_eq!(error["error"]["details"]["rolled_back"], true);
+    assert_eq!(
+        error["error"]["details"]["recovery_command"],
+        "lwc maintenance materialize"
+    );
+    assert_eq!(
+        world.err(
+            &world.project,
+            &["page", "show", "rollback-projection-first"]
+        )["error"]["code"],
+        "page_not_found"
+    );
+
+    fs::remove_file(&wiki).unwrap();
+    fs::rename(saved, &wiki).unwrap();
+    let repaired = world.ok(&world.project, &["changeset", "rollback", changeset_id]);
+    assert_eq!(repaired["materialized"], true);
+    assert!(
+        !String::from_utf8(fs::read(wiki.join("index.md")).unwrap())
+            .unwrap()
+            .contains("rollback-projection-first")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn changeset_reports_committed_cleanup_failure_and_retry_only_finishes_cleanup() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    stage_clean_linked_pages(&world, "cleanup-failure", "cleanup");
+    let directory = world.project.join(".lwc/changesets");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).unwrap();
+    let error = world.err(&world.project, &["changeset", "commit", "cleanup-failure"]);
+    assert_eq!(error["error"]["code"], "changeset_committed_cleanup_failed");
+    assert_eq!(error["error"]["details"]["committed"], true);
+    let id = error["error"]["details"]["changeset_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "cleanup-first"])["page"]["title"],
+        "First"
+    );
+
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+    let late_body = world.write("cleanup-late.md", "must not disappear during recovery");
+    let late_write = world.err(
+        &world.project,
+        &[
+            "--changeset",
+            "cleanup-failure",
+            "page",
+            "put",
+            "cleanup-late",
+            "--title",
+            "Cleanup Late",
+            "--file",
+            as_str(&late_body),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    assert_eq!(late_write["error"]["code"], "changeset_frozen");
+    let retried = world.ok(&world.project, &["changeset", "commit", "cleanup-failure"]);
+    assert_eq!(retried["changeset_id"], id);
+    assert!(!directory.join("cleanup-failure.db").exists());
+    assert_eq!(
+        world.err(&world.project, &["page", "show", "cleanup-late"])["error"]["code"],
+        "page_not_found"
+    );
+    let commit_count: i64 = Connection::open(world.project.join(".lwc/wiki.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM operations
+             WHERE action = 'changeset_commit' AND target = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(commit_count, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn changeset_locked_recheck_rejects_a_draft_writer_that_finishes_during_commit() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    stage_clean_linked_pages(&world, "draft-race", "draft-race");
+    let live = world.project.join(".lwc/wiki.db");
+    let before_revision: String = Connection::open(&live)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'store_revision'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let draft = world.project.join(".lwc/changesets/draft-race.db");
+    let writer = Connection::open(&draft).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lwc"))
+        .current_dir(&world.project)
+        .env("HOME", &world.home)
+        .args(["changeset", "commit", "draft-race"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let checkpoint_dir = world.project.join(".lwc/checkpoints");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (!checkpoint_dir.is_dir() || fs::read_dir(&checkpoint_dir).unwrap().next().is_none())
+        && child.try_wait().unwrap().is_none()
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(child.try_wait().unwrap().is_none());
+    writer
+        .execute_batch(
+            "INSERT INTO operations(action, target, detail_json)
+             VALUES ('test_draft_race', 'draft', '{}');
+             UPDATE meta SET value = LOWER(HEX(RANDOMBLOB(32)))
+             WHERE key = 'store_revision';
+             COMMIT;",
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(stderr_json(&output)["error"]["code"], "changeset_changed");
+    let after_revision: String = Connection::open(&live)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'store_revision'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(after_revision, before_revision);
+    assert_eq!(
+        world.err(&world.project, &["page", "show", "draft-race-first"])["error"]["code"],
+        "page_not_found"
+    );
+    assert!(draft.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn changeset_locked_recheck_preserves_a_live_writer_that_finishes_during_commit() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    stage_clean_linked_pages(&world, "live-race", "live-race");
+    let live = world.project.join(".lwc/wiki.db");
+    let writer = Connection::open(&live).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lwc"))
+        .current_dir(&world.project)
+        .env("HOME", &world.home)
+        .args(["changeset", "commit", "live-race"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let checkpoint_dir = world.project.join(".lwc/checkpoints");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (!checkpoint_dir.is_dir() || fs::read_dir(&checkpoint_dir).unwrap().next().is_none())
+        && child.try_wait().unwrap().is_none()
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(child.try_wait().unwrap().is_none());
+    writer
+        .execute_batch(
+            "INSERT INTO operations(action, target, detail_json)
+             VALUES ('test_live_race', 'live', '{}');
+             UPDATE meta SET value = LOWER(HEX(RANDOMBLOB(32)))
+             WHERE key = 'store_revision';
+             COMMIT;",
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(stderr_json(&output)["error"]["code"], "changeset_conflict");
+    let race_count: i64 = Connection::open(&live)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM operations WHERE action = 'test_live_race'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(race_count, 1);
+    assert_eq!(
+        world.err(&world.project, &["page", "show", "live-race-first"])["error"]["code"],
+        "page_not_found"
+    );
+}
+
+#[test]
+fn changeset_rejects_all_scope_and_unsafe_names_before_creating_files() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+
+    let all = world.err(
+        &world.project,
+        &["--scope", "all", "changeset", "begin", "bad"],
+    );
+    assert_eq!(all["error"]["code"], "scope_not_supported");
+
+    for name in [
+        "",
+        " ",
+        "../escape",
+        ".",
+        "..",
+        "two/segments",
+        "two\\segments",
+        " leading",
+        "trailing ",
+        "line\nbreak",
+    ] {
+        let invalid = world.err(&world.project, &["changeset", "begin", name]);
+        assert_eq!(invalid["error"]["code"], "changeset_name_invalid");
+    }
+    let oversized = "x".repeat(81);
+    let invalid = world.err(&world.project, &["changeset", "begin", oversized.as_str()]);
+    assert_eq!(invalid["error"]["code"], "changeset_name_invalid");
+    assert!(!world.project.join(".lwc/changesets").exists());
+}
+
+#[test]
+fn changeset_rejects_unsupported_command_families_without_live_mutation() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(&world.project, &["changeset", "begin", "guarded"]);
+    let database = world.project.join(".lwc/wiki.db");
+    let before: (String, i64) = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT
+                (SELECT value FROM meta WHERE key = 'store_revision'),
+                (SELECT COUNT(*) FROM operations)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    for args in [
+        vec!["--changeset", "guarded", "init"],
+        vec!["--changeset", "guarded", "maintenance", "materialize"],
+        vec!["--changeset", "guarded", "checkpoint", "list"],
+        vec!["--changeset", "guarded", "changeset", "list"],
+    ] {
+        let error = world.err(&world.project, &args);
+        assert_eq!(error["error"]["code"], "changeset_command_unsupported");
+    }
+    let all = world.err(
+        &world.project,
+        &["--scope", "all", "--changeset", "guarded", "context"],
+    );
+    assert_eq!(all["error"]["code"], "scope_not_supported");
+
+    let after: (String, i64) = Connection::open(database)
+        .unwrap()
+        .query_row(
+            "SELECT
+                (SELECT value FROM meta WHERE key = 'store_revision'),
+                (SELECT COUNT(*) FROM operations)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn changeset_read_only_preview_stays_empty_but_recorded_reads_are_staged() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(&world.project, &["changeset", "begin", "preview"]);
+
+    for args in [
+        vec!["--changeset", "preview", "context"],
+        vec!["--changeset", "preview", "lint"],
+        vec!["--changeset", "preview", "log"],
+        vec!["--changeset", "preview", "search", "not-present"],
+    ] {
+        world.ok(&world.project, &args);
+    }
+    assert_eq!(
+        world.ok(&world.project, &["changeset", "show", "preview"])["empty"],
+        true
+    );
+
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "preview",
+            "search",
+            "durable question",
+            "--record",
+        ],
+    );
+    let shown = world.ok(&world.project, &["changeset", "show", "preview"]);
+    assert_eq!(shown["empty"], false);
+    assert_eq!(shown["action_counts"]["search"], 1);
+}
+
+#[test]
+fn changeset_stages_a_complete_ingest_then_discards_every_candidate_row() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(&world.project, &["changeset", "begin", "complete-ingest"]);
+    let source = world.write("evidence.md", "atomic candidate evidence");
+    let added = world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "complete-ingest",
+            "source",
+            "add",
+            as_str(&source),
+        ],
+    );
+    let source_id = added["source"]["id"].as_i64().unwrap().to_string();
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "complete-ingest",
+            "ingest",
+            "claim",
+            &source_id,
+        ],
+    );
+    let analysis = world.write("candidate-analysis.md", "candidate analysis");
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "complete-ingest",
+            "ingest",
+            "analyze",
+            &source_id,
+            "--file",
+            as_str(&analysis),
+        ],
+    );
+    let source_page = world.write(
+        "candidate-source.md",
+        "candidate source summary. [[candidate-synthesis]]",
+    );
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "complete-ingest",
+            "page",
+            "put",
+            "source-candidate",
+            "--title",
+            "Candidate Source",
+            "--kind",
+            "source",
+            "--summary",
+            "Immutable candidate evidence",
+            "--file",
+            as_str(&source_page),
+            "--source",
+            &source_id,
+        ],
+    );
+    let synthesis = world.write(
+        "candidate-synthesis.md",
+        "Atomic candidate synthesis. [[source-candidate]]",
+    );
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "complete-ingest",
+            "page",
+            "put",
+            "candidate-synthesis",
+            "--title",
+            "Candidate Synthesis",
+            "--kind",
+            "synthesis",
+            "--summary",
+            "Atomic candidate conclusion",
+            "--file",
+            as_str(&synthesis),
+            "--source",
+            &source_id,
+        ],
+    );
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "complete-ingest",
+            "ingest",
+            "complete",
+            &source_id,
+        ],
+    );
+    let search = world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "complete-ingest",
+            "search",
+            "atomic candidate",
+        ],
+    );
+    assert!(find_result(&search, "candidate-synthesis")["rank"].is_number());
+    assert_eq!(
+        world.ok(&world.project, &["source", "list"])["sources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        world.ok(&world.project, &["--changeset", "complete-ingest", "lint"])["total"],
+        0
+    );
+    world.ok(&world.project, &["changeset", "discard", "complete-ingest"]);
+    assert_eq!(
+        world.ok(&world.project, &["source", "list"])["sources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn changeset_routes_schema_purpose_graph_weight_context_search_lint_and_log() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let live_schema = world.ok(&world.project, &["schema", "show"])["schema"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    world.ok(&world.project, &["changeset", "begin", "command-matrix"]);
+    let schema = world.write("matrix-schema.md", "# Draft Schema\n\nMatrix only.");
+    let purpose = world.write("matrix-purpose.md", "# Draft Purpose\n\nMatrix only.");
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "command-matrix",
+            "schema",
+            "set",
+            as_str(&schema),
+        ],
+    );
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "command-matrix",
+            "purpose",
+            "set",
+            as_str(&purpose),
+        ],
+    );
+    let first = world.write("matrix-first.md", "matrix token [[matrix-second]]");
+    let second = world.write("matrix-second.md", "matrix token [[matrix-first]]");
+    for (slug, title, file) in [
+        ("matrix-first", "Matrix First", &first),
+        ("matrix-second", "Matrix Second", &second),
+    ] {
+        world.ok(
+            &world.project,
+            &[
+                "--changeset",
+                "command-matrix",
+                "page",
+                "put",
+                slug,
+                "--title",
+                title,
+                "--summary",
+                title,
+                "--file",
+                as_str(file),
+                "--provenance",
+                "agent-observed",
+            ],
+        );
+    }
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "command-matrix",
+            "weight",
+            "set",
+            "page",
+            "matrix-first",
+            "--value",
+            "2",
+            "--reason",
+            "draft canonical page",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "command-matrix",
+            "weight",
+            "feedback",
+            "page",
+            "matrix-first",
+            "--query",
+            "matrix token",
+            "--signal",
+            "relevant",
+            "--reason",
+            "draft result verified",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let related = world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "command-matrix",
+            "graph",
+            "related",
+            "matrix-first",
+        ],
+    );
+    assert_eq!(related["related"][0]["slug"], "matrix-second");
+    let context = world.ok(
+        &world.project,
+        &["--changeset", "command-matrix", "context"],
+    );
+    assert!(
+        context["stores"][0]["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|page| page["slug"] == "matrix-first")
+    );
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "command-matrix",
+            "search",
+            "matrix token",
+            "--record",
+        ],
+    );
+    assert_eq!(
+        world.ok(&world.project, &["--changeset", "command-matrix", "lint"])["total"],
+        0
+    );
+    assert!(
+        world.ok(
+            &world.project,
+            &["--changeset", "command-matrix", "log", "--limit", "20"]
+        )["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|operation| operation["action"] == "weight_set")
+    );
+    assert_eq!(
+        world.ok(&world.project, &["schema", "show"])["schema"],
+        live_schema
+    );
+    world.ok(&world.project, &["changeset", "discard", "command-matrix"]);
+}
+
+#[test]
+fn same_changeset_name_is_isolated_between_project_and_global_scopes() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(&world.project, &["--scope", "global", "init"]);
+    world.ok(&world.project, &["changeset", "begin", "same-name"]);
+    world.ok(
+        &world.project,
+        &["--scope", "global", "changeset", "begin", "same-name"],
+    );
+    let project_body = world.write("project-scope.md", "project candidate");
+    let global_body = world.write("global-scope.md", "global candidate");
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "same-name",
+            "page",
+            "put",
+            "scope-page",
+            "--title",
+            "Project Candidate",
+            "--file",
+            as_str(&project_body),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    world.ok(
+        &world.project,
+        &[
+            "--scope",
+            "global",
+            "--changeset",
+            "same-name",
+            "page",
+            "put",
+            "scope-page",
+            "--title",
+            "Global Candidate",
+            "--file",
+            as_str(&global_body),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    assert_eq!(
+        world.ok(
+            &world.project,
+            &["--changeset", "same-name", "page", "show", "scope-page"]
+        )["page"]["title"],
+        "Project Candidate"
+    );
+    assert_eq!(
+        world.ok(
+            &world.project,
+            &[
+                "--scope",
+                "global",
+                "--changeset",
+                "same-name",
+                "page",
+                "show",
+                "scope-page",
+            ]
+        )["page"]["title"],
+        "Global Candidate"
+    );
+    world.ok(&world.project, &["changeset", "discard", "same-name"]);
+    assert_eq!(
+        world.ok(
+            &world.project,
+            &["--scope", "global", "changeset", "show", "same-name",]
+        )["status"],
+        "draft"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn changeset_keeps_live_source_authority_and_rejects_symlinked_draft_storage() {
+    use std::os::unix::fs::symlink;
+
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(&world.project, &["changeset", "begin", "bounded"]);
+    let outside_source = world.project.parent().unwrap().join("outside.md");
+    fs::write(&outside_source, "outside evidence").unwrap();
+    let error = world.err(
+        &world.project,
+        &[
+            "--changeset",
+            "bounded",
+            "source",
+            "add",
+            as_str(&outside_source),
+        ],
+    );
+    assert_eq!(
+        error["error"]["code"],
+        "external_source_requires_acknowledgement"
+    );
+    let protected = world.project.parent().unwrap().join("protected-wal");
+    fs::write(&protected, "must survive").unwrap();
+    let wal = world.project.join(".lwc/changesets/bounded.db-wal");
+    if wal.exists() {
+        fs::remove_file(&wal).unwrap();
+    }
+    symlink(&protected, &wal).unwrap();
+    let invalid = world.err(&world.project, &["changeset", "discard", "bounded"]);
+    assert_eq!(invalid["error"]["code"], "changeset_path_invalid");
+    assert_eq!(fs::read_to_string(&protected).unwrap(), "must survive");
+    fs::remove_file(wal).unwrap();
+    world.ok(&world.project, &["changeset", "discard", "bounded"]);
+
+    fs::remove_dir(world.project.join(".lwc/changesets")).unwrap();
+    let outside_directory = world.project.parent().unwrap().join("outside-drafts");
+    fs::create_dir(&outside_directory).unwrap();
+    symlink(&outside_directory, world.project.join(".lwc/changesets")).unwrap();
+    let invalid = world.err(&world.project, &["changeset", "begin", "escape"]);
+    assert_eq!(invalid["error"]["code"], "changeset_path_invalid");
+    assert!(fs::read_dir(outside_directory).unwrap().next().is_none());
+}
+
 fn find_result<'a>(search: &'a Value, identifier: &str) -> &'a Value {
     search["results"]
         .as_array()
@@ -176,6 +1406,8 @@ fn help_documents_the_agent_workflow_and_command_side_effects() {
                 "LWC_PROJECT_ROOT",
                 "JSON",
                 "Do not edit .lwc/wiki.db",
+                "Atomic multi-command changes:",
+                "lwc changeset begin",
             ],
         ),
         (
@@ -1084,6 +2316,13 @@ fn every_public_command_exposes_renderable_help() {
     let world = TestWorld::new();
     let commands = [
         "init",
+        "changeset",
+        "changeset begin",
+        "changeset list",
+        "changeset show",
+        "changeset commit",
+        "changeset discard",
+        "changeset rollback",
         "schema",
         "schema set",
         "schema show",
@@ -1525,7 +2764,10 @@ fn read_commands_transparently_migrate_a_writable_v5_store() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9, "context should migrate a writable legacy store");
+    assert_eq!(
+        version, 10,
+        "context should migrate a writable legacy store"
+    );
 }
 
 #[test]
@@ -1579,7 +2821,7 @@ fn read_commands_migrate_v6_store_to_structured_provenance() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     conn.prepare("SELECT page_slug, provenance FROM page_provenance LIMIT 0")
         .unwrap();
 }
@@ -1617,7 +2859,7 @@ fn read_commands_migrate_v7_without_guessing_source_path_history() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert_eq!(tracked, 0, "migration must not guess a legacy path head");
 
     let source_id = added["source"]["id"].as_i64().unwrap().to_string();
@@ -1664,7 +2906,7 @@ fn read_commands_atomically_migrate_a_v8_store_to_weighted_retrieval() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     conn.prepare("SELECT path_terms FROM search_fts LIMIT 0")
         .unwrap();
     conn.prepare("SELECT weight FROM retrieval_weights LIMIT 0")
@@ -1736,6 +2978,87 @@ fn failed_v8_migration_leaves_version_and_schema_unchanged() {
         assert_eq!(columns, 0, "failed migration added a column to {table}");
     }
     conn.prepare("SELECT sentinel FROM retrieval_weights LIMIT 0")
+        .unwrap();
+}
+
+#[test]
+fn read_commands_atomically_migrate_a_v9_store_to_changeset_metadata() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    put_page(&world, "v9-page", "V9 page", "v9 migration content");
+
+    let database = world.project.join(".lwc/wiki.db");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "DROP TABLE changesets;
+         DELETE FROM meta WHERE key IN ('store_id', 'store_revision');
+         UPDATE meta SET value = '9' WHERE key = 'format_version';
+         PRAGMA user_version = 9;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let shown = world.ok(&world.project, &["page", "show", "v9-page"]);
+    assert_eq!(shown["page"]["body"], "v9 migration content");
+
+    let conn = Connection::open(database).unwrap();
+    let version: i32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 10);
+    for key in ["store_id", "store_revision"] {
+        let value: String = conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(value.len(), 64);
+    }
+    conn.prepare("SELECT id, status, post_revision FROM changesets LIMIT 0")
+        .unwrap();
+}
+
+#[test]
+fn failed_v9_changeset_migration_leaves_version_and_schema_unchanged() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let database = world.project.join(".lwc/wiki.db");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "DROP TABLE changesets;
+         CREATE TABLE changesets(sentinel TEXT NOT NULL);
+         DELETE FROM meta WHERE key IN ('store_id', 'store_revision');
+         UPDATE meta SET value = '9' WHERE key = 'format_version';
+         PRAGMA user_version = 9;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let error = world.err(&world.project, &["context", "--limit", "1"]);
+    assert_eq!(error["error"]["code"], "store_migration_failed");
+
+    let conn = Connection::open(database).unwrap();
+    let version: i32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    let format_version: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'format_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let identity_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM meta WHERE key IN ('store_id', 'store_revision')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 9);
+    assert_eq!(format_version, "9");
+    assert_eq!(identity_count, 0);
+    conn.prepare("SELECT sentinel FROM changesets LIMIT 0")
         .unwrap();
 }
 
@@ -1979,6 +3302,62 @@ fn configured_project_root_rejects_a_symlinked_store_directory() {
     assert!(!output.status.success());
     assert_eq!(stderr_json(&output)["error"]["code"], "project_root_escape");
     assert!(!outside.join("wiki.db").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn unconfigured_project_scope_rejects_a_symlinked_live_store_directory() {
+    use std::os::unix::fs::symlink;
+
+    let world = TestWorld::new();
+    let outside_project = world.home.join("outside-project");
+    fs::create_dir_all(&outside_project).unwrap();
+    world.ok(&outside_project, &["init"]);
+    let outside_store = outside_project.join(".lwc");
+    symlink(&outside_store, world.project.join(".lwc")).unwrap();
+
+    let error = world.err(&world.project, &["changeset", "begin", "escape"]);
+    assert_eq!(error["error"]["code"], "project_root_escape");
+    assert!(!outside_store.join("changesets").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn unconfigured_project_scope_rejects_a_symlinked_live_database() {
+    use std::os::unix::fs::symlink;
+
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let outside_project = world.home.join("outside-project");
+    fs::create_dir_all(&outside_project).unwrap();
+    world.ok(&outside_project, &["init"]);
+    let project_database = world.project.join(".lwc/wiki.db");
+    fs::remove_file(&project_database).unwrap();
+    symlink(outside_project.join(".lwc/wiki.db"), &project_database).unwrap();
+
+    let error = world.err(&world.project, &["changeset", "begin", "escape"]);
+    assert_eq!(error["error"]["code"], "project_root_escape");
+    assert!(!world.project.join(".lwc/changesets").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn global_scope_rejects_a_symlinked_live_store_directory() {
+    use std::os::unix::fs::symlink;
+
+    let world = TestWorld::new();
+    let outside_project = world.project.join("outside-global");
+    fs::create_dir_all(&outside_project).unwrap();
+    world.ok(&outside_project, &["init"]);
+    let outside_store = outside_project.join(".lwc");
+    symlink(&outside_store, world.home.join(".lwc")).unwrap();
+
+    let error = world.err(
+        &world.project,
+        &["--scope", "global", "changeset", "begin", "escape"],
+    );
+    assert_eq!(error["error"]["code"], "store_path_invalid");
+    assert!(!outside_store.join("changesets").exists());
 }
 
 #[test]

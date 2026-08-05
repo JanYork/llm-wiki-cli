@@ -23,11 +23,28 @@ pub enum Scope {
 pub struct StorePath {
     pub scope: Scope,
     pub path: PathBuf,
+    authority_path: PathBuf,
 }
 
 impl StorePath {
-    fn new(scope: Scope, path: PathBuf) -> Self {
-        Self { scope, path }
+    pub(crate) fn new(scope: Scope, path: PathBuf) -> Self {
+        Self {
+            scope,
+            authority_path: path.clone(),
+            path,
+        }
+    }
+
+    pub(crate) fn with_database(&self, path: PathBuf) -> Self {
+        Self {
+            scope: self.scope,
+            path,
+            authority_path: self.authority_path.clone(),
+        }
+    }
+
+    pub(crate) fn authority_path(&self) -> &Path {
+        &self.authority_path
     }
 }
 
@@ -37,7 +54,11 @@ pub fn init_store_path(scope: Scope, cwd: &Path) -> Result<StorePath> {
             Scope::Project,
             project_store(cwd, true)?.expect("initialization always returns a project path"),
         )),
-        Scope::Global => Ok(StorePath::new(Scope::Global, global_store_path()?)),
+        Scope::Global => {
+            let path = global_store_path()?;
+            inspect_store_path(&path, None)?;
+            Ok(StorePath::new(Scope::Global, path))
+        }
         Scope::All => Err(scope_not_supported("init")),
     }
 }
@@ -52,7 +73,7 @@ pub fn resolve_store_path(scope: Scope, cwd: &Path) -> Result<StorePath> {
         }
         Scope::Global => {
             let path = global_store_path()?;
-            if !path.is_file() {
+            if !inspect_store_path(&path, None)? {
                 return Err(store_not_found("global wiki is not initialized"));
             }
             Ok(StorePath::new(Scope::Global, path))
@@ -78,7 +99,7 @@ pub fn resolve_read_store_paths(
             }
 
             let global = global_store_path()?;
-            if global.is_file() {
+            if inspect_store_path(&global, None)? {
                 stores.push(StorePath::new(Scope::Global, global));
             }
 
@@ -112,8 +133,16 @@ fn project_store(cwd: &Path, initialize: bool) -> Result<Option<PathBuf>> {
 
     let store = find_project_store(start, boundary)?
         .or_else(|| initialize.then(|| project_store_path(initialization_root)));
-    if let (Some(root), Some(path)) = (boundary, store.as_deref()) {
-        ensure_project_path(path, root)?;
+    if let Some(path) = store.as_deref() {
+        let root = boundary.unwrap_or_else(|| {
+            path.parent()
+                .and_then(Path::parent)
+                .expect("project store always has a project root")
+        });
+        if boundary.is_some() {
+            ensure_project_path(path, root)?;
+        }
+        inspect_store_path(path, Some(root))?;
     }
     Ok(store)
 }
@@ -213,7 +242,9 @@ fn find_project_store(start: &Path, configured_boundary: Option<&Path>) -> Resul
 
     for candidate in start.ancestors() {
         let path = project_store_path(candidate);
-        if global.as_ref() != Some(&path) && path.is_file() {
+        let exists = global.as_ref() != Some(&path)
+            && inspect_store_path(&path, Some(configured_boundary.unwrap_or(candidate)))?;
+        if exists {
             if configured_boundary.is_none() {
                 return Ok(Some(path));
             }
@@ -234,6 +265,75 @@ fn find_project_store(start: &Path, configured_boundary: Option<&Path>) -> Resul
         }
     }
     Ok(found)
+}
+
+fn inspect_store_path(path: &Path, project_root: Option<&Path>) -> Result<bool> {
+    let directory = path
+        .parent()
+        .expect("wiki database path always has a parent directory");
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(invalid_store_path(
+                path,
+                project_root,
+                "store directory is a symbolic link",
+            ));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(invalid_store_path(
+                path,
+                project_root,
+                "store directory is not a directory",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(invalid_store_path(path, project_root, &error.to_string())),
+    }
+
+    let mut database_exists = false;
+    for candidate in [
+        path.to_path_buf(),
+        store_sidecar(path, "-wal"),
+        store_sidecar(path, "-shm"),
+    ] {
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(invalid_store_path(
+                    &candidate,
+                    project_root,
+                    "store database or sidecar is not a regular file",
+                ));
+            }
+            Ok(_) if candidate == path => database_exists = true,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(invalid_store_path(
+                    &candidate,
+                    project_root,
+                    &error.to_string(),
+                ));
+            }
+        }
+    }
+    Ok(database_exists)
+}
+
+fn store_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    sidecar.into()
+}
+
+fn invalid_store_path(path: &Path, project_root: Option<&Path>, reason: &str) -> AppError {
+    match project_root {
+        Some(root) => project_root_escape(path, root, reason),
+        None => AppError::new(
+            "store_path_invalid",
+            format!("Wiki store path {} is unsafe: {reason}", path.display()),
+        ),
+    }
 }
 
 fn global_store_path() -> Result<PathBuf> {

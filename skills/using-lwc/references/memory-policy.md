@@ -131,17 +131,19 @@ Before `lwc init` or the first later mutation, resolve and verify:
 
 1. `active_project_root`;
 2. the canonical project Wiki database path;
-3. every filesystem write target;
-4. that each non-global target is inside `active_project_root`;
-5. that an outside-root target has explicit current-task authorization and is
+3. for a changeset, the canonical draft database and owned cleanup paths under
+   that same live Wiki;
+4. every filesystem write target;
+5. that each non-global target is inside `active_project_root`;
+6. that an outside-root target has explicit current-task authorization and is
    inside a host-permitted root.
 
 Block on failure. Apply this gate to `source add`, `page put`, generated
-Markdown, reports, navigation, databases, indexes, caches, and staging files.
-An external evidence file may be read only when authorized, but it does not
-move the Wiki database or other outputs outside the active project. Pass
-`--allow-external-source` only after verifying that current authorization and
-Wiki ownership both apply.
+Markdown, reports, navigation, live and draft databases, changeset cleanup,
+indexes, caches, and staging files. An external evidence file may be read only
+when authorized, but it does not move the Wiki database or other outputs
+outside the active project. Pass `--allow-external-source` only after verifying
+that current authorization and Wiki ownership both apply.
 
 ## Scope decisions
 
@@ -211,6 +213,58 @@ source IDs. If genuinely durable, store them with an explicit provenance and
 date; never invent a citation. Repeat `--provenance user-provided`,
 `--provenance agent-observed`, or `--provenance hypothesis` when more than one
 class applies. Label hypotheses and verification state.
+
+## Atomic multi-command changes
+
+One source/page command is already transactional, but an ingest or broad
+revision spans many commands. Keep that logical unit out of live knowledge
+until it is complete:
+
+```bash
+"$LWC" --scope project changeset begin <NAME>
+"$LWC" --scope project --changeset <NAME> source add-manifest sources.json
+"$LWC" --scope project --changeset <NAME> ingest claim <SOURCE_ID>
+# analyze, write cited source/shared pages, and complete the ingest in the draft
+"$LWC" --scope project --changeset <NAME> lint
+"$LWC" --scope project changeset show <NAME>
+"$LWC" --scope project changeset commit <NAME>
+```
+
+Use the same explicit scope on lifecycle and routed commands. `project` and
+`global` changesets are independent; `--scope all` is forbidden. A draft is
+bound to the exact authorized live store and does not create a Markdown
+projection. Existing page/source/search/context/graph/log/lint reads inspect the
+draft when passed `--changeset <NAME>`. `init`, `maintenance`, `checkpoint`, and
+nested changeset commands reject the selector.
+
+`changeset show` reports staged operations, lint, revisions, conflict, and
+readiness. Commit rejects empty drafts and lint issues by default. Use
+`--allow-lint-issues --reason "..."` only for specific reviewed pre-existing
+debt; do not waive new errors. `changeset_conflict` means live changed after
+begin; `changeset_changed` means the draft changed during commit preflight.
+Neither may be forced or merged automatically: preserve live work, discard the
+stale draft with `changeset discard <NAME>`, begin a fresh draft, and reapply the
+reviewed change.
+
+Commit freezes the reviewed draft before checkpoint/publication. From then on,
+every routed mutation fails transactionally with `changeset_frozen`, including
+when a committed draft remains only for WAL-checkpoint or cleanup recovery.
+Retry the same commit, or discard after a reported conflict; never stage new
+work into a frozen draft.
+
+A successful commit atomically publishes canonical SQLite, records history,
+creates a pre-commit checkpoint, cleans its owned draft files, rebuilds the live
+projection once, and returns `changeset_id`. `wal_checkpointed=false` means an
+active reader prevented immediate WAL truncation; it does not mean publication
+failed. If cleanup or projection fails after canonical commit, trust the
+structured `committed=true`/recovery fields and run the stated repair; never
+reapply the knowledge blindly.
+
+Use `changeset rollback <CHANGESET_ID>` only for the immediately committed
+batch. It restores the exact pre-commit snapshot, records the rollback, and
+creates a pre-rollback checkpoint. Any later live mutation causes a guarded
+rollback conflict; there is no force option. `changeset discard` applies only
+to an uncommitted draft and never mutates live state.
 
 ## Source integration
 
@@ -389,6 +443,18 @@ changed scope before calling the changed knowledge ready:
    "$LWC" --scope "$LWC_SCOPE" search "<paraphrase>" --type auto --limit 5
    ```
 
+   When the work is staged, first run the same fixed gate against the draft:
+
+   ```bash
+   "$LWC" --scope "$LWC_SCOPE" --changeset <NAME> lint
+   "$LWC" --scope "$LWC_SCOPE" --changeset <NAME> search "<question>" --type auto --limit 5
+   "$LWC" --scope "$LWC_SCOPE" --changeset <NAME> search "<paraphrase>" --type auto --limit 5
+   ```
+
+   Commit only after the draft passes. Then repeat the unchanged lint, search,
+   page, and source checks against live state without `--changeset`; draft
+   acceptance alone does not prove that publication succeeded.
+
 3. Open the expected and actual hit pages with
    `"$LWC" --scope "$LWC_SCOPE" page show "<SLUG>"`. For source-grounded
    answers, inspect cited evidence with
@@ -430,11 +496,14 @@ summaries, links, citations, and index problems. Use scope-specific
 read-only by default; add `--record` only when the validation event itself is
 durable knowledge.
 
-Before a multi-source ingest or broad replacement of existing pages, create a
-named checkpoint. Restore only with `checkpoint restore`; it validates the
-backup, preserves the current database as `pre-restore-*`, and rematerializes
-the Wiki. Use `source remove` and `page remove` for deletion, and stop when
-citations or inbound links make the object in use.
+Use an atomic changeset for a multi-source ingest or broad replacement of
+existing pages; successful commit creates the required pre-change checkpoint
+automatically. Create a named manual checkpoint for large one-command work or
+maintenance that cannot run inside a changeset. Restore only with `checkpoint
+restore`; it validates the backup, preserves the current database as
+`pre-restore-*`, and rematerializes the Wiki. Use `source remove` and `page
+remove` for deletion, and stop when citations or inbound links make the object
+in use.
 
 If storage growth matters, run scope-specific `maintenance compact` only during
 an idle window. Inspect `busy` and `after_bytes`; a successful process exit does

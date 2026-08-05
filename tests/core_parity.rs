@@ -73,6 +73,51 @@ fn as_str(path: &Path) -> &str {
 }
 
 #[test]
+fn changeset_commit_and_rollback_keep_source_and_operation_ids_monotonic() {
+    let world = TestWorld::new();
+    world.ok(&["init"]);
+    let base = world.write("base.md", "base source");
+    let base_source = world.ok(&["source", "add", as_str(&base)]);
+    assert_eq!(base_source["source"]["id"], 1);
+
+    world.ok(&["changeset", "begin", "id-sequence"]);
+    let candidate = world.write("candidate.md", "candidate sequence source");
+    let staged = world.ok(&[
+        "--changeset",
+        "id-sequence",
+        "source",
+        "add",
+        as_str(&candidate),
+    ]);
+    let staged_id = staged["source"]["id"].as_i64().unwrap();
+    let committed = world.ok(&["changeset", "commit", "id-sequence"]);
+    let changeset_id = committed["changeset_id"].as_str().unwrap();
+    assert_eq!(
+        world.ok(&["source", "show", &staged_id.to_string()])["source"]["content"],
+        "candidate sequence source"
+    );
+    world.ok(&["changeset", "rollback", changeset_id]);
+    assert_eq!(
+        world.err(&["source", "show", &staged_id.to_string()])["error"]["code"],
+        "source_not_found"
+    );
+
+    let after = world.write("after.md", "after rollback source");
+    let after = world.ok(&["source", "add", as_str(&after)]);
+    assert!(after["source"]["id"].as_i64().unwrap() > staged_id);
+    let database = world.project.join(".lwc/wiki.db");
+    let ids: Vec<i64> = Connection::open(database)
+        .unwrap()
+        .prepare("SELECT id FROM operations ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+#[test]
 fn directory_ingest_is_recursive_filtered_and_idempotent() {
     let world = TestWorld::new();
     world.ok(&["init"]);
