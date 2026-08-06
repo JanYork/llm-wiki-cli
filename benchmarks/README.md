@@ -1,10 +1,39 @@
-# Search benchmark
+# Search and graph benchmarks
 
 This repo ships an opt-in local benchmark for lexical source retrieval, import
 cost, and storage amplification. Normal integration tests cover compiled-page
 ranking and workflow correctness.
 
 It is intentionally ignored in normal test runs.
+
+`tests/graph_benchmark.rs` additionally builds a deterministic generated Wiki
+and reports hierarchy indexing time, graph/node/span/delta counts, database and
+retained-sidecar growth, sentence/passage search, span expansion,
+neighbors/path/impact/overview p95 latency, GraphQLite full projection, and one
+document-replacement projection. Run a release benchmark with:
+
+```bash
+LWC_GRAPH_BENCH_DOCS=100 LWC_GRAPH_BENCH_SAMPLES=30 \
+  cargo test --release --test graph_benchmark \
+  graph_benchmark_reports_latency_growth_projection_and_bounds \
+  -- --ignored --nocapture
+```
+
+The release-mode assertions enforce the documented latency budgets. The JSON
+records OS, architecture, build mode, corpus size, counts, projection state,
+per-table canonical page usage, and separate canonical/delta/sidecar
+measurements. Generated inputs live only in a temporary directory.
+
+A verified macOS x86_64 release run on the default 100-document/30-sample
+fixture reported 1,275 ms canonical indexing for a 100 KiB replacement, 75 ms
+incremental GraphQLite projection, 162.5 ms net overview p95 (all other net
+query/traversal p95 values below 48 ms), and 3.76x canonical storage growth.
+The write budgets intentionally retain complete reverse-dependent co-occurrence
+updates and exact deltas; the user approved this bounded latency tradeoff because
+its correctness benefit outweighs the former 750/500 ms targets. The compact
+representation otherwise trades only persisted co-occurrence display precision
+(six decimal places); exact position bytes, exact aggregate evidence, rank
+order, locators, and rebuild semantics remain intact.
 
 ## Inputs
 
@@ -52,7 +81,7 @@ internal source id.
 | Compiled retrieval | page-first ranking, paired-source suppression, type/kind filters | `tests/cli.rs` |
 | Ingest quality gate | source + non-source integration, explicit exception | `tests/cli.rs`, `tests/core_parity.rs` |
 | Large sources | Unicode-safe resumable windows | `tests/cli.rs` |
-| Graph | structural-evidence-only candidates | unit and core parity tests |
+| Graph | hierarchy, semantic lifecycle, bounded traversal, rslg/GraphQLite parity, p95 budgets | `tests/cli.rs`, `src/graph_backend.rs`, ignored graph benchmark |
 | Storage | contentless FTS5, migrations, lint, WAL compaction | `tests/storage_regressions.rs`, production tests |
 
 Because the benchmark creates no Wiki pages, default search is a raw-only

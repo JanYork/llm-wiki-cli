@@ -1,3 +1,11 @@
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenOccurrence {
+    pub normalized: String,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub ordinal: usize,
+}
+
 const STOP_WORDS: &[&str] = &[
     "的", "是", "了", "什么", "在", "有", "和", "与", "对", "从", "the", "is", "a", "an", "what",
     "how", "are", "was", "were", "do", "does", "did", "be", "been", "being", "have", "has", "had",
@@ -20,11 +28,17 @@ pub fn tokenize_for_index(text: &str) -> Vec<String> {
     tokenize(text, true)
 }
 
+pub fn tokenize_for_index_with_positions(text: &str) -> Vec<TokenOccurrence> {
+    let mut occurrences = Vec::new();
+    tokenize_occurrences_into(text, true, |occurrence| occurrences.push(occurrence));
+    occurrences
+}
+
 pub fn joined_index_terms(text: &str) -> String {
     let mut joined = String::with_capacity(text.len());
-    tokenize_into(text, true, |token| {
+    tokenize_occurrences_into(text, true, |occurrence| {
         joined.push('\u{1e}');
-        joined.push_str(&token);
+        joined.push_str(&occurrence.normalized);
         joined.push('\u{1f}');
     });
     joined
@@ -32,61 +46,121 @@ pub fn joined_index_terms(text: &str) -> String {
 
 fn tokenize(text: &str, include_cjk_unigrams: bool) -> Vec<String> {
     let mut tokens = Vec::new();
-    tokenize_into(text, include_cjk_unigrams, |token| tokens.push(token));
+    tokenize_occurrences_into(text, include_cjk_unigrams, |occurrence| {
+        tokens.push(occurrence.normalized)
+    });
     tokens
 }
 
-fn tokenize_into(text: &str, include_cjk_unigrams: bool, mut push_token: impl FnMut(String)) {
+fn tokenize_occurrences_into(
+    text: &str,
+    include_cjk_unigrams: bool,
+    mut push: impl FnMut(TokenOccurrence),
+) {
     let mut word = String::new();
-    let mut cjk = Vec::new();
+    let mut word_start = None;
+    let mut word_end = 0usize;
+    let mut cjk: Vec<(char, usize, usize)> = Vec::new();
+    let mut ordinal = 0usize;
 
-    for ch in text.to_lowercase().chars() {
-        if is_cjk(ch) {
-            push_word(&mut push_token, &mut word);
-            cjk.push(ch);
-        } else if ch.is_alphanumeric() {
-            push_cjk(&mut push_token, &mut cjk, include_cjk_unigrams);
-            word.push(ch);
-        } else {
-            push_word(&mut push_token, &mut word);
-            push_cjk(&mut push_token, &mut cjk, include_cjk_unigrams);
-        }
-    }
-    push_word(&mut push_token, &mut word);
-    push_cjk(&mut push_token, &mut cjk, include_cjk_unigrams);
-}
-
-fn push_word(push_token: &mut impl FnMut(String), word: &mut String) {
-    if !word.is_empty() && !is_stop_word(word) {
-        push_token(std::mem::take(word));
-    } else {
-        word.clear();
-    }
-}
-
-fn push_cjk(push_token: &mut impl FnMut(String), cjk: &mut Vec<char>, include_unigrams: bool) {
-    if cjk.len() == 1 {
-        let token = cjk[0].to_string();
-        if !is_stop_word(&token) {
-            push_token(token);
-        }
-    } else {
-        for pair in cjk.windows(2) {
-            let token = pair.iter().collect::<String>();
-            if !is_stop_word(&token) {
-                push_token(token);
+    for (byte_start, original) in text.char_indices() {
+        let byte_end = byte_start + original.len_utf8();
+        for ch in original.to_lowercase() {
+            if is_cjk(ch) {
+                push_word_occurrence(
+                    &mut push,
+                    &mut ordinal,
+                    &mut word,
+                    &mut word_start,
+                    word_end,
+                );
+                cjk.push((ch, byte_start, byte_end));
+            } else if ch.is_alphanumeric() {
+                push_cjk_occurrences(&mut push, &mut ordinal, &mut cjk, include_cjk_unigrams);
+                word_start.get_or_insert(byte_start);
+                word_end = byte_end;
+                word.push(ch);
+            } else {
+                push_word_occurrence(
+                    &mut push,
+                    &mut ordinal,
+                    &mut word,
+                    &mut word_start,
+                    word_end,
+                );
+                push_cjk_occurrences(&mut push, &mut ordinal, &mut cjk, include_cjk_unigrams);
             }
         }
+    }
+    push_word_occurrence(
+        &mut push,
+        &mut ordinal,
+        &mut word,
+        &mut word_start,
+        word_end,
+    );
+    push_cjk_occurrences(&mut push, &mut ordinal, &mut cjk, include_cjk_unigrams);
+}
+
+fn push_word_occurrence(
+    push: &mut impl FnMut(TokenOccurrence),
+    ordinal: &mut usize,
+    word: &mut String,
+    word_start: &mut Option<usize>,
+    word_end: usize,
+) {
+    let Some(byte_start) = word_start.take() else {
+        return;
+    };
+    let normalized = std::mem::take(word);
+    push_occurrence(push, ordinal, normalized, byte_start, word_end);
+}
+
+fn push_cjk_occurrences(
+    push: &mut impl FnMut(TokenOccurrence),
+    ordinal: &mut usize,
+    cjk: &mut Vec<(char, usize, usize)>,
+    include_unigrams: bool,
+) {
+    if cjk.len() == 1 {
+        let (ch, byte_start, byte_end) = cjk[0];
+        push_occurrence(push, ordinal, ch.to_string(), byte_start, byte_end);
+    } else {
+        for pair in cjk.windows(2) {
+            push_occurrence(
+                push,
+                ordinal,
+                [pair[0].0, pair[1].0].iter().collect(),
+                pair[0].1,
+                pair[1].2,
+            );
+        }
         if include_unigrams {
-            for ch in cjk.iter() {
-                let token = ch.to_string();
-                if !is_stop_word(&token) {
-                    push_token(token);
-                }
+            for (ch, byte_start, byte_end) in cjk.iter().copied() {
+                push_occurrence(push, ordinal, ch.to_string(), byte_start, byte_end);
             }
         }
     }
     cjk.clear();
+}
+
+fn push_occurrence(
+    push: &mut impl FnMut(TokenOccurrence),
+    ordinal: &mut usize,
+    normalized: String,
+    byte_start: usize,
+    byte_end: usize,
+) {
+    if is_stop_word(&normalized) {
+        return;
+    }
+    push(TokenOccurrence {
+        normalized,
+        byte_start,
+        byte_end,
+        ordinal: *ordinal,
+    });
+    *ordinal += 1;
 }
 
 fn is_stop_word(token: &str) -> bool {
@@ -105,7 +179,10 @@ fn is_cjk(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{joined_index_terms, tokenize_for_index, tokenize_for_query};
+    use super::{
+        joined_index_terms, tokenize_for_index, tokenize_for_index_with_positions,
+        tokenize_for_query,
+    };
 
     #[test]
     fn chinese_search_tokenizes_meaningful_terms() {
@@ -201,5 +278,51 @@ mod tests {
                 .collect::<String>();
             assert_eq!(joined_index_terms(text), expected, "input: {text:?}");
         }
+    }
+
+    #[test]
+    fn positional_tokens_keep_exact_original_utf8_ranges_and_ordinals() {
+        let text = "Rust 注意力 alpha";
+        let occurrences = tokenize_for_index_with_positions(text);
+
+        assert_eq!(
+            occurrences
+                .iter()
+                .map(|token| (
+                    token.normalized.as_str(),
+                    &text[token.byte_start..token.byte_end],
+                    token.ordinal,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("rust", "Rust", 0),
+                ("注意", "注意", 1),
+                ("意力", "意力", 2),
+                ("注", "注", 3),
+                ("意", "意", 4),
+                ("力", "力", 5),
+                ("alpha", "alpha", 6),
+            ]
+        );
+    }
+
+    #[test]
+    fn lowercase_expansion_keeps_original_source_ranges() {
+        let text = "İstanbul Σ";
+
+        assert_eq!(
+            tokenize_for_index_with_positions(text)
+                .iter()
+                .map(|token| (
+                    token.normalized.as_str(),
+                    &text[token.byte_start..token.byte_end],
+                ))
+                .collect::<Vec<_>>(),
+            vec![("i", "İ"), ("stanbul", "stanbul"), ("σ", "Σ")]
+        );
+        assert_eq!(
+            tokenize_for_query(text),
+            vec!["i".to_string(), "stanbul".to_string(), "σ".to_string()]
+        );
     }
 }

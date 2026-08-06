@@ -251,6 +251,7 @@ pub fn commit(
             "live Wiki changed after the changeset began",
         ));
     }
+    draft.validate_changeset_integrity()?;
     let lint_issues = draft.lint(1, 0)?.total;
     if lint_issues > 0 && !allow_lint_issues {
         return Err(AppError::new(
@@ -288,6 +289,19 @@ pub fn commit(
             lint_override_reason: reason.map(str::to_string),
         },
     )?;
+    if let Err(error) = live_store.reconcile_graph_projection() {
+        return Err(AppError::new(
+            "graph_projection_failed",
+            "changeset committed canonically but physical graph projection failed",
+        )
+        .with_details(json!({
+            "canonical_committed": true,
+            "changeset_id": committed.changeset_id,
+            "checkpoint": committed.checkpoint,
+            "cause": error.code,
+            "recovery_command": format!("lwc changeset commit {}", committed.name),
+        })));
+    }
     drop(live_store);
     finish_committed(live, &path, committed, started, checkpoint_ms)
 }

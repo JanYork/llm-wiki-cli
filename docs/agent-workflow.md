@@ -224,6 +224,48 @@ lwc source show 12 --max-chars 100000
 lwc graph related relevant-slug
 ```
 
+When document recall is too coarse, retrieve exact spans and expand only the
+needed context:
+
+```bash
+lwc search "question keywords" --granularity sentence --type page
+lwc search "question keywords" --granularity all --group-by document
+lwc span get <SPAN_ID>
+lwc span expand <SPAN_ID> --before 1 --after 1 --children 20
+```
+
+Treat returned span IDs as exact locators, not semantic identities. On
+`stale_span`, inspect the prior/current fingerprint metadata and search the
+current document deliberately; never silently substitute similar text.
+
+Use the graph after lexical recall—or without keywords when mapping an unknown
+knowledge area:
+
+```bash
+lwc graph explore
+lwc graph neighbors page:relevant-slug --direction both
+lwc graph path page:implementation page:policy --max-depth 6
+lwc graph impact page:policy
+lwc graph overview
+lwc graph status
+lwc graph verify
+```
+
+Write `SUPPORTS`, `CONTRADICTS`, `REFINES`, `SUPERSEDES`, `CAUSES`, and
+`DEPENDS_ON` only when the relation is explicit. Always provide provenance,
+reason, confidence, and every supporting Source ID for `source-grounded`:
+
+```bash
+lwc graph relation set page:implementation DEPENDS_ON page:policy \
+  --provenance source-grounded --source 12 \
+  --reason "Source 12 states the dependency" --confidence 0.95
+```
+
+Never treat `CO_OCCURS` as semantic evidence or include it in impact by default.
+If `graph status` is pending/stale, do not bypass it with rslg: follow the
+structured recovery action. Superseded GraphQLite sidecars require manual review
+and are intentionally retained.
+
 The default `--type auto` returns compiled pages first, hides the raw source
 paired with a matching `kind=source` page, and falls back to sources when
 needed. Use `--type source` to inspect immutable evidence, `--type page` for

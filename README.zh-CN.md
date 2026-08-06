@@ -178,6 +178,73 @@ Markdown。命令成功时向 stdout 返回 JSON，失败时向 stderr 返回结
 对于当前格式的 store，读取命令保持只读；新版 CLI 第一次打开可写的旧版 store
 时，会先在事务中完成一次 schema 迁移，再继续读取。
 
+## 分层检索与知识图
+
+每个当前 Source 和 Wiki 页面都会被确定性拆分并索引为段、句和规范化词。SQLite
+仍是权威数据源；Span FTS 与类型化规范图都是可重建索引。现有搜索默认仍只返回
+文档，只有显式指定粒度才检索段句：
+
+```bash
+lwc search "投影一致性" --granularity sentence --type page
+lwc search "投影一致性" --granularity passage
+lwc search "投影一致性" --granularity all --group-by document
+lwc span get <SPAN_ID>
+lwc span expand <SPAN_ID> --before 1 --after 1 --children 20
+```
+
+Span locator 绑定文档指纹和切分器版本。页面正文替换后，旧 locator 会以
+`stale_span` 失败并返回新旧元数据；LWC 不会把它模糊映射到相似文本。
+
+无需关键词也可使用有界、类型化图 API：
+
+```bash
+lwc graph explore
+lwc graph explore term:一致性 --depth 2 --edge-type CO_OCCURS
+lwc graph node page:projection-policy
+lwc graph neighbors page:projection-policy --direction outgoing
+lwc graph path page:implementation page:policy --max-depth 6
+lwc graph impact page:policy --max-depth 4
+lwc graph overview
+lwc graph status
+lwc graph verify
+```
+
+自动边只表达结构或可证明的证据关系；语义关系必须显式写入并可审计：
+
+```bash
+lwc graph relation set page:implementation DEPENDS_ON page:policy \
+  --provenance source-grounded --source 12 \
+  --reason "来源 12 明确给出该约束" --confidence 0.95
+lwc graph relation list --from page:implementation
+lwc graph relation retract page:implementation DEPENDS_ON page:policy \
+  --reason "该依赖已被新证据取代"
+```
+
+关系理由是持久内容，不得写入凭证、秘密或原始思维链。
+
+物理图默认启用。`auto` 在受支持的 macOS/Linux 目标上选择内置且校验过的
+GraphQLite，在其他平台使用 rslg；Windows 不嵌入或加载 GraphQLite。配置按
+内置、全局、项目三层解析，项目值可继承：
+
+```bash
+lwc config show
+lwc config set --physical enabled --engine auto
+lwc config set --engine rslg
+lwc config unset --physical --engine
+```
+
+规范 schema 将每个“词×文档”的精确位置只保存一次，采用紧凑 posting blob。
+段/句 `OCCURS_IN` 以及 `CONTAINS`/`NEXT`/`PREVIOUS` 结构边均由 posting 与 span
+locator 确定性派生，因此不牺牲公开图语义，也无需把同一位置和索引重复保存三份。
+共现证据使用按文档压缩 blob 和增量总量；持久化的归一化边权保留六位小数，精确总量
+仍用于重建。
+
+GraphQLite 是可丢弃的校验和 sidecar 投影。规范数据先提交；若投影失败，命令返回
+`graph_projection_failed`，状态变为 stale，图读取会失败关闭。下一次可写打开或
+`lwc config set --engine graphqlite` 会恢复/重建。旧 sidecar 不会自动删除，
+`graph status` 会列出它们供人工审查。Changeset 草稿始终使用候选规范表上的 rslg，
+不会读取或发布本机投影状态。
+
 ## 安装
 
 大多数用户应直接使用上面的 Agent 配置提示词。下面的手动命令主要用于维护、排障，

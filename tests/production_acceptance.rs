@@ -79,7 +79,7 @@ fn run_command(bin: &str, home: &Path, cwd: &Path, args: &[&str]) -> ExitStatus 
         .env("HOME", home)
         .args(args)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .status()
         .unwrap()
 }

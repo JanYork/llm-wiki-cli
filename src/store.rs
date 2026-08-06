@@ -1,7 +1,16 @@
 use crate::{
     artifacts,
+    config::{self, EngineSetting, PhysicalSetting},
     error::{AppError, Result},
-    graph::{GraphPage, related},
+    graph::{
+        CanonicalEdge, DocumentGraphInput, DocumentGraphReplacement, DocumentType, GraphPage,
+        TermPairContribution, automatic_edge, build_cooccurrence, build_document_graph,
+        rank_cooccurrence, related,
+    },
+    graph_backend::{
+        create_hierarchical_graph_schema, decode_positions, encode_positions,
+        graphqlite_projection_counts, project_graphqlite_snapshot,
+    },
     tokenize::{joined_index_terms, tokenize_for_query},
 };
 use rusqlite::{
@@ -14,10 +23,11 @@ use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::CStr,
     fs,
     io::{BufReader, BufWriter, Seek, Write},
+    ops::Range,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -27,14 +37,15 @@ const COMPOUND_WIKI_VERSION: i32 = 6;
 const PAGE_PROVENANCE_VERSION: i32 = 7;
 const SOURCE_PATH_REVISIONS_VERSION: i32 = 8;
 const RETRIEVAL_WEIGHTING_VERSION: i32 = 9;
-const USER_VERSION: i32 = 10;
+const CHANGESETS_VERSION: i32 = 10;
+const USER_VERSION: i32 = 11;
 const CHANGESET_FREEZE_KEY: &str = "changeset_frozen";
 const SEARCH_INDEX_VERSION: i32 = 4;
 const INGEST_WORKFLOW_VERSION: i32 = 5;
 const TOKENIZER_ID: &str = "cjk-bigram@1/bounded-terms";
 const SOURCE_GROUNDED: &str = "source-grounded";
 const EXPLICIT_PROVENANCE: [&str; 3] = ["user-provided", "agent-observed", "hypothesis"];
-const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
+const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 const TIMESTAMP_SQL: &str = "STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')";
 const TITLE_WEIGHT: f64 = 32.0;
 const PATH_WEIGHT: f64 = 16.0;
@@ -277,6 +288,21 @@ pub struct SourceAddResponse {
     pub database: String,
     pub source: SourceSummary,
     pub created: bool,
+    pub graph: GraphMutationSummary,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GraphMutationSummary {
+    pub generation: i64,
+    pub passages: usize,
+    pub sentences: usize,
+    pub terms: usize,
+    pub cooccurrence_truncated: usize,
+    pub invalidated_semantic_relations: usize,
+    pub projection_engine: String,
+    pub projection_status: String,
+    pub canonical_duration_ms: u64,
+    pub projection_duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -361,6 +387,7 @@ pub struct PagePutResponse {
     pub database: String,
     pub page: PageWriteRecord,
     pub created: bool,
+    pub graph: GraphMutationSummary,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -428,6 +455,14 @@ pub struct SearchResult {
     #[serde(rename = "type")]
     pub result_type: String,
     pub identifier: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<SearchDocumentRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<SearchSpanRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fused_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matches: Option<Vec<SearchMatch>>,
     pub title: Option<String>,
     pub kind: Option<String>,
     pub summary: Option<String>,
@@ -438,6 +473,35 @@ pub struct SearchResult {
     pub explanation: Option<SearchExplanation>,
     #[serde(skip)]
     paired_source_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SearchMatch {
+    #[serde(rename = "type")]
+    pub result_type: String,
+    pub identifier: String,
+    pub snippet: String,
+    pub rank: f64,
+    pub fused_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<SearchSpanRef>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SearchDocumentRef {
+    #[serde(rename = "type")]
+    pub document_type: String,
+    pub identifier: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SearchSpanRef {
+    pub parent_identifier: String,
+    pub ordinal: usize,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub content_fingerprint: String,
+    pub segmenter_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -488,6 +552,54 @@ pub struct SearchResponse {
     pub results: Vec<SearchResult>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SpanRecord {
+    pub identifier: String,
+    #[serde(rename = "type")]
+    pub span_type: String,
+    pub document: SearchDocumentRef,
+    pub parent_identifier: String,
+    pub ordinal: usize,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub content_fingerprint: String,
+    pub segmenter_version: u32,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SpanGetResponse {
+    pub scope: String,
+    pub database: String,
+    pub span: SpanRecord,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SpanExpandResponse {
+    pub scope: String,
+    pub database: String,
+    pub span: SpanRecord,
+    pub parent: Option<SpanRecord>,
+    pub siblings: Vec<SpanRecord>,
+    pub children: Vec<SpanRecord>,
+    pub children_truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StoredGraphEdge {
+    edge_id: String,
+    edge_type: String,
+    from: String,
+    to: String,
+    weight: Option<f64>,
+    confidence: Option<f64>,
+    provenance: Option<String>,
+    reason: Option<String>,
+    frequency: Option<usize>,
+    positions: Option<Vec<Range<usize>>>,
+    first_position: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
     Auto,
@@ -496,9 +608,25 @@ pub enum SearchMode {
     All,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchGranularity {
+    Document,
+    Passage,
+    Sentence,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchGrouping {
+    None,
+    Document,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchOptions {
     pub mode: SearchMode,
+    pub granularity: SearchGranularity,
+    pub grouping: SearchGrouping,
     pub kinds: Vec<String>,
     pub explain: bool,
 }
@@ -829,6 +957,7 @@ impl Store {
                 json!({ "user_version": USER_VERSION, "tokenizer": TOKENIZER_ID }),
             )?;
         }
+        store.reconcile_graph_projection()?;
         Ok((store, created))
     }
 
@@ -846,11 +975,13 @@ impl Store {
         configure_connection(&conn)?;
         prepare_store(&mut conn, false)?;
 
-        Ok(Self {
+        let mut store = Self {
             scope,
             database,
             conn,
-        })
+        };
+        store.reconcile_graph_projection()?;
+        Ok(store)
     }
 
     pub fn open_read_only(scope: impl Into<String>, database: impl AsRef<Path>) -> Result<Self> {
@@ -886,6 +1017,162 @@ impl Store {
 
     pub fn identity(&self) -> Result<StoreIdentity> {
         store_identity(&self.conn)
+    }
+
+    pub fn validate_changeset_integrity(&self) -> Result<()> {
+        validate_database_integrity(&self.conn)
+    }
+
+    pub fn reconcile_graph_projection(&mut self) -> Result<()> {
+        let mut effective = config::resolve(&self.scope, &self.database)?;
+        if self
+            .database
+            .components()
+            .any(|component| component.as_os_str() == "changesets")
+        {
+            effective.physical = PhysicalSetting::Enabled;
+            effective.resolved_engine = EngineSetting::Rslg;
+        }
+        let observed_generation: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(generation), 0) FROM graph_generations",
+            [],
+            |row| row.get(0),
+        )?;
+        let (observed_engine, observed_status, observed_canonical, observed_projected): (
+            String,
+            String,
+            i64,
+            i64,
+        ) = self.conn.query_row(
+            "SELECT engine, status, canonical_generation, projected_generation
+             FROM graph_projection_state WHERE projection = 'physical'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let already_resolved = if effective.physical == PhysicalSetting::Disabled {
+            observed_status == "disabled"
+                && observed_canonical == observed_generation
+                && observed_projected == observed_generation
+        } else if effective.resolved_engine == EngineSetting::Rslg {
+            observed_engine == "rslg"
+                && observed_status == "fresh"
+                && observed_canonical == observed_generation
+                && observed_projected == observed_generation
+        } else {
+            observed_engine == "graphlite"
+                && observed_status == "fresh"
+                && observed_canonical == observed_generation
+                && observed_projected == observed_generation
+        };
+        if already_resolved {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let generation: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(generation), 0) FROM graph_generations",
+            [],
+            |row| row.get(0),
+        )?;
+        if effective.physical == PhysicalSetting::Disabled {
+            tx.execute(
+                &format!(
+                    "UPDATE graph_projection_state
+                     SET engine = 'rslg', canonical_generation = ?1,
+                         projected_generation = ?1, status = 'disabled',
+                         last_error_code = NULL, last_error_message = NULL,
+                         updated_at = {TIMESTAMP_SQL}
+                     WHERE projection = 'physical'"
+                ),
+                params![generation],
+            )?;
+            tx.commit()?;
+            return Ok(());
+        }
+        if effective.resolved_engine == EngineSetting::Rslg {
+            tx.execute(
+                &format!(
+                    "UPDATE graph_projection_state
+                     SET engine = 'rslg', canonical_generation = ?1,
+                         projected_generation = ?1, status = 'fresh',
+                         last_error_code = NULL, last_error_message = NULL,
+                         updated_at = {TIMESTAMP_SQL}
+                     WHERE projection = 'physical'"
+                ),
+                params![generation],
+            )?;
+            tx.commit()?;
+            return Ok(());
+        }
+        let digest = if generation == 0 {
+            database_graph_digest(&tx)?
+        } else {
+            tx.query_row(
+                "SELECT canonical_digest FROM graph_generations WHERE generation = ?1",
+                params![generation],
+                |row| row.get::<_, String>(0),
+            )?
+        };
+        let already_fresh = tx.query_row(
+            "SELECT engine = 'graphlite' AND canonical_generation = ?1
+                    AND projected_generation = ?1 AND status = 'fresh'
+             FROM graph_projection_state WHERE projection = 'physical'",
+            params![generation],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if already_fresh {
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute(
+            &format!(
+                "UPDATE graph_projection_state
+                 SET engine = 'graphlite', canonical_generation = ?1,
+                     status = 'pending', last_error_code = NULL,
+                     last_error_message = NULL, updated_at = {TIMESTAMP_SQL}
+                 WHERE projection = 'physical'"
+            ),
+            params![generation],
+        )?;
+        match project_graphqlite_snapshot(&tx, &self.database, generation, &digest) {
+            Ok(_) => {
+                tx.execute(
+                    &format!(
+                        "UPDATE graph_projection_state
+                         SET projected_generation = ?1, status = 'fresh',
+                             last_error_code = NULL, last_error_message = NULL,
+                             updated_at = {TIMESTAMP_SQL}
+                         WHERE projection = 'physical' AND engine = 'graphlite'"
+                    ),
+                    params![generation],
+                )?;
+                tx.commit()?;
+                Ok(())
+            }
+            Err(error) => {
+                tx.execute(
+                    &format!(
+                        "UPDATE graph_projection_state
+                         SET status = 'stale', last_error_code = ?1,
+                             last_error_message = 'GraphQLite projection failed',
+                             updated_at = {TIMESTAMP_SQL}
+                         WHERE projection = 'physical' AND engine = 'graphlite'"
+                    ),
+                    params![error.code],
+                )?;
+                tx.commit()?;
+                Err(AppError::new(
+                    "graph_projection_failed",
+                    "canonical mutation committed but GraphQLite projection failed",
+                )
+                .with_details(json!({
+                    "canonical_committed": true,
+                    "generation": generation,
+                    "cause": error.code,
+                })))
+            }
+        }
     }
 
     pub fn snapshot_to(&self, path: &Path) -> Result<()> {
@@ -1374,6 +1661,7 @@ impl Store {
     where
         I: IntoIterator<Item = Result<SourceAddInput>>,
     {
+        let mutation_started = Instant::now();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1382,6 +1670,10 @@ impl Store {
             inserted.push(insert_source(&tx, &input?)?);
         }
         tx.commit()?;
+        let canonical_duration_ms = elapsed_millis(mutation_started);
+        let projection_started = Instant::now();
+        self.reconcile_graph_projection()?;
+        let projection_duration_ms = elapsed_millis(projection_started);
 
         inserted
             .into_iter()
@@ -1391,6 +1683,12 @@ impl Store {
                     database: self.database_string(),
                     source: self.load_source_summary(source_id)?,
                     created,
+                    graph: self.load_graph_mutation_summary(
+                        "source",
+                        &source_id.to_string(),
+                        canonical_duration_ms,
+                        projection_duration_ms,
+                    )?,
                 })
             })
             .collect()
@@ -1672,7 +1970,9 @@ impl Store {
                 "untracked_paths": untracked_paths,
             }),
         )?;
+        remove_document_graph(&tx, "source", &id.to_string())?;
         tx.commit()?;
+        self.reconcile_graph_projection()?;
         Ok(SourceRemoveResponse {
             scope: self.scope.clone(),
             database: self.database_string(),
@@ -1684,6 +1984,7 @@ impl Store {
     }
 
     pub fn page_put(&mut self, input: PagePutInput) -> Result<PagePutResponse> {
+        let mutation_started = Instant::now();
         validate_page_slug(&input.slug)?;
         let source_ids = dedupe_i64(input.source_ids);
         let explicit_provenance = normalize_explicit_provenance(input.provenance)?;
@@ -1694,14 +1995,26 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_sources(&tx, &source_ids)?;
 
-        let existed = tx
+        let previous = tx
             .query_row(
-                "SELECT 1 FROM pages WHERE slug = ?1",
+                "SELECT title, body FROM pages WHERE slug = ?1",
                 params![&input.slug],
-                |_| Ok(()),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
-            .optional()?
-            .is_some();
+            .optional()?;
+        let before_graph = previous
+            .as_ref()
+            .map(|(title, body)| {
+                build_document_graph(&DocumentGraphInput {
+                    document_type: DocumentType::Page,
+                    identifier: &input.slug,
+                    label: title,
+                    content: body,
+                })
+                .map_err(segment_error)
+            })
+            .transpose()?;
+        let existed = previous.is_some();
 
         if existed {
             tx.execute(
@@ -1787,13 +2100,35 @@ impl Store {
             &input.slug,
             &json!({ "created": !existed }),
         )?;
+        let graph_generation = persist_document_graph(
+            &tx,
+            &DocumentGraphInput {
+                document_type: DocumentType::Page,
+                identifier: &input.slug,
+                label: &input.title,
+                content: &input.body,
+            },
+            before_graph.as_ref(),
+            &page_relation_edges(&tx, &input.slug, &source_ids, &links)?,
+        )?;
+        persist_inbound_link_edges(&tx, &input.slug, graph_generation)?;
         tx.commit()?;
+        let canonical_duration_ms = elapsed_millis(mutation_started);
+        let projection_started = Instant::now();
+        self.reconcile_graph_projection()?;
+        let projection_duration_ms = elapsed_millis(projection_started);
 
         Ok(PagePutResponse {
             scope: self.scope.clone(),
             database: self.database_string(),
             page: self.load_page_write(&input.slug)?,
             created: !existed,
+            graph: self.load_graph_mutation_summary(
+                "page",
+                &input.slug,
+                canonical_duration_ms,
+                projection_duration_ms,
+            )?,
         })
     }
 
@@ -1885,9 +2220,11 @@ impl Store {
              WHERE target_type = 'page' AND target_identifier = ?1",
             params![slug],
         )?;
-        tx.execute("DELETE FROM pages WHERE slug = ?1", params![slug])?;
         record_operation(&tx, "page_remove", slug, &json!({}))?;
+        remove_document_graph(&tx, "page", slug)?;
+        tx.execute("DELETE FROM pages WHERE slug = ?1", params![slug])?;
         tx.commit()?;
+        self.reconcile_graph_projection()?;
         Ok(PageRemoveResponse {
             scope: self.scope.clone(),
             database: self.database_string(),
@@ -1903,6 +2240,8 @@ impl Store {
             limit,
             &SearchOptions {
                 mode: SearchMode::All,
+                granularity: SearchGranularity::Document,
+                grouping: SearchGrouping::None,
                 kinds: Vec::new(),
                 explain: false,
             },
@@ -1923,18 +2262,46 @@ impl Store {
         } else {
             8
         };
+        let candidate_limit = limit
+            .saturating_mul(candidate_multiplier)
+            .clamp(limit, 1000);
         let mut results = if tokens.is_empty() {
             Vec::new()
         } else {
-            search_index(
-                &self.conn,
-                &self.scope,
-                query,
-                &tokens,
-                limit
-                    .saturating_mul(candidate_multiplier)
-                    .clamp(limit, 1000),
-            )?
+            match options.granularity {
+                SearchGranularity::Document => {
+                    search_index(&self.conn, &self.scope, query, &tokens, candidate_limit)?
+                }
+                SearchGranularity::Passage => search_span_index(
+                    &self.conn,
+                    &self.scope,
+                    query,
+                    &tokens,
+                    Some("passage"),
+                    candidate_limit,
+                )?,
+                SearchGranularity::Sentence => search_span_index(
+                    &self.conn,
+                    &self.scope,
+                    query,
+                    &tokens,
+                    Some("sentence"),
+                    candidate_limit,
+                )?,
+                SearchGranularity::All => {
+                    let mut results =
+                        search_index(&self.conn, &self.scope, query, &tokens, candidate_limit)?;
+                    results.extend(search_span_index(
+                        &self.conn,
+                        &self.scope,
+                        query,
+                        &tokens,
+                        None,
+                        candidate_limit,
+                    )?);
+                    results
+                }
+            }
         };
 
         let normalized_kinds = options
@@ -1943,13 +2310,18 @@ impl Store {
             .map(|kind| kind.trim().to_lowercase())
             .collect::<BTreeSet<_>>();
         results.retain(|result| {
+            let document_type = result
+                .document
+                .as_ref()
+                .map(|document| document.document_type.as_str())
+                .unwrap_or(result.result_type.as_str());
             let type_matches = match options.mode {
                 SearchMode::Auto | SearchMode::All => true,
-                SearchMode::Page => result.result_type == "page",
-                SearchMode::Source => result.result_type == "source",
+                SearchMode::Page => document_type == "page",
+                SearchMode::Source => document_type == "source",
             };
             let kind_matches = normalized_kinds.is_empty()
-                || result.result_type == "source"
+                || document_type == "source"
                 || result
                     .kind
                     .as_deref()
@@ -1990,6 +2362,12 @@ impl Store {
                 .then_with(|| left.identifier.cmp(&right.identifier))
         });
         self.apply_graph_reranking(&mut results)?;
+        if options.granularity == SearchGranularity::All {
+            apply_mixed_fusion(&mut results);
+        }
+        if options.grouping == SearchGrouping::Document {
+            results = group_search_results(results);
+        }
 
         results.sort_by(|left, right| {
             search_type_priority(left, options.mode)
@@ -2007,6 +2385,326 @@ impl Store {
         }
 
         Ok(SearchResponse { results })
+    }
+
+    pub fn span_get(&self, identifier: &str) -> Result<SpanGetResponse> {
+        Ok(SpanGetResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            span: load_span_record(&self.conn, identifier)?,
+        })
+    }
+
+    pub fn span_expand(
+        &self,
+        identifier: &str,
+        before: usize,
+        after: usize,
+        child_limit: usize,
+    ) -> Result<SpanExpandResponse> {
+        let span = load_span_record(&self.conn, identifier)?;
+        let parent = self
+            .conn
+            .query_row(
+                "SELECT node_type FROM graph_nodes WHERE node_id = ?1",
+                params![&span.parent_identifier],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .filter(|node_type| matches!(node_type.as_str(), "passage" | "sentence"))
+            .map(|_| load_span_record(&self.conn, &span.parent_identifier))
+            .transpose()?;
+        let lower = span.ordinal.saturating_sub(before);
+        let upper = span.ordinal.saturating_add(after);
+        let mut statement = self.conn.prepare(
+            "SELECT node_id FROM graph_nodes
+             WHERE parent_node_id = ?1 AND node_type = ?2
+               AND ordinal BETWEEN ?3 AND ?4
+             ORDER BY ordinal, node_id",
+        )?;
+        let sibling_ids = statement
+            .query_map(
+                params![
+                    &span.parent_identifier,
+                    &span.span_type,
+                    lower as i64,
+                    upper as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let siblings = sibling_ids
+            .iter()
+            .map(|id| load_span_record(&self.conn, id))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut child_statement = self.conn.prepare(
+            "SELECT node_id FROM graph_nodes
+             WHERE parent_node_id = ?1 AND node_type IN ('passage', 'sentence')
+             ORDER BY ordinal, node_id LIMIT ?2",
+        )?;
+        let child_ids = child_statement
+            .query_map(
+                params![identifier, child_limit.saturating_add(1) as i64],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let children_truncated = child_ids.len() > child_limit;
+        let children = child_ids
+            .iter()
+            .take(child_limit)
+            .map(|id| load_span_record(&self.conn, id))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(SpanExpandResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            span,
+            parent,
+            siblings,
+            children,
+            children_truncated,
+        })
+    }
+
+    pub fn graph_explore(
+        &self,
+        identifier: &str,
+        depth: usize,
+        limit: usize,
+        direction: &str,
+        edge_types: &[String],
+    ) -> Result<Value> {
+        ensure_graph_projection_fresh(&self.conn, &self.database)?;
+        graph_explore_value(
+            &self.conn,
+            &self.scope,
+            identifier,
+            depth,
+            limit,
+            direction,
+            edge_types,
+        )
+    }
+
+    pub fn graph_explore_macro(
+        &self,
+        depth: usize,
+        limit: usize,
+        edge_types: &[String],
+    ) -> Result<Value> {
+        ensure_graph_projection_fresh(&self.conn, &self.database)?;
+        graph_macro_explore_value(&self.conn, &self.scope, depth, limit, edge_types)
+    }
+
+    pub fn graph_node(&self, identifier: &str) -> Result<Value> {
+        ensure_graph_projection_fresh(&self.conn, &self.database)?;
+        let identifier = resolve_graph_node(&self.conn, identifier)?;
+        let mut node = graph_node_json(&self.conn, &identifier)?;
+        node["outgoing_degree"] = json!(self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_edges WHERE from_node_id = ?1",
+            params![&identifier],
+            |row| row.get::<_, i64>(0),
+        )?);
+        node["incoming_degree"] = json!(self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_edges WHERE to_node_id = ?1",
+            params![&identifier],
+            |row| row.get::<_, i64>(0),
+        )?);
+        Ok(json!({"scope": self.scope, "node": node}))
+    }
+
+    pub fn graph_neighbors(
+        &self,
+        identifier: &str,
+        limit: usize,
+        direction: &str,
+        edge_types: &[String],
+    ) -> Result<Value> {
+        ensure_graph_projection_fresh(&self.conn, &self.database)?;
+        let mut response = graph_explore_value(
+            &self.conn,
+            &self.scope,
+            identifier,
+            1,
+            limit.saturating_add(1),
+            direction,
+            edge_types,
+        )?;
+        response["limit"] = json!(limit);
+        response["neighbors"] = response["nodes"]
+            .as_array()
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .filter(|node| node["depth"] == 1)
+                    .take(limit)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .map(Value::Array)
+            .unwrap_or_else(|| json!([]));
+        Ok(response)
+    }
+
+    pub fn graph_path(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: usize,
+        limit: usize,
+        direction: &str,
+        edge_types: &[String],
+    ) -> Result<Value> {
+        ensure_graph_projection_fresh(&self.conn, &self.database)?;
+        graph_path_value(
+            &self.conn,
+            &self.scope,
+            from,
+            to,
+            max_depth,
+            limit,
+            direction,
+            edge_types,
+        )
+    }
+
+    pub fn graph_impact(&self, identifier: &str, max_depth: usize, limit: usize) -> Result<Value> {
+        ensure_graph_projection_fresh(&self.conn, &self.database)?;
+        graph_impact_value(&self.conn, &self.scope, identifier, max_depth, limit)
+    }
+
+    pub fn graph_overview(&self, limit: usize) -> Result<Value> {
+        ensure_graph_projection_fresh(&self.conn, &self.database)?;
+        graph_overview_value(&self.conn, &self.scope, limit)
+    }
+
+    pub fn graph_status(&self) -> Result<Value> {
+        graph_status_value(&self.conn, &self.scope, &self.database)
+    }
+
+    pub fn graph_verify(&self) -> Result<Value> {
+        graph_verify_value(&self.conn, &self.scope, &self.database)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn graph_relation_set(
+        &mut self,
+        from: &str,
+        relation_type: &str,
+        to: &str,
+        provenance: &str,
+        reason: &str,
+        confidence: f64,
+        source_ids: &[i64],
+    ) -> Result<Value> {
+        let response = graph_relation_set_value(
+            &mut self.conn,
+            &self.scope,
+            from,
+            relation_type,
+            to,
+            provenance,
+            reason,
+            confidence,
+            source_ids,
+        )?;
+        self.reconcile_graph_projection()?;
+        Ok(response)
+    }
+
+    pub fn graph_relation_list(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        relation_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Value> {
+        graph_relation_list_value(&self.conn, &self.scope, from, to, relation_type, limit)
+    }
+
+    pub fn graph_relation_retract(
+        &mut self,
+        from: &str,
+        relation_type: &str,
+        to: &str,
+        reason: &str,
+    ) -> Result<Value> {
+        let response = graph_relation_retract_value(
+            &mut self.conn,
+            &self.scope,
+            from,
+            relation_type,
+            to,
+            reason,
+        )?;
+        self.reconcile_graph_projection()?;
+        Ok(response)
+    }
+
+    fn load_graph_mutation_summary(
+        &self,
+        document_type: &str,
+        document_identifier: &str,
+        canonical_duration_ms: u64,
+        projection_duration_ms: u64,
+    ) -> Result<GraphMutationSummary> {
+        let (generation, truncated): (i64, i64) = self.conn.query_row(
+            "SELECT generation, cooccurrence_truncated
+             FROM document_index_state
+             WHERE document_type = ?1 AND document_identifier = ?2",
+            params![document_type, document_identifier],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let count_nodes = |node_type: &str| -> Result<usize> {
+            let count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM graph_nodes
+                 WHERE document_type = ?1 AND document_identifier = ?2
+                   AND node_type = ?3",
+                params![document_type, document_identifier, node_type],
+                |row| row.get(0),
+            )?;
+            usize::try_from(count)
+                .map_err(|_| AppError::new("database_error", "graph node count is invalid"))
+        };
+        let terms: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_occurrences
+             WHERE document_type = ?1 AND document_identifier = ?2",
+            params![document_type, document_identifier],
+            |row| row.get(0),
+        )?;
+        let invalidated_semantic_relations: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_deltas
+             WHERE generation = ?1 AND action = 'remove' AND entity_type = 'edge'
+               AND json_extract(before_json, '$.owner_type') = 'manual'",
+            params![generation],
+            |row| row.get(0),
+        )?;
+        let (projection_engine, projection_status) = self.conn.query_row(
+            "SELECT engine, status FROM graph_projection_state WHERE projection = 'physical'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(GraphMutationSummary {
+            generation,
+            passages: count_nodes("passage")?,
+            sentences: count_nodes("sentence")?,
+            terms: usize::try_from(terms)
+                .map_err(|_| AppError::new("database_error", "graph term count is invalid"))?,
+            cooccurrence_truncated: usize::try_from(truncated).map_err(|_| {
+                AppError::new(
+                    "database_error",
+                    "co-occurrence truncation count is invalid",
+                )
+            })?,
+            invalidated_semantic_relations: usize::try_from(invalidated_semantic_relations)
+                .map_err(|_| {
+                    AppError::new("database_error", "semantic invalidation count is invalid")
+                })?,
+            projection_engine,
+            projection_status,
+            canonical_duration_ms,
+            projection_duration_ms,
+        })
     }
 
     fn apply_graph_reranking(&self, results: &mut [SearchResult]) -> Result<()> {
@@ -2728,46 +3426,59 @@ impl Store {
     pub fn lint(&self, limit: usize, offset: usize) -> Result<LintResponse> {
         let scope = self.scope.clone();
         let database = self.database_string();
-        let mut counts = BTreeMap::new();
-        {
-            let mut statement = self.conn.prepare(&format!(
-                "{LINT_ISSUES_SQL}
-                 SELECT code, COUNT(*) FROM issues GROUP BY code ORDER BY code"
-            ))?;
-            let rows = statement.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?;
-            for row in rows {
-                let (code, count) = row?;
-                let count = usize::try_from(count).map_err(|_| {
-                    AppError::new("database_error", "lint issue count is out of range")
-                })?;
-                counts.insert(code, count);
+        let mut statement = self.conn.prepare(&format!(
+            "{LINT_ISSUES_SQL}
+             SELECT code, page, target, message
+             FROM issues ORDER BY code, page, target"
+        ))?;
+        let mut all_issues = statement
+            .query_map([], |row| {
+                Ok(LintIssue {
+                    code: row.get(0)?,
+                    page: row.get(1)?,
+                    target: row.get(2)?,
+                    message: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        all_issues.extend(graph_lint_issues(&self.conn)?);
+        let verification = graph_verify_value(&self.conn, &self.scope, &self.database)?;
+        if let Some(verification_issues) = verification["issues"].as_array() {
+            for issue in verification_issues {
+                let Some(code) = issue["code"].as_str() else {
+                    continue;
+                };
+                if all_issues.iter().any(|existing| existing.code == code) {
+                    continue;
+                }
+                all_issues.push(LintIssue {
+                    code: code.to_string(),
+                    page: None,
+                    target: issue
+                        .get("count")
+                        .or_else(|| issue.get("generation"))
+                        .map(Value::to_string),
+                    message: "graph verification invariant failed".to_string(),
+                });
             }
         }
-        let total = counts.values().sum();
-
-        let issues = {
-            let mut statement = self.conn.prepare(&format!(
-                "{LINT_ISSUES_SQL}
-                 SELECT code, page, target, message
-                 FROM issues
-                 ORDER BY code, page, target
-                 LIMIT ?1 OFFSET ?2"
-            ))?;
-            statement
-                .query_map(params![limit as i64, offset as i64], |row| {
-                    Ok(LintIssue {
-                        code: row.get(0)?,
-                        page: row.get(1)?,
-                        target: row.get(2)?,
-                        message: row.get(3)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
+        all_issues.sort_by(|left, right| {
+            left.code
+                .cmp(&right.code)
+                .then_with(|| left.page.cmp(&right.page))
+                .then_with(|| left.target.cmp(&right.target))
+        });
+        let mut counts = BTreeMap::new();
+        for issue in &all_issues {
+            *counts.entry(issue.code.clone()).or_insert(0usize) += 1;
+        }
+        let total = all_issues.len();
+        let issues = all_issues
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
         let has_more = offset.saturating_add(issues.len()) < total;
-
         Ok(LintResponse {
             scope,
             database,
@@ -3526,6 +4237,10 @@ fn prepare_store(conn: &mut Connection, allow_create: bool) -> Result<bool> {
         migrate_changesets(conn)?;
         version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     }
+    if version == CHANGESETS_VERSION {
+        migrate_hierarchical_graph(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
     if version != USER_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
@@ -3554,7 +4269,7 @@ fn prepare_store_read_only(conn: &Connection) -> Result<()> {
             ),
         ));
     }
-    validate_store(conn)
+    validate_store_read_only(conn)
 }
 
 fn migrate_ingest_workflow(conn: &mut Connection) -> Result<()> {
@@ -3793,7 +4508,7 @@ fn migrate_changesets(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match current {
-        USER_VERSION => {
+        CHANGESETS_VERSION..=USER_VERSION => {
             tx.commit()?;
             return Ok(());
         }
@@ -3821,13 +4536,203 @@ fn migrate_changesets(conn: &mut Connection) -> Result<()> {
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![CHANGESETS_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", CHANGESETS_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to commit v{CHANGESETS_VERSION} changeset migration: {error}"),
+        )
+    })
+}
+
+fn migrate_hierarchical_graph(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match current {
+        USER_VERSION => {
+            tx.commit()?;
+            return Ok(());
+        }
+        CHANGESETS_VERSION => {}
+        other => {
+            return Err(AppError::new(
+                "unsupported_store_version",
+                format!("cannot migrate wiki database version {other} to {USER_VERSION}"),
+            ));
+        }
+    }
+    create_hierarchical_graph_schema(&tx).map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to create v{USER_VERSION} hierarchical graph schema: {error}"),
+        )
+    })?;
+    tx.execute(
+        &format!(
+            "INSERT OR IGNORE INTO graph_projection_state(
+                projection, engine, schema_version, canonical_generation,
+                projected_generation, status, updated_at
+             ) VALUES ('physical', 'rslg', 1, 0, 0, 'fresh', {TIMESTAMP_SQL})"
+        ),
+        [],
+    )?;
+
+    let sources = {
+        let mut statement =
+            tx.prepare("SELECT id, title, origin, content FROM sources ORDER BY id")?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (source_id, title, origin, content) in &sources {
+        persist_document_graph(
+            &tx,
+            &DocumentGraphInput {
+                document_type: DocumentType::Source,
+                identifier: &source_id.to_string(),
+                label: title.as_deref().unwrap_or(origin),
+                content,
+            },
+            None,
+            &[],
+        )?;
+    }
+
+    let pages = {
+        let mut statement = tx.prepare("SELECT slug, title, body FROM pages ORDER BY slug")?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (slug, title, body) in &pages {
+        let source_ids = {
+            let mut statement = tx.prepare(
+                "SELECT source_id FROM page_sources WHERE page_slug = ?1 ORDER BY source_id",
+            )?;
+            statement
+                .query_map(params![slug], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let relations = page_relation_edges(&tx, slug, &source_ids, &[])?;
+        persist_document_graph(
+            &tx,
+            &DocumentGraphInput {
+                document_type: DocumentType::Page,
+                identifier: slug,
+                label: title,
+                content: body,
+            },
+            None,
+            &relations,
+        )?;
+    }
+
+    let initial_generation = if sources.is_empty() && pages.is_empty() {
+        0
+    } else {
+        1
+    };
+    if initial_generation == 1 {
+        let links = {
+            let mut statement = tx.prepare(
+                "SELECT l.from_slug, l.to_slug
+                 FROM links l
+                 JOIN pages target ON target.slug = l.to_slug
+                 ORDER BY l.from_slug, l.to_slug",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (from_slug, to_slug) in links {
+            persist_migration_relation_edge(
+                &tx,
+                &automatic_edge(
+                    "LINKS_TO",
+                    &format!("page:{from_slug}"),
+                    &format!("page:{to_slug}"),
+                ),
+                "page",
+                &from_slug,
+                initial_generation,
+                "{}",
+            )?;
+        }
+        let revisions = {
+            let mut statement = tx.prepare(
+                "SELECT tracked_path, revision, source_id
+                 FROM source_path_revisions
+                 WHERE revision > 1
+                 ORDER BY tracked_path, revision",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (tracked_path, revision, source_id) in revisions {
+            persist_revision_edge(
+                &tx,
+                &tracked_path,
+                revision,
+                source_id,
+                Some(initial_generation),
+            )?;
+        }
+        tx.execute("UPDATE graph_deltas SET generation = 1", [])?;
+        tx.execute("UPDATE document_index_state SET generation = 1", [])?;
+        tx.execute("DELETE FROM graph_generations WHERE generation <> 1", [])?;
+        tx.execute(
+            "UPDATE graph_generations
+             SET canonical_digest = ?1, changed_document_count = ?2
+             WHERE generation = 1",
+            params![
+                database_graph_digest(&tx)?,
+                (sources.len() + pages.len()) as i64
+            ],
+        )?;
+        tx.execute(
+            &format!(
+                "UPDATE graph_projection_state
+                 SET canonical_generation = 1, projected_generation = 1,
+                     status = 'fresh', updated_at = {TIMESTAMP_SQL}
+                 WHERE projection = 'physical'"
+            ),
+            [],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![USER_VERSION.to_string()],
     )?;
     tx.pragma_update(None, "user_version", USER_VERSION)?;
     tx.commit().map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to commit v{USER_VERSION} changeset migration: {error}"),
+            format!("failed to commit v{USER_VERSION} hierarchical graph migration: {error}"),
         )
     })
 }
@@ -4066,6 +4971,16 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
         "
     ))?;
     create_changeset_state(&tx)?;
+    create_hierarchical_graph_schema(&tx)?;
+    tx.execute(
+        &format!(
+            "INSERT INTO graph_projection_state(
+                projection, engine, schema_version, canonical_generation,
+                projected_generation, status, updated_at
+             ) VALUES ('physical', 'rslg', 1, 0, 0, 'fresh', {TIMESTAMP_SQL})"
+        ),
+        [],
+    )?;
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('schema', ?1)",
         params![DEFAULT_SCHEMA],
@@ -4189,6 +5104,74 @@ fn rebuild_search_index(tx: &Transaction<'_>) -> Result<(usize, usize)> {
     Ok((source_count, page_count))
 }
 
+fn validate_store_read_only(conn: &Connection) -> Result<()> {
+    let essential_tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema
+         WHERE type = 'table' AND name IN (
+            'meta', 'sources', 'pages', 'page_sources', 'page_provenance', 'links',
+            'operations', 'ingest_jobs', 'source_path_revisions', 'retrieval_weights',
+            'retrieval_feedback', 'changesets', 'search_fts', 'document_index_state',
+            'graph_nodes', 'graph_edges', 'term_pair_contributions', 'graph_generations',
+            'graph_deltas', 'graph_projection_state', 'span_fts'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if essential_tables != 21 {
+        return Err(AppError::new(
+            "corrupt_store",
+            "wiki database schema is incomplete",
+        ));
+    }
+    let metadata = conn
+        .query_row(
+            "SELECT
+                MAX(CASE WHEN key = 'format_version' THEN value END),
+                MAX(CASE WHEN key = 'tokenizer' THEN value END),
+                MAX(CASE WHEN key = 'store_id' THEN value END),
+                MAX(CASE WHEN key = 'store_revision' THEN value END)
+             FROM meta
+             WHERE key IN ('format_version', 'tokenizer', 'store_id', 'store_revision')",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .unwrap_or_default();
+    if metadata.0.as_deref() != Some(USER_VERSION.to_string().as_str()) {
+        return Err(AppError::new(
+            "corrupt_store",
+            "wiki format metadata does not match the store version",
+        ));
+    }
+    if metadata.1.as_deref() != Some(TOKENIZER_ID) {
+        return Err(AppError::new(
+            "incompatible_search_index",
+            "wiki search tokenizer is incompatible",
+        ));
+    }
+    for value in [metadata.2, metadata.3] {
+        if !value.as_deref().is_some_and(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            return Err(AppError::new(
+                "corrupt_store",
+                "wiki store identity metadata is missing or invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_store(conn: &Connection) -> Result<()> {
     for sql in [
         "SELECT key, value FROM meta LIMIT 0",
@@ -4204,6 +5187,16 @@ fn validate_store(conn: &Connection) -> Result<()> {
         "SELECT query_fingerprint, target_type, target_identifier, provenance, signal, reason, updated_at FROM retrieval_feedback LIMIT 0",
         "SELECT id, name, status, base_revision, base_operation_id, begin_operation_id, pre_commit_checkpoint, post_revision, created_at, committed_at, rolled_back_at FROM changesets LIMIT 0",
         "SELECT rowid, doc_type, identifier, title_terms, path_terms, summary_terms, body_terms FROM search_fts LIMIT 0",
+        "SELECT document_type, document_identifier, document_node_id, content_fingerprint, segmenter_version, generation, cooccurrence_truncated, indexed_at FROM document_index_state LIMIT 0",
+        "SELECT node_id, node_type, document_type, document_identifier, parent_node_id, ordinal, byte_start, byte_end, content_fingerprint, segmenter_version, label, properties_json FROM graph_nodes LIMIT 0",
+        "SELECT edge_id, edge_type, from_node_id, to_node_id, owner_type, owner_identifier, weight, confidence, provenance, reason, frequency, positions, first_position, properties_json, created_at, updated_at FROM graph_edges LIMIT 0",
+        "SELECT term_node_id, document_type, document_identifier, frequency, positions, first_position FROM graph_occurrences LIMIT 0",
+        "SELECT document_type, document_identifier, contributions FROM term_pair_contributions LIMIT 0",
+        "SELECT from_term_id, to_term_id, raw_strength, witness_count FROM term_pair_totals LIMIT 0",
+        "SELECT generation, store_revision, canonical_digest, changed_document_count, created_at FROM graph_generations LIMIT 0",
+        "SELECT id, generation, action, entity_type, entity_id, document_type, document_identifier, before_json, after_json, created_at FROM graph_deltas LIMIT 0",
+        "SELECT projection, engine, schema_version, canonical_generation, projected_generation, status, last_error_code, last_error_message, updated_at FROM graph_projection_state LIMIT 0",
+        "SELECT rowid, span_id, span_type, document_type, document_identifier, title_terms, path_terms, body_terms FROM span_fts LIMIT 0",
     ] {
         conn.prepare(sql).map_err(|error| {
             AppError::new(
@@ -4356,6 +5349,26 @@ fn insert_source(tx: &Transaction<'_>, input: &SourceAddInput) -> Result<(i64, b
             "path_advanced": path_revision.map(|value| value.1),
         }),
     )?;
+    let generation = if created {
+        Some(persist_document_graph(
+            tx,
+            &DocumentGraphInput {
+                document_type: DocumentType::Source,
+                identifier: &source_id.to_string(),
+                label: &title,
+                content: &input.content,
+            },
+            None,
+            &[],
+        )?)
+    } else {
+        None
+    };
+    if let Some((revision, true)) = path_revision
+        && let Some(path) = input.tracked_path.as_deref()
+    {
+        persist_revision_edge(tx, path, revision, source_id, generation)?;
+    }
     Ok((source_id, created))
 }
 
@@ -4768,8 +5781,15 @@ fn attached_store_identity(conn: &Connection) -> Result<StoreIdentity> {
 }
 
 fn validate_changeset_table_inventory(conn: &Connection, schema: &str) -> Result<()> {
-    const TABLES: [&str; 18] = [
+    const TABLES: [&str; 33] = [
         "changesets",
+        "document_index_state",
+        "graph_deltas",
+        "graph_edges",
+        "graph_generations",
+        "graph_nodes",
+        "graph_occurrences",
+        "graph_projection_state",
         "ingest_jobs",
         "links",
         "meta",
@@ -4787,6 +5807,14 @@ fn validate_changeset_table_inventory(conn: &Connection, schema: &str) -> Result
         "search_fts_idx",
         "source_path_revisions",
         "sources",
+        "span_fts",
+        "span_fts_config",
+        "span_fts_content",
+        "span_fts_data",
+        "span_fts_docsize",
+        "span_fts_idx",
+        "term_pair_contributions",
+        "term_pair_totals",
     ];
     let sql = format!(
         "SELECT name FROM {schema}.sqlite_schema
@@ -4982,7 +6010,15 @@ fn replace_main_from_attached(tx: &Transaction<'_>, source_schema: &str) -> Resu
         ));
     }
     tx.execute_batch(
-        "DELETE FROM page_sources;
+        "DELETE FROM term_pair_totals;
+         DELETE FROM term_pair_contributions;
+         DELETE FROM graph_occurrences;
+         DELETE FROM graph_edges;
+         DELETE FROM graph_nodes;
+         DELETE FROM document_index_state;
+         DELETE FROM graph_deltas;
+         DELETE FROM graph_generations;
+         DELETE FROM page_sources;
          DELETE FROM page_provenance;
          DELETE FROM links;
          DELETE FROM ingest_jobs;
@@ -5049,9 +6085,143 @@ fn replace_main_from_attached(tx: &Transaction<'_>, source_schema: &str) -> Resu
          ) SELECT
              id, name, status, base_revision, base_operation_id, begin_operation_id,
              pre_commit_checkpoint, post_revision, created_at, committed_at, rolled_back_at
-           FROM candidate.changesets;",
+           FROM candidate.changesets;
+         INSERT INTO graph_nodes(
+             node_id, node_type, document_type, document_identifier,
+             parent_node_id, ordinal, byte_start, byte_end,
+             content_fingerprint, segmenter_version, label, properties_json
+         ) SELECT
+             node_id, node_type, document_type, document_identifier,
+             parent_node_id, ordinal, byte_start, byte_end,
+             content_fingerprint, segmenter_version, label, properties_json
+           FROM candidate.graph_nodes;
+         INSERT INTO graph_edges(
+             edge_id, edge_type, from_node_id, to_node_id,
+             owner_type, owner_identifier, weight, confidence,
+             provenance, reason, frequency, positions, first_position,
+             properties_json, created_at, updated_at
+         ) SELECT
+             edge_id, edge_type, from_node_id, to_node_id,
+             owner_type, owner_identifier, weight, confidence,
+             provenance, reason, frequency, positions, first_position,
+             properties_json, created_at, updated_at
+           FROM candidate.graph_edges;
+         INSERT INTO graph_occurrences(
+             term_node_id, document_type, document_identifier,
+             frequency, positions, first_position
+         ) SELECT
+             term_node_id, document_type, document_identifier,
+             frequency, positions, first_position
+           FROM candidate.graph_occurrences;
+         INSERT INTO term_pair_contributions(
+             document_type, document_identifier, contributions
+         ) SELECT document_type, document_identifier, contributions
+           FROM candidate.term_pair_contributions;
+         INSERT INTO term_pair_totals(
+             from_term_id, to_term_id, raw_strength, witness_count
+         ) SELECT from_term_id, to_term_id, raw_strength, witness_count
+           FROM candidate.term_pair_totals;
+         INSERT INTO document_index_state(
+             document_type, document_identifier, document_node_id,
+             content_fingerprint, segmenter_version, generation,
+             cooccurrence_truncated, indexed_at
+         ) SELECT
+             document_type, document_identifier, document_node_id,
+             content_fingerprint, segmenter_version, generation,
+             cooccurrence_truncated, indexed_at
+           FROM candidate.document_index_state;
+         INSERT INTO graph_generations(
+             generation, store_revision, canonical_digest,
+             changed_document_count, created_at
+         ) SELECT
+             generation, store_revision, canonical_digest,
+             changed_document_count, created_at
+           FROM candidate.graph_generations;
+         INSERT INTO graph_deltas(
+             id, generation, action, entity_type, entity_id,
+             document_type, document_identifier, before_json, after_json, created_at
+         ) SELECT
+             id, generation, action, entity_type, entity_id,
+             document_type, document_identifier, before_json, after_json, created_at
+           FROM candidate.graph_deltas;",
     )
     .map_err(changeset_copy_error)?;
+    rebuild_span_index(tx)?;
+    let generation: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(generation), 0) FROM graph_generations",
+        [],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        &format!(
+            "UPDATE graph_projection_state
+             SET canonical_generation = ?1,
+                 projected_generation = CASE
+                     WHEN engine = 'rslg' THEN ?1 ELSE projected_generation END,
+                 status = CASE WHEN engine = 'rslg' THEN 'fresh' ELSE 'pending' END,
+                 last_error_code = NULL, last_error_message = NULL,
+                 updated_at = {TIMESTAMP_SQL}
+             WHERE projection = 'physical'"
+        ),
+        params![generation],
+    )?;
+    Ok(())
+}
+
+fn rebuild_span_index(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute("DELETE FROM span_fts", [])?;
+    let rows = {
+        let mut statement = tx.prepare(
+            "SELECT n.node_id, n.node_type, n.document_type,
+                    n.document_identifier, n.label,
+                    CASE n.document_type
+                        WHEN 'page' THEN p.title
+                        ELSE COALESCE(s.title, s.origin)
+                    END AS title,
+                    CASE n.document_type
+                        WHEN 'page' THEN p.slug
+                        ELSE s.origin
+                    END AS path
+             FROM graph_nodes n
+             LEFT JOIN pages p
+               ON n.document_type = 'page' AND p.slug = n.document_identifier
+             LEFT JOIN sources s
+               ON n.document_type = 'source'
+              AND s.id = CAST(n.document_identifier AS INTEGER)
+             WHERE n.node_type IN ('passage', 'sentence')
+             ORDER BY n.document_type, n.document_identifier, n.node_type, n.ordinal, n.node_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (node_id, node_type, document_type, document_identifier, label, title, path) in rows {
+        tx.execute(
+            "INSERT INTO span_fts(
+                span_id, span_type, document_type, document_identifier,
+                title_terms, path_terms, body_terms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                node_id,
+                node_type,
+                document_type,
+                document_identifier,
+                joined_terms(&title),
+                joined_terms(&path),
+                joined_terms(&label),
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -5100,14 +6270,14 @@ fn validate_database_integrity(conn: &Connection) -> Result<()> {
     if foreign_keys.query([])?.next()?.is_some() {
         return Err(AppError::new(
             "changeset_corrupt",
-            "published changeset violates a foreign key",
+            "changeset database violates a foreign key",
         ));
     }
     let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         return Err(AppError::new(
             "changeset_corrupt",
-            format!("published changeset failed integrity_check: {integrity}"),
+            format!("changeset database failed integrity_check: {integrity}"),
         ));
     }
     Ok(())
@@ -5529,6 +6699,1422 @@ fn extract_links(body: &str) -> Vec<String> {
     links.into_iter().collect()
 }
 
+fn persist_migration_relation_edge(
+    tx: &Transaction<'_>,
+    edge: &CanonicalEdge,
+    owner_type: &str,
+    owner_identifier: &str,
+    generation: i64,
+    properties_json: &str,
+) -> Result<()> {
+    tx.execute(
+        &format!(
+            "INSERT INTO graph_edges(
+                edge_id, edge_type, from_node_id, to_node_id,
+                owner_type, owner_identifier, provenance,
+                properties_json, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'automatic', ?7,
+                       {TIMESTAMP_SQL}, {TIMESTAMP_SQL})"
+        ),
+        params![
+            &edge.edge_id,
+            edge.edge_type,
+            &edge.from_node_id,
+            &edge.to_node_id,
+            owner_type,
+            owner_identifier,
+            properties_json,
+        ],
+    )?;
+    tx.execute(
+        &format!(
+            "INSERT INTO graph_deltas(
+                generation, action, entity_type, entity_id,
+                document_type, document_identifier,
+                after_json, created_at
+             ) VALUES (?1, 'add', 'edge', ?2, ?3, ?4, ?5, {TIMESTAMP_SQL})"
+        ),
+        params![
+            generation,
+            &edge.edge_id,
+            if owner_type == "page" {
+                Some("page")
+            } else {
+                None
+            },
+            if owner_type == "page" {
+                Some(owner_identifier)
+            } else {
+                None
+            },
+            json!({
+                "edge_id": edge.edge_id,
+                "edge_type": edge.edge_type,
+                "from_node_id": edge.from_node_id,
+                "to_node_id": edge.to_node_id,
+                "properties": serde_json::from_str::<Value>(properties_json)
+                    .unwrap_or(Value::Null),
+            })
+            .to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn database_graph_digest(conn: &Connection) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut hash_record = |record: String| {
+        hasher.update((record.len() as u64).to_be_bytes());
+        hasher.update(record.as_bytes());
+    };
+    {
+        let mut statement = conn.prepare(
+            "SELECT node_id, node_type, document_type, document_identifier,
+                    parent_node_id, ordinal, byte_start, byte_end,
+                    content_fingerprint, segmenter_version, label, properties_json
+             FROM graph_nodes ORDER BY node_id",
+        )?;
+        let records = statement.query_map([], |row| {
+            Ok(json!({
+                "node_id": row.get::<_, String>(0)?,
+                "node_type": row.get::<_, String>(1)?,
+                "document_type": row.get::<_, Option<String>>(2)?,
+                "document_identifier": row.get::<_, Option<String>>(3)?,
+                "parent_node_id": row.get::<_, Option<String>>(4)?,
+                "ordinal": row.get::<_, Option<i64>>(5)?,
+                "byte_start": row.get::<_, Option<i64>>(6)?,
+                "byte_end": row.get::<_, Option<i64>>(7)?,
+                "content_fingerprint": row.get::<_, Option<String>>(8)?,
+                "segmenter_version": row.get::<_, Option<i64>>(9)?,
+                "label": row.get::<_, String>(10)?,
+                "properties_json": row.get::<_, String>(11)?,
+            })
+            .to_string())
+        })?;
+        for record in records {
+            hash_record(record?);
+        }
+    }
+    {
+        let mut statement = conn.prepare(
+            "SELECT edge_id, edge_type, from_node_id, to_node_id,
+                    owner_type, owner_identifier, weight, confidence,
+                    provenance, reason, frequency, HEX(positions), first_position,
+                    properties_json
+             FROM graph_edges ORDER BY edge_id",
+        )?;
+        let records = statement.query_map([], |row| {
+            Ok(json!({
+                "edge_id": row.get::<_, String>(0)?,
+                "edge_type": row.get::<_, String>(1)?,
+                "from_node_id": row.get::<_, String>(2)?,
+                "to_node_id": row.get::<_, String>(3)?,
+                "owner_type": row.get::<_, String>(4)?,
+                "owner_identifier": row.get::<_, String>(5)?,
+                "weight": row.get::<_, Option<f64>>(6)?,
+                "confidence": row.get::<_, Option<f64>>(7)?,
+                "provenance": row.get::<_, Option<String>>(8)?,
+                "reason": row.get::<_, Option<String>>(9)?,
+                "frequency": row.get::<_, Option<i64>>(10)?,
+                "positions": row.get::<_, String>(11)?,
+                "first_position": row.get::<_, Option<i64>>(12)?,
+                "properties_json": row.get::<_, String>(13)?,
+            })
+            .to_string())
+        })?;
+        for record in records {
+            hash_record(record?);
+        }
+    }
+    {
+        let mut statement = conn.prepare(
+            "SELECT term_node_id, document_type, document_identifier,
+                    frequency, HEX(positions), first_position
+             FROM graph_occurrences
+             ORDER BY term_node_id, document_type, document_identifier",
+        )?;
+        let records = statement.query_map([], |row| {
+            Ok(json!({
+                "term_node_id": row.get::<_, String>(0)?,
+                "document_type": row.get::<_, String>(1)?,
+                "document_identifier": row.get::<_, String>(2)?,
+                "frequency": row.get::<_, i64>(3)?,
+                "positions": row.get::<_, String>(4)?,
+                "first_position": row.get::<_, i64>(5)?,
+            })
+            .to_string())
+        })?;
+        for record in records {
+            hash_record(record?);
+        }
+    }
+    {
+        let mut statement = conn.prepare(
+            "SELECT document_type, document_identifier, HEX(contributions)
+             FROM term_pair_contributions
+             ORDER BY document_type, document_identifier",
+        )?;
+        for record in statement.query_map([], |row| {
+            Ok(json!({
+                "document_type": row.get::<_, String>(0)?,
+                "document_identifier": row.get::<_, String>(1)?,
+                "contributions": row.get::<_, String>(2)?,
+            })
+            .to_string())
+        })? {
+            hash_record(record?);
+        }
+    }
+    {
+        let mut statement = conn.prepare(
+            "SELECT from_term_id, to_term_id, raw_strength, witness_count
+             FROM term_pair_totals ORDER BY from_term_id, to_term_id",
+        )?;
+        for record in statement.query_map([], |row| {
+            Ok(json!({
+                "from_term_id": row.get::<_, String>(0)?,
+                "to_term_id": row.get::<_, String>(1)?,
+                "raw_strength": row.get::<_, f64>(2)?,
+                "witness_count": row.get::<_, i64>(3)?,
+            })
+            .to_string())
+        })? {
+            hash_record(record?);
+        }
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn persist_revision_edge(
+    tx: &Transaction<'_>,
+    tracked_path: &str,
+    revision: i64,
+    source_id: i64,
+    generation: Option<i64>,
+) -> Result<()> {
+    if revision <= 1 {
+        return Ok(());
+    }
+    let previous_source_id: i64 = tx.query_row(
+        "SELECT source_id FROM source_path_revisions
+         WHERE tracked_path = ?1 AND revision = ?2",
+        params![tracked_path, revision - 1],
+        |row| row.get(0),
+    )?;
+    let from_node_id = format!("source:{source_id}");
+    let to_node_id = format!("source:{previous_source_id}");
+    let owner_identifier = format!("{tracked_path}#{revision}");
+    let edge_id = format!(
+        "edge:{}",
+        hash_content(&format!(
+            "REVISION_OF\0{tracked_path}\0{revision}\0{from_node_id}\0{to_node_id}"
+        ))
+    );
+    let generation = match generation {
+        Some(generation) => generation,
+        None => {
+            let generation: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(generation), 0) + 1 FROM graph_generations",
+                [],
+                |row| row.get(0),
+            )?;
+            let store_revision: String = tx.query_row(
+                "SELECT value FROM meta WHERE key = 'store_revision'",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                &format!(
+                    "INSERT INTO graph_generations(
+                        generation, store_revision, canonical_digest,
+                        changed_document_count, created_at
+                     ) VALUES (?1, ?2, ?3, 0, {TIMESTAMP_SQL})"
+                ),
+                params![generation, store_revision, hash_content(&edge_id)],
+            )?;
+            generation
+        }
+    };
+    tx.execute(
+        &format!(
+            "INSERT INTO graph_edges(
+                edge_id, edge_type, from_node_id, to_node_id,
+                owner_type, owner_identifier, provenance,
+                properties_json, created_at, updated_at
+             ) VALUES (
+                ?1, 'REVISION_OF', ?2, ?3, 'path', ?4, 'automatic', ?5,
+                {TIMESTAMP_SQL}, {TIMESTAMP_SQL}
+             )"
+        ),
+        params![
+            &edge_id,
+            &from_node_id,
+            &to_node_id,
+            &owner_identifier,
+            json!({"tracked_path": tracked_path, "revision": revision}).to_string(),
+        ],
+    )?;
+    let after_json = json!({
+        "edge_id": &edge_id,
+        "edge_type": "REVISION_OF",
+        "from_node_id": from_node_id,
+        "to_node_id": to_node_id,
+        "tracked_path": tracked_path,
+        "revision": revision,
+    })
+    .to_string();
+    tx.execute(
+        &format!(
+            "INSERT INTO graph_deltas(
+                generation, action, entity_type, entity_id,
+                document_type, document_identifier,
+                after_json, created_at
+             ) VALUES (?1, 'add', 'edge', ?2, 'source', ?3, ?4, {TIMESTAMP_SQL})"
+        ),
+        params![generation, &edge_id, source_id.to_string(), after_json],
+    )?;
+    tx.execute(
+        "UPDATE graph_generations SET canonical_digest = ?1 WHERE generation = ?2",
+        params![database_graph_digest(tx)?, generation],
+    )?;
+    tx.execute(
+        &format!(
+            "UPDATE graph_projection_state
+             SET canonical_generation = ?1,
+                 projected_generation = CASE
+                     WHEN engine = 'rslg' THEN ?1 ELSE projected_generation END,
+                 status = CASE WHEN engine = 'rslg' THEN 'fresh' ELSE 'pending' END,
+                 updated_at = {TIMESTAMP_SQL}
+             WHERE projection = 'physical'"
+        ),
+        params![generation],
+    )?;
+    Ok(())
+}
+
+fn page_relation_edges(
+    tx: &Transaction<'_>,
+    slug: &str,
+    source_ids: &[i64],
+    links: &[String],
+) -> Result<Vec<CanonicalEdge>> {
+    let from = format!("page:{slug}");
+    let mut edges = source_ids
+        .iter()
+        .map(|source_id| automatic_edge("CITES", &from, &format!("source:{source_id}")))
+        .collect::<Vec<_>>();
+    for link in links {
+        let exists = tx
+            .query_row("SELECT 1 FROM pages WHERE slug = ?1", params![link], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        if exists {
+            edges.push(automatic_edge("LINKS_TO", &from, &format!("page:{link}")));
+        }
+    }
+    Ok(edges)
+}
+
+fn canonical_database_records(conn: &Connection) -> Result<BTreeMap<(String, String), String>> {
+    let mut records = BTreeMap::new();
+    let mut node_statement = conn.prepare(
+        "SELECT node_id, json_object(
+            'node_id', node_id, 'node_type', node_type,
+            'document_type', document_type,
+            'document_identifier', document_identifier,
+            'parent_node_id', parent_node_id, 'ordinal', ordinal,
+            'byte_start', byte_start, 'byte_end', byte_end,
+            'content_fingerprint', content_fingerprint,
+            'segmenter_version', segmenter_version,
+            'label', label, 'properties_json', properties_json
+         ) FROM graph_nodes ORDER BY node_id",
+    )?;
+    for row in node_statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (identifier, record) = row?;
+        records.insert(("node".to_string(), identifier), record);
+    }
+    let mut edge_statement = conn.prepare(
+        "SELECT edge_id, json_object(
+            'edge_id', edge_id, 'edge_type', edge_type,
+            'from_node_id', from_node_id, 'to_node_id', to_node_id,
+            'owner_type', owner_type, 'owner_identifier', owner_identifier,
+            'weight', weight, 'confidence', confidence,
+            'provenance', provenance, 'reason', reason,
+            'frequency', frequency, 'positions', HEX(positions),
+            'first_position', first_position,
+            'properties_json', properties_json
+         ) FROM graph_edges ORDER BY edge_id",
+    )?;
+    for row in edge_statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (identifier, record) = row?;
+        records.insert(("edge".to_string(), identifier), record);
+    }
+    insert_occurrence_records(conn, &mut records, None)?;
+    Ok(records)
+}
+
+fn insert_occurrence_records(
+    conn: &Connection,
+    records: &mut BTreeMap<(String, String), String>,
+    document: Option<(&str, &str)>,
+) -> Result<()> {
+    let mut statement = conn.prepare(
+        "SELECT o.term_node_id, s.document_node_id, o.document_type,
+                o.document_identifier, o.frequency, HEX(o.positions), o.first_position
+         FROM graph_occurrences o
+         JOIN document_index_state s
+           ON s.document_type = o.document_type
+          AND s.document_identifier = o.document_identifier
+         WHERE (?1 IS NULL OR (o.document_type = ?1 AND o.document_identifier = ?2))
+         ORDER BY o.term_node_id, o.document_type, o.document_identifier",
+    )?;
+    let (document_type, document_identifier) = document
+        .map(|(kind, identifier)| (Some(kind), Some(identifier)))
+        .unwrap_or((None, None));
+    for row in statement.query_map(params![document_type, document_identifier], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+        ))
+    })? {
+        let (term, target, owner_type, owner_identifier, frequency, positions, first_position) =
+            row?;
+        let identifier = automatic_edge("OCCURS_IN", &term, &target).edge_id;
+        let record = json!({
+            "edge_id": identifier,
+            "edge_type": "OCCURS_IN",
+            "from_node_id": term,
+            "to_node_id": target,
+            "owner_type": owner_type,
+            "owner_identifier": owner_identifier,
+            "weight": Value::Null,
+            "confidence": Value::Null,
+            "provenance": "automatic",
+            "reason": Value::Null,
+            "frequency": frequency,
+            "positions": positions,
+            "first_position": first_position,
+            "properties_json": "{}",
+        })
+        .to_string();
+        records.insert(("edge".to_string(), identifier), record);
+    }
+    Ok(())
+}
+
+fn canonical_document_records(
+    conn: &Connection,
+    document_type: &str,
+    document_identifier: &str,
+    affected_terms: &BTreeSet<String>,
+) -> Result<BTreeMap<(String, String), String>> {
+    let mut records = BTreeMap::new();
+    {
+        let mut statement = conn.prepare(
+            "SELECT node_id, json_object(
+                'node_id', node_id, 'node_type', node_type,
+                'document_type', document_type,
+                'document_identifier', document_identifier,
+                'parent_node_id', parent_node_id, 'ordinal', ordinal,
+                'byte_start', byte_start, 'byte_end', byte_end,
+                'content_fingerprint', content_fingerprint,
+                'segmenter_version', segmenter_version,
+                'label', label, 'properties_json', properties_json
+             ) FROM graph_nodes
+             WHERE document_type = ?1 AND document_identifier = ?2
+             ORDER BY node_id",
+        )?;
+        for row in statement.query_map(params![document_type, document_identifier], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (identifier, record) = row?;
+            records.insert(("node".to_string(), identifier), record);
+        }
+    }
+    {
+        let mut statement = conn.prepare(
+            "SELECT edge_id, json_object(
+                'edge_id', edge_id, 'edge_type', edge_type,
+                'from_node_id', from_node_id, 'to_node_id', to_node_id,
+                'owner_type', owner_type, 'owner_identifier', owner_identifier,
+                'weight', weight, 'confidence', confidence,
+                'provenance', provenance, 'reason', reason,
+                'frequency', frequency, 'positions', HEX(positions),
+                'first_position', first_position,
+                'properties_json', properties_json
+             ) FROM graph_edges e
+             WHERE (owner_type = ?1 AND owner_identifier = ?2)
+                OR (owner_type = 'manual' AND (
+                    EXISTS (
+                        SELECT 1 FROM graph_nodes n
+                        WHERE n.node_id = e.from_node_id
+                          AND n.document_type = ?1 AND n.document_identifier = ?2
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM graph_nodes n
+                        WHERE n.node_id = e.to_node_id
+                          AND n.document_type = ?1 AND n.document_identifier = ?2
+                    )
+                ))
+             ORDER BY edge_id",
+        )?;
+        for row in statement.query_map(params![document_type, document_identifier], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (identifier, record) = row?;
+            records.insert(("edge".to_string(), identifier), record);
+        }
+    }
+    let mut term_node = conn.prepare(
+        "SELECT node_id, json_object(
+            'node_id', node_id, 'node_type', node_type,
+            'document_type', document_type,
+            'document_identifier', document_identifier,
+            'parent_node_id', parent_node_id, 'ordinal', ordinal,
+            'byte_start', byte_start, 'byte_end', byte_end,
+            'content_fingerprint', content_fingerprint,
+            'segmenter_version', segmenter_version,
+            'label', label, 'properties_json', properties_json
+         ) FROM graph_nodes WHERE node_id = ?1",
+    )?;
+    let mut term_edges = conn.prepare(
+        "SELECT edge_id, json_object(
+            'edge_id', edge_id, 'edge_type', edge_type,
+            'from_node_id', from_node_id, 'to_node_id', to_node_id,
+            'owner_type', owner_type, 'owner_identifier', owner_identifier,
+            'weight', weight, 'confidence', confidence,
+            'provenance', provenance, 'reason', reason,
+            'frequency', frequency, 'positions', HEX(positions),
+            'first_position', first_position,
+            'properties_json', properties_json
+         ) FROM graph_edges
+         WHERE edge_type = 'CO_OCCURS' AND from_node_id = ?1
+         ORDER BY edge_id",
+    )?;
+    for term in affected_terms {
+        if let Some((identifier, record)) = term_node
+            .query_row([term], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()?
+        {
+            records.insert(("node".to_string(), identifier), record);
+        }
+        for row in term_edges.query_map([term], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (identifier, record) = row?;
+            records.insert(("edge".to_string(), identifier), record);
+        }
+    }
+    insert_occurrence_records(
+        conn,
+        &mut records,
+        Some((document_type, document_identifier)),
+    )?;
+    Ok(records)
+}
+
+fn remove_document_graph(
+    tx: &Transaction<'_>,
+    document_type: &str,
+    document_identifier: &str,
+) -> Result<()> {
+    let before = canonical_database_records(tx)?;
+    tx.execute(
+        "DELETE FROM graph_occurrences
+         WHERE document_type = ?1 AND document_identifier = ?2",
+        params![document_type, document_identifier],
+    )?;
+    tx.execute(
+        "DELETE FROM graph_edges
+         WHERE owner_type = ?1 AND owner_identifier = ?2",
+        params![document_type, document_identifier],
+    )?;
+    if let Some(encoded) = tx
+        .query_row(
+            "SELECT contributions FROM term_pair_contributions
+             WHERE document_type = ?1 AND document_identifier = ?2",
+            params![document_type, document_identifier],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+    {
+        apply_term_pair_totals(tx, &decode_term_pair_contributions(&encoded)?, -1.0)?;
+    }
+    tx.execute(
+        "DELETE FROM term_pair_contributions
+         WHERE document_type = ?1 AND document_identifier = ?2",
+        params![document_type, document_identifier],
+    )?;
+    tx.execute(
+        "DELETE FROM span_fts
+         WHERE document_type = ?1 AND document_identifier = ?2",
+        params![document_type, document_identifier],
+    )?;
+    tx.execute(
+        "DELETE FROM graph_nodes
+         WHERE document_type = ?1 AND document_identifier = ?2",
+        params![document_type, document_identifier],
+    )?;
+    tx.execute(
+        "DELETE FROM document_index_state
+         WHERE document_type = ?1 AND document_identifier = ?2",
+        params![document_type, document_identifier],
+    )?;
+    rebuild_cooccurrence_edges(tx)?;
+    let after = canonical_database_records(tx)?;
+    let generation: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(generation), 0) + 1 FROM graph_generations",
+        [],
+        |row| row.get(0),
+    )?;
+    let store_revision: String = tx.query_row(
+        "SELECT value FROM meta WHERE key = 'store_revision'",
+        [],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        &format!(
+            "INSERT INTO graph_generations(
+                generation, store_revision, canonical_digest,
+                changed_document_count, created_at
+             ) VALUES (?1, ?2, ?3, 1, {TIMESTAMP_SQL})"
+        ),
+        params![generation, store_revision, database_graph_digest(tx)?],
+    )?;
+    let keys = before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for (entity_type, entity_id) in keys {
+        let old = before.get(&(entity_type.clone(), entity_id.clone()));
+        let new = after.get(&(entity_type.clone(), entity_id.clone()));
+        if old == new {
+            continue;
+        }
+        let action = match (old, new) {
+            (None, Some(_)) => "add",
+            (Some(_), None) => "remove",
+            (Some(_), Some(_)) => "update",
+            (None, None) => continue,
+        };
+        tx.execute(
+            &format!(
+                "INSERT INTO graph_deltas(
+                    generation, action, entity_type, entity_id,
+                    document_type, document_identifier,
+                    before_json, after_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, {TIMESTAMP_SQL})"
+            ),
+            params![
+                generation,
+                action,
+                entity_type,
+                entity_id,
+                document_type,
+                document_identifier,
+                old,
+                new,
+            ],
+        )?;
+    }
+    tx.execute(
+        &format!(
+            "UPDATE graph_projection_state
+             SET canonical_generation = ?1,
+                 projected_generation = CASE
+                     WHEN engine = 'rslg' THEN ?1 ELSE projected_generation END,
+                 status = CASE WHEN engine = 'rslg' THEN 'fresh' ELSE 'pending' END,
+                 updated_at = {TIMESTAMP_SQL}
+             WHERE projection = 'physical'"
+        ),
+        params![generation],
+    )?;
+    Ok(())
+}
+
+fn persist_inbound_link_edges(
+    tx: &Transaction<'_>,
+    target_slug: &str,
+    generation: i64,
+) -> Result<()> {
+    let from_slugs = {
+        let mut statement = tx.prepare(
+            "SELECT DISTINCT l.from_slug FROM links l
+             JOIN graph_nodes source
+               ON source.node_id = 'page:' || l.from_slug
+             WHERE l.to_slug = ?1 AND l.from_slug <> ?1
+             ORDER BY l.from_slug",
+        )?;
+        statement
+            .query_map(params![target_slug], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut changed = false;
+    for from_slug in from_slugs {
+        let edge = automatic_edge(
+            "LINKS_TO",
+            &format!("page:{from_slug}"),
+            &format!("page:{target_slug}"),
+        );
+        let inserted = tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO graph_edges(
+                    edge_id, edge_type, from_node_id, to_node_id,
+                    owner_type, owner_identifier, provenance,
+                    properties_json, created_at, updated_at
+                 ) VALUES (?1, 'LINKS_TO', ?2, ?3, 'page', ?4, 'automatic',
+                           '{{}}', {TIMESTAMP_SQL}, {TIMESTAMP_SQL})"
+            ),
+            params![
+                &edge.edge_id,
+                &edge.from_node_id,
+                &edge.to_node_id,
+                &from_slug,
+            ],
+        )?;
+        if inserted == 0 {
+            continue;
+        }
+        changed = true;
+        tx.execute(
+            &format!(
+                "INSERT INTO graph_deltas(
+                    generation, action, entity_type, entity_id,
+                    document_type, document_identifier, after_json, created_at
+                 ) VALUES (?1, 'add', 'edge', ?2, 'page', ?3, ?4, {TIMESTAMP_SQL})"
+            ),
+            params![
+                generation,
+                &edge.edge_id,
+                &from_slug,
+                json!({
+                    "edge_id": edge.edge_id,
+                    "edge_type": "LINKS_TO",
+                    "from_node_id": edge.from_node_id,
+                    "to_node_id": edge.to_node_id,
+                    "owner_type": "page",
+                    "owner_identifier": from_slug,
+                    "provenance": "automatic",
+                })
+                .to_string(),
+            ],
+        )?;
+    }
+    if changed {
+        tx.execute(
+            "UPDATE graph_generations SET canonical_digest = ?1 WHERE generation = ?2",
+            params![database_graph_digest(tx)?, generation],
+        )?;
+    }
+    Ok(())
+}
+
+fn persist_document_graph(
+    tx: &Transaction<'_>,
+    input: &DocumentGraphInput<'_>,
+    _before: Option<&DocumentGraphReplacement>,
+    extra_edges: &[CanonicalEdge],
+) -> Result<i64> {
+    let mut graph = build_document_graph(input).map_err(segment_error)?;
+    graph.edges.extend_from_slice(extra_edges);
+    let cooccurrence = build_cooccurrence(input).map_err(segment_error)?;
+    let document_type = match input.document_type {
+        DocumentType::Page => "page",
+        DocumentType::Source => "source",
+    };
+    let mut affected_terms = cooccurrence
+        .contributions
+        .iter()
+        .flat_map(|contribution| {
+            [
+                contribution.from_term_id.clone(),
+                contribution.to_term_id.clone(),
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    affected_terms.extend(
+        graph
+            .nodes
+            .iter()
+            .filter(|node| node.node_type == "term")
+            .map(|node| node.node_id.clone()),
+    );
+    let previous_contributions = tx
+        .query_row(
+            "SELECT contributions FROM term_pair_contributions
+             WHERE document_type = ?1 AND document_identifier = ?2",
+            params![document_type, input.identifier],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .map(|encoded| decode_term_pair_contributions(&encoded))
+        .transpose()?
+        .unwrap_or_default();
+    for contribution in &previous_contributions {
+        affected_terms.insert(contribution.from_term_id.clone());
+        affected_terms.insert(contribution.to_term_id.clone());
+    }
+    {
+        let mut statement = tx.prepare(
+            "SELECT term_node_id FROM graph_occurrences
+             WHERE document_type = ?1 AND document_identifier = ?2",
+        )?;
+        for row in statement.query_map(params![document_type, input.identifier], |row| {
+            row.get::<_, String>(0)
+        })? {
+            affected_terms.insert(row?);
+        }
+    }
+    expand_affected_cooccurrence_sources(tx, &mut affected_terms)?;
+    let before_records =
+        canonical_document_records(tx, document_type, input.identifier, &affected_terms)?;
+
+    tx.execute(
+        "DELETE FROM graph_occurrences
+         WHERE document_type = ?1 AND document_identifier = ?2",
+        params![document_type, input.identifier],
+    )?;
+    tx.execute(
+        "DELETE FROM graph_edges
+         WHERE owner_type = ?1 AND owner_identifier = ?2",
+        params![document_type, input.identifier],
+    )?;
+    apply_term_pair_totals(tx, &previous_contributions, -1.0)?;
+    tx.execute(
+        "DELETE FROM term_pair_contributions
+         WHERE document_type = ?1 AND document_identifier = ?2",
+        params![document_type, input.identifier],
+    )?;
+    tx.execute(
+        "DELETE FROM span_fts
+         WHERE document_type = ?1 AND document_identifier = ?2",
+        params![document_type, input.identifier],
+    )?;
+    tx.execute(
+        "DELETE FROM graph_nodes
+         WHERE document_type = ?1 AND document_identifier = ?2
+           AND node_type IN ('passage', 'sentence')",
+        params![document_type, input.identifier],
+    )?;
+
+    {
+        let mut node_statement = tx.prepare(
+            "INSERT INTO graph_nodes(
+                node_id, node_type, document_type, document_identifier,
+                parent_node_id, ordinal, byte_start, byte_end,
+                content_fingerprint, segmenter_version, label, properties_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, '{}')
+             ON CONFLICT(node_id) DO UPDATE SET
+                node_type = excluded.node_type,
+                document_type = excluded.document_type,
+                document_identifier = excluded.document_identifier,
+                parent_node_id = excluded.parent_node_id,
+                ordinal = excluded.ordinal,
+                byte_start = excluded.byte_start,
+                byte_end = excluded.byte_end,
+                content_fingerprint = excluded.content_fingerprint,
+                segmenter_version = excluded.segmenter_version,
+                label = excluded.label",
+        )?;
+        let mut span_statement = tx.prepare(
+            "INSERT INTO span_fts(
+                span_id, span_type, document_type, document_identifier,
+                title_terms, path_terms, body_terms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        let title_terms = joined_terms(input.label);
+        let path_terms = joined_terms(input.identifier);
+        for node in &graph.nodes {
+            let node_document_type = node.document_type.map(|value| match value {
+                DocumentType::Page => "page",
+                DocumentType::Source => "source",
+            });
+            let (byte_start, byte_end) = node
+                .byte_range
+                .as_ref()
+                .map(|range| (Some(range.start as i64), Some(range.end as i64)))
+                .unwrap_or((None, None));
+            node_statement.execute(params![
+                &node.node_id,
+                node.node_type,
+                node_document_type,
+                node.document_identifier.as_deref(),
+                node.parent_node_id.as_deref(),
+                node.ordinal.map(|value| value as i64),
+                byte_start,
+                byte_end,
+                node.content_fingerprint.as_deref(),
+                node.segmenter_version.map(i64::from),
+                if matches!(node.node_type, "passage" | "sentence") {
+                    ""
+                } else {
+                    &node.label
+                },
+            ])?;
+            if matches!(node.node_type, "passage" | "sentence") {
+                span_statement.execute(params![
+                    &node.node_id,
+                    node.node_type,
+                    document_type,
+                    input.identifier,
+                    &title_terms,
+                    &path_terms,
+                    joined_terms(&node.label),
+                ])?;
+            }
+        }
+    }
+
+    {
+        let mut edge_statement = tx.prepare(&format!(
+            "INSERT INTO graph_edges(
+                edge_id, edge_type, from_node_id, to_node_id,
+                owner_type, owner_identifier,
+                provenance, properties_json, created_at, updated_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6,
+                'automatic', '{{}}', {TIMESTAMP_SQL}, {TIMESTAMP_SQL}
+             )"
+        ))?;
+        let mut occurrence_statement = tx.prepare(
+            "INSERT INTO graph_occurrences(
+                term_node_id, document_type, document_identifier,
+                frequency, positions, first_position
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for edge in &graph.edges {
+            if edge.edge_type == "OCCURS_IN" {
+                if edge.to_node_id == graph.document_node_id {
+                    occurrence_statement.execute(params![
+                        &edge.from_node_id,
+                        document_type,
+                        input.identifier,
+                        edge.frequency.map(|value| value as i64),
+                        encode_positions(&edge.positions).map_err(position_encoding_error)?,
+                        edge.positions.first().map(|range| range.start as i64),
+                    ])?;
+                }
+                continue;
+            }
+            if matches!(edge.edge_type, "CONTAINS" | "NEXT" | "PREVIOUS") {
+                continue;
+            }
+            edge_statement.execute(params![
+                &edge.edge_id,
+                edge.edge_type,
+                &edge.from_node_id,
+                &edge.to_node_id,
+                document_type,
+                input.identifier,
+            ])?;
+        }
+    }
+
+    if !cooccurrence.contributions.is_empty() {
+        tx.execute(
+            "INSERT INTO term_pair_contributions(
+                document_type, document_identifier, contributions
+             ) VALUES (?1, ?2, ?3)",
+            params![
+                document_type,
+                input.identifier,
+                encode_term_pair_contributions(&cooccurrence.contributions)?,
+            ],
+        )?;
+    }
+    apply_term_pair_totals(tx, &cooccurrence.contributions, 1.0)?;
+    expand_affected_cooccurrence_sources(tx, &mut affected_terms)?;
+    rebuild_cooccurrence_edges_for(tx, Some(&affected_terms))?;
+
+    let generation: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(generation), 0) + 1 FROM graph_generations",
+        [],
+        |row| row.get(0),
+    )?;
+    let store_revision: String = tx.query_row(
+        "SELECT value FROM meta WHERE key = 'store_revision'",
+        [],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        &format!(
+            "INSERT INTO graph_generations(
+                generation, store_revision, canonical_digest,
+                changed_document_count, created_at
+             ) VALUES (?1, ?2, ?3, 1, {TIMESTAMP_SQL})"
+        ),
+        params![generation, store_revision, database_graph_digest(tx)?],
+    )?;
+    let after_records =
+        canonical_document_records(tx, document_type, input.identifier, &affected_terms)?;
+    let record_keys = before_records
+        .keys()
+        .chain(after_records.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    {
+        let mut delta_statement = tx.prepare(&format!(
+            "INSERT INTO graph_deltas(
+                generation, action, entity_type, entity_id,
+                document_type, document_identifier,
+                before_json, after_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, {TIMESTAMP_SQL})"
+        ))?;
+        for (entity_type, entity_id) in record_keys {
+            let old = before_records.get(&(entity_type.clone(), entity_id.clone()));
+            let new = after_records.get(&(entity_type.clone(), entity_id.clone()));
+            if old == new {
+                continue;
+            }
+            let action = match (old, new) {
+                (None, Some(_)) => "add",
+                (Some(_), None) => "remove",
+                (Some(_), Some(_)) => "update",
+                (None, None) => continue,
+            };
+            delta_statement.execute(params![
+                generation,
+                action,
+                entity_type,
+                entity_id,
+                document_type,
+                input.identifier,
+                old,
+                new,
+            ])?;
+        }
+    }
+    tx.execute(
+        &format!(
+            "INSERT INTO document_index_state(
+                document_type, document_identifier, document_node_id,
+                content_fingerprint, segmenter_version, generation,
+                cooccurrence_truncated, indexed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, {TIMESTAMP_SQL})
+             ON CONFLICT(document_type, document_identifier) DO UPDATE SET
+                document_node_id = excluded.document_node_id,
+                content_fingerprint = excluded.content_fingerprint,
+                segmenter_version = excluded.segmenter_version,
+                generation = excluded.generation,
+                cooccurrence_truncated = excluded.cooccurrence_truncated,
+                indexed_at = excluded.indexed_at"
+        ),
+        params![
+            document_type,
+            input.identifier,
+            &graph.document_node_id,
+            &graph.content_fingerprint,
+            i64::from(crate::segment::SEGMENTER_VERSION),
+            generation,
+            cooccurrence.truncated_sentence_count as i64,
+        ],
+    )?;
+    tx.execute(
+        &format!(
+            "UPDATE graph_projection_state
+             SET canonical_generation = ?1,
+                 projected_generation = CASE
+                     WHEN engine = 'rslg' THEN ?1 ELSE projected_generation END,
+                 status = CASE WHEN engine = 'rslg' THEN 'fresh' ELSE 'pending' END,
+                 updated_at = {TIMESTAMP_SQL}
+             WHERE projection = 'physical'"
+        ),
+        params![generation],
+    )?;
+    Ok(generation)
+}
+
+fn apply_term_pair_totals(
+    tx: &Transaction<'_>,
+    contributions: &[TermPairContribution],
+    direction: f64,
+) -> Result<()> {
+    if contributions.is_empty() {
+        return Ok(());
+    }
+    let mut add = tx.prepare(
+        "INSERT INTO term_pair_totals(
+            from_term_id, to_term_id, raw_strength, witness_count
+         ) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(from_term_id, to_term_id) DO UPDATE SET
+            raw_strength = raw_strength + excluded.raw_strength,
+            witness_count = witness_count + excluded.witness_count",
+    )?;
+    let mut remove = tx.prepare(
+        "DELETE FROM term_pair_totals
+         WHERE from_term_id = ?1 AND to_term_id = ?2 AND witness_count = ?3",
+    )?;
+    let mut subtract = tx.prepare(
+        "UPDATE term_pair_totals
+         SET raw_strength = MAX(0.0, raw_strength - ?3),
+             witness_count = witness_count - ?4
+         WHERE from_term_id = ?1 AND to_term_id = ?2 AND witness_count > ?4",
+    )?;
+    for contribution in contributions {
+        let witness = i64::try_from(contribution.witness_count).map_err(|_| {
+            AppError::new(
+                "graph_index_capacity_exceeded",
+                "co-occurrence witness count is too large",
+            )
+        })?;
+        let strength = contribution.sentence_weight + contribution.passage_weight;
+        if direction < 0.0 {
+            if remove.execute(params![
+                &contribution.from_term_id,
+                &contribution.to_term_id,
+                witness,
+            ])? == 0
+                && subtract.execute(params![
+                    &contribution.from_term_id,
+                    &contribution.to_term_id,
+                    strength,
+                    witness,
+                ])? != 1
+            {
+                return Err(AppError::new(
+                    "graph_index_corrupt",
+                    "co-occurrence total is missing during document replacement",
+                ));
+            }
+        } else {
+            add.execute(params![
+                &contribution.from_term_id,
+                &contribution.to_term_id,
+                strength,
+                witness,
+            ])?;
+        }
+    }
+    tx.execute(
+        "DELETE FROM term_pair_totals
+         WHERE witness_count <= 0 OR raw_strength <= 0.000000000001",
+        [],
+    )?;
+    Ok(())
+}
+
+fn expand_affected_cooccurrence_sources(
+    tx: &Transaction<'_>,
+    affected_terms: &mut BTreeSet<String>,
+) -> Result<()> {
+    let targets = affected_terms.iter().cloned().collect::<Vec<_>>();
+    let mut statement = tx.prepare(
+        "SELECT DISTINCT from_term_id FROM term_pair_totals
+         WHERE to_term_id = ?1 ORDER BY from_term_id",
+    )?;
+    for target in targets {
+        for source in statement.query_map([target], |row| row.get::<_, String>(0))? {
+            affected_terms.insert(source?);
+        }
+    }
+    Ok(())
+}
+
+fn persisted_cooccurrence_weight(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+fn rebuild_cooccurrence_edges(tx: &Transaction<'_>) -> Result<()> {
+    rebuild_cooccurrence_edges_for(tx, None)
+}
+
+fn rebuild_cooccurrence_edges_for(
+    tx: &Transaction<'_>,
+    affected_terms: Option<&BTreeSet<String>>,
+) -> Result<()> {
+    let contributions = {
+        let mut statement = tx.prepare(
+            "SELECT from_term_id, to_term_id, raw_strength, witness_count
+             FROM term_pair_totals ORDER BY from_term_id, to_term_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(TermPairContribution {
+                    from_term_id: row.get(0)?,
+                    to_term_id: row.get(1)?,
+                    sentence_weight: row.get(2)?,
+                    passage_weight: 0.0,
+                    witness_count: row.get::<_, i64>(3)? as usize,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    match affected_terms {
+        Some(affected) => {
+            let mut statement = tx.prepare(
+                "DELETE FROM graph_edges
+                 WHERE owner_type = 'global' AND edge_type = 'CO_OCCURS'
+                   AND from_node_id = ?1",
+            )?;
+            for term in affected {
+                statement.execute([term])?;
+            }
+        }
+        None => {
+            tx.execute(
+                "DELETE FROM graph_edges
+                 WHERE owner_type = 'global' AND edge_type = 'CO_OCCURS'",
+                [],
+            )?;
+        }
+    }
+    let ranked = rank_cooccurrence(&contributions, 32);
+    let mut insert_statement = tx.prepare(&format!(
+        "INSERT INTO graph_edges(
+            edge_id, edge_type, from_node_id, to_node_id,
+            owner_type, owner_identifier, weight, provenance,
+            properties_json, created_at, updated_at
+         ) VALUES (
+            ?1, 'CO_OCCURS', ?2, ?3, 'global', 'cooccurrence', ?4,
+            'automatic', ?5, {TIMESTAMP_SQL}, {TIMESTAMP_SQL}
+         )"
+    ))?;
+    for edge in ranked {
+        if affected_terms.is_some_and(|affected| !affected.contains(&edge.from_term_id)) {
+            continue;
+        }
+        let edge_id = format!(
+            "edge:{}",
+            hash_content(&format!(
+                "CO_OCCURS\0{}\0{}",
+                edge.from_term_id, edge.to_term_id
+            ))
+        );
+        let normalized_strength = persisted_cooccurrence_weight(edge.normalized_strength);
+        insert_statement.execute(params![
+            edge_id,
+            edge.from_term_id,
+            edge.to_term_id,
+            normalized_strength,
+            json!({"rank": edge.rank}).to_string(),
+        ])?;
+    }
+    tx.execute(
+        "DELETE FROM graph_nodes
+         WHERE node_type = 'term'
+           AND NOT EXISTS (
+               SELECT 1 FROM graph_edges
+               WHERE from_node_id = graph_nodes.node_id
+                  OR to_node_id = graph_nodes.node_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM graph_occurrences
+               WHERE term_node_id = graph_nodes.node_id
+           )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn segment_error(error: crate::segment::SegmentError) -> AppError {
+    AppError::new(
+        "graph_index_capacity_exceeded",
+        format!("document segmentation failed: {error:?}"),
+    )
+}
+
+fn write_compact_u64(output: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        output.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+fn read_compact_u64(input: &[u8], cursor: &mut usize) -> Result<u64> {
+    let mut value = 0u64;
+    for shift in (0..=63).step_by(7) {
+        let byte = *input.get(*cursor).ok_or_else(|| {
+            AppError::new(
+                "graph_index_corrupt",
+                "truncated co-occurrence contribution blob",
+            )
+        })?;
+        *cursor += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(AppError::new(
+        "graph_index_corrupt",
+        "invalid co-occurrence contribution varint",
+    ))
+}
+
+fn encode_term_pair_contributions(contributions: &[TermPairContribution]) -> Result<Vec<u8>> {
+    let terms = contributions
+        .iter()
+        .flat_map(|contribution| {
+            [
+                contribution.from_term_id.clone(),
+                contribution.to_term_id.clone(),
+            ]
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let term_indexes = terms
+        .iter()
+        .enumerate()
+        .map(|(index, term)| (term.as_str(), index as u64))
+        .collect::<BTreeMap<_, _>>();
+    let mut output = vec![1];
+    write_compact_u64(&mut output, terms.len() as u64);
+    for term in &terms {
+        write_compact_u64(&mut output, term.len() as u64);
+        output.extend_from_slice(term.as_bytes());
+    }
+    write_compact_u64(&mut output, contributions.len() as u64);
+    for contribution in contributions {
+        write_compact_u64(
+            &mut output,
+            term_indexes[contribution.from_term_id.as_str()],
+        );
+        write_compact_u64(&mut output, term_indexes[contribution.to_term_id.as_str()]);
+        output.extend_from_slice(&contribution.sentence_weight.to_le_bytes());
+        output.extend_from_slice(&contribution.passage_weight.to_le_bytes());
+        write_compact_u64(&mut output, contribution.witness_count as u64);
+    }
+    Ok(output)
+}
+
+fn decode_term_pair_contributions(input: &[u8]) -> Result<Vec<TermPairContribution>> {
+    const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
+    const MAX_TERMS: usize = 100_000;
+    const MAX_CONTRIBUTIONS: usize = 1_000_000;
+    if input.len() > MAX_BLOB_BYTES {
+        return Err(AppError::new(
+            "graph_index_corrupt",
+            "co-occurrence contribution blob exceeds the safety limit",
+        ));
+    }
+    if input.first() != Some(&1) {
+        return Err(AppError::new(
+            "graph_index_corrupt",
+            "unsupported co-occurrence contribution blob version",
+        ));
+    }
+    let mut cursor = 1usize;
+    let term_count = usize::try_from(read_compact_u64(input, &mut cursor)?).map_err(|_| {
+        AppError::new(
+            "graph_index_corrupt",
+            "co-occurrence term count is too large",
+        )
+    })?;
+    if term_count > MAX_TERMS || term_count > input.len() {
+        return Err(AppError::new(
+            "graph_index_corrupt",
+            "co-occurrence term count exceeds the safety limit",
+        ));
+    }
+    let mut terms = Vec::with_capacity(term_count);
+    for _ in 0..term_count {
+        let length = usize::try_from(read_compact_u64(input, &mut cursor)?).map_err(|_| {
+            AppError::new(
+                "graph_index_corrupt",
+                "co-occurrence term length is too large",
+            )
+        })?;
+        let end = cursor.checked_add(length).ok_or_else(|| {
+            AppError::new("graph_index_corrupt", "co-occurrence term range overflow")
+        })?;
+        let term =
+            std::str::from_utf8(input.get(cursor..end).ok_or_else(|| {
+                AppError::new("graph_index_corrupt", "truncated co-occurrence term")
+            })?)
+            .map_err(|_| {
+                AppError::new("graph_index_corrupt", "invalid co-occurrence term UTF-8")
+            })?;
+        terms.push(term.to_string());
+        cursor = end;
+    }
+    let contribution_count =
+        usize::try_from(read_compact_u64(input, &mut cursor)?).map_err(|_| {
+            AppError::new(
+                "graph_index_corrupt",
+                "co-occurrence contribution count is too large",
+            )
+        })?;
+    if contribution_count > MAX_CONTRIBUTIONS
+        || contribution_count > input.len().saturating_sub(cursor) / 19
+    {
+        return Err(AppError::new(
+            "graph_index_corrupt",
+            "co-occurrence contribution count exceeds the safety limit",
+        ));
+    }
+    let mut contributions = Vec::with_capacity(contribution_count);
+    for _ in 0..contribution_count {
+        let from = usize::try_from(read_compact_u64(input, &mut cursor)?).unwrap_or(usize::MAX);
+        let to = usize::try_from(read_compact_u64(input, &mut cursor)?).unwrap_or(usize::MAX);
+        let weights_end = cursor.checked_add(16).ok_or_else(|| {
+            AppError::new("graph_index_corrupt", "co-occurrence weight range overflow")
+        })?;
+        let weights = input.get(cursor..weights_end).ok_or_else(|| {
+            AppError::new("graph_index_corrupt", "truncated co-occurrence weights")
+        })?;
+        let sentence_weight = f64::from_le_bytes(weights[..8].try_into().unwrap());
+        let passage_weight = f64::from_le_bytes(weights[8..].try_into().unwrap());
+        cursor = weights_end;
+        let witness_count =
+            usize::try_from(read_compact_u64(input, &mut cursor)?).unwrap_or(usize::MAX);
+        if from >= terms.len()
+            || to >= terms.len()
+            || from == to
+            || !sentence_weight.is_finite()
+            || sentence_weight < 0.0
+            || !passage_weight.is_finite()
+            || passage_weight < 0.0
+            || witness_count == 0
+        {
+            return Err(AppError::new(
+                "graph_index_corrupt",
+                "invalid co-occurrence contribution entry",
+            ));
+        }
+        contributions.push(TermPairContribution {
+            from_term_id: terms[from].clone(),
+            to_term_id: terms[to].clone(),
+            sentence_weight,
+            passage_weight,
+            witness_count,
+        });
+    }
+    if cursor != input.len() {
+        return Err(AppError::new(
+            "graph_index_corrupt",
+            "trailing co-occurrence contribution bytes",
+        ));
+    }
+    Ok(contributions)
+}
+
+fn position_encoding_error(error: crate::graph_backend::PositionEncodingError) -> AppError {
+    AppError::new(
+        "graph_index_invalid_positions",
+        format!("could not encode term positions: {error:?}"),
+    )
+}
+
 fn hash_content(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
@@ -5754,6 +8340,10 @@ fn search_index(
                     scope: scope.to_string(),
                     result_type,
                     identifier: row.get(1)?,
+                    document: None,
+                    span: None,
+                    fused_score: None,
+                    matches: None,
                     rank: explanation.final_rank,
                     title,
                     kind: row.get(3)?,
@@ -5769,6 +8359,2248 @@ fn search_index(
         .map_err(Into::into)
 }
 
+fn ensure_graph_projection_fresh(conn: &Connection, database: &Path) -> Result<()> {
+    let (engine, status, canonical, projected): (String, String, i64, i64) = conn.query_row(
+        "SELECT engine, status, canonical_generation, projected_generation
+         FROM graph_projection_state WHERE projection = 'physical'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if status == "disabled" {
+        return Ok(());
+    }
+    if status != "fresh" || canonical != projected {
+        return Err(AppError::new(
+            "graph_projection_stale",
+            "physical graph projection is not synchronized with canonical graph state",
+        )
+        .with_details(json!({
+            "canonical_generation": canonical,
+            "projected_generation": projected,
+            "status": status,
+        })));
+    }
+    if engine == "graphlite" {
+        let digest = if canonical == 0 {
+            database_graph_digest(conn)?
+        } else {
+            conn.query_row(
+                "SELECT canonical_digest FROM graph_generations WHERE generation = ?1",
+                params![canonical],
+                |row| row.get::<_, String>(0),
+            )?
+        };
+        let physical =
+            graphqlite_projection_counts(database, canonical, &digest).map_err(|error| {
+                AppError::new(
+                    "graph_projection_stale",
+                    "GraphQLite projection cannot be verified",
+                )
+                .with_details(json!({"cause": error.code, "generation": canonical}))
+            })?;
+        let logical = (
+            conn.query_row("SELECT COUNT(*) FROM graph_nodes", [], |row| row.get(0))?,
+            conn.query_row("SELECT COUNT(*) FROM graph_edges", [], |row| row.get(0))?,
+        );
+        if physical != logical {
+            return Err(AppError::new(
+                "graph_projection_stale",
+                "GraphQLite projection counts do not match canonical graph",
+            )
+            .with_details(json!({
+                "generation": canonical,
+                "canonical": {"nodes": logical.0, "edges": logical.1},
+                "physical": {"nodes": physical.0, "edges": physical.1},
+            })));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_graph_node(conn: &Connection, identifier: &str) -> Result<String> {
+    let identifier = identifier.trim();
+    if identifier.is_empty() {
+        return Err(AppError::new(
+            "invalid_input",
+            "graph identifier cannot be empty",
+        ));
+    }
+    let mut candidates = vec![identifier.to_string()];
+    if !identifier.contains(':') {
+        candidates.push(format!("page:{identifier}"));
+        if identifier.parse::<i64>().is_ok() {
+            candidates.push(format!("source:{identifier}"));
+        }
+        let tokens = tokenize_for_query(identifier);
+        if tokens.len() == 1 {
+            candidates.push(format!("term:{}", tokens[0]));
+        }
+    }
+    for candidate in candidates {
+        if conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM graph_nodes WHERE node_id = ?1)",
+            params![&candidate],
+            |row| row.get::<_, i64>(0),
+        )? != 0
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::new(
+        "graph_node_not_found",
+        format!("graph node {identifier:?} was not found"),
+    ))
+}
+
+fn graph_node_json(conn: &Connection, node_id: &str) -> Result<Value> {
+    let mut node = conn.query_row(
+        "SELECT node_id, node_type, label, document_type, document_identifier,
+                parent_node_id, ordinal
+         FROM graph_nodes WHERE node_id = ?1",
+        params![node_id],
+        |row| {
+            Ok(json!({
+                "identifier": row.get::<_, String>(0)?,
+                "type": row.get::<_, String>(1)?,
+                "label": row.get::<_, String>(2)?,
+                "document": match (
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ) {
+                    (Some(document_type), Some(identifier)) => {
+                        Some(json!({"type": document_type, "identifier": identifier}))
+                    }
+                    _ => None,
+                },
+                "parent_identifier": row.get::<_, Option<String>>(5)?,
+                "ordinal": row.get::<_, Option<i64>>(6)?,
+            }))
+        },
+    )?;
+    if matches!(node["type"].as_str(), Some("passage" | "sentence")) {
+        node["label"] = json!(load_span_record(conn, node_id)?.text);
+    }
+    Ok(node)
+}
+
+fn validate_graph_edge_types(edge_types: &[String]) -> Result<BTreeSet<String>> {
+    const TYPES: [&str; 14] = [
+        "CONTAINS",
+        "NEXT",
+        "PREVIOUS",
+        "OCCURS_IN",
+        "LINKS_TO",
+        "CITES",
+        "REVISION_OF",
+        "CO_OCCURS",
+        "SUPPORTS",
+        "CONTRADICTS",
+        "REFINES",
+        "SUPERSEDES",
+        "CAUSES",
+        "DEPENDS_ON",
+    ];
+    let valid = TYPES.into_iter().collect::<BTreeSet<_>>();
+    let mut normalized = BTreeSet::new();
+    for edge_type in edge_types {
+        let edge_type = edge_type.trim().to_uppercase();
+        if !valid.contains(edge_type.as_str()) {
+            return Err(AppError::new(
+                "invalid_graph_edge_type",
+                format!("unsupported graph edge type {edge_type:?}"),
+            ));
+        }
+        normalized.insert(edge_type);
+    }
+    Ok(normalized)
+}
+
+fn load_adjacent_graph_edges(
+    conn: &Connection,
+    node_id: &str,
+    direction: &str,
+    edge_types: &BTreeSet<String>,
+    limit: usize,
+) -> Result<Vec<StoredGraphEdge>> {
+    let direction_clause = match direction {
+        "outgoing" => "from_node_id = ?1",
+        "incoming" => "to_node_id = ?1",
+        "both" => "(from_node_id = ?1 OR to_node_id = ?1)",
+        _ => {
+            return Err(AppError::new(
+                "invalid_graph_direction",
+                "graph direction must be outgoing, incoming, or both",
+            ));
+        }
+    };
+    let type_clause = if edge_types.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " AND edge_type IN ({})",
+            edge_types
+                .iter()
+                .map(|edge_type| format!("'{edge_type}'"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    let sql = format!(
+        "SELECT edge_id, edge_type, from_node_id, to_node_id,
+                weight, confidence, provenance, reason,
+                frequency, positions, first_position
+         FROM graph_edges
+         WHERE {direction_clause}{type_clause}
+         ORDER BY edge_type, from_node_id, to_node_id, edge_id
+         LIMIT ?2"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let mut edges = statement
+        .query_map(params![node_id, limit as i64], |row| {
+            Ok(StoredGraphEdge {
+                edge_id: row.get(0)?,
+                edge_type: row.get(1)?,
+                from: row.get(2)?,
+                to: row.get(3)?,
+                weight: row.get(4)?,
+                confidence: row.get(5)?,
+                provenance: row.get(6)?,
+                reason: row.get(7)?,
+                frequency: row.get::<_, Option<i64>>(8)?.map(|value| value as usize),
+                positions: row
+                    .get::<_, Option<Vec<u8>>>(9)?
+                    .map(|encoded| decode_positions(&encoded))
+                    .transpose()
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            9,
+                            rusqlite::types::Type::Blob,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("invalid graph positions: {error:?}"),
+                            )),
+                        )
+                    })?,
+                first_position: row.get::<_, Option<i64>>(10)?.map(|value| value as usize),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    edges.extend(load_derived_graph_edges(
+        conn, node_id, direction, edge_types, limit,
+    )?);
+    edges.sort_by(|left, right| {
+        (&left.edge_type, &left.from, &left.to, &left.edge_id).cmp(&(
+            &right.edge_type,
+            &right.from,
+            &right.to,
+            &right.edge_id,
+        ))
+    });
+    edges.dedup_by(|left, right| left.edge_id == right.edge_id);
+    edges.truncate(limit);
+    Ok(edges)
+}
+
+fn load_derived_graph_edges(
+    conn: &Connection,
+    node_id: &str,
+    direction: &str,
+    edge_types: &BTreeSet<String>,
+    limit: usize,
+) -> Result<Vec<StoredGraphEdge>> {
+    let includes = |edge_type: &str| edge_types.is_empty() || edge_types.contains(edge_type);
+    let accepts = |from: &str, to: &str| match direction {
+        "outgoing" => from == node_id,
+        "incoming" => to == node_id,
+        "both" => from == node_id || to == node_id,
+        _ => false,
+    };
+    let make = |edge_type: &'static str, from: &str, to: &str| StoredGraphEdge {
+        edge_id: automatic_edge(edge_type, from, to).edge_id,
+        edge_type: edge_type.to_string(),
+        from: from.to_string(),
+        to: to.to_string(),
+        weight: None,
+        confidence: None,
+        provenance: Some("automatic".to_string()),
+        reason: None,
+        frequency: None,
+        positions: None,
+        first_position: None,
+    };
+    let make_occurrence = |from: &str, to: &str, positions: Vec<Range<usize>>| StoredGraphEdge {
+        edge_id: automatic_edge("OCCURS_IN", from, to).edge_id,
+        edge_type: "OCCURS_IN".to_string(),
+        from: from.to_string(),
+        to: to.to_string(),
+        weight: None,
+        confidence: None,
+        provenance: Some("automatic".to_string()),
+        reason: None,
+        frequency: Some(positions.len()),
+        first_position: positions.first().map(|position| position.start),
+        positions: Some(positions),
+    };
+    let node = conn
+        .query_row(
+            "SELECT node_type, document_type, document_identifier,
+                    parent_node_id, ordinal, byte_start, byte_end
+             FROM graph_nodes WHERE node_id = ?1",
+            params![node_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((node_type, document_type, document_identifier, parent, ordinal, start, end)) = node
+    else {
+        return Ok(Vec::new());
+    };
+    let mut edges = Vec::new();
+    if includes("CONTAINS") {
+        if let Some(parent) = &parent
+            && accepts(parent, node_id)
+        {
+            edges.push(make("CONTAINS", parent, node_id));
+        }
+        let mut children = conn.prepare(
+            "SELECT node_id FROM graph_nodes
+             WHERE parent_node_id = ?1 ORDER BY ordinal, node_id LIMIT ?2",
+        )?;
+        for child in children.query_map(params![node_id, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })? {
+            let child = child?;
+            if accepts(node_id, &child) {
+                edges.push(make("CONTAINS", node_id, &child));
+            }
+        }
+    }
+    if matches!(node_type.as_str(), "passage" | "sentence")
+        && let (Some(parent), Some(ordinal)) = (&parent, ordinal)
+    {
+        for (edge_type, sibling_ordinal) in [
+            ("NEXT", ordinal + 1),
+            ("PREVIOUS", ordinal.saturating_sub(1)),
+        ] {
+            if !includes(edge_type) || (edge_type == "PREVIOUS" && ordinal == 0) {
+                continue;
+            }
+            if let Some(sibling) = conn
+                .query_row(
+                    "SELECT node_id FROM graph_nodes
+                         WHERE parent_node_id = ?1 AND node_type = ?2 AND ordinal = ?3",
+                    params![parent, &node_type, sibling_ordinal],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .filter(|sibling| accepts(node_id, sibling))
+            {
+                edges.push(make(edge_type, node_id, &sibling));
+            }
+        }
+        for (edge_type, sibling_ordinal) in [
+            ("NEXT", ordinal.saturating_sub(1)),
+            ("PREVIOUS", ordinal + 1),
+        ] {
+            if !includes(edge_type) || (edge_type == "NEXT" && ordinal == 0) {
+                continue;
+            }
+            if let Some(sibling) = conn
+                .query_row(
+                    "SELECT node_id FROM graph_nodes
+                         WHERE parent_node_id = ?1 AND node_type = ?2 AND ordinal = ?3",
+                    params![parent, &node_type, sibling_ordinal],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .filter(|sibling| accepts(sibling, node_id))
+            {
+                edges.push(make(edge_type, &sibling, node_id));
+            }
+        }
+    }
+    if includes("OCCURS_IN") {
+        if node_type == "term" {
+            let mut occurrences = conn.prepare(
+                "SELECT o.document_type, o.document_identifier, o.positions,
+                        s.document_node_id
+                 FROM graph_occurrences o
+                 JOIN document_index_state s
+                   ON s.document_type = o.document_type
+                  AND s.document_identifier = o.document_identifier
+                 WHERE o.term_node_id = ?1
+                 ORDER BY o.document_type, o.document_identifier",
+            )?;
+            for row in occurrences.query_map([node_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })? {
+                let (kind, identifier, encoded, document_node) = row?;
+                let positions = decode_positions(&encoded).map_err(position_encoding_error)?;
+                if accepts(node_id, &document_node) {
+                    edges.push(make_occurrence(node_id, &document_node, positions.clone()));
+                }
+                let mut spans = conn.prepare(
+                    "SELECT node_id, byte_start, byte_end FROM graph_nodes
+                     WHERE document_type = ?1 AND document_identifier = ?2
+                       AND node_type IN ('passage', 'sentence')
+                     ORDER BY node_type, ordinal, node_id",
+                )?;
+                for span in spans.query_map(params![kind, identifier], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? as usize,
+                        row.get::<_, i64>(2)? as usize,
+                    ))
+                })? {
+                    let (span_id, span_start, span_end) = span?;
+                    let span_positions = positions
+                        .iter()
+                        .filter(|position| position.start >= span_start && position.end <= span_end)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !span_positions.is_empty() && accepts(node_id, &span_id) {
+                        edges.push(make_occurrence(node_id, &span_id, span_positions));
+                    }
+                    if edges.len() >= limit {
+                        break;
+                    }
+                }
+                if edges.len() >= limit {
+                    break;
+                }
+            }
+        } else if let (Some(kind), Some(identifier)) = (document_type, document_identifier) {
+            let mut occurrences = conn.prepare(
+                "SELECT term_node_id, positions FROM graph_occurrences
+                 WHERE document_type = ?1 AND document_identifier = ?2
+                 ORDER BY term_node_id LIMIT ?3",
+            )?;
+            for row in occurrences.query_map(params![kind, identifier, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })? {
+                let (term, encoded) = row?;
+                let all_positions = decode_positions(&encoded).map_err(position_encoding_error)?;
+                let positions = match (start, end) {
+                    (Some(start), Some(end)) => all_positions
+                        .into_iter()
+                        .filter(|position| {
+                            position.start >= start as usize && position.end <= end as usize
+                        })
+                        .collect::<Vec<_>>(),
+                    _ => all_positions,
+                };
+                if !positions.is_empty() && accepts(&term, node_id) {
+                    edges.push(make_occurrence(&term, node_id, positions));
+                }
+            }
+        }
+    }
+    Ok(edges)
+}
+
+fn graph_edge_json(edge: &StoredGraphEdge) -> Value {
+    json!({
+        "identifier": edge.edge_id,
+        "type": edge.edge_type,
+        "from": edge.from,
+        "to": edge.to,
+        "weight": edge.weight,
+        "confidence": edge.confidence,
+        "provenance": edge.provenance,
+        "reason": edge.reason,
+        "frequency": edge.frequency,
+        "positions": edge.positions.as_ref().map(|positions| positions
+            .iter()
+            .map(|position| json!({"byte_start": position.start, "byte_end": position.end}))
+            .collect::<Vec<_>>()),
+        "first_position": edge.first_position,
+    })
+}
+
+fn traversed_neighbor<'a>(
+    edge: &'a StoredGraphEdge,
+    node: &str,
+    direction: &str,
+) -> Option<&'a str> {
+    match direction {
+        "outgoing" if edge.from == node => Some(&edge.to),
+        "incoming" if edge.to == node => Some(&edge.from),
+        "both" if edge.from == node => Some(&edge.to),
+        "both" if edge.to == node => Some(&edge.from),
+        _ => None,
+    }
+}
+
+fn graph_explore_value(
+    conn: &Connection,
+    scope: &str,
+    identifier: &str,
+    max_depth: usize,
+    limit: usize,
+    direction: &str,
+    requested_edge_types: &[String],
+) -> Result<Value> {
+    let start = resolve_graph_node(conn, identifier)?;
+    let edge_types = validate_graph_edge_types(requested_edge_types)?;
+    let mut queue = VecDeque::from([(start.clone(), 0usize)]);
+    let mut depths = BTreeMap::from([(start.clone(), 0usize)]);
+    let mut selected_edges = BTreeMap::new();
+    let mut truncated = false;
+    while let Some((node, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        let adjacent = load_adjacent_graph_edges(conn, &node, direction, &edge_types, 20_001)?;
+        if adjacent.len() > 20_000 {
+            truncated = true;
+        }
+        for edge in adjacent.into_iter().take(20_000) {
+            if selected_edges.len() >= 20_000 && !selected_edges.contains_key(&edge.edge_id) {
+                truncated = true;
+                continue;
+            }
+            let Some(neighbor) = traversed_neighbor(&edge, &node, direction) else {
+                continue;
+            };
+            let neighbor = neighbor.to_string();
+            selected_edges.insert(edge.edge_id.clone(), edge);
+            if depths.contains_key(&neighbor) {
+                continue;
+            }
+            if depths.len() >= limit {
+                truncated = true;
+                continue;
+            }
+            depths.insert(neighbor.clone(), depth + 1);
+            queue.push_back((neighbor, depth + 1));
+        }
+    }
+    let nodes = depths
+        .iter()
+        .map(|(node_id, depth)| {
+            let mut node = graph_node_json(conn, node_id)?;
+            node["depth"] = json!(depth);
+            Ok(node)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let selected = selected_edges
+        .values()
+        .map(graph_edge_json)
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "scope": scope,
+        "start": graph_node_json(conn, &start)?,
+        "nodes": nodes,
+        "edges": selected,
+        "diagnostics": {
+            "direction": direction,
+            "max_depth": max_depth,
+            "limit": limit,
+            "truncated": truncated,
+            "edge_limit": 20_000,
+            "frontier_remaining": queue.len(),
+            "edge_types": edge_types,
+        }
+    }))
+}
+
+fn graph_macro_explore_value(
+    conn: &Connection,
+    scope: &str,
+    depth: usize,
+    limit: usize,
+    edge_types: &[String],
+) -> Result<Value> {
+    let mut statement = conn.prepare(
+        "SELECT n.node_id, COUNT(DISTINCT e.edge_id) AS degree
+         FROM graph_nodes n
+         LEFT JOIN graph_edges e
+           ON e.from_node_id = n.node_id OR e.to_node_id = n.node_id
+         WHERE n.node_type IN ('document', 'term')
+         GROUP BY n.node_id
+         ORDER BY degree DESC, n.node_type, n.node_id
+         LIMIT ?1",
+    )?;
+    let representatives = statement
+        .query_map(params![limit.min(8) as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if representatives.is_empty() {
+        return Ok(json!({
+            "scope": scope,
+            "keyword_free": true,
+            "representatives": [],
+            "nodes": [],
+            "edges": [],
+            "diagnostics": {"truncated": false, "max_depth": depth, "limit": limit},
+        }));
+    }
+    let mut response = graph_explore_value(
+        conn,
+        scope,
+        &representatives[0].0,
+        depth,
+        limit,
+        "both",
+        edge_types,
+    )?;
+    response["keyword_free"] = json!(true);
+    response["representatives"] = Value::Array(
+        representatives
+            .iter()
+            .map(|(identifier, degree)| {
+                let mut node = graph_node_json(conn, identifier)?;
+                node["degree"] = json!(degree);
+                Ok(node)
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    Ok(response)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn graph_path_value(
+    conn: &Connection,
+    scope: &str,
+    from: &str,
+    to: &str,
+    max_depth: usize,
+    limit: usize,
+    direction: &str,
+    requested_edge_types: &[String],
+) -> Result<Value> {
+    let from = resolve_graph_node(conn, from)?;
+    let to = resolve_graph_node(conn, to)?;
+    let mut edge_types = validate_graph_edge_types(requested_edge_types)?;
+    if edge_types.is_empty() {
+        edge_types.extend(
+            [
+                "LINKS_TO",
+                "CITES",
+                "REVISION_OF",
+                "SUPPORTS",
+                "CONTRADICTS",
+                "REFINES",
+                "SUPERSEDES",
+                "CAUSES",
+                "DEPENDS_ON",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+    }
+    let mut queue = VecDeque::from([(from.clone(), 0usize)]);
+    let mut visited = BTreeSet::from([from.clone()]);
+    let mut previous: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut path_edge_records = BTreeMap::new();
+    let mut explored_edges = 0usize;
+    let mut truncated = false;
+    while let Some((node, depth)) = queue.pop_front() {
+        if node == to || depth >= max_depth {
+            continue;
+        }
+        let remaining = 20_000usize.saturating_sub(explored_edges);
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let adjacent = load_adjacent_graph_edges(
+            conn,
+            &node,
+            direction,
+            &edge_types,
+            remaining.saturating_add(1),
+        )?;
+        if adjacent.len() > remaining {
+            truncated = true;
+        }
+        for edge in adjacent.into_iter().take(remaining) {
+            explored_edges += 1;
+            let Some(neighbor) = traversed_neighbor(&edge, &node, direction) else {
+                continue;
+            };
+            let neighbor = neighbor.to_string();
+            if visited.contains(&neighbor) {
+                continue;
+            }
+            if visited.len() >= limit {
+                truncated = true;
+                continue;
+            }
+            visited.insert(neighbor.clone());
+            previous.insert(neighbor.clone(), (node.clone(), edge.edge_id.clone()));
+            path_edge_records.insert(edge.edge_id.clone(), edge);
+            queue.push_back((neighbor, depth + 1));
+        }
+    }
+    let found = visited.contains(&to);
+    let mut node_ids = Vec::new();
+    let mut edge_ids = Vec::new();
+    if found {
+        let mut current = to.clone();
+        node_ids.push(current.clone());
+        while current != from {
+            let (prior, edge_id) = previous.get(&current).ok_or_else(|| {
+                AppError::new("graph_path_failed", "path predecessor chain is incomplete")
+            })?;
+            edge_ids.push(edge_id.clone());
+            current = prior.clone();
+            node_ids.push(current.clone());
+        }
+        node_ids.reverse();
+        edge_ids.reverse();
+    }
+    let nodes = node_ids
+        .iter()
+        .map(|node_id| graph_node_json(conn, node_id))
+        .collect::<Result<Vec<_>>>()?;
+    let path_edges = edge_ids
+        .iter()
+        .map(|edge_id| {
+            path_edge_records
+                .get(edge_id)
+                .map(graph_edge_json)
+                .ok_or_else(|| AppError::new("graph_path_failed", "path edge was not found"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(json!({
+        "scope": scope,
+        "from": from,
+        "to": to,
+        "found": found,
+        "nodes": nodes,
+        "edges": path_edges,
+        "hop_count": edge_ids.len(),
+        "diagnostics": {
+            "direction": direction,
+            "max_depth": max_depth,
+            "limit": limit,
+            "truncated": truncated,
+            "visited_nodes": visited.len(),
+            "explored_edges": explored_edges,
+            "edge_limit": 20_000,
+            "frontier_remaining": queue.len(),
+            "edge_types": edge_types,
+        }
+    }))
+}
+
+fn graph_impact_value(
+    conn: &Connection,
+    scope: &str,
+    identifier: &str,
+    max_depth: usize,
+    limit: usize,
+) -> Result<Value> {
+    let start = resolve_graph_node(conn, identifier)?;
+    let impact_types = [
+        "DEPENDS_ON",
+        "CAUSES",
+        "SUPERSEDES",
+        "CITES",
+        "LINKS_TO",
+        "SUPPORTS",
+        "CONTRADICTS",
+        "REFINES",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<BTreeSet<_>>();
+    let mut queue = VecDeque::from([(start.clone(), 0usize, 1.0f64)]);
+    let mut visited = BTreeSet::from([start.clone()]);
+    let mut hard = Vec::new();
+    let mut review = Vec::new();
+    let mut explored_edges = 0usize;
+    let mut truncated = false;
+    while let Some((node, depth, parent_score)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        let remaining = 20_000usize.saturating_sub(explored_edges);
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let adjacent = load_adjacent_graph_edges(
+            conn,
+            &node,
+            "incoming",
+            &impact_types,
+            remaining.saturating_add(1),
+        )?;
+        if adjacent.len() > remaining {
+            truncated = true;
+        }
+        for edge in adjacent.into_iter().take(remaining) {
+            explored_edges += 1;
+            if visited.contains(&edge.from) {
+                continue;
+            }
+            if visited.len() >= limit {
+                truncated = true;
+                continue;
+            }
+            visited.insert(edge.from.clone());
+            let attenuation = match edge.edge_type.as_str() {
+                "DEPENDS_ON" | "SUPERSEDES" => 1.0,
+                "CAUSES" => 0.9,
+                "CONTRADICTS" => 0.8,
+                "SUPPORTS" => 0.75,
+                "REFINES" => 0.7,
+                "CITES" => 0.6,
+                "LINKS_TO" => 0.5,
+                _ => 0.0,
+            };
+            let score = parent_score * attenuation;
+            let mut affected = graph_node_json(conn, &edge.from)?;
+            affected["depth"] = json!(depth + 1);
+            affected["attenuation"] = json!(attenuation);
+            affected["score"] = json!(score);
+            affected["via"] = graph_edge_json(&edge);
+            if matches!(
+                edge.edge_type.as_str(),
+                "DEPENDS_ON" | "CAUSES" | "SUPERSEDES"
+            ) {
+                affected["classification"] = json!("hard");
+                hard.push(affected);
+            } else {
+                affected["classification"] = json!("review");
+                review.push(affected);
+            }
+            queue.push_back((edge.from.clone(), depth + 1, score));
+        }
+    }
+    Ok(json!({
+        "scope": scope,
+        "changed": graph_node_json(conn, &start)?,
+        "hard": hard,
+        "review": review,
+        "diagnostics": {
+            "max_depth": max_depth,
+            "limit": limit,
+            "truncated": truncated,
+            "explored_edges": explored_edges,
+            "edge_limit": 20_000,
+            "frontier_remaining": queue.len(),
+        }
+    }))
+}
+
+fn graph_overview_value(conn: &Connection, scope: &str, limit: usize) -> Result<Value> {
+    let mut node_statement = conn.prepare(
+        "SELECT node_type, COUNT(*) FROM graph_nodes GROUP BY node_type ORDER BY node_type",
+    )?;
+    let node_counts = node_statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+    let mut edge_statement = conn.prepare(
+        "SELECT edge_type, COUNT(*) FROM graph_edges GROUP BY edge_type ORDER BY edge_type",
+    )?;
+    let mut edge_counts = edge_statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+    edge_counts.insert(
+        "CONTAINS".to_string(),
+        conn.query_row(
+            "SELECT COUNT(*) FROM graph_nodes WHERE parent_node_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?,
+    );
+    let peer_edges: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM graph_nodes
+         WHERE node_type IN ('passage', 'sentence') AND ordinal > 0",
+        [],
+        |row| row.get(0),
+    )?;
+    edge_counts.insert("NEXT".to_string(), peer_edges);
+    edge_counts.insert("PREVIOUS".to_string(), peer_edges);
+    edge_counts.insert(
+        "OCCURS_IN".to_string(),
+        conn.query_row("SELECT COUNT(*) FROM graph_occurrences", [], |row| {
+            row.get(0)
+        })?,
+    );
+    let mut top_statement = conn.prepare(
+        "SELECT n.node_id, n.label, COUNT(*) AS occurrences
+         FROM graph_nodes n
+         JOIN graph_occurrences o ON o.term_node_id = n.node_id
+         WHERE n.node_type = 'term'
+         GROUP BY n.node_id, n.label
+         ORDER BY occurrences DESC, n.node_id ASC LIMIT ?1",
+    )?;
+    let top_terms = top_statement
+        .query_map(params![limit as i64], |row| {
+            Ok(json!({
+                "identifier": row.get::<_, String>(0)?,
+                "label": row.get::<_, String>(1)?,
+                "occurrence_edges": row.get::<_, i64>(2)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut hub_statement = conn.prepare(
+        "SELECT n.node_id, n.node_type, n.label, COUNT(DISTINCT e.edge_id) AS degree
+         FROM graph_nodes n
+         JOIN graph_edges e ON e.from_node_id = n.node_id OR e.to_node_id = n.node_id
+         GROUP BY n.node_id, n.node_type, n.label
+         ORDER BY degree DESC, n.node_id LIMIT ?1",
+    )?;
+    let hubs = hub_statement
+        .query_map(params![limit as i64], |row| {
+            Ok(json!({
+                "identifier": row.get::<_, String>(0)?,
+                "type": row.get::<_, String>(1)?,
+                "label": row.get::<_, String>(2)?,
+                "degree": row.get::<_, i64>(3)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut orphan_statement = conn.prepare(
+        "SELECT n.node_id, n.label FROM graph_nodes n
+         WHERE n.node_type = 'document'
+           AND NOT EXISTS (
+               SELECT 1 FROM graph_edges e
+               WHERE (e.from_node_id = n.node_id OR e.to_node_id = n.node_id)
+                 AND e.edge_type IN (
+                    'LINKS_TO', 'CITES', 'REVISION_OF', 'SUPPORTS', 'CONTRADICTS',
+                    'REFINES', 'SUPERSEDES', 'CAUSES', 'DEPENDS_ON'
+                 )
+           )
+         ORDER BY n.node_id LIMIT ?1",
+    )?;
+    let orphans = orphan_statement
+        .query_map(params![limit as i64], |row| {
+            Ok(json!({
+                "identifier": row.get::<_, String>(0)?,
+                "label": row.get::<_, String>(1)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let component_count: i64 = conn.query_row(
+        "WITH RECURSIVE
+         docs(id) AS (SELECT node_id FROM graph_nodes WHERE node_type = 'document'),
+         adjacency(a, b) AS (
+            SELECT from_node_id, to_node_id FROM graph_edges
+            WHERE edge_type IN (
+                'LINKS_TO', 'CITES', 'REVISION_OF', 'SUPPORTS', 'CONTRADICTS',
+                'REFINES', 'SUPERSEDES', 'CAUSES', 'DEPENDS_ON'
+            )
+            UNION
+            SELECT to_node_id, from_node_id FROM graph_edges
+            WHERE edge_type IN (
+                'LINKS_TO', 'CITES', 'REVISION_OF', 'SUPPORTS', 'CONTRADICTS',
+                'REFINES', 'SUPERSEDES', 'CAUSES', 'DEPENDS_ON'
+            )
+         ),
+         reach(root, node) AS (
+            SELECT id, id FROM docs
+            UNION
+            SELECT reach.root, adjacency.b
+            FROM reach JOIN adjacency ON adjacency.a = reach.node
+         ),
+         assigned(node, component) AS (
+            SELECT node, MIN(root) FROM reach GROUP BY node
+         )
+         SELECT COUNT(DISTINCT component) FROM assigned",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut bridge_statement = conn.prepare(
+        "SELECT e.edge_id, e.edge_type, e.from_node_id, e.to_node_id,
+                (SELECT COUNT(*) FROM graph_edges x
+                 WHERE x.from_node_id = e.from_node_id OR x.to_node_id = e.from_node_id)
+              + (SELECT COUNT(*) FROM graph_edges x
+                 WHERE x.from_node_id = e.to_node_id OR x.to_node_id = e.to_node_id) AS score
+         FROM graph_edges e
+         WHERE e.edge_type IN (
+            'LINKS_TO', 'CITES', 'REVISION_OF', 'SUPPORTS', 'CONTRADICTS',
+            'REFINES', 'SUPERSEDES', 'CAUSES', 'DEPENDS_ON'
+         )
+         ORDER BY score DESC, e.edge_id LIMIT ?1",
+    )?;
+    let bridge_candidates = bridge_statement
+        .query_map(params![limit as i64], |row| {
+            Ok(json!({
+                "identifier": row.get::<_, String>(0)?,
+                "type": row.get::<_, String>(1)?,
+                "from": row.get::<_, String>(2)?,
+                "to": row.get::<_, String>(3)?,
+                "connectivity_score": row.get::<_, i64>(4)?,
+                "heuristic": true,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut recent_statement = conn.prepare(
+        "SELECT generation, action, entity_type, entity_id, created_at
+         FROM graph_deltas ORDER BY id DESC LIMIT ?1",
+    )?;
+    let recent_changes = recent_statement
+        .query_map(params![limit as i64], |row| {
+            Ok(json!({
+                "generation": row.get::<_, i64>(0)?,
+                "action": row.get::<_, String>(1)?,
+                "entity_type": row.get::<_, String>(2)?,
+                "identifier": row.get::<_, String>(3)?,
+                "created_at": row.get::<_, String>(4)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let projection = conn.query_row(
+        "SELECT engine, canonical_generation, projected_generation, status, updated_at
+         FROM graph_projection_state WHERE projection = 'physical'",
+        [],
+        |row| {
+            Ok(json!({
+                "engine": row.get::<_, String>(0)?,
+                "canonical_generation": row.get::<_, i64>(1)?,
+                "projected_generation": row.get::<_, i64>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "updated_at": row.get::<_, String>(4)?,
+            }))
+        },
+    )?;
+    let cooccurrence_truncated: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(cooccurrence_truncated), 0) FROM document_index_state",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(json!({
+        "scope": scope,
+        "node_counts": node_counts,
+        "edge_counts": edge_counts,
+        "top_terms": top_terms,
+        "hubs": hubs,
+        "orphans": orphans,
+        "component_count": component_count,
+        "bridge_candidates": bridge_candidates,
+        "recent_changes": recent_changes,
+        "cooccurrence_truncated": cooccurrence_truncated,
+        "projection": projection,
+    }))
+}
+
+fn graph_lint_issues(conn: &Connection) -> Result<Vec<LintIssue>> {
+    let mut issues = Vec::new();
+    let mut missing_statement = conn.prepare(
+        "SELECT d.document_type, d.identifier FROM (
+            SELECT 'page' AS document_type, slug AS identifier FROM pages
+            UNION ALL SELECT 'source', CAST(id AS TEXT) FROM sources
+         ) d
+         WHERE NOT EXISTS (
+            SELECT 1 FROM document_index_state s
+            WHERE s.document_type = d.document_type
+              AND s.document_identifier = d.identifier
+         ) ORDER BY d.document_type, d.identifier",
+    )?;
+    for row in missing_statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (document_type, identifier) = row?;
+        issues.push(LintIssue {
+            code: "graph_document_index_missing".to_string(),
+            page: (document_type == "page").then_some(identifier.clone()),
+            target: Some(format!("{document_type}:{identifier}")),
+            message: "canonical document is missing its hierarchy index".to_string(),
+        });
+    }
+    let span_nodes: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM graph_nodes WHERE node_type IN ('passage', 'sentence')",
+        [],
+        |row| row.get(0),
+    )?;
+    let span_rows: i64 = conn.query_row("SELECT COUNT(*) FROM span_fts", [], |row| row.get(0))?;
+    if span_nodes != span_rows {
+        issues.push(LintIssue {
+            code: "span_index_mismatch".to_string(),
+            page: None,
+            target: Some(format!("nodes:{span_nodes}/fts:{span_rows}")),
+            message: "span FTS rows do not match canonical span nodes".to_string(),
+        });
+    }
+    let mut truncated_statement = conn.prepare(
+        "SELECT document_type, document_identifier, cooccurrence_truncated
+         FROM document_index_state WHERE cooccurrence_truncated > 0
+         ORDER BY document_type, document_identifier",
+    )?;
+    for row in truncated_statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })? {
+        let (document_type, identifier, count) = row?;
+        issues.push(LintIssue {
+            code: "cooccurrence_truncated".to_string(),
+            page: (document_type == "page").then_some(identifier.clone()),
+            target: Some(format!("{document_type}:{identifier}")),
+            message: format!("{count} sentence co-occurrence windows were truncated"),
+        });
+    }
+    let mut degree_statement = conn.prepare(
+        "SELECT from_node_id, COUNT(*) FROM graph_edges
+         WHERE edge_type = 'CO_OCCURS'
+         GROUP BY from_node_id HAVING COUNT(*) > 32
+         ORDER BY from_node_id",
+    )?;
+    for row in degree_statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })? {
+        let (identifier, count) = row?;
+        issues.push(LintIssue {
+            code: "cooccurrence_degree_exceeded".to_string(),
+            page: None,
+            target: Some(identifier),
+            message: format!("term has {count} outgoing co-occurrence edges; maximum is 32"),
+        });
+    }
+    let projection: (String, i64, i64) = conn.query_row(
+        "SELECT status, canonical_generation, projected_generation
+         FROM graph_projection_state WHERE projection = 'physical'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if projection.0 == "stale" || projection.0 == "pending" || projection.1 != projection.2 {
+        issues.push(LintIssue {
+            code: "graph_projection_stale".to_string(),
+            page: None,
+            target: Some(format!("{}:{}", projection.1, projection.2)),
+            message: "physical graph projection is not current".to_string(),
+        });
+    }
+    if let Some((generation, expected)) = conn
+        .query_row(
+            "SELECT generation, canonical_digest FROM graph_generations
+             ORDER BY generation DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        let actual = database_graph_digest(conn)?;
+        issues.extend((actual != expected).then(|| LintIssue {
+            code: "graph_digest_mismatch".to_string(),
+            page: None,
+            target: Some(generation.to_string()),
+            message: "latest generation digest does not match canonical graph".to_string(),
+        }));
+    }
+    Ok(issues)
+}
+
+fn graph_status_value(conn: &Connection, scope: &str, database: &Path) -> Result<Value> {
+    let mut projection = conn.query_row(
+        "SELECT engine, schema_version, canonical_generation, projected_generation,
+                status, last_error_code, last_error_message, updated_at
+         FROM graph_projection_state WHERE projection = 'physical'",
+        [],
+        |row| {
+            Ok(json!({
+                "engine": row.get::<_, String>(0)?,
+                "schema_version": row.get::<_, i64>(1)?,
+                "canonical_generation": row.get::<_, i64>(2)?,
+                "projected_generation": row.get::<_, i64>(3)?,
+                "status": row.get::<_, String>(4)?,
+                "last_error_code": row.get::<_, Option<String>>(5)?,
+                "last_error_message": row.get::<_, Option<String>>(6)?,
+                "updated_at": row.get::<_, String>(7)?,
+            }))
+        },
+    )?;
+    let projected_generation = projection["projected_generation"].as_i64().unwrap_or(0);
+    projection["projected_digest"] = if projected_generation == 0 {
+        Value::Null
+    } else {
+        conn.query_row(
+            "SELECT canonical_digest FROM graph_generations WHERE generation = ?1",
+            [projected_generation],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(Value::String)
+        .unwrap_or(Value::Null)
+    };
+    let counts = json!({
+        "nodes": conn.query_row("SELECT COUNT(*) FROM graph_nodes", [], |row| row.get::<_, i64>(0))?,
+        "edges": conn.query_row("SELECT COUNT(*) FROM graph_edges", [], |row| row.get::<_, i64>(0))?,
+        "stored_edges": conn.query_row("SELECT COUNT(*) FROM graph_edges", [], |row| row.get::<_, i64>(0))?,
+        "occurrence_postings": conn.query_row("SELECT COUNT(*) FROM graph_occurrences", [], |row| row.get::<_, i64>(0))?,
+        "documents": conn.query_row("SELECT COUNT(*) FROM document_index_state", [], |row| row.get::<_, i64>(0))?,
+        "generations": conn.query_row("SELECT COUNT(*) FROM graph_generations", [], |row| row.get::<_, i64>(0))?,
+        "deltas": conn.query_row("SELECT COUNT(*) FROM graph_deltas", [], |row| row.get::<_, i64>(0))?,
+        "cooccurrence_truncated": conn.query_row("SELECT COALESCE(SUM(cooccurrence_truncated), 0) FROM document_index_state", [], |row| row.get::<_, i64>(0))?,
+    });
+    let mut node_statement = conn.prepare(
+        "SELECT node_type, COUNT(*) FROM graph_nodes GROUP BY node_type ORDER BY node_type",
+    )?;
+    let node_counts = node_statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+    let mut edge_statement = conn.prepare(
+        "SELECT edge_type, COUNT(*) FROM graph_edges GROUP BY edge_type ORDER BY edge_type",
+    )?;
+    let edge_counts = edge_statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+    let generation = conn
+        .query_row(
+            "SELECT generation, canonical_digest FROM graph_generations
+             ORDER BY generation DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let generation_range = conn.query_row(
+        "SELECT MIN(generation), MAX(generation) FROM graph_generations",
+        [],
+        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+    )?;
+    let delta_range = conn.query_row(
+        "SELECT MIN(generation), MAX(generation) FROM graph_deltas",
+        [],
+        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+    )?;
+    let effective_config = config::resolve(scope, database)?;
+    let retained_sidecars = database
+        .parent()
+        .and_then(|parent| fs::read_dir(parent).ok())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("graph-graphqlite-g") && name.ends_with(".db"))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let projection_status = projection["status"].as_str().unwrap_or("stale").to_string();
+    let resume_available = matches!(projection_status.as_str(), "stale" | "pending");
+    Ok(json!({
+        "scope": scope,
+        "database": database,
+        "format_version": USER_VERSION,
+        "segmenter_version": crate::segment::SEGMENTER_VERSION,
+        "config": effective_config,
+        "projection": projection,
+        "canonical": {
+            "generation": generation.as_ref().map(|value| value.0).unwrap_or(0),
+            "digest": generation.as_ref().map(|value| value.1.clone()).unwrap_or_else(|| database_graph_digest(conn).unwrap_or_default()),
+            "generation_range": {"first": generation_range.0, "last": generation_range.1},
+            "delta_generation_range": {"first": delta_range.0, "last": delta_range.1},
+        },
+        "counts": counts,
+        "node_counts": node_counts,
+        "edge_counts": edge_counts,
+        "resume_available": resume_available,
+        "rebuild_required": projection_status == "stale",
+        "recovery_command": "lwc config set --engine graphqlite",
+        "retained_sidecars": retained_sidecars,
+        "sidecar_cleanup": "manual-review-required",
+    }))
+}
+
+fn graph_verify_value(conn: &Connection, scope: &str, database: &Path) -> Result<Value> {
+    let mut issues = Vec::new();
+    let foreign_key_issues: i64 =
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_key_issues > 0 {
+        issues.push(json!({"code": "graph_foreign_key_violation", "count": foreign_key_issues}));
+    }
+    let missing_documents: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM (
+            SELECT 'page' AS document_type, slug AS identifier FROM pages
+            UNION ALL SELECT 'source', CAST(id AS TEXT) FROM sources
+         ) d
+         WHERE NOT EXISTS (
+            SELECT 1 FROM document_index_state s
+            WHERE s.document_type = d.document_type
+              AND s.document_identifier = d.identifier
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if missing_documents > 0 {
+        issues.push(json!({"code": "graph_document_index_missing", "count": missing_documents}));
+    }
+    let span_index_mismatch: i64 = conn.query_row(
+        "SELECT ABS(
+            (SELECT COUNT(*) FROM graph_nodes WHERE node_type IN ('passage', 'sentence'))
+            - (SELECT COUNT(*) FROM span_fts)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if span_index_mismatch > 0 {
+        issues.push(json!({"code": "span_index_mismatch", "count": span_index_mismatch}));
+    }
+    let cooccurrence_overflow: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM (
+            SELECT from_node_id FROM graph_edges
+            WHERE edge_type = 'CO_OCCURS'
+            GROUP BY from_node_id HAVING COUNT(*) > 32
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if cooccurrence_overflow > 0 {
+        issues
+            .push(json!({"code": "cooccurrence_degree_exceeded", "count": cooccurrence_overflow}));
+    }
+    let hierarchy_errors: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM graph_nodes n
+         LEFT JOIN graph_nodes parent ON parent.node_id = n.parent_node_id
+         LEFT JOIN document_index_state state
+           ON state.document_type = n.document_type
+          AND state.document_identifier = n.document_identifier
+         LEFT JOIN pages p
+           ON n.document_type = 'page' AND p.slug = n.document_identifier
+         LEFT JOIN sources s
+           ON n.document_type = 'source' AND CAST(s.id AS TEXT) = n.document_identifier
+         WHERE n.node_type IN ('passage', 'sentence')
+           AND (
+             parent.node_id IS NULL
+             OR (n.node_type = 'passage' AND parent.node_type <> 'document')
+             OR (n.node_type = 'sentence' AND parent.node_type <> 'passage')
+             OR n.content_fingerprint <> state.content_fingerprint
+             OR n.segmenter_version <> state.segmenter_version
+             OR n.byte_start < 0 OR n.byte_end <= n.byte_start
+             OR n.byte_end > CASE n.document_type
+                 WHEN 'page' THEN LENGTH(CAST(p.body AS BLOB))
+                 ELSE LENGTH(CAST(s.content AS BLOB)) END
+           )",
+        [],
+        |row| row.get(0),
+    )?;
+    if hierarchy_errors > 0 {
+        issues.push(json!({"code": "hierarchy_invariant_violation", "count": hierarchy_errors}));
+    }
+    let mut occurrence_statement = conn.prepare(
+        "SELECT term_node_id || ':' || document_type || ':' || document_identifier,
+                frequency, positions, first_position
+         FROM graph_occurrences
+         ORDER BY term_node_id, document_type, document_identifier",
+    )?;
+    let occurrences = occurrence_statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let occurrence_errors = occurrences
+        .iter()
+        .filter(|(_, frequency, encoded, first)| {
+            decode_positions(encoded).map_or(true, |positions| {
+                positions.len() != *frequency as usize
+                    || positions.first().map(|range| range.start as i64) != Some(*first)
+            })
+        })
+        .count();
+    if occurrence_errors > 0 {
+        issues.push(json!({"code": "occurrence_position_invalid", "count": occurrence_errors}));
+    }
+    let (contribution_errors, contribution_aggregate) = {
+        let mut statement = conn.prepare(
+            "SELECT contributions FROM term_pair_contributions
+             ORDER BY document_type, document_identifier",
+        )?;
+        let encoded = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut errors = 0usize;
+        let mut aggregate: BTreeMap<(String, String), (f64, usize)> = BTreeMap::new();
+        for encoded in encoded {
+            match decode_term_pair_contributions(&encoded) {
+                Ok(contributions) => {
+                    for contribution in contributions {
+                        let total = aggregate
+                            .entry((contribution.from_term_id, contribution.to_term_id))
+                            .or_default();
+                        total.0 += contribution.sentence_weight + contribution.passage_weight;
+                        total.1 += contribution.witness_count;
+                    }
+                }
+                Err(_) => errors += 1,
+            }
+        }
+        (errors, aggregate)
+    };
+    if contribution_errors > 0 {
+        issues.push(json!({
+            "code": "cooccurrence_contribution_invalid",
+            "count": contribution_errors,
+        }));
+    } else {
+        let totals = {
+            let mut statement = conn.prepare(
+                "SELECT from_term_id, to_term_id, raw_strength, witness_count
+                 FROM term_pair_totals ORDER BY from_term_id, to_term_id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                        (row.get::<_, f64>(2)?, row.get::<_, i64>(3)? as usize),
+                    ))
+                })?
+                .collect::<rusqlite::Result<BTreeMap<_, _>>>()?
+        };
+        let totals_match = contribution_aggregate.len() == totals.len()
+            && contribution_aggregate.iter().all(|(pair, expected)| {
+                totals.get(pair).is_some_and(|actual| {
+                    (expected.0 - actual.0).abs() <= 1e-9 && expected.1 == actual.1
+                })
+            });
+        if !totals_match {
+            issues.push(json!({"code": "cooccurrence_totals_mismatch", "count": 1}));
+        } else {
+            let contributions = totals
+                .iter()
+                .map(|((from, to), (strength, witnesses))| TermPairContribution {
+                    from_term_id: from.clone(),
+                    to_term_id: to.clone(),
+                    sentence_weight: *strength,
+                    passage_weight: 0.0,
+                    witness_count: *witnesses,
+                })
+                .collect::<Vec<_>>();
+            let expected = rank_cooccurrence(&contributions, 32)
+                .into_iter()
+                .map(|edge| {
+                    (
+                        (edge.from_term_id, edge.to_term_id),
+                        (
+                            persisted_cooccurrence_weight(edge.normalized_strength),
+                            edge.rank,
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let actual = {
+                let mut statement = conn.prepare(
+                    "SELECT from_node_id, to_node_id, weight,
+                            CAST(json_extract(properties_json, '$.rank') AS INTEGER)
+                     FROM graph_edges WHERE edge_type = 'CO_OCCURS'
+                     ORDER BY from_node_id, to_node_id",
+                )?;
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                            (row.get::<_, f64>(2)?, row.get::<_, i64>(3)? as usize),
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<BTreeMap<_, _>>>()?
+            };
+            if expected != actual {
+                issues.push(json!({
+                    "code": "cooccurrence_projection_mismatch",
+                    "count": 1,
+                    "expected_edges": expected.len(),
+                    "actual_edges": actual.len(),
+                    "missing": expected.keys().filter(|key| !actual.contains_key(*key)).count(),
+                    "unexpected": actual.keys().filter(|key| !expected.contains_key(*key)).count(),
+                    "value_mismatches": expected.iter().filter(|(key, value)| {
+                        actual.get(*key).is_some_and(|actual| actual != *value)
+                    }).count(),
+                }));
+            }
+        }
+    }
+    let automatic_owner_errors: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM graph_edges
+         WHERE edge_type IN (
+            'CONTAINS', 'NEXT', 'PREVIOUS', 'OCCURS_IN', 'LINKS_TO', 'CITES',
+            'REVISION_OF', 'CO_OCCURS'
+         ) AND (owner_type = 'manual' OR provenance <> 'automatic')",
+        [],
+        |row| row.get(0),
+    )?;
+    if automatic_owner_errors > 0 {
+        issues
+            .push(json!({"code": "automatic_edge_owner_invalid", "count": automatic_owner_errors}));
+    }
+    let semantic_errors: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM graph_edges
+         WHERE edge_type IN (
+            'SUPPORTS', 'CONTRADICTS', 'REFINES', 'SUPERSEDES', 'CAUSES', 'DEPENDS_ON'
+         ) AND (
+            owner_type <> 'manual' OR provenance IS NULL OR provenance = 'automatic'
+            OR TRIM(COALESCE(reason, '')) = '' OR confidence IS NULL
+            OR (provenance = 'source-grounded' AND (
+                json_array_length(COALESCE(json_extract(properties_json, '$.source_ids'), '[]')) = 0
+                OR EXISTS (
+                    SELECT 1 FROM json_each(properties_json, '$.source_ids') ids
+                    WHERE NOT EXISTS (SELECT 1 FROM sources s WHERE s.id = ids.value)
+                )
+            ))
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if semantic_errors > 0 {
+        issues.push(json!({"code": "semantic_relation_invalid", "count": semantic_errors}));
+    }
+    let orphan_deltas: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM graph_deltas d
+         WHERE NOT EXISTS (
+            SELECT 1 FROM graph_generations g WHERE g.generation = d.generation
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if orphan_deltas > 0 {
+        issues.push(json!({"code": "graph_delta_generation_missing", "count": orphan_deltas}));
+    }
+    let latest = conn
+        .query_row(
+            "SELECT generation, canonical_digest FROM graph_generations
+         ORDER BY generation DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    if let Some((generation, expected)) = latest {
+        let actual = database_graph_digest(conn)?;
+        if actual != expected {
+            issues.push(json!({
+                "code": "graph_digest_mismatch",
+                "generation": generation,
+                "expected": expected,
+                "actual": actual,
+            }));
+        }
+    }
+    if let Err(error) = ensure_graph_projection_fresh(conn, database) {
+        issues.push(json!({"code": error.code, "details": error.details}));
+    }
+    Ok(json!({
+        "scope": scope,
+        "valid": issues.is_empty(),
+        "issues": issues,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn graph_relation_set_value(
+    conn: &mut Connection,
+    scope: &str,
+    from: &str,
+    relation_type: &str,
+    to: &str,
+    provenance: &str,
+    reason: &str,
+    confidence: f64,
+    source_ids: &[i64],
+) -> Result<Value> {
+    const SEMANTIC_TYPES: [&str; 6] = [
+        "SUPPORTS",
+        "CONTRADICTS",
+        "REFINES",
+        "SUPERSEDES",
+        "CAUSES",
+        "DEPENDS_ON",
+    ];
+    const PROVENANCE: [&str; 4] = [
+        "source-grounded",
+        "user-provided",
+        "agent-observed",
+        "hypothesis",
+    ];
+    let relation_type = relation_type.trim().to_uppercase();
+    let provenance = provenance.trim().to_lowercase();
+    let reason = reason.trim();
+    if !SEMANTIC_TYPES.contains(&relation_type.as_str()) {
+        return Err(AppError::new(
+            "invalid_semantic_relation",
+            "semantic relation must be SUPPORTS, CONTRADICTS, REFINES, SUPERSEDES, CAUSES, or DEPENDS_ON",
+        ));
+    }
+    if !PROVENANCE.contains(&provenance.as_str()) {
+        return Err(AppError::new(
+            "invalid_provenance",
+            "semantic relation provenance is not supported",
+        ));
+    }
+    if reason.is_empty() {
+        return Err(AppError::new(
+            "invalid_input",
+            "semantic relation reason cannot be empty",
+        ));
+    }
+    let source_ids = dedupe_i64(source_ids.to_vec());
+    if provenance == "source-grounded" && source_ids.is_empty() {
+        return Err(AppError::new(
+            "invalid_semantic_relation",
+            "source-grounded semantic relations require at least one --source",
+        ));
+    }
+    if !(0.0..=1.0).contains(&confidence) || !confidence.is_finite() {
+        return Err(AppError::new(
+            "invalid_confidence",
+            "confidence must be a finite value between 0 and 1",
+        ));
+    }
+    let from = resolve_graph_node(conn, from)?;
+    let to = resolve_graph_node(conn, to)?;
+    if from == to {
+        return Err(AppError::new(
+            "invalid_semantic_relation",
+            "semantic relation endpoints must be different",
+        ));
+    }
+    let edge_id = format!(
+        "edge:{}",
+        hash_content(&format!("manual\0{relation_type}\0{from}\0{to}"))
+    );
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_sources(&tx, &source_ids)?;
+    let before_json = tx
+        .query_row(
+            "SELECT json_object(
+                'identifier', edge_id, 'type', edge_type, 'from', from_node_id,
+                'to', to_node_id, 'confidence', confidence,
+                'provenance', provenance, 'reason', reason,
+                'source_ids', json(json_extract(properties_json, '$.source_ids'))
+             ) FROM graph_edges WHERE edge_id = ?1",
+            params![&edge_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    tx.execute(
+        &format!(
+            "INSERT INTO graph_edges(
+                edge_id, edge_type, from_node_id, to_node_id,
+                owner_type, owner_identifier, confidence, provenance, reason,
+                properties_json, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 'manual', ?1, ?5, ?6, ?7, ?8,
+                       {TIMESTAMP_SQL}, {TIMESTAMP_SQL})
+             ON CONFLICT(edge_id) DO UPDATE SET
+                confidence = excluded.confidence,
+                provenance = excluded.provenance,
+                reason = excluded.reason,
+                properties_json = excluded.properties_json,
+                updated_at = excluded.updated_at"
+        ),
+        params![
+            &edge_id,
+            &relation_type,
+            &from,
+            &to,
+            confidence,
+            &provenance,
+            reason,
+            json!({"source_ids": source_ids}).to_string(),
+        ],
+    )?;
+    let after_json = json!({
+        "identifier": edge_id,
+        "type": relation_type,
+        "from": from,
+        "to": to,
+        "confidence": confidence,
+        "provenance": provenance,
+        "reason": reason,
+        "source_ids": source_ids,
+    })
+    .to_string();
+    let store_revision = record_operation(
+        &tx,
+        "graph_relation_set",
+        &edge_id,
+        &serde_json::from_str(&after_json).unwrap_or(Value::Null),
+    )?;
+    let generation: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(generation), 0) + 1 FROM graph_generations",
+        [],
+        |row| row.get(0),
+    )?;
+    let digest = database_graph_digest(&tx)?;
+    tx.execute(
+        &format!(
+            "INSERT INTO graph_generations(
+                generation, store_revision, canonical_digest,
+                changed_document_count, created_at
+             ) VALUES (?1, ?2, ?3, 0, {TIMESTAMP_SQL})"
+        ),
+        params![generation, store_revision, digest],
+    )?;
+    tx.execute(
+        &format!(
+            "INSERT INTO graph_deltas(
+                generation, action, entity_type, entity_id,
+                before_json, after_json, created_at
+             ) VALUES (?1, ?2, 'edge', ?3, ?4, ?5, {TIMESTAMP_SQL})"
+        ),
+        params![
+            generation,
+            if before_json.is_some() {
+                "update"
+            } else {
+                "add"
+            },
+            &edge_id,
+            before_json,
+            &after_json,
+        ],
+    )?;
+    tx.execute(
+        &format!(
+            "UPDATE graph_projection_state
+             SET canonical_generation = ?1,
+                 projected_generation = CASE
+                     WHEN engine = 'rslg' THEN ?1 ELSE projected_generation END,
+                 status = CASE WHEN engine = 'rslg' THEN 'fresh' ELSE 'pending' END,
+                 updated_at = {TIMESTAMP_SQL}
+             WHERE projection = 'physical'"
+        ),
+        params![generation],
+    )?;
+    tx.commit()?;
+    Ok(json!({
+        "scope": scope,
+        "relation": serde_json::from_str::<Value>(&after_json)
+            .unwrap_or(Value::Null),
+        "generation": generation,
+    }))
+}
+
+fn graph_relation_list_value(
+    conn: &Connection,
+    scope: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+    relation_type: Option<&str>,
+    limit: usize,
+) -> Result<Value> {
+    let from = from
+        .map(|value| resolve_graph_node(conn, value))
+        .transpose()?;
+    let to = to
+        .map(|value| resolve_graph_node(conn, value))
+        .transpose()?;
+    let relation_type = relation_type.map(|value| value.trim().to_uppercase());
+    if relation_type.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "SUPPORTS" | "CONTRADICTS" | "REFINES" | "SUPERSEDES" | "CAUSES" | "DEPENDS_ON"
+        )
+    }) {
+        return Err(AppError::new(
+            "invalid_semantic_relation",
+            "semantic relation type is not supported",
+        ));
+    }
+    let mut statement = conn.prepare(
+        "SELECT edge_id, edge_type, from_node_id, to_node_id,
+                confidence, provenance, reason, properties_json
+         FROM graph_edges
+         WHERE owner_type = 'manual'
+           AND (?1 IS NULL OR from_node_id = ?1)
+           AND (?2 IS NULL OR to_node_id = ?2)
+           AND (?3 IS NULL OR edge_type = ?3)
+         ORDER BY edge_type, from_node_id, to_node_id, edge_id
+         LIMIT ?4",
+    )?;
+    let rows = statement
+        .query_map(params![from, to, relation_type, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let relations = rows
+        .into_iter()
+        .map(
+            |(identifier, relation_type, from, to, confidence, provenance, reason, properties)| {
+                let properties = serde_json::from_str::<Value>(&properties).unwrap_or(Value::Null);
+                json!({
+                    "identifier": identifier,
+                    "type": relation_type,
+                    "from": from,
+                    "to": to,
+                    "confidence": confidence,
+                    "provenance": provenance,
+                    "reason": reason,
+                    "source_ids": properties.get("source_ids").cloned().unwrap_or(json!([])),
+                })
+            },
+        )
+        .collect::<Vec<_>>();
+    Ok(json!({"scope": scope, "relations": relations, "limit": limit}))
+}
+
+fn graph_relation_retract_value(
+    conn: &mut Connection,
+    scope: &str,
+    from: &str,
+    relation_type: &str,
+    to: &str,
+    reason: &str,
+) -> Result<Value> {
+    let relation_type = relation_type.trim().to_uppercase();
+    if !matches!(
+        relation_type.as_str(),
+        "SUPPORTS" | "CONTRADICTS" | "REFINES" | "SUPERSEDES" | "CAUSES" | "DEPENDS_ON"
+    ) {
+        return Err(AppError::new(
+            "invalid_semantic_relation",
+            "only explicit semantic relations can be retracted",
+        ));
+    }
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(AppError::new(
+            "invalid_input",
+            "semantic relation retraction reason cannot be empty",
+        ));
+    }
+    let from = resolve_graph_node(conn, from)?;
+    let to = resolve_graph_node(conn, to)?;
+    let edge_id = format!(
+        "edge:{}",
+        hash_content(&format!("manual\0{relation_type}\0{from}\0{to}"))
+    );
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let before_json = tx
+        .query_row(
+            "SELECT json_object(
+                'identifier', edge_id, 'type', edge_type, 'from', from_node_id,
+                'to', to_node_id, 'confidence', confidence,
+                'provenance', provenance, 'reason', reason,
+                'source_ids', json(json_extract(properties_json, '$.source_ids'))
+             ) FROM graph_edges
+             WHERE edge_id = ?1 AND owner_type = 'manual'",
+            params![&edge_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            AppError::new(
+                "semantic_relation_not_found",
+                "explicit semantic relation was not found",
+            )
+        })?;
+    tx.execute(
+        "DELETE FROM graph_edges WHERE edge_id = ?1 AND owner_type = 'manual'",
+        params![&edge_id],
+    )?;
+    let store_revision = record_operation(
+        &tx,
+        "graph_relation_retract",
+        &edge_id,
+        &json!({"reason": reason}),
+    )?;
+    let generation: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(generation), 0) + 1 FROM graph_generations",
+        [],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        &format!(
+            "INSERT INTO graph_generations(
+                generation, store_revision, canonical_digest,
+                changed_document_count, created_at
+             ) VALUES (?1, ?2, ?3, 0, {TIMESTAMP_SQL})"
+        ),
+        params![generation, store_revision, database_graph_digest(&tx)?],
+    )?;
+    tx.execute(
+        &format!(
+            "INSERT INTO graph_deltas(
+                generation, action, entity_type, entity_id,
+                before_json, created_at
+             ) VALUES (?1, 'remove', 'edge', ?2, ?3, {TIMESTAMP_SQL})"
+        ),
+        params![generation, &edge_id, before_json],
+    )?;
+    tx.execute(
+        &format!(
+            "UPDATE graph_projection_state
+             SET canonical_generation = ?1,
+                 projected_generation = CASE
+                     WHEN engine = 'rslg' THEN ?1 ELSE projected_generation END,
+                 status = CASE WHEN engine = 'rslg' THEN 'fresh' ELSE 'pending' END,
+                 updated_at = {TIMESTAMP_SQL}
+             WHERE projection = 'physical'"
+        ),
+        params![generation],
+    )?;
+    tx.commit()?;
+    Ok(json!({
+        "scope": scope,
+        "identifier": edge_id,
+        "retracted": true,
+        "reason": reason,
+        "generation": generation,
+    }))
+}
+
+fn load_span_record(conn: &Connection, identifier: &str) -> Result<SpanRecord> {
+    let row = conn
+        .query_row(
+            "SELECT n.node_id, n.node_type, n.document_type, n.document_identifier,
+                    n.parent_node_id, n.ordinal, n.byte_start, n.byte_end,
+                    n.content_fingerprint, n.segmenter_version,
+                    CASE n.document_type WHEN 'page' THEN p.body ELSE s.content END
+             FROM graph_nodes n
+             LEFT JOIN pages p
+               ON n.document_type = 'page' AND p.slug = n.document_identifier
+             LEFT JOIN sources s
+               ON n.document_type = 'source'
+              AND s.id = CAST(n.document_identifier AS INTEGER)
+             WHERE n.node_id = ?1 AND n.node_type IN ('passage', 'sentence')",
+            params![identifier],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        identifier,
+        span_type,
+        document_type,
+        document_identifier,
+        parent_identifier,
+        ordinal,
+        byte_start,
+        byte_end,
+        content_fingerprint,
+        segmenter_version,
+        content,
+    )) = row
+    else {
+        let history = conn
+            .query_row(
+                "SELECT before_json FROM graph_deltas
+                 WHERE entity_type = 'node' AND entity_id = ?1 AND action = 'remove'
+                   AND before_json IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+                params![identifier],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(history) = history else {
+            return Err(AppError::new(
+                "span_not_found",
+                "span locator was not found",
+            ));
+        };
+        let prior = serde_json::from_str::<Value>(&history).unwrap_or(Value::Null);
+        let document_type = prior
+            .get("document_type")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let document_identifier = prior
+            .get("document_identifier")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let current = match (document_type.as_deref(), document_identifier.as_deref()) {
+            (Some(document_type), Some(document_identifier)) => conn
+                .query_row(
+                    "SELECT content_fingerprint, segmenter_version
+                     FROM document_index_state
+                     WHERE document_type = ?1 AND document_identifier = ?2",
+                    params![document_type, document_identifier],
+                    |row| {
+                        Ok(json!({
+                            "content_fingerprint": row.get::<_, String>(0)?,
+                            "segmenter_version": row.get::<_, i64>(1)?,
+                        }))
+                    },
+                )
+                .optional()?,
+            _ => None,
+        };
+        return Err(AppError::new(
+            "stale_span",
+            "span locator belongs to an older document fingerprint",
+        )
+        .with_details(json!({
+            "identifier": identifier,
+            "document": {
+                "type": document_type,
+                "identifier": document_identifier,
+            },
+            "prior": {
+                "content_fingerprint": prior.get("content_fingerprint"),
+                "segmenter_version": prior.get("segmenter_version"),
+                "byte_start": prior.get("byte_start"),
+                "byte_end": prior.get("byte_end"),
+            },
+            "current": current,
+        })));
+    };
+    let byte_start = usize::try_from(byte_start)
+        .map_err(|_| AppError::new("invalid_span", "span byte_start is invalid"))?;
+    let byte_end = usize::try_from(byte_end)
+        .map_err(|_| AppError::new("invalid_span", "span byte_end is invalid"))?;
+    let text = content.get(byte_start..byte_end).ok_or_else(|| {
+        AppError::new(
+            "stale_span",
+            "span byte range no longer matches the indexed document",
+        )
+    })?;
+    if hash_content(&content) != content_fingerprint {
+        return Err(AppError::new(
+            "stale_span",
+            "span fingerprint no longer matches the indexed document",
+        ));
+    }
+    Ok(SpanRecord {
+        identifier,
+        span_type,
+        document: SearchDocumentRef {
+            document_type,
+            identifier: document_identifier,
+        },
+        parent_identifier,
+        ordinal: ordinal as usize,
+        byte_start,
+        byte_end,
+        content_fingerprint,
+        segmenter_version: segmenter_version as u32,
+        text: text.to_string(),
+    })
+}
+
+fn search_span_index(
+    conn: &Connection,
+    scope: &str,
+    raw_query: &str,
+    tokens: &[String],
+    span_type: Option<&str>,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    if tokens.len() > 64 {
+        return Err(AppError::new(
+            "invalid_query",
+            "query contains more than 64 searchable terms",
+        ));
+    }
+    let match_query = tokens
+        .iter()
+        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let mut statement = conn.prepare(
+        "SELECT
+            f.span_id, f.span_type, f.document_type, f.document_identifier,
+            CASE f.document_type WHEN 'page' THEN p.title ELSE s.title END,
+            CASE f.document_type WHEN 'page' THEN p.kind ELSE NULL END,
+            CASE f.document_type WHEN 'page' THEN p.summary ELSE NULL END,
+            CASE f.document_type WHEN 'page' THEN p.slug ELSE s.origin END,
+            n.label, n.parent_node_id, n.ordinal, n.byte_start, n.byte_end,
+            n.content_fingerprint, n.segmenter_version,
+            bm25(span_fts, 0.0, 0.0, 0.0, 0.0, 4.0, 2.0, 1.0),
+            CASE f.document_type
+                WHEN 'page' THEN p.structural_navigation
+                ELSE s.structural_navigation
+            END,
+            CASE f.document_type WHEN 'page' THEN p.body ELSE s.content END
+         FROM span_fts f
+         JOIN graph_nodes n ON n.node_id = f.span_id
+         LEFT JOIN pages p
+           ON f.document_type = 'page' AND p.slug = f.document_identifier
+         LEFT JOIN sources s
+           ON f.document_type = 'source'
+          AND s.id = CAST(f.document_identifier AS INTEGER)
+         WHERE span_fts MATCH ?1
+           AND (?2 IS NULL OR f.span_type = ?2)
+         ORDER BY 16 ASC, f.rowid ASC
+         LIMIT ?3",
+    )?;
+    statement
+        .query_map(params![match_query, span_type, limit as i64], |row| {
+            let document_type = row.get::<_, String>(2)?;
+            let title = row.get::<_, Option<String>>(4)?;
+            let path = row.get::<_, String>(7)?;
+            let base_rank = row.get::<_, f64>(15)?;
+            let byte_start = row.get::<_, i64>(11)? as usize;
+            let byte_end = row.get::<_, i64>(12)? as usize;
+            let body = row.get::<_, String>(17)?;
+            let text = body.get(byte_start..byte_end).unwrap_or("").to_string();
+            let explanation = lexical_explanation(
+                &document_type,
+                title.as_deref(),
+                &path,
+                raw_query,
+                tokens,
+                base_rank,
+                row.get::<_, i64>(16)? != 0,
+            );
+            Ok(SearchResult {
+                scope: scope.to_string(),
+                result_type: row.get(1)?,
+                identifier: row.get(0)?,
+                document: Some(SearchDocumentRef {
+                    document_type,
+                    identifier: row.get(3)?,
+                }),
+                span: Some(SearchSpanRef {
+                    parent_identifier: row.get(9)?,
+                    ordinal: row.get::<_, i64>(10)? as usize,
+                    byte_start,
+                    byte_end,
+                    content_fingerprint: row.get(13)?,
+                    segmenter_version: row.get::<_, i64>(14)? as u32,
+                }),
+                fused_score: None,
+                matches: None,
+                title,
+                kind: row.get(5)?,
+                summary: row.get(6)?,
+                provenance: None,
+                snippet: text,
+                rank: explanation.final_rank,
+                explanation: Some(explanation),
+                paired_source_ids: Vec::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn apply_mixed_fusion(results: &mut [SearchResult]) {
+    let mut by_granularity: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, result) in results.iter().enumerate() {
+        by_granularity
+            .entry(result.result_type.clone())
+            .or_default()
+            .push(index);
+    }
+    for indices in by_granularity.values_mut() {
+        indices.sort_by(|left, right| {
+            results[*left]
+                .rank
+                .total_cmp(&results[*right].rank)
+                .then_with(|| results[*left].identifier.cmp(&results[*right].identifier))
+        });
+        for (position, index) in indices.iter().copied().enumerate() {
+            let prior = match results[index].result_type.as_str() {
+                "sentence" => 1.15,
+                "passage" => 1.05,
+                _ => 1.0,
+            };
+            let score = prior / (60.0 + (position + 1) as f64);
+            results[index].fused_score = Some(score);
+            results[index].rank = -score;
+        }
+    }
+}
+
+fn group_search_results(results: Vec<SearchResult>) -> Vec<SearchResult> {
+    let mut groups: BTreeMap<(String, String), Vec<SearchResult>> = BTreeMap::new();
+    for result in results {
+        let key = result
+            .document
+            .as_ref()
+            .map(|document| (document.document_type.clone(), document.identifier.clone()))
+            .unwrap_or_else(|| (result.result_type.clone(), result.identifier.clone()));
+        groups.entry(key).or_default().push(result);
+    }
+
+    groups
+        .into_iter()
+        .map(|((document_type, document_identifier), mut matches)| {
+            matches.sort_by(|left, right| {
+                left.rank
+                    .total_cmp(&right.rank)
+                    .then_with(|| left.result_type.cmp(&right.result_type))
+                    .then_with(|| left.identifier.cmp(&right.identifier))
+            });
+            let best = matches[0].clone();
+            let mut grouped = matches
+                .iter()
+                .find(|result| {
+                    result.result_type == document_type && result.identifier == document_identifier
+                })
+                .cloned()
+                .unwrap_or_else(|| best.clone());
+            let selected = matches
+                .iter()
+                .take(3)
+                .map(|result| SearchMatch {
+                    result_type: result.result_type.clone(),
+                    identifier: result.identifier.clone(),
+                    snippet: result.snippet.clone(),
+                    rank: result.rank,
+                    fused_score: result.fused_score,
+                    span: result.span.clone(),
+                })
+                .collect::<Vec<_>>();
+            let group_score = selected
+                .iter()
+                .enumerate()
+                .map(|(index, result)| {
+                    result.fused_score.unwrap_or(-result.rank)
+                        * match index {
+                            0 => 1.0,
+                            1 => 0.5,
+                            _ => 0.25,
+                        }
+                })
+                .sum::<f64>();
+            grouped.result_type = document_type;
+            grouped.identifier = document_identifier;
+            grouped.document = None;
+            grouped.span = None;
+            grouped.fused_score = Some(group_score);
+            grouped.matches = Some(selected);
+            grouped.snippet = best.snippet;
+            grouped.rank = -group_score;
+            grouped.explanation = best.explanation;
+            grouped
+        })
+        .collect()
+}
+
 fn apply_retrieval_state(
     conn: &Connection,
     query_tokens: &[String],
@@ -5777,7 +10609,11 @@ fn apply_retrieval_state(
     let weights = load_effective_weights(conn)?;
     let feedback = load_effective_feedback(conn, &query_fingerprint(query_tokens))?;
     for result in results {
-        let key = (result.result_type.clone(), result.identifier.clone());
+        let key = result
+            .document
+            .as_ref()
+            .map(|document| (document.document_type.clone(), document.identifier.clone()))
+            .unwrap_or_else(|| (result.result_type.clone(), result.identifier.clone()));
         let Some(explanation) = result.explanation.as_mut() else {
             continue;
         };
@@ -6027,6 +10863,482 @@ mod tests {
     }
 
     #[test]
+    fn v10_hierarchical_migration_builds_one_complete_initial_generation() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES ('store_revision', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+             INSERT INTO meta VALUES ('format_version', '10');
+             CREATE TABLE sources(
+                id INTEGER PRIMARY KEY, content_hash TEXT NOT NULL UNIQUE, title TEXT,
+                origin TEXT NOT NULL, content TEXT NOT NULL,
+                structural_navigation INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+             );
+             CREATE TABLE pages(
+                slug TEXT PRIMARY KEY, title TEXT NOT NULL, kind TEXT, summary TEXT,
+                body TEXT NOT NULL, structural_navigation INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE page_sources(page_slug TEXT NOT NULL, source_id INTEGER NOT NULL,
+                PRIMARY KEY(page_slug, source_id));
+             CREATE TABLE links(from_slug TEXT NOT NULL, to_slug TEXT NOT NULL,
+                PRIMARY KEY(from_slug, to_slug));
+             CREATE TABLE source_path_revisions(
+                tracked_path TEXT NOT NULL, revision INTEGER NOT NULL,
+                source_id INTEGER NOT NULL, observed_at TEXT NOT NULL,
+                PRIMARY KEY(tracked_path, revision)
+             );
+             INSERT INTO sources VALUES (
+                1, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                'Evidence', 'evidence.md', 'alpha beta.', 0, 'now'
+             );
+             INSERT INTO pages VALUES (
+                'summary', 'Summary', 'source', NULL, 'alpha summary.', 0, 'now', 'now'
+             );
+             INSERT INTO page_sources VALUES ('summary', 1);
+             PRAGMA user_version = 10;",
+        )
+        .unwrap();
+
+        migrate_hierarchical_graph(&mut conn).unwrap();
+
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            11
+        );
+        assert_eq!(
+            conn.query_row("SELECT MAX(generation) FROM graph_generations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM graph_nodes WHERE node_type = 'document'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        assert!(
+            conn.query_row("SELECT COUNT(*) FROM graph_deltas", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+                > 0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM graph_edges WHERE edge_type = 'CITES'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn new_store_bootstraps_hierarchical_graph_schema_at_v11() {
+        let store = test_store();
+
+        assert_eq!(
+            store
+                .conn
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))
+                .unwrap(),
+            11
+        );
+        for table in [
+            "document_index_state",
+            "graph_nodes",
+            "graph_edges",
+            "graph_occurrences",
+            "term_pair_contributions",
+            "span_fts",
+            "graph_generations",
+            "graph_deltas",
+            "graph_projection_state",
+        ] {
+            assert_eq!(
+                store
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE type IN ('table', 'view') AND name = ?1",
+                        [table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "missing {table}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_add_atomically_builds_hierarchy_occurrences_generation_and_deltas() {
+        let mut store = test_store();
+
+        let source = store
+            .source_add(SourceAddInput {
+                title: Some("Evidence".to_string()),
+                origin: "docs/evidence.md".to_string(),
+                tracked_path: None,
+                content: "alpha beta.".to_string(),
+            })
+            .unwrap();
+        let source_id = source.source.id.to_string();
+        assert_eq!(source.graph.terms, 2);
+
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT document_node_id FROM document_index_state
+                     WHERE document_type = 'source' AND document_identifier = ?1",
+                    [&source_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            format!("source:{source_id}")
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT MAX(generation) FROM graph_generations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM graph_deltas", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT canonical_generation, projected_generation, status
+                     FROM graph_projection_state WHERE projection = 'physical'",
+                    [],
+                    |row| Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?
+                    )),
+                )
+                .unwrap(),
+            (1, 1, "fresh".to_string())
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM graph_occurrences
+                     WHERE document_type = 'source'
+                       AND document_identifier = ?1",
+                    [source_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM graph_edges
+                     WHERE edge_type IN ('CONTAINS', 'NEXT', 'PREVIOUS', 'OCCURS_IN')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let term_edges = load_adjacent_graph_edges(
+            &store.conn,
+            "term:alpha",
+            "outgoing",
+            &BTreeSet::from(["OCCURS_IN".to_string()]),
+            20,
+        )
+        .unwrap();
+        assert!(
+            term_edges
+                .iter()
+                .any(|edge| edge.to == format!("source:{source_id}"))
+        );
+        assert!(term_edges.iter().any(|edge| {
+            store
+                .conn
+                .query_row(
+                    "SELECT node_type FROM graph_nodes WHERE node_id = ?1",
+                    [&edge.to],
+                    |row| row.get::<_, String>(0),
+                )
+                .is_ok_and(|kind| matches!(kind.as_str(), "passage" | "sentence"))
+        }));
+        let hierarchy = load_adjacent_graph_edges(
+            &store.conn,
+            &format!("source:{source_id}"),
+            "outgoing",
+            &BTreeSet::from(["CONTAINS".to_string()]),
+            20,
+        )
+        .unwrap();
+        assert!(!hierarchy.is_empty());
+    }
+
+    #[test]
+    fn compact_term_pair_contributions_round_trip_and_reject_corruption() {
+        let contributions = vec![TermPairContribution {
+            from_term_id: "term:alpha".to_string(),
+            to_term_id: "term:知识".to_string(),
+            sentence_weight: 1.25,
+            passage_weight: 0.125,
+            witness_count: 7,
+        }];
+        let encoded = encode_term_pair_contributions(&contributions).unwrap();
+        assert!(encoded.len() < 64);
+        assert_eq!(
+            decode_term_pair_contributions(&encoded).unwrap(),
+            contributions
+        );
+        assert_eq!(
+            decode_term_pair_contributions(&encoded[..encoded.len() - 1])
+                .unwrap_err()
+                .code,
+            "graph_index_corrupt"
+        );
+        let mut oversized_header = vec![1];
+        write_compact_u64(&mut oversized_header, 100_001);
+        assert_eq!(
+            decode_term_pair_contributions(&oversized_header)
+                .unwrap_err()
+                .code,
+            "graph_index_corrupt"
+        );
+    }
+
+    #[test]
+    fn graph_verify_reports_corrupt_compact_contributions() {
+        let mut store = test_store();
+        store
+            .source_add(SourceAddInput {
+                title: Some("Evidence".to_string()),
+                origin: "evidence.md".to_string(),
+                tracked_path: None,
+                content: "alpha beta.".to_string(),
+            })
+            .unwrap();
+        let valid_blob: Vec<u8> = store
+            .conn
+            .query_row(
+                "SELECT contributions FROM term_pair_contributions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE term_pair_contributions SET contributions = X'02'",
+                [],
+            )
+            .unwrap();
+        let verified = graph_verify_value(&store.conn, &store.scope, &store.database).unwrap();
+        assert!(verified["issues"].as_array().unwrap().iter().any(|issue| {
+            issue["code"] == "cooccurrence_contribution_invalid" && issue["count"] == 1
+        }));
+        store
+            .conn
+            .execute(
+                "UPDATE term_pair_contributions SET contributions = ?1",
+                [valid_blob],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE term_pair_totals SET witness_count = witness_count + 1",
+                [],
+            )
+            .unwrap();
+        let verified = graph_verify_value(&store.conn, &store.scope, &store.database).unwrap();
+        assert!(verified["issues"].as_array().unwrap().iter().any(|issue| {
+            issue["code"] == "cooccurrence_totals_mismatch" && issue["count"] == 1
+        }));
+    }
+
+    #[test]
+    fn page_replacement_preserves_document_identity_and_replaces_revision_spans() {
+        let mut store = test_store();
+        let put = |store: &mut Store, body: &str| {
+            store
+                .page_put(PagePutInput {
+                    slug: "mutable".to_string(),
+                    title: "Mutable".to_string(),
+                    kind: Some("concept".to_string()),
+                    summary: None,
+                    body: body.to_string(),
+                    source_ids: Vec::new(),
+                    provenance: vec!["agent-observed".to_string()],
+                })
+                .unwrap();
+        };
+
+        put(&mut store, "alpha.");
+        let old_span: String = store
+            .conn
+            .query_row(
+                "SELECT node_id FROM graph_nodes
+                 WHERE document_type = 'page' AND document_identifier = 'mutable'
+                   AND node_type = 'sentence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        put(&mut store, "beta.");
+
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM graph_nodes WHERE node_id = 'page:mutable'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM graph_nodes WHERE node_id = ?1",
+                    [&old_span],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT MAX(generation) FROM graph_generations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+        assert!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM graph_deltas
+                     WHERE generation = 2 AND action = 'remove' AND entity_id = 'term:alpha'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                > 0
+        );
+        assert!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM graph_nodes WHERE node_id = 'term:beta'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[test]
+    fn page_graph_adds_only_provable_link_and_citation_edges() {
+        let mut store = test_store();
+        let source = store
+            .source_add(SourceAddInput {
+                title: Some("Evidence".to_string()),
+                origin: "evidence.md".to_string(),
+                tracked_path: None,
+                content: "evidence".to_string(),
+            })
+            .unwrap();
+        store
+            .page_put(PagePutInput {
+                slug: "target".to_string(),
+                title: "Target".to_string(),
+                kind: None,
+                summary: None,
+                body: "target".to_string(),
+                source_ids: Vec::new(),
+                provenance: vec!["agent-observed".to_string()],
+            })
+            .unwrap();
+        store
+            .page_put(PagePutInput {
+                slug: "origin".to_string(),
+                title: "Origin".to_string(),
+                kind: None,
+                summary: None,
+                body: "See [[target]] and [[missing]].".to_string(),
+                source_ids: vec![source.source.id],
+                provenance: Vec::new(),
+            })
+            .unwrap();
+
+        let edges = store
+            .conn
+            .prepare(
+                "SELECT edge_type, from_node_id, to_node_id
+                 FROM graph_edges
+                 WHERE owner_type = 'page' AND owner_identifier = 'origin'
+                   AND edge_type IN ('LINKS_TO', 'CITES')
+                 ORDER BY edge_type, to_node_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(
+            edges,
+            vec![
+                (
+                    "CITES".to_string(),
+                    "page:origin".to_string(),
+                    format!("source:{}", source.source.id),
+                ),
+                (
+                    "LINKS_TO".to_string(),
+                    "page:origin".to_string(),
+                    "page:target".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn duplicate_source_reuses_first_metadata_and_logs_each_attempt() {
         let mut store = test_store();
 
@@ -6173,6 +11485,40 @@ mod tests {
                 (1, first.source.id),
                 (2, second.source.id),
                 (3, first.source.id),
+            ]
+        );
+        let lineage = store
+            .conn
+            .prepare(
+                "SELECT from_node_id, to_node_id, owner_identifier
+                 FROM graph_edges
+                 WHERE edge_type = 'REVISION_OF'
+                 ORDER BY owner_identifier",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            lineage,
+            vec![
+                (
+                    format!("source:{}", second.source.id),
+                    format!("source:{}", first.source.id),
+                    format!("{path}#2"),
+                ),
+                (
+                    format!("source:{}", first.source.id),
+                    format!("source:{}", second.source.id),
+                    format!("{path}#3"),
+                ),
             ]
         );
     }
@@ -6351,6 +11697,59 @@ mod tests {
             .unwrap();
         assert_eq!(relation_count, 1);
         assert_eq!(link_count, 2);
+    }
+
+    #[test]
+    fn reverse_dependent_cooccurrence_changes_capture_complete_before_deltas() {
+        let mut store = test_store();
+        let put = |store: &mut Store, slug: &str, body: &str| {
+            store
+                .page_put(PagePutInput {
+                    slug: slug.to_string(),
+                    title: slug.to_string(),
+                    kind: Some("concept".to_string()),
+                    summary: None,
+                    body: body.to_string(),
+                    source_ids: Vec::new(),
+                    provenance: vec!["agent-observed".to_string()],
+                })
+                .unwrap()
+        };
+        put(&mut store, "a", "alpha beta shared.");
+        put(&mut store, "b", "beta gamma shared.");
+        let reverse_edge: String = store
+            .conn
+            .query_row(
+                "SELECT edge_id FROM graph_edges
+                 WHERE edge_type = 'CO_OCCURS'
+                   AND from_node_id = 'term:gamma' AND to_node_id = 'term:beta'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let generation = put(&mut store, "a", "alpha delta shared.").graph.generation;
+        let delta = store
+            .conn
+            .query_row(
+                "SELECT action, before_json, after_json FROM graph_deltas
+                 WHERE generation = ?1 AND entity_id = ?2 ORDER BY id DESC LIMIT 1",
+                params![generation, reverse_edge],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_ne!(delta.0, "add");
+        assert!(delta.1.is_some());
+        assert!(delta.0 == "remove" || delta.2.is_some());
+        assert_eq!(
+            graph_verify_value(&store.conn, &store.scope, &store.database).unwrap()["valid"],
+            true
+        );
     }
 
     #[test]

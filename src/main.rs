@@ -1,12 +1,15 @@
 mod artifacts;
 mod changeset;
+mod config;
 mod error;
-mod graph;
+pub mod graph;
+pub mod graph_backend;
 mod import;
 mod scope;
+pub mod segment;
 mod source_diff;
 mod store;
-mod tokenize;
+pub mod tokenize;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use error::{AppError, Result};
@@ -32,7 +35,10 @@ use std::{
     process::Command as ProcessCommand,
     time::{SystemTime, UNIX_EPOCH},
 };
-use store::{PagePutInput, SearchMode, SearchOptions, SourceAddInput, Store};
+use store::{
+    PagePutInput, SearchGranularity, SearchGrouping, SearchMode, SearchOptions, SourceAddInput,
+    Store,
+};
 
 const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -230,10 +236,15 @@ enum Command {
         #[command(subcommand)]
         command: IngestCommand,
     },
-    /// Rank related pages using links, citations, neighbors, and page types.
+    /// Inspect and update layered graph engine configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Explore, explain, verify, and maintain the typed canonical knowledge graph.
     #[command(
-        long_about = "Explore already-compiled Wiki relationships. Graph results explain their direct-link, shared-source, common-neighbor, and type-affinity signals.",
-        after_help = "When to use:\n  Call `related` after search/page show when an Agent needs adjacent concepts, possible synthesis targets, or missing cross-links.\n\nNext action:\n  Inspect candidate pages with `page show`; update links or synthesis only when supported by cited evidence."
+        long_about = "Explore deterministic document, passage, sentence, term, evidence, co-occurrence, and explicit semantic relationships. Reads are bounded and fail closed while an enabled physical projection is stale.",
+        after_help = "Examples:\n  lwc graph explore\n  lwc graph neighbors page:policy --direction outgoing\n  lwc graph path page:implementation page:policy\n  lwc graph impact page:policy\n  lwc graph overview\n  lwc graph status\n  lwc graph verify\n\nSemantic claims are explicit: use `graph relation set/list/retract` with provenance, reason, confidence, and supporting Source IDs."
     )]
     Graph {
         #[command(subcommand)]
@@ -271,11 +282,12 @@ enum Command {
         long_about = "Search compiled Wiki pages and immutable raw sources with SQLite FTS5.\n\n\
 The default --type auto ranks Wiki pages first, hides their paired raw sources, and falls back to raw sources when needed. \
 Use --type page for compiled knowledge, --type source for immutable evidence, or --type all for both. Repeat --kind to restrict page kinds. \
+Use --granularity sentence or passage for direct span retrieval; --granularity all applies deterministic reciprocal-rank fusion and groups by document unless --group-by none is explicit. \
 Read results[].type, kind, identifier, title, snippet, rank, and scope; a lower numeric rank is more relevant. \
 The command is read-only by default and does not persist the query. Use --record only when the query itself should become part of the operation history. \
 Use --scope all to merge project and global results; ranking remains deterministic across stores. \
 Combining --scope all with --record appends the query operation to each selected store.",
-        after_help = "Examples:\n  lwc search \"注意力机制\"\n  lwc search \"release policy\" --type page --kind concept --kind synthesis --limit 10\n  lwc search \"exact evidence\" --type source\n  lwc search \"audit both layers\" --type all\n  lwc --scope all search \"shared convention\"\n  lwc search \"durable research question\" --record"
+        after_help = "Examples:\n  lwc search \"注意力机制\"\n  lwc search \"release policy\" --type page --kind concept --kind synthesis --limit 10\n  lwc search \"exact evidence\" --type source\n  lwc search \"audit both layers\" --type all\n  lwc search \"exact context\" --granularity sentence\n  lwc search \"mixed context\" --granularity all --group-by document\n  lwc --scope all search \"shared convention\"\n  lwc search \"durable research question\" --record"
     )]
     Search {
         /// Natural-language or keyword query. FTS syntax is escaped automatically.
@@ -283,6 +295,12 @@ Combining --scope all with --record appends the query operation to each selected
         /// Search auto-ranked Wiki pages with source fallback, pages only, sources only, or both.
         #[arg(long = "type", value_enum, default_value = "auto")]
         target: SearchTarget,
+        /// Retrieve whole documents, passages, sentences, or all granularities.
+        #[arg(long, value_enum, default_value = "document")]
+        granularity: SearchGranularityArg,
+        /// Group all-granularity matches by owning document.
+        #[arg(long, value_enum, default_value = "auto")]
+        group_by: SearchGroupArg,
         /// Restrict page results to this kind; repeat for multiple kinds.
         #[arg(long = "kind")]
         kinds: Vec<String>,
@@ -295,6 +313,11 @@ Combining --scope all with --record appends the query operation to each selected
         /// Include exact bounded score signals and arithmetic for every result.
         #[arg(long)]
         explain: bool,
+    },
+    /// Resolve stable sentence and passage locators and expand local context.
+    Span {
+        #[command(subcommand)]
+        command: SpanCommand,
     },
     /// Return Agent-ready schema, purpose, page index, and recent operations.
     #[command(
@@ -626,6 +649,62 @@ This prevents completion after merely indexing raw text or writing a detached su
 }
 
 #[derive(Subcommand)]
+enum ConfigCommand {
+    /// Show effective graph configuration and value origins.
+    Show,
+    /// Atomically set one or both graph configuration values.
+    Set {
+        #[arg(long, value_enum)]
+        physical: Option<ConfigPhysicalArg>,
+        #[arg(long, value_enum)]
+        engine: Option<ConfigEngineArg>,
+    },
+    /// Restore one or both graph configuration values to inherited defaults.
+    Unset {
+        #[arg(long)]
+        physical: bool,
+        #[arg(long)]
+        engine: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ConfigPhysicalArg {
+    Enabled,
+    Disabled,
+    Inherit,
+}
+
+impl From<ConfigPhysicalArg> for config::PhysicalSetting {
+    fn from(value: ConfigPhysicalArg) -> Self {
+        match value {
+            ConfigPhysicalArg::Enabled => Self::Enabled,
+            ConfigPhysicalArg::Disabled => Self::Disabled,
+            ConfigPhysicalArg::Inherit => Self::Inherit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ConfigEngineArg {
+    Auto,
+    Graphqlite,
+    Rslg,
+    Inherit,
+}
+
+impl From<ConfigEngineArg> for config::EngineSetting {
+    fn from(value: ConfigEngineArg) -> Self {
+        match value {
+            ConfigEngineArg::Auto => Self::Auto,
+            ConfigEngineArg::Graphqlite => Self::Graphqlite,
+            ConfigEngineArg::Rslg => Self::Rslg,
+            ConfigEngineArg::Inherit => Self::Inherit,
+        }
+    }
+}
+
+#[derive(Subcommand)]
 enum GraphCommand {
     /// Rank pages related to one Wiki page.
     #[command(
@@ -639,6 +718,120 @@ The result exposes each scoring signal so Agents can explain why pages are relat
         /// Maximum related pages returned (1..=1000).
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Traverse typed canonical relationships from a node.
+    Explore {
+        identifier: Option<String>,
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, value_enum, default_value = "both")]
+        direction: GraphDirectionArg,
+        #[arg(long = "edge-type")]
+        edge_types: Vec<String>,
+    },
+    /// Resolve one node and report bounded degree metadata.
+    Node { identifier: String },
+    /// Return immediate typed neighbors of one node.
+    Neighbors {
+        identifier: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, value_enum, default_value = "both")]
+        direction: GraphDirectionArg,
+        #[arg(long = "edge-type")]
+        edge_types: Vec<String>,
+    },
+    /// Find and explain a shortest typed relationship path.
+    Path {
+        from: String,
+        to: String,
+        #[arg(long, default_value_t = 6)]
+        max_depth: usize,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        #[arg(long, value_enum, default_value = "outgoing")]
+        direction: GraphDirectionArg,
+        #[arg(long = "edge-type")]
+        edge_types: Vec<String>,
+    },
+    /// Propagate reverse dependency impact with hard/review classification.
+    Impact {
+        identifier: String,
+        #[arg(long, default_value_t = 4)]
+        max_depth: usize,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Summarize graph size, types, hubs, and projection freshness.
+    Overview {
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Report projection freshness, generation history, and bounded diagnostics.
+    Status,
+    /// Verify canonical graph invariants, digest, and physical parity.
+    Verify,
+    /// Persist explicit semantic relationships with provenance.
+    Relation {
+        #[command(subcommand)]
+        command: GraphRelationCommand,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GraphDirectionArg {
+    Outgoing,
+    Incoming,
+    Both,
+}
+
+impl GraphDirectionArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Outgoing => "outgoing",
+            Self::Incoming => "incoming",
+            Self::Both => "both",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum GraphRelationCommand {
+    /// Create or replace one explicit semantic edge.
+    Set {
+        from: String,
+        relation_type: String,
+        to: String,
+        #[arg(long)]
+        provenance: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        confidence: f64,
+        /// Supporting immutable Source IDs; repeat for multiple sources.
+        #[arg(long = "source")]
+        source_ids: Vec<i64>,
+    },
+    /// List explicit semantic relationships with optional endpoint/type filters.
+    List {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long = "type")]
+        relation_type: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Retract one explicit semantic relationship with an audit reason.
+    Retract {
+        from: String,
+        relation_type: String,
+        to: String,
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -788,6 +981,37 @@ enum SearchTarget {
     Page,
     Source,
     All,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SearchGranularityArg {
+    Document,
+    Passage,
+    Sentence,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SearchGroupArg {
+    Auto,
+    None,
+    Document,
+}
+
+#[derive(Debug, Subcommand)]
+enum SpanCommand {
+    /// Return the exact indexed text and locator metadata for a span.
+    Get { identifier: String },
+    /// Expand a span to its parent, bounded siblings, and bounded children.
+    Expand {
+        identifier: String,
+        #[arg(long, default_value_t = 1)]
+        before: usize,
+        #[arg(long, default_value_t = 1)]
+        after: usize,
+        #[arg(long, default_value_t = 20)]
+        children: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1412,16 +1636,202 @@ fn run(cli: Cli) -> Result<Value> {
                 }
             }
         }
+        Command::Config { command } => {
+            ensure_scope_supported(cli.scope, false, "config")?;
+            if selected_changeset.is_some() {
+                return Err(AppError::new(
+                    "changeset_command_not_supported",
+                    "graph configuration is deployment-local and cannot be changed in a changeset",
+                ));
+            }
+            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
+            match command {
+                ConfigCommand::Show => {
+                    config::response(scope_name(store_path.scope), &store_path.path)
+                }
+                ConfigCommand::Set { physical, engine } => {
+                    if physical.is_none() && engine.is_none() {
+                        return Err(AppError::new(
+                            "invalid_input",
+                            "config set requires --physical and/or --engine",
+                        ));
+                    }
+                    config::update(
+                        &store_path.path,
+                        physical.map(Into::into),
+                        engine.map(Into::into),
+                    )?;
+                    Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    config::response(scope_name(store_path.scope), &store_path.path)
+                }
+                ConfigCommand::Unset { physical, engine } => {
+                    if !physical && !engine {
+                        return Err(AppError::new(
+                            "invalid_input",
+                            "config unset requires --physical and/or --engine",
+                        ));
+                    }
+                    config::update(
+                        &store_path.path,
+                        physical.then_some(config::PhysicalSetting::Inherit),
+                        engine.then_some(config::EngineSetting::Inherit),
+                    )?;
+                    Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    config::response(scope_name(store_path.scope), &store_path.path)
+                }
+            }
+        }
         Command::Graph { command } => {
             ensure_scope_supported(cli.scope, false, "graph")?;
             let store_path =
                 resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
-            let store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
             match command {
                 GraphCommand::Related { slug, limit } => {
                     validate_limit(limit)?;
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
                     to_json(store.graph_related(&slug, limit)?)
                 }
+                GraphCommand::Explore {
+                    identifier,
+                    depth,
+                    limit,
+                    direction,
+                    edge_types,
+                } => {
+                    validate_graph_depth(depth)?;
+                    validate_graph_limit(limit)?;
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    match identifier {
+                        Some(identifier) => Ok(store.graph_explore(
+                            &identifier,
+                            depth,
+                            limit,
+                            direction.as_str(),
+                            &edge_types,
+                        )?),
+                        None => Ok(store.graph_explore_macro(depth, limit, &edge_types)?),
+                    }
+                }
+                GraphCommand::Node { identifier } => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    Ok(store.graph_node(&identifier)?)
+                }
+                GraphCommand::Neighbors {
+                    identifier,
+                    limit,
+                    direction,
+                    edge_types,
+                } => {
+                    validate_graph_limit(limit)?;
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    Ok(store.graph_neighbors(
+                        &identifier,
+                        limit,
+                        direction.as_str(),
+                        &edge_types,
+                    )?)
+                }
+                GraphCommand::Path {
+                    from,
+                    to,
+                    max_depth,
+                    limit,
+                    direction,
+                    edge_types,
+                } => {
+                    validate_graph_depth(max_depth)?;
+                    validate_graph_limit(limit)?;
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    Ok(store.graph_path(
+                        &from,
+                        &to,
+                        max_depth,
+                        limit,
+                        direction.as_str(),
+                        &edge_types,
+                    )?)
+                }
+                GraphCommand::Impact {
+                    identifier,
+                    max_depth,
+                    limit,
+                } => {
+                    validate_graph_depth(max_depth)?;
+                    validate_graph_limit(limit)?;
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    Ok(store.graph_impact(&identifier, max_depth, limit)?)
+                }
+                GraphCommand::Overview { limit } => {
+                    validate_limit(limit)?;
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    Ok(store.graph_overview(limit)?)
+                }
+                GraphCommand::Status => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    Ok(store.graph_status()?)
+                }
+                GraphCommand::Verify => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    Ok(store.graph_verify()?)
+                }
+                GraphCommand::Relation { command } => match command {
+                    GraphRelationCommand::Set {
+                        from,
+                        relation_type,
+                        to,
+                        provenance,
+                        reason,
+                        confidence,
+                        source_ids,
+                    } => {
+                        let mut store =
+                            Store::open(scope_name(store_path.scope), &store_path.path)?;
+                        Ok(store.graph_relation_set(
+                            &from,
+                            &relation_type,
+                            &to,
+                            &provenance,
+                            &reason,
+                            confidence,
+                            &source_ids,
+                        )?)
+                    }
+                    GraphRelationCommand::List {
+                        from,
+                        to,
+                        relation_type,
+                        limit,
+                    } => {
+                        validate_limit(limit)?;
+                        let store =
+                            Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                        Ok(store.graph_relation_list(
+                            from.as_deref(),
+                            to.as_deref(),
+                            relation_type.as_deref(),
+                            limit,
+                        )?)
+                    }
+                    GraphRelationCommand::Retract {
+                        from,
+                        relation_type,
+                        to,
+                        reason,
+                    } => {
+                        let mut store =
+                            Store::open(scope_name(store_path.scope), &store_path.path)?;
+                        Ok(store.graph_relation_retract(&from, &relation_type, &to, &reason)?)
+                    }
+                },
             }
         }
         Command::Weight { command } => {
@@ -1548,6 +1958,8 @@ fn run(cli: Cli) -> Result<Value> {
         Command::Search {
             query,
             target,
+            granularity,
+            group_by,
             kinds,
             limit,
             record,
@@ -1570,8 +1982,31 @@ fn run(cli: Cli) -> Result<Value> {
                 SearchTarget::Source => SearchMode::Source,
                 SearchTarget::All => SearchMode::All,
             };
+            let granularity = match granularity {
+                SearchGranularityArg::Document => SearchGranularity::Document,
+                SearchGranularityArg::Passage => SearchGranularity::Passage,
+                SearchGranularityArg::Sentence => SearchGranularity::Sentence,
+                SearchGranularityArg::All => SearchGranularity::All,
+            };
+            let grouping = match group_by {
+                SearchGroupArg::Auto if granularity == SearchGranularity::All => {
+                    SearchGrouping::Document
+                }
+                SearchGroupArg::Auto | SearchGroupArg::None => SearchGrouping::None,
+                SearchGroupArg::Document if granularity == SearchGranularity::All => {
+                    SearchGrouping::Document
+                }
+                SearchGroupArg::Document => {
+                    return Err(AppError::new(
+                        "invalid_input",
+                        "--group-by document requires --granularity all",
+                    ));
+                }
+            };
             let options = SearchOptions {
                 mode,
+                granularity,
+                grouping,
                 kinds,
                 explain,
             };
@@ -1610,6 +2045,39 @@ fn run(cli: Cli) -> Result<Value> {
             });
             results.truncate(limit);
             Ok(json!({"results": results}))
+        }
+        Command::Span { command } => {
+            ensure_scope_supported(cli.scope, false, "span")?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
+            let store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+            match command {
+                SpanCommand::Get { identifier } => {
+                    require_text("identifier", &identifier)?;
+                    to_json(store.span_get(&identifier)?)
+                }
+                SpanCommand::Expand {
+                    identifier,
+                    before,
+                    after,
+                    children,
+                } => {
+                    require_text("identifier", &identifier)?;
+                    if before > 20 || after > 20 {
+                        return Err(AppError::new(
+                            "invalid_limit",
+                            "before and after must not exceed 20",
+                        ));
+                    }
+                    if !(1..=200).contains(&children) {
+                        return Err(AppError::new(
+                            "invalid_limit",
+                            "children must be between 1 and 200",
+                        ));
+                    }
+                    to_json(store.span_expand(&identifier, before, after, children)?)
+                }
+            }
         }
         Command::Context { limit } => {
             validate_limit(limit)?;
@@ -2443,6 +2911,26 @@ fn contains_token(content: &str, prefix: &str, minimum_length: usize) -> bool {
             .count()
             >= minimum_length
     })
+}
+
+fn validate_graph_depth(depth: usize) -> Result<()> {
+    if !(1..=10).contains(&depth) {
+        return Err(AppError::new(
+            "invalid_graph_depth",
+            "graph depth must be between 1 and 10",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_graph_limit(limit: usize) -> Result<()> {
+    if !(1..=5000).contains(&limit) {
+        return Err(AppError::new(
+            "invalid_graph_limit",
+            "graph node limit must be between 1 and 5000",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_limit(limit: usize) -> Result<()> {

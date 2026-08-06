@@ -204,6 +204,83 @@ Read commands keep current-format stores read-only. When an older writable
 store is opened by a newer CLI, its schema is migrated transactionally once
 before the read proceeds.
 
+## Hierarchical Recall and Knowledge Graph
+
+Every current Source and Wiki page is deterministically indexed as passages,
+sentences, and normalized terms. SQLite remains authoritative; span FTS and the
+typed canonical graph are rebuilt indexes. Existing search stays document-only
+unless a granularity is requested:
+
+```bash
+lwc search "projection consistency" --granularity sentence --type page
+lwc search "projection consistency" --granularity passage
+lwc search "projection consistency" --granularity all --group-by document
+lwc span get <SPAN_ID>
+lwc span expand <SPAN_ID> --before 1 --after 1 --children 20
+```
+
+Span locators contain the document fingerprint and segmentation version. A
+locator from a replaced body fails with `stale_span` and reports prior/current
+metadata; LWC never silently remaps it to similar text.
+
+Use the bounded, typed graph API for exploration without requiring keywords:
+
+```bash
+lwc graph explore                         # representative macro view
+lwc graph explore term:consistency --depth 2 --edge-type CO_OCCURS
+lwc graph node page:projection-policy
+lwc graph neighbors page:projection-policy --direction outgoing
+lwc graph path page:implementation page:policy --max-depth 6
+lwc graph impact page:policy --max-depth 4
+lwc graph overview
+lwc graph status
+lwc graph verify
+```
+
+Automatic edges are limited to structural/evidential facts. Semantic claims
+must be explicit and auditable:
+
+```bash
+lwc graph relation set page:implementation DEPENDS_ON page:policy \
+  --provenance source-grounded --source 12 \
+  --reason "Source 12 states the required policy" --confidence 0.95
+lwc graph relation list --from page:implementation
+lwc graph relation retract page:implementation DEPENDS_ON page:policy \
+  --reason "The dependency was superseded"
+```
+
+Relation reasons are durable content: never put credentials, secrets, or raw
+chain-of-thought in them.
+
+The physical graph is enabled by default. `auto` selects the pinned embedded
+GraphQLite runtime on supported macOS/Linux targets and rslg elsewhere. Windows
+uses rslg and does not embed or load GraphQLite. Configuration is layered from
+built-in defaults through global and project files; project values can inherit:
+
+```bash
+lwc config show
+lwc config set --physical enabled --engine auto
+lwc config set --engine rslg
+lwc config unset --physical --engine
+```
+
+The canonical schema stores exact term positions once per term/document in a
+compact posting blob. Passage/sentence `OCCURS_IN` edges and structural
+`CONTAINS`/`NEXT`/`PREVIOUS` edges are derived deterministically from those
+postings and span locators, so public graph behavior stays exact without
+triplicating row/index storage. Co-occurrence evidence is stored in compact
+per-document blobs plus incremental totals; normalized edge weights are
+persisted to six decimal places while exact totals remain available for
+rebuilds.
+
+GraphQLite is a disposable, checksummed sidecar projection. Canonical mutations
+commit first; a projection failure returns `graph_projection_failed`, marks the
+projection stale, and graph reads fail closed. A subsequent writable open or
+`lwc config set --engine graphqlite` resumes/rebuilds it. Superseded sidecars are
+retained and reported by `graph status` for manual review rather than deleted
+automatically. Draft changesets always query their candidate canonical graph
+with rslg and never import deployment-local projection state.
+
 ## Installation
 
 Most users should use the Agent setup prompt above. The manual commands below

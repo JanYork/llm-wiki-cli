@@ -2312,6 +2312,455 @@ fn graph_reranking_is_bounded_query_conditioned_and_does_not_promote_sources() {
 }
 
 #[test]
+fn graph_config_resolves_layers_and_updates_project_atomically() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let defaults = world.ok(&world.project, &["config", "show"]);
+    assert_eq!(defaults["graph"]["physical"], "enabled");
+    assert_eq!(defaults["graph"]["engine"], "auto");
+    assert_eq!(defaults["graph"]["physical_origin"], "built-in");
+    assert_eq!(defaults["graph"]["engine_origin"], "built-in");
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    assert_eq!(defaults["graph"]["resolved_engine"], "graphqlite");
+
+    let set = world.ok(
+        &world.project,
+        &[
+            "config",
+            "set",
+            "--physical",
+            "disabled",
+            "--engine",
+            "rslg",
+        ],
+    );
+    assert_eq!(set["graph"]["physical"], "disabled");
+    assert_eq!(set["graph"]["resolved_engine"], "rslg");
+    assert_eq!(set["graph"]["physical_origin"], "project");
+    assert_eq!(set["graph"]["engine_origin"], "project");
+
+    let inherited = world.ok(
+        &world.project,
+        &["config", "unset", "--physical", "--engine"],
+    );
+    assert_eq!(inherited["graph"]["physical"], "enabled");
+    assert_eq!(inherited["graph"]["engine"], "auto");
+
+    world.ok(&world.project, &["--scope", "global", "init"]);
+    world.ok(
+        &world.project,
+        &["--scope", "global", "config", "set", "--engine", "rslg"],
+    );
+    let layered = world.ok(&world.project, &["config", "show"]);
+    assert_eq!(layered["graph"]["engine"], "rslg");
+    assert_eq!(layered["graph"]["engine_origin"], "global");
+    assert_eq!(layered["graph"]["resolved_engine"], "rslg");
+}
+
+#[cfg(unix)]
+#[test]
+fn graph_config_rejects_symlink_all_scope_and_changeset_mutation() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let outside = world.home.join("outside-config.json");
+    fs::write(&outside, "sentinel").unwrap();
+    std::os::unix::fs::symlink(&outside, world.project.join(".lwc/config.json")).unwrap();
+    let error = world.err(&world.project, &["config", "set", "--engine", "rslg"]);
+    assert_eq!(error["error"]["code"], "unsafe_config_path");
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "sentinel");
+
+    let all = world.err(&world.project, &["--scope", "all", "config", "show"]);
+    assert_eq!(all["error"]["code"], "scope_not_supported");
+
+    let second = TestWorld::new();
+    second.ok(&second.project, &["init"]);
+    second.ok(&second.project, &["changeset", "begin", "config-guard"]);
+    let staged = second.err(
+        &second.project,
+        &[
+            "--changeset",
+            "config-guard",
+            "config",
+            "set",
+            "--engine",
+            "rslg",
+        ],
+    );
+    assert_eq!(staged["error"]["code"], "changeset_command_not_supported");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn graphqlite_projection_failure_commits_canonical_fails_closed_and_recovers() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let body = world.write("projection.md", "Committed projection evidence.");
+    let output = Command::new(env!("CARGO_BIN_EXE_lwc"))
+        .current_dir(&world.project)
+        .env("HOME", &world.home)
+        .env("LWC_TEST_GRAPHQLITE_FAIL_AT", "before")
+        .args([
+            "page",
+            "put",
+            "projection-page",
+            "--title",
+            "Projection page",
+            "--file",
+            as_str(&body),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = stderr_json(&output);
+    assert_eq!(error["error"]["code"], "graph_projection_failed");
+    assert_eq!(error["error"]["details"]["canonical_committed"], true);
+
+    let status = world.ok(&world.project, &["graph", "status"]);
+    assert_eq!(status["projection"]["status"], "stale");
+    let stale = world.err(
+        &world.project,
+        &["graph", "explore", "page:projection-page"],
+    );
+    assert_eq!(stale["error"]["code"], "graph_projection_stale");
+
+    world.ok(&world.project, &["config", "set", "--engine", "graphqlite"]);
+    let status = world.ok(&world.project, &["graph", "status"]);
+    assert_eq!(status["projection"]["status"], "fresh");
+    let page = world.ok(&world.project, &["page", "show", "projection-page"]);
+    assert_eq!(page["page"]["title"], "Projection page");
+}
+
+#[test]
+fn canonical_graph_supports_exploration_paths_relations_impact_and_overview() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    put_page(&world, "beta", "Beta", "SharedTerm target knowledge.");
+    put_page(
+        &world,
+        "alpha",
+        "Alpha",
+        "SharedTerm source knowledge. [[beta]]",
+    );
+
+    let explored = world.ok(
+        &world.project,
+        &[
+            "graph",
+            "explore",
+            "term:sharedterm",
+            "--depth",
+            "2",
+            "--limit",
+            "100",
+        ],
+    );
+    assert_eq!(explored["start"]["identifier"], "term:sharedterm");
+    assert!(explored["nodes"].as_array().unwrap().len() >= 3);
+    let occurrence = explored["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|edge| edge["type"] == "OCCURS_IN")
+        .unwrap();
+    assert!(occurrence["frequency"].as_u64().unwrap() > 0);
+    assert_eq!(
+        occurrence["positions"].as_array().unwrap().len() as u64,
+        occurrence["frequency"].as_u64().unwrap()
+    );
+    assert_eq!(
+        occurrence["positions"][0]["byte_start"],
+        occurrence["first_position"]
+    );
+    world.ok(&world.project, &["config", "set", "--engine", "rslg"]);
+    let rslg_explored = world.ok(
+        &world.project,
+        &[
+            "graph",
+            "explore",
+            "term:sharedterm",
+            "--depth",
+            "2",
+            "--limit",
+            "100",
+        ],
+    );
+    assert_eq!(rslg_explored["nodes"], explored["nodes"]);
+    assert_eq!(rslg_explored["edges"], explored["edges"]);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    world.ok(&world.project, &["config", "set", "--engine", "graphqlite"]);
+    let node = world.ok(&world.project, &["graph", "node", "page:alpha"]);
+    assert_eq!(node["node"]["label"], "Alpha");
+    let neighbors = world.ok(
+        &world.project,
+        &[
+            "graph",
+            "neighbors",
+            "page:alpha",
+            "--direction",
+            "outgoing",
+        ],
+    );
+    assert!(
+        neighbors["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["type"] == "LINKS_TO")
+    );
+    let keyword_free = world.ok(&world.project, &["graph", "explore"]);
+    assert_eq!(keyword_free["keyword_free"], true);
+    assert!(
+        !keyword_free["representatives"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let path = world.ok(
+        &world.project,
+        &["graph", "path", "page:alpha", "page:beta"],
+    );
+    assert_eq!(path["found"], true);
+    assert_eq!(path["edges"][0]["type"], "LINKS_TO");
+
+    let relation = world.ok(
+        &world.project,
+        &[
+            "graph",
+            "relation",
+            "set",
+            "page:alpha",
+            "SUPPORTS",
+            "page:beta",
+            "--provenance",
+            "agent-observed",
+            "--reason",
+            "Alpha explicitly supports beta",
+            "--confidence",
+            "0.9",
+        ],
+    );
+    assert_eq!(relation["relation"]["type"], "SUPPORTS");
+    assert_eq!(relation["relation"]["provenance"], "agent-observed");
+
+    let impact = world.ok(&world.project, &["graph", "impact", "page:beta"]);
+    assert!(
+        impact["review"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["identifier"] == "page:alpha")
+    );
+
+    let status = world.ok(&world.project, &["graph", "status"]);
+    assert_eq!(status["projection"]["status"], "fresh");
+    assert_eq!(
+        status["projection"]["canonical_generation"],
+        status["projection"]["projected_generation"]
+    );
+    let verified = world.ok(&world.project, &["graph", "verify"]);
+    assert_eq!(verified["valid"], true, "{verified}");
+
+    let overview = world.ok(&world.project, &["graph", "overview"]);
+    assert!(overview["node_counts"]["term"].as_u64().unwrap() > 0);
+    assert!(overview["edge_counts"]["SUPPORTS"].as_u64().unwrap() > 0);
+    assert_eq!(overview["projection"]["status"], "fresh");
+
+    let listed = world.ok(
+        &world.project,
+        &["graph", "relation", "list", "--from", "page:alpha"],
+    );
+    assert_eq!(listed["relations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        listed["relations"][0]["reason"],
+        "Alpha explicitly supports beta"
+    );
+
+    let retracted = world.ok(
+        &world.project,
+        &[
+            "graph",
+            "relation",
+            "retract",
+            "page:alpha",
+            "SUPPORTS",
+            "page:beta",
+            "--reason",
+            "Evidence was superseded",
+        ],
+    );
+    assert_eq!(retracted["retracted"], true);
+    let listed = world.ok(&world.project, &["graph", "relation", "list"]);
+    assert!(listed["relations"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn semantic_relation_lifecycle_validates_all_types_provenance_sources_and_retraction() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(&world.project, &["config", "set", "--engine", "rslg"]);
+    let source = world.write("relation-source.md", "Semantic relation evidence.");
+    let added = world.ok(&world.project, &["source", "add", as_str(&source)]);
+    let source_id = added["source"]["id"].as_i64().unwrap().to_string();
+    put_page(&world, "relation-a", "Relation A", "Relation source node.");
+    put_page(&world, "relation-b", "Relation B", "Relation target node.");
+
+    for relation_type in [
+        "SUPPORTS",
+        "CONTRADICTS",
+        "REFINES",
+        "SUPERSEDES",
+        "CAUSES",
+        "DEPENDS_ON",
+    ] {
+        world.ok(
+            &world.project,
+            &[
+                "graph",
+                "relation",
+                "set",
+                "page:relation-a",
+                relation_type,
+                "page:relation-b",
+                "--provenance",
+                "agent-observed",
+                "--reason",
+                "validated semantic relation",
+                "--confidence",
+                "0.8",
+            ],
+        );
+    }
+    let listed = world.ok(&world.project, &["graph", "relation", "list"]);
+    assert_eq!(listed["relations"].as_array().unwrap().len(), 6);
+
+    for arguments in [
+        vec!["LINKS_TO", "agent-observed", "reason", "0.8"],
+        vec!["SUPPORTS", "automatic", "reason", "0.8"],
+        vec!["SUPPORTS", "agent-observed", "reason", "1.2"],
+        vec!["SUPPORTS", "agent-observed", "", "0.8"],
+    ] {
+        let error = world.err(
+            &world.project,
+            &[
+                "graph",
+                "relation",
+                "set",
+                "page:relation-a",
+                arguments[0],
+                "page:relation-b",
+                "--provenance",
+                arguments[1],
+                "--reason",
+                arguments[2],
+                "--confidence",
+                arguments[3],
+            ],
+        );
+        assert!(
+            error["error"]["code"]
+                .as_str()
+                .unwrap()
+                .starts_with("invalid_")
+        );
+    }
+    let missing_source = world.err(
+        &world.project,
+        &[
+            "graph",
+            "relation",
+            "set",
+            "page:relation-a",
+            "SUPPORTS",
+            "page:relation-b",
+            "--provenance",
+            "source-grounded",
+            "--reason",
+            "requires evidence",
+            "--confidence",
+            "0.9",
+        ],
+    );
+    assert_eq!(missing_source["error"]["code"], "invalid_semantic_relation");
+    let grounded = world.ok(
+        &world.project,
+        &[
+            "graph",
+            "relation",
+            "set",
+            "page:relation-a",
+            "SUPPORTS",
+            "page:relation-b",
+            "--provenance",
+            "source-grounded",
+            "--reason",
+            "grounded evidence",
+            "--confidence",
+            "0.9",
+            "--source",
+            &source_id,
+        ],
+    );
+    assert_eq!(
+        grounded["relation"]["source_ids"][0],
+        source_id.parse::<i64>().unwrap()
+    );
+
+    let retracted = world.ok(
+        &world.project,
+        &[
+            "graph",
+            "relation",
+            "retract",
+            "page:relation-a",
+            "DEPENDS_ON",
+            "page:relation-b",
+            "--reason",
+            "dependency removed",
+        ],
+    );
+    assert_eq!(retracted["retracted"], true);
+}
+
+#[test]
+fn document_removal_synchronously_removes_hierarchy_and_preserves_stale_span_diagnostics() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    put_page(
+        &world,
+        "temporary-graph-page",
+        "Temporary graph page",
+        "RemovalNeedle remains locatable until deletion.",
+    );
+    let found = world.ok(
+        &world.project,
+        &["search", "RemovalNeedle", "--granularity", "sentence"],
+    );
+    let span_id = found["results"][0]["identifier"].as_str().unwrap();
+
+    world.ok(&world.project, &["page", "remove", "temporary-graph-page"]);
+    let after = world.ok(
+        &world.project,
+        &[
+            "search",
+            "RemovalNeedle",
+            "--granularity",
+            "all",
+            "--group-by",
+            "none",
+        ],
+    );
+    assert!(after["results"].as_array().unwrap().is_empty());
+    let stale = world.err(&world.project, &["span", "get", span_id]);
+    assert_eq!(stale["error"]["code"], "stale_span");
+    let missing = world.err(
+        &world.project,
+        &["graph", "explore", "page:temporary-graph-page"],
+    );
+    assert_eq!(missing["error"]["code"], "graph_node_not_found");
+}
+
+#[test]
 fn every_public_command_exposes_renderable_help() {
     let world = TestWorld::new();
     let commands = [
@@ -2353,8 +2802,27 @@ fn every_public_command_exposes_renderable_help() {
         "ingest complete",
         "ingest fail",
         "ingest retry",
+        "config",
+        "config show",
+        "config set",
+        "config unset",
         "graph",
         "graph related",
+        "graph explore",
+        "graph node",
+        "graph neighbors",
+        "graph path",
+        "graph impact",
+        "graph overview",
+        "graph status",
+        "graph verify",
+        "graph relation",
+        "graph relation set",
+        "graph relation list",
+        "graph relation retract",
+        "span",
+        "span get",
+        "span expand",
         "maintenance",
         "maintenance materialize",
         "maintenance reindex",
@@ -2765,7 +3233,7 @@ fn read_commands_transparently_migrate_a_writable_v5_store() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 10,
+        version, 11,
         "context should migrate a writable legacy store"
     );
 }
@@ -2821,7 +3289,7 @@ fn read_commands_migrate_v6_store_to_structured_provenance() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     conn.prepare("SELECT page_slug, provenance FROM page_provenance LIMIT 0")
         .unwrap();
 }
@@ -2859,7 +3327,7 @@ fn read_commands_migrate_v7_without_guessing_source_path_history() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert_eq!(tracked, 0, "migration must not guess a legacy path head");
 
     let source_id = added["source"]["id"].as_i64().unwrap().to_string();
@@ -2906,7 +3374,7 @@ fn read_commands_atomically_migrate_a_v8_store_to_weighted_retrieval() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     conn.prepare("SELECT path_terms FROM search_fts LIMIT 0")
         .unwrap();
     conn.prepare("SELECT weight FROM retrieval_weights LIMIT 0")
@@ -3005,7 +3473,7 @@ fn read_commands_atomically_migrate_a_v9_store_to_changeset_metadata() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     for key in ["store_id", "store_revision"] {
         let value: String = conn
             .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
@@ -3853,13 +4321,8 @@ fn source_diff_rejects_untracked_and_oversized_inputs_before_rendering() {
     assert_eq!(error["error"]["code"], "source_diff_too_large");
 
     let too_many_lines = world.write("raw/many-lines.md", &"x\n".repeat(200_001));
-    let added = world.ok(&world.project, &["source", "add", as_str(&too_many_lines)]);
-    let lines_id = added["source"]["id"].as_i64().unwrap().to_string();
-    let error = world.err(
-        &world.project,
-        &["source", "diff", &lines_id, "--to-source", &lines_id],
-    );
-    assert_eq!(error["error"]["code"], "source_diff_too_large");
+    let error = world.err(&world.project, &["source", "add", as_str(&too_many_lines)]);
+    assert_eq!(error["error"]["code"], "graph_index_capacity_exceeded");
 }
 
 #[cfg(unix)]
@@ -4133,6 +4596,211 @@ fn source_windows_keep_large_utf8_documents_bounded_and_resumable() {
     assert_eq!(packet["job"]["source"]["content"], "甲乙丙丁");
     assert_eq!(packet["job"]["source_window"]["next_offset_chars"], 4);
     assert_eq!(packet["job"]["source_window"]["has_more"], true);
+}
+
+#[test]
+fn search_directly_returns_sentence_and_passage_locators() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    put_page(
+        &world,
+        "span-page",
+        "Span page",
+        "First context. UniqueNeedle appears here. Final context.",
+    );
+
+    let sentence = world.ok(
+        &world.project,
+        &[
+            "search",
+            "UniqueNeedle",
+            "--type",
+            "page",
+            "--granularity",
+            "sentence",
+        ],
+    );
+    assert_eq!(sentence["results"][0]["type"], "sentence");
+    assert_eq!(sentence["results"][0]["document"]["type"], "page");
+    assert_eq!(
+        sentence["results"][0]["document"]["identifier"],
+        "span-page"
+    );
+    assert_eq!(
+        sentence["results"][0]["snippet"],
+        "UniqueNeedle appears here."
+    );
+    assert_eq!(sentence["results"][0]["span"]["segmenter_version"], 1);
+    assert!(
+        sentence["results"][0]["span"]["byte_end"].as_u64().unwrap()
+            > sentence["results"][0]["span"]["byte_start"]
+                .as_u64()
+                .unwrap()
+    );
+
+    let passage = world.ok(
+        &world.project,
+        &[
+            "search",
+            "UniqueNeedle",
+            "--type",
+            "page",
+            "--granularity",
+            "passage",
+        ],
+    );
+    assert_eq!(passage["results"][0]["type"], "passage");
+    assert_eq!(
+        passage["results"][0]["snippet"],
+        "First context. UniqueNeedle appears here. Final context."
+    );
+
+    let grouped = world.ok(
+        &world.project,
+        &[
+            "search",
+            "UniqueNeedle",
+            "--type",
+            "page",
+            "--granularity",
+            "all",
+            "--group-by",
+            "document",
+        ],
+    );
+    assert_eq!(grouped["results"].as_array().unwrap().len(), 1);
+    assert_eq!(grouped["results"][0]["type"], "page");
+    assert_eq!(grouped["results"][0]["identifier"], "span-page");
+    assert_eq!(
+        grouped["results"][0]["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| result["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["sentence", "passage", "page"]
+    );
+    let matches = grouped["results"][0]["matches"].as_array().unwrap();
+    for (actual, expected) in [
+        (matches[0]["fused_score"].as_f64().unwrap(), 1.15 / 61.0),
+        (matches[1]["fused_score"].as_f64().unwrap(), 1.05 / 61.0),
+        (matches[2]["fused_score"].as_f64().unwrap(), 1.0 / 61.0),
+    ] {
+        assert!((actual - expected).abs() < 1e-12, "{actual} != {expected}");
+    }
+
+    world.ok(
+        &world.project,
+        &[
+            "weight",
+            "set",
+            "page",
+            "span-page",
+            "--value",
+            "2",
+            "--reason",
+            "canonical span owner",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let adjusted = world.ok(
+        &world.project,
+        &[
+            "search",
+            "UniqueNeedle",
+            "--type",
+            "page",
+            "--granularity",
+            "sentence",
+            "--explain",
+        ],
+    );
+    assert_eq!(
+        adjusted["results"][0]["explanation"]["signals"]["manual_adjustment"],
+        1.0
+    );
+    assert_eq!(
+        adjusted["results"][0]["explanation"]["contributions"]["manual"],
+        -2.0
+    );
+
+    let sentence_id = sentence["results"][0]["identifier"].as_str().unwrap();
+    let shown = world.ok(&world.project, &["span", "get", sentence_id]);
+    assert_eq!(shown["span"]["text"], "UniqueNeedle appears here.");
+    assert_eq!(shown["span"]["document"]["identifier"], "span-page");
+    let expanded = world.ok(
+        &world.project,
+        &[
+            "span",
+            "expand",
+            sentence_id,
+            "--before",
+            "1",
+            "--after",
+            "1",
+        ],
+    );
+    assert_eq!(
+        expanded["siblings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|span| span["text"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "First context.",
+            "UniqueNeedle appears here.",
+            "Final context."
+        ]
+    );
+    assert_eq!(
+        expanded["parent"]["text"],
+        "First context. UniqueNeedle appears here. Final context."
+    );
+
+    world.ok(
+        &world.project,
+        &[
+            "graph",
+            "relation",
+            "set",
+            sentence_id,
+            "REFINES",
+            "page:span-page",
+            "--provenance",
+            "agent-observed",
+            "--reason",
+            "span-scoped interpretation",
+            "--confidence",
+            "0.7",
+        ],
+    );
+    let replacement = world.write(
+        "span-replacement.md",
+        "Replacement content has a different fingerprint.",
+    );
+    let replaced = world.ok(
+        &world.project,
+        &[
+            "page",
+            "put",
+            "span-page",
+            "--title",
+            "Span page",
+            "--file",
+            as_str(&replacement),
+        ],
+    );
+    assert_eq!(replaced["graph"]["invalidated_semantic_relations"], 1);
+    let stale = world.err(&world.project, &["span", "get", sentence_id]);
+    assert_eq!(stale["error"]["code"], "stale_span", "{stale}");
+    assert_eq!(stale["error"]["details"]["prior"]["segmenter_version"], 1);
+    assert_eq!(stale["error"]["details"]["current"]["segmenter_version"], 1);
+    assert_ne!(
+        stale["error"]["details"]["prior"]["content_fingerprint"],
+        stale["error"]["details"]["current"]["content_fingerprint"]
+    );
 }
 
 #[test]

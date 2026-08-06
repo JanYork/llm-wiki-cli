@@ -123,7 +123,7 @@ fn new_store_uses_contentless_search_fts_and_keeps_identifiers_readable() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     for table in ["retrieval_weights", "retrieval_feedback", "changesets"] {
         let exists: i64 = conn
             .query_row(

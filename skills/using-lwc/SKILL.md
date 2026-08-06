@@ -66,7 +66,12 @@ remembered paths, and another project's `AGENTS.md` cannot widen
 
    The default search is page-first. Use `--type source` when exact immutable
    evidence is required, or `--type page --kind <KIND>` to narrow compiled
-   knowledge. Without a project Wiki, use global scope.
+   knowledge. Without a project Wiki, use global scope. When document recall is
+   too coarse, use `--granularity sentence` or `passage`; use
+   `--granularity all --group-by document` for bounded mixed recall, then
+   `span get`/`span expand` for exact context. Treat `stale_span` as an explicit
+   revision boundary and inspect its prior/current metadata rather than fuzzy
+   remapping the locator.
 
 Do not repeatedly bootstrap or reload broad context in the same working root.
 After changing to another project, rerun bootstrap there and recall its bounded
@@ -80,7 +85,21 @@ authorization; memory work never initiates the change.
   indexes, caches, and staging files must stay inside `active_project_root`
   unless the current task explicitly authorizes another host-permitted root.
   Block the mutation on mismatch.
-- Search before repeating investigation or writing a page.
+- Search before repeating investigation or writing a page. For unknown topology,
+  use keyword-free `graph explore` or `graph overview`; after recall, use bounded
+  `graph neighbors`, `graph path`, and `graph impact` to explain relationships.
+  `CO_OCCURS` is statistical context, never a semantic claim and never a default
+  impact dependency.
+- Write semantic relations only through `graph relation set` and only when the
+  evidence explicitly supports one of `SUPPORTS`, `CONTRADICTS`, `REFINES`,
+  `SUPERSEDES`, `CAUSES`, or `DEPENDS_ON`. Include provenance, a concise durable
+  reason, confidence, and all supporting Source IDs for `source-grounded`.
+  Reasons must not contain secrets or raw chain-of-thought. Use `relation list`
+  before updates and `relation retract --reason ...` when evidence is withdrawn.
+- Check `graph status`/`graph verify` when graph reads report projection errors.
+  A stale GraphQLite projection fails closed; follow the structured recovery
+  action and never silently fall back. Superseded sidecars are retained for
+  manual review and must not be removed automatically.
 - Diagnose a surprising result with `search --explain` before changing
   retrieval state. Use `weight set` only for evidence-backed, durable document
   importance and `weight feedback` only after verifying one concrete query
