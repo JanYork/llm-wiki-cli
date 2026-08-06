@@ -50,6 +50,8 @@ jobs:
           -- --ignored --nocapture
 
       - name: Package verification
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/lwc-package-target
         run: cargo package --locked
 
   build:
