@@ -297,7 +297,10 @@ fn purpose_and_markdown_projection_preserve_the_three_layer_architecture() {
         "--provenance",
         "agent-observed",
     ]);
-    world.ok(&["maintenance", "materialize"]);
+    let queued = world.ok(&["maintenance", "materialize"]);
+    let work_id = queued["work"]["id"].as_str().unwrap().to_owned();
+    let finished = world.ok(&["work", "watch", &work_id]);
+    assert_eq!(finished["work"]["state"], "succeeded", "{finished}");
 
     let projected =
         fs::read_to_string(world.project.join(".lwc/wiki/concepts/architecture.md")).unwrap();
@@ -392,7 +395,11 @@ fn maintenance_reindex_repairs_missing_fts_rows() {
 
     let before = world.ok(&["lint"]);
     assert_eq!(before["counts"]["search_index_missing"], 1);
-    let rebuilt = world.ok(&["maintenance", "reindex"]);
+    let queued = world.ok(&["maintenance", "reindex"]);
+    let work_id = queued["work"]["id"].as_str().unwrap().to_owned();
+    let finished = world.ok(&["work", "watch", &work_id]);
+    assert_eq!(finished["work"]["state"], "succeeded", "{finished}");
+    let rebuilt = &finished["work"]["result"];
     assert_eq!(rebuilt["pages"], 1);
     assert_eq!(rebuilt["sources"], 0);
 

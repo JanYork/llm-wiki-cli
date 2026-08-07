@@ -10,6 +10,7 @@ pub mod segment;
 mod source_diff;
 mod store;
 pub mod tokenize;
+mod work;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use error::{AppError, Result};
@@ -185,6 +186,18 @@ enum Command {
         /// Do not add the project .lwc directory to Git's local exclude file.
         #[arg(long)]
         no_git_exclude: bool,
+    },
+    /// Inspect and control long-running Wiki work.
+    Work {
+        #[command(subcommand)]
+        command: WorkCommand,
+    },
+    #[command(name = "__work-run", hide = true)]
+    WorkRun {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        id: String,
     },
     /// Stage, inspect, publish, discard, or roll back an atomic Wiki changeset.
     Changeset {
@@ -380,6 +393,20 @@ enum ChangesetCommand {
     Discard { name: String },
     /// Restore the exact pre-commit snapshot when no later live write exists.
     Rollback { changeset_id: String },
+}
+
+#[derive(Subcommand)]
+enum WorkCommand {
+    /// List recent work for the selected Wiki.
+    List,
+    /// Read the latest progress for one work item.
+    Status { id: String },
+    /// Wait until one work item reaches a terminal state.
+    Watch { id: String },
+    /// Request cooperative cancellation.
+    Cancel { id: String },
+    /// Resume failed, cancelled, or stale interrupted work.
+    Resume { id: String },
 }
 
 #[derive(Subcommand)]
@@ -1113,6 +1140,22 @@ fn main() {
 fn run(cli: Cli) -> Result<Value> {
     let cwd = env::current_dir()?;
     let selected_changeset = cli.changeset.clone();
+    if !matches!(
+        &cli.command,
+        Command::Init { .. } | Command::Work { .. } | Command::WorkRun { .. }
+    ) {
+        let paths = if cli.scope == Scope::All {
+            resolve_live_read_store_paths(cli.scope, &cwd, true)?
+        } else {
+            vec![resolve_live_store_path(cli.scope, &cwd)?]
+        };
+        for path in paths {
+            if work::schema_migration_needed(&path.path)? {
+                changeset::reject_selector(selected_changeset.as_deref(), "schema migration")?;
+                return work::start_schema_migration(&path);
+            }
+        }
+    }
     match cli.command {
         Command::Init { no_git_exclude } => {
             changeset::reject_selector(selected_changeset.as_deref(), "init")?;
@@ -1129,6 +1172,22 @@ fn run(cli: Cli) -> Result<Value> {
                 "created": created,
                 "git_exclude": git_exclude
             }))
+        }
+        Command::Work { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "work")?;
+            ensure_scope_supported(cli.scope, false, "work")?;
+            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
+            match command {
+                WorkCommand::List => work::list(&store_path),
+                WorkCommand::Status { id } => work::status(&store_path, &id),
+                WorkCommand::Watch { id } => work::watch(&store_path, &id),
+                WorkCommand::Cancel { id } => work::cancel(&store_path, &id),
+                WorkCommand::Resume { id } => work::resume(&store_path, &id),
+            }
+        }
+        Command::WorkRun { root, id } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "work runner")?;
+            work::run(&root, &id)
         }
         Command::Changeset { command } => {
             changeset::reject_selector(selected_changeset.as_deref(), "changeset")?;
@@ -1921,15 +1980,10 @@ fn run(cli: Cli) -> Result<Value> {
             changeset::reject_selector(selected_changeset.as_deref(), "maintenance")?;
             ensure_scope_supported(cli.scope, false, "maintenance")?;
             let store_path = resolve_live_store_path(cli.scope, &cwd)?;
-            let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
             match command {
-                MaintenanceCommand::Materialize => to_json(store.materialize()?),
-                MaintenanceCommand::Reindex => {
-                    let response = store.reindex()?;
-                    store.materialize_wiki()?;
-                    to_json(response)
-                }
-                MaintenanceCommand::Compact => to_json(store.compact()?),
+                MaintenanceCommand::Materialize => work::start_materialize(&store_path),
+                MaintenanceCommand::Reindex => work::start_reindex(&store_path),
+                MaintenanceCommand::Compact => work::start_compact(&store_path),
             }
         }
         Command::Checkpoint { command } => {

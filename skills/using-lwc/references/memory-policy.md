@@ -505,9 +505,12 @@ restore`; it validates the backup, preserves the current database as
 remove` for deletion, and stop when citations or inbound links make the object
 in use.
 
-If storage growth matters, run scope-specific `maintenance compact` only during
-an idle window. Inspect `busy` and `after_bytes`; a successful process exit does
-not mean an active reader allowed a full WAL truncate.
+Maintenance commands return durable work. Capture `work.id`, use `work status`
+for progress or `work watch` to wait, and require `state=succeeded` before using
+`work.result`. If storage growth matters, run scope-specific `maintenance
+compact` only during an idle window. Inspect `work.result.busy` and
+`work.result.after_bytes`; a successful process exit does not mean an active
+reader allowed a full WAL truncate.
 
 Periodically perform the semantic work the CLI cannot:
 

@@ -606,6 +606,11 @@ lwc lint
 lwc maintenance reindex
 lwc maintenance materialize
 lwc maintenance compact
+lwc work list
+lwc work status <WORK_ID>
+lwc work watch <WORK_ID>
+lwc work cancel <WORK_ID>
+lwc work resume <WORK_ID>
 lwc checkpoint create before-large-update
 lwc checkpoint list
 lwc log --limit 20
@@ -613,6 +618,9 @@ lwc log --limit 20
 
 说明：
 
+- 维护命令会立即返回持久化 `work`。使用 `work status` 查看进度，或使用
+  `work watch` 等待完成并读取 `work.result`。v10 到 v11 的 schema 迁移也会
+  自动进入同一机制，普通命令不会再在前台执行迁移。
 - `lint` 默认完全只读；只有这次检查确实需要进入持久操作历史时才加 `--record`。
 - `maintenance reindex` 从 SQLite 重建派生搜索产物。
 - `maintenance materialize` 从 SQLite 重建投影出来的 Markdown 树。

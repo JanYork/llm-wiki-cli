@@ -264,7 +264,10 @@ fn source_origin_and_page_slug_are_rebuilt_into_path_terms() {
         row["type"] == "page" && row["identifier"] == "payment-reconciliation-guide"
     }));
 
-    world.ok(&["maintenance", "reindex"]);
+    let queued = world.ok(&["maintenance", "reindex"]);
+    let work_id = queued["work"]["id"].as_str().unwrap().to_owned();
+    let finished = world.ok(&["work", "watch", &work_id]);
+    assert_eq!(finished["work"]["state"], "succeeded", "{finished}");
     let after = world.ok(&["search", "reconciliation", "--type", "all"]);
     assert_eq!(before["results"], after["results"]);
 
@@ -315,7 +318,11 @@ fn maintenance_compact_truncates_wal_and_reports_metrics() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let queued: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let work_id = queued["work"]["id"].as_str().unwrap();
+    let finished = world.ok(&["work", "watch", work_id]);
+    assert_eq!(finished["work"]["state"], "succeeded", "{finished}");
+    let json = &finished["work"]["result"];
     assert_eq!(json["scope"], json!("project"));
     assert_eq!(
         json["database"],

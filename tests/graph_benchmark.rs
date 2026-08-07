@@ -144,7 +144,9 @@ fn graph_benchmark_reports_latency_growth_projection_and_bounds() {
         ]);
     }
     let indexing_ms = started.elapsed().as_secs_f64() * 1000.0;
-    world.run(&["maintenance", "compact"]);
+    let (queued, _) = world.run(&["maintenance", "compact"]);
+    let work_id = queued["work"]["id"].as_str().unwrap();
+    world.run(&["work", "watch", work_id]);
 
     let mut sentence_search = Vec::new();
     let mut passage_search = Vec::new();

@@ -80,6 +80,12 @@ authorization; memory work never initiates the change.
 
 ## Work and Remember
 
+- A normal command can return a `work` instead of its usual payload when the
+  Wiki needs schema migration. Capture `work.id`, use `work status` for bounded
+  progress or `work watch` to wait, require `state=succeeded`, then retry the
+  original command. Use `work cancel` for cooperative cancellation and `work
+  resume` only for failed, cancelled, or stale interrupted work. Never treat a
+  queued/running work response as the requested knowledge result.
 - Before the first mutation, canonicalize the Wiki database and every write
   target. Project Wiki data, generated projections, reports, navigation,
   indexes, caches, and staging files must stay inside `active_project_root`
@@ -197,8 +203,10 @@ authorization; memory work never initiates the change.
   assume the canonical SQLite transaction rolled back.
 - Remove sources and pages only through the guarded CLI commands; never bypass
   citation or inbound-link checks by editing SQLite.
-- Use `maintenance compact` only during an idle maintenance window when storage
-  growth matters; inspect `busy` and `after_bytes`.
+- Maintenance commands run as durable work. Capture the returned ID and inspect
+  progress; after `work watch` succeeds, read `work.result`. Use `maintenance
+  compact` only during an idle maintenance window when storage growth matters,
+  then inspect `work.result.busy` and `work.result.after_bytes`.
 
 ## Deep Principle
 

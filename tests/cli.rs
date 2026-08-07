@@ -4,13 +4,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
+    time::Instant,
 };
 #[cfg(unix)]
-use std::{
-    process::Stdio,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{process::Stdio, thread, time::Duration};
 use tempfile::TempDir;
 
 struct TestWorld {
@@ -85,6 +82,32 @@ impl TestWorld {
 
 fn as_str(path: &Path) -> &str {
     path.to_str().unwrap()
+}
+
+fn downgrade_to_v10(database: &Path) {
+    let conn = Connection::open(database).unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         DROP TABLE span_fts;
+         DROP TABLE IF EXISTS span_fts_data;
+         DROP TABLE IF EXISTS span_fts_idx;
+         DROP TABLE IF EXISTS span_fts_content;
+         DROP TABLE IF EXISTS span_fts_docsize;
+         DROP TABLE IF EXISTS span_fts_config;
+         DROP TABLE graph_deltas;
+         DROP TABLE graph_generations;
+         DROP TABLE graph_projection_state;
+         DROP TABLE term_pair_totals;
+         DROP TABLE term_pair_contributions;
+         DROP TABLE graph_occurrences;
+         DROP TABLE graph_edges;
+         DROP TABLE graph_nodes;
+         DROP TABLE document_index_state;
+         UPDATE meta SET value = '10' WHERE key = 'format_version';
+         PRAGMA user_version = 10;
+         PRAGMA foreign_keys = ON;",
+    )
+    .unwrap();
 }
 
 fn stdout_json(output: &Output) -> Value {
@@ -644,7 +667,10 @@ fn changeset_reports_a_committed_materialization_failure_and_repairs_it() {
 
     fs::remove_file(&wiki).unwrap();
     fs::rename(saved, &wiki).unwrap();
-    world.ok(&world.project, &["maintenance", "materialize"]);
+    let queued = world.ok(&world.project, &["maintenance", "materialize"]);
+    let work_id = queued["work"]["id"].as_str().unwrap().to_owned();
+    let finished = world.ok(&world.project, &["work", "watch", &work_id]);
+    assert_eq!(finished["work"]["state"], "succeeded", "{finished}");
     assert!(
         String::from_utf8(fs::read(wiki.join("index.md")).unwrap())
             .unwrap()
@@ -2827,6 +2853,12 @@ fn every_public_command_exposes_renderable_help() {
         "maintenance materialize",
         "maintenance reindex",
         "maintenance compact",
+        "work",
+        "work list",
+        "work status",
+        "work watch",
+        "work cancel",
+        "work resume",
         "checkpoint",
         "checkpoint create",
         "checkpoint list",
@@ -3235,6 +3267,72 @@ fn read_commands_transparently_migrate_a_writable_v5_store() {
     assert_eq!(
         version, 11,
         "context should migrate a writable legacy store"
+    );
+}
+
+#[test]
+fn v10_commands_return_schema_migration_work_without_blocking_inline() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    put_page(
+        &world,
+        "migration-work",
+        "Migration work",
+        "migration work evidence",
+    );
+    let database = world.project.join(".lwc/wiki.db");
+    downgrade_to_v10(&database);
+
+    let started = Instant::now();
+    let output = world.command(&world.project, &["context", "--limit", "5"]);
+    let elapsed = started.elapsed();
+    assert!(
+        output.status.success(),
+        "old-schema preflight failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = stdout_json(&output);
+    assert_eq!(response["work"]["kind"], "schema-migrate");
+    assert!(
+        matches!(
+            response["work"]["state"].as_str(),
+            Some("queued" | "running")
+        ),
+        "unexpected Work response: {response}"
+    );
+    let work_id = response["work"]["id"].as_str().unwrap();
+    assert_eq!(work_id.len(), 64);
+    assert!(work_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(
+        elapsed.as_millis() <= 500,
+        "foreground migration preflight took {} ms",
+        elapsed.as_millis()
+    );
+
+    let watched = world.ok(&world.project, &["work", "watch", work_id]);
+    assert_eq!(watched["work"]["state"], "succeeded", "{watched}");
+    assert_eq!(watched["work"]["percent"], 100.0);
+    let status = world.ok(&world.project, &["work", "status", work_id]);
+    assert_eq!(status["work"]["id"], work_id);
+    let works = world.ok(&world.project, &["work", "list"]);
+    assert!(
+        works["works"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|work| work["id"] == work_id)
+    );
+    let resume_error = world.err(&world.project, &["work", "resume", work_id]);
+    assert_eq!(resume_error["error"]["code"], "work_not_resumable");
+    world.ok(&world.project, &["context", "--limit", "5"]);
+    let verified = world.ok(&world.project, &["graph", "verify"]);
+    assert_eq!(verified["valid"], true, "{verified}");
+    let migrated = Connection::open(database).unwrap();
+    assert_eq!(
+        migrated
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        11
     );
 }
 

@@ -20,6 +20,8 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::cell::Cell;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
@@ -55,6 +57,27 @@ const GRAPH_HUB_WEIGHT: f64 = 4.0;
 const MANUAL_WEIGHT: f64 = 2.0;
 const FEEDBACK_WEIGHT: f64 = 1.5;
 static SOURCE_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+type MigrationProgress<'a> = dyn FnMut(usize, usize, &str) -> Result<()> + 'a;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GRAPH_DIGEST_CALLS: Cell<usize> = const { Cell::new(0) };
+    static TEST_COOCCURRENCE_REBUILDS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_test_graph_build_counts() {
+    TEST_GRAPH_DIGEST_CALLS.set(0);
+    TEST_COOCCURRENCE_REBUILDS.set(0);
+}
+
+#[cfg(test)]
+fn test_graph_build_counts() -> (usize, usize) {
+    (
+        TEST_GRAPH_DIGEST_CALLS.get(),
+        TEST_COOCCURRENCE_REBUILDS.get(),
+    )
+}
 pub const DEFAULT_SCHEMA: &str = r#"# Wiki Schema
 
 ## Page types
@@ -949,7 +972,7 @@ impl Store {
             database,
             conn,
         };
-        let created = prepare_store(&mut store.conn, true)?;
+        let created = prepare_store(&mut store.conn, true, None)?;
         if created {
             store.record_top_level_operation(
                 "init",
@@ -973,13 +996,41 @@ impl Store {
 
         let mut conn = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         configure_connection(&conn)?;
-        prepare_store(&mut conn, false)?;
+        prepare_store(&mut conn, false, None)?;
 
         let mut store = Self {
             scope,
             database,
             conn,
         };
+        store.reconcile_graph_projection()?;
+        Ok(store)
+    }
+
+    pub fn open_with_migration_progress(
+        scope: impl Into<String>,
+        database: impl AsRef<Path>,
+        progress: &mut dyn FnMut(usize, usize, &str) -> Result<()>,
+    ) -> Result<Self> {
+        let scope = scope.into();
+        let database = database.as_ref().to_path_buf();
+        if !database.is_file() {
+            return Err(AppError::new(
+                "store_not_found",
+                format!("wiki database not found: {}", database.display()),
+            ));
+        }
+
+        let mut conn = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        configure_connection(&conn)?;
+        prepare_store(&mut conn, false, Some(&mut *progress))?;
+
+        let mut store = Self {
+            scope,
+            database,
+            conn,
+        };
+        progress(1, 1, "projecting")?;
         store.reconcile_graph_projection()?;
         Ok(store)
     }
@@ -2110,6 +2161,7 @@ impl Store {
             },
             before_graph.as_ref(),
             &page_relation_edges(&tx, &input.slug, &source_ids, &links)?,
+            true,
         )?;
         persist_inbound_link_edges(&tx, &input.slug, graph_generation)?;
         tx.commit()?;
@@ -4189,7 +4241,11 @@ fn enable_wal(conn: &Connection) -> Result<()> {
     }
 }
 
-fn prepare_store(conn: &mut Connection, allow_create: bool) -> Result<bool> {
+fn prepare_store(
+    conn: &mut Connection,
+    allow_create: bool,
+    migration_progress: Option<&mut MigrationProgress<'_>>,
+) -> Result<bool> {
     let mut version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version == 0 {
         return if allow_create {
@@ -4238,7 +4294,7 @@ fn prepare_store(conn: &mut Connection, allow_create: bool) -> Result<bool> {
         version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     }
     if version == CHANGESETS_VERSION {
-        migrate_hierarchical_graph(conn)?;
+        migrate_hierarchical_graph(conn, migration_progress)?;
         version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     }
     if version != USER_VERSION {
@@ -4547,7 +4603,10 @@ fn migrate_changesets(conn: &mut Connection) -> Result<()> {
     })
 }
 
-fn migrate_hierarchical_graph(conn: &mut Connection) -> Result<()> {
+fn migrate_hierarchical_graph(
+    conn: &mut Connection,
+    mut progress: Option<&mut MigrationProgress<'_>>,
+) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match current {
@@ -4569,6 +4628,18 @@ fn migrate_hierarchical_graph(conn: &mut Connection) -> Result<()> {
             format!("failed to create v{USER_VERSION} hierarchical graph schema: {error}"),
         )
     })?;
+    tx.execute_batch(
+        "DELETE FROM graph_deltas;
+         DELETE FROM graph_generations;
+         DELETE FROM graph_projection_state;
+         DELETE FROM graph_occurrences;
+         DELETE FROM term_pair_contributions;
+         DELETE FROM term_pair_totals;
+         DELETE FROM graph_edges;
+         DELETE FROM span_fts;
+         DELETE FROM graph_nodes;
+         DELETE FROM document_index_state;",
+    )?;
     tx.execute(
         &format!(
             "INSERT OR IGNORE INTO graph_projection_state(
@@ -4593,20 +4664,6 @@ fn migrate_hierarchical_graph(conn: &mut Connection) -> Result<()> {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for (source_id, title, origin, content) in &sources {
-        persist_document_graph(
-            &tx,
-            &DocumentGraphInput {
-                document_type: DocumentType::Source,
-                identifier: &source_id.to_string(),
-                label: title.as_deref().unwrap_or(origin),
-                content,
-            },
-            None,
-            &[],
-        )?;
-    }
-
     let pages = {
         let mut statement = tx.prepare("SELECT slug, title, body FROM pages ORDER BY slug")?;
         statement
@@ -4619,6 +4676,26 @@ fn migrate_hierarchical_graph(conn: &mut Connection) -> Result<()> {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
+    let total = sources.len() + pages.len();
+    let mut completed = 0;
+    report_migration_progress(&mut progress, completed, total, "indexing")?;
+    for (source_id, title, origin, content) in &sources {
+        persist_document_graph(
+            &tx,
+            &DocumentGraphInput {
+                document_type: DocumentType::Source,
+                identifier: &source_id.to_string(),
+                label: title.as_deref().unwrap_or(origin),
+                content,
+            },
+            None,
+            &[],
+            false,
+        )?;
+        completed += 1;
+        report_migration_progress(&mut progress, completed, total, "indexing-sources")?;
+    }
+
     for (slug, title, body) in &pages {
         let source_ids = {
             let mut statement = tx.prepare(
@@ -4639,7 +4716,10 @@ fn migrate_hierarchical_graph(conn: &mut Connection) -> Result<()> {
             },
             None,
             &relations,
+            false,
         )?;
+        completed += 1;
+        report_migration_progress(&mut progress, completed, total, "indexing-pages")?;
     }
 
     let initial_generation = if sources.is_empty() && pages.is_empty() {
@@ -4648,6 +4728,26 @@ fn migrate_hierarchical_graph(conn: &mut Connection) -> Result<()> {
         1
     };
     if initial_generation == 1 {
+        report_migration_progress(&mut progress, completed, total, "finalizing-graph")?;
+        rebuild_cooccurrence_edges(&tx)?;
+        let store_revision: String = tx.query_row(
+            "SELECT value FROM meta WHERE key = 'store_revision'",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            &format!(
+                "INSERT INTO graph_generations(
+                    generation, store_revision, canonical_digest,
+                    changed_document_count, created_at
+                 ) VALUES (1, ?1, ?2, ?3, {TIMESTAMP_SQL})"
+            ),
+            params![
+                store_revision,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                (sources.len() + pages.len()) as i64,
+            ],
+        )?;
         let links = {
             let mut statement = tx.prepare(
                 "SELECT l.from_slug, l.to_slug
@@ -4701,9 +4801,45 @@ fn migrate_hierarchical_graph(conn: &mut Connection) -> Result<()> {
                 Some(initial_generation),
             )?;
         }
-        tx.execute("UPDATE graph_deltas SET generation = 1", [])?;
-        tx.execute("UPDATE document_index_state SET generation = 1", [])?;
-        tx.execute("DELETE FROM graph_generations WHERE generation <> 1", [])?;
+        tx.execute("DELETE FROM graph_deltas", [])?;
+        let records = canonical_database_records(&tx)?;
+        {
+            let mut statement = tx.prepare(&format!(
+                "INSERT INTO graph_deltas(
+                    generation, action, entity_type, entity_id,
+                    document_type, document_identifier,
+                    after_json, created_at
+                 ) VALUES (1, 'add', ?1, ?2, ?3, ?4, ?5, {TIMESTAMP_SQL})"
+            ))?;
+            for ((entity_type, entity_id), after_json) in records {
+                let record: Value = serde_json::from_str(&after_json).map_err(|error| {
+                    AppError::new(
+                        "store_migration_failed",
+                        format!("failed to encode initial graph delta: {error}"),
+                    )
+                })?;
+                let owner_type = if entity_type == "node" {
+                    record.get("document_type")
+                } else {
+                    record.get("owner_type")
+                }
+                .and_then(Value::as_str)
+                .filter(|value| matches!(*value, "page" | "source"));
+                let owner_identifier = if entity_type == "node" {
+                    record.get("document_identifier")
+                } else {
+                    record.get("owner_identifier")
+                }
+                .and_then(Value::as_str);
+                statement.execute(params![
+                    entity_type,
+                    entity_id,
+                    owner_type,
+                    owner_identifier,
+                    after_json,
+                ])?;
+            }
+        }
         tx.execute(
             "UPDATE graph_generations
              SET canonical_digest = ?1, changed_document_count = ?2
@@ -4735,6 +4871,18 @@ fn migrate_hierarchical_graph(conn: &mut Connection) -> Result<()> {
             format!("failed to commit v{USER_VERSION} hierarchical graph migration: {error}"),
         )
     })
+}
+
+fn report_migration_progress(
+    progress: &mut Option<&mut MigrationProgress<'_>>,
+    completed: usize,
+    total: usize,
+    phase: &str,
+) -> Result<()> {
+    if let Some(progress) = progress.as_mut() {
+        progress(completed, total, phase)?;
+    }
+    Ok(())
 }
 
 fn add_structural_navigation_state(tx: &Transaction<'_>) -> Result<()> {
@@ -5360,6 +5508,7 @@ fn insert_source(tx: &Transaction<'_>, input: &SourceAddInput) -> Result<(i64, b
             },
             None,
             &[],
+            true,
         )?)
     } else {
         None
@@ -6762,6 +6911,8 @@ fn persist_migration_relation_edge(
 }
 
 fn database_graph_digest(conn: &Connection) -> Result<String> {
+    #[cfg(test)]
+    TEST_GRAPH_DIGEST_CALLS.set(TEST_GRAPH_DIGEST_CALLS.get() + 1);
     let mut hasher = Sha256::new();
     let mut hash_record = |record: String| {
         hasher.update((record.len() as u64).to_be_bytes());
@@ -7432,6 +7583,7 @@ fn persist_document_graph(
     input: &DocumentGraphInput<'_>,
     _before: Option<&DocumentGraphReplacement>,
     extra_edges: &[CanonicalEdge],
+    finalize_generation: bool,
 ) -> Result<i64> {
     let mut graph = build_document_graph(input).map_err(segment_error)?;
     graph.edges.extend_from_slice(extra_edges);
@@ -7483,9 +7635,12 @@ fn persist_document_graph(
             affected_terms.insert(row?);
         }
     }
-    expand_affected_cooccurrence_sources(tx, &mut affected_terms)?;
-    let before_records =
-        canonical_document_records(tx, document_type, input.identifier, &affected_terms)?;
+    let before_records = if finalize_generation {
+        expand_affected_cooccurrence_sources(tx, &mut affected_terms)?;
+        canonical_document_records(tx, document_type, input.identifier, &affected_terms)?
+    } else {
+        BTreeMap::new()
+    };
 
     tx.execute(
         "DELETE FROM graph_occurrences
@@ -7641,67 +7796,72 @@ fn persist_document_graph(
         )?;
     }
     apply_term_pair_totals(tx, &cooccurrence.contributions, 1.0)?;
-    expand_affected_cooccurrence_sources(tx, &mut affected_terms)?;
-    rebuild_cooccurrence_edges_for(tx, Some(&affected_terms))?;
+    let generation = if finalize_generation {
+        expand_affected_cooccurrence_sources(tx, &mut affected_terms)?;
+        rebuild_cooccurrence_edges_for(tx, Some(&affected_terms))?;
 
-    let generation: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(generation), 0) + 1 FROM graph_generations",
-        [],
-        |row| row.get(0),
-    )?;
-    let store_revision: String = tx.query_row(
-        "SELECT value FROM meta WHERE key = 'store_revision'",
-        [],
-        |row| row.get(0),
-    )?;
-    tx.execute(
-        &format!(
-            "INSERT INTO graph_generations(
-                generation, store_revision, canonical_digest,
-                changed_document_count, created_at
-             ) VALUES (?1, ?2, ?3, 1, {TIMESTAMP_SQL})"
-        ),
-        params![generation, store_revision, database_graph_digest(tx)?],
-    )?;
-    let after_records =
-        canonical_document_records(tx, document_type, input.identifier, &affected_terms)?;
-    let record_keys = before_records
-        .keys()
-        .chain(after_records.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    {
-        let mut delta_statement = tx.prepare(&format!(
-            "INSERT INTO graph_deltas(
-                generation, action, entity_type, entity_id,
-                document_type, document_identifier,
-                before_json, after_json, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, {TIMESTAMP_SQL})"
-        ))?;
-        for (entity_type, entity_id) in record_keys {
-            let old = before_records.get(&(entity_type.clone(), entity_id.clone()));
-            let new = after_records.get(&(entity_type.clone(), entity_id.clone()));
-            if old == new {
-                continue;
+        let generation: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(generation), 0) + 1 FROM graph_generations",
+            [],
+            |row| row.get(0),
+        )?;
+        let store_revision: String = tx.query_row(
+            "SELECT value FROM meta WHERE key = 'store_revision'",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            &format!(
+                "INSERT INTO graph_generations(
+                    generation, store_revision, canonical_digest,
+                    changed_document_count, created_at
+                 ) VALUES (?1, ?2, ?3, 1, {TIMESTAMP_SQL})"
+            ),
+            params![generation, store_revision, database_graph_digest(tx)?],
+        )?;
+        let after_records =
+            canonical_document_records(tx, document_type, input.identifier, &affected_terms)?;
+        let record_keys = before_records
+            .keys()
+            .chain(after_records.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        {
+            let mut delta_statement = tx.prepare(&format!(
+                "INSERT INTO graph_deltas(
+                    generation, action, entity_type, entity_id,
+                    document_type, document_identifier,
+                    before_json, after_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, {TIMESTAMP_SQL})"
+            ))?;
+            for (entity_type, entity_id) in record_keys {
+                let old = before_records.get(&(entity_type.clone(), entity_id.clone()));
+                let new = after_records.get(&(entity_type.clone(), entity_id.clone()));
+                if old == new {
+                    continue;
+                }
+                let action = match (old, new) {
+                    (None, Some(_)) => "add",
+                    (Some(_), None) => "remove",
+                    (Some(_), Some(_)) => "update",
+                    (None, None) => continue,
+                };
+                delta_statement.execute(params![
+                    generation,
+                    action,
+                    entity_type,
+                    entity_id,
+                    document_type,
+                    input.identifier,
+                    old,
+                    new,
+                ])?;
             }
-            let action = match (old, new) {
-                (None, Some(_)) => "add",
-                (Some(_), None) => "remove",
-                (Some(_), Some(_)) => "update",
-                (None, None) => continue,
-            };
-            delta_statement.execute(params![
-                generation,
-                action,
-                entity_type,
-                entity_id,
-                document_type,
-                input.identifier,
-                old,
-                new,
-            ])?;
         }
-    }
+        generation
+    } else {
+        1
+    };
     tx.execute(
         &format!(
             "INSERT INTO document_index_state(
@@ -7727,18 +7887,20 @@ fn persist_document_graph(
             cooccurrence.truncated_sentence_count as i64,
         ],
     )?;
-    tx.execute(
-        &format!(
-            "UPDATE graph_projection_state
-             SET canonical_generation = ?1,
-                 projected_generation = CASE
-                     WHEN engine = 'rslg' THEN ?1 ELSE projected_generation END,
-                 status = CASE WHEN engine = 'rslg' THEN 'fresh' ELSE 'pending' END,
-                 updated_at = {TIMESTAMP_SQL}
-             WHERE projection = 'physical'"
-        ),
-        params![generation],
-    )?;
+    if finalize_generation {
+        tx.execute(
+            &format!(
+                "UPDATE graph_projection_state
+                 SET canonical_generation = ?1,
+                     projected_generation = CASE
+                         WHEN engine = 'rslg' THEN ?1 ELSE projected_generation END,
+                     status = CASE WHEN engine = 'rslg' THEN 'fresh' ELSE 'pending' END,
+                     updated_at = {TIMESTAMP_SQL}
+                 WHERE projection = 'physical'"
+            ),
+            params![generation],
+        )?;
+    }
     Ok(generation)
 }
 
@@ -7840,6 +8002,8 @@ fn rebuild_cooccurrence_edges_for(
     tx: &Transaction<'_>,
     affected_terms: Option<&BTreeSet<String>>,
 ) -> Result<()> {
+    #[cfg(test)]
+    TEST_COOCCURRENCE_REBUILDS.set(TEST_COOCCURRENCE_REBUILDS.get() + 1);
     let contributions = {
         let mut statement = tx.prepare(
             "SELECT from_term_id, to_term_id, raw_strength, witness_count
@@ -10889,19 +11053,87 @@ mod tests {
                 source_id INTEGER NOT NULL, observed_at TEXT NOT NULL,
                 PRIMARY KEY(tracked_path, revision)
              );
-             INSERT INTO sources VALUES (
-                1, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-                'Evidence', 'evidence.md', 'alpha beta.', 0, 'now'
-             );
-             INSERT INTO pages VALUES (
-                'summary', 'Summary', 'source', NULL, 'alpha summary.', 0, 'now', 'now'
-             );
+             INSERT INTO sources VALUES
+                (1, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                 'Evidence', 'evidence.md', 'alpha beta.', 0, 'now'),
+                (2, 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                 'Policy', 'policy.md', 'beta gamma.', 0, 'now');
+             INSERT INTO pages VALUES
+                ('summary', 'Summary', 'source', NULL, 'alpha summary.', 0, 'now', 'now'),
+                ('policy', 'Policy', 'concept', NULL, 'beta policy.', 0, 'now', 'now');
              INSERT INTO page_sources VALUES ('summary', 1);
+             INSERT INTO page_sources VALUES ('policy', 2);
+             INSERT INTO links VALUES ('summary', 'policy');
              PRAGMA user_version = 10;",
         )
         .unwrap();
+        for id in 3..=50 {
+            let slug = format!("page-{id}");
+            conn.execute(
+                "INSERT INTO sources VALUES (?1, ?2, ?3, ?4, ?5, 0, 'now')",
+                params![
+                    id,
+                    format!("{id:064x}"),
+                    format!("Source {id}"),
+                    format!("source-{id}.md"),
+                    "shared migration evidence ".repeat(40),
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pages VALUES (?1, ?2, 'concept', NULL, ?3, 0, 'now', 'now')",
+                params![
+                    &slug,
+                    format!("Page {id}"),
+                    "shared migration policy ".repeat(40),
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO page_sources VALUES (?1, ?2)",
+                params![slug, id],
+            )
+            .unwrap();
+        }
 
-        migrate_hierarchical_graph(&mut conn).unwrap();
+        let mut cancelled = Connection::open_in_memory().unwrap();
+        {
+            let backup = Backup::new(&conn, &mut cancelled).unwrap();
+            backup
+                .run_to_completion(100, Duration::from_millis(1), None)
+                .unwrap();
+        }
+        let mut progress_calls = 0;
+        let error = migrate_hierarchical_graph(
+            &mut cancelled,
+            Some(&mut |_, _, _| {
+                progress_calls += 1;
+                Err(AppError::new("work_cancelled", "cancelled by test"))
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "work_cancelled");
+        assert_eq!(progress_calls, 1);
+        assert_eq!(
+            cancelled
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            10,
+            "cancelled migration must roll back the whole transaction"
+        );
+        assert_eq!(
+            cancelled
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'graph_nodes'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        reset_test_graph_build_counts();
+        migrate_hierarchical_graph(&mut conn, None).unwrap();
 
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
@@ -10922,7 +11154,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-            2
+            100
         );
         assert!(
             conn.query_row("SELECT COUNT(*) FROM graph_deltas", [], |row| {
@@ -10938,7 +11170,12 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-            1
+            50
+        );
+        assert_eq!(
+            test_graph_build_counts(),
+            (1, 1),
+            "initial migration must finalize canonical digest and co-occurrence once"
         );
     }
 

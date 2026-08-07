@@ -387,9 +387,10 @@ window:
 lwc maintenance compact
 ```
 
-The command optimizes FTS and attempts a WAL truncate checkpoint. If `busy` is
-true, an active reader prevented full reclamation; retry later. Never infer
-success from the command exit alone—inspect `busy` and `after_bytes`.
+The command returns a durable `work` immediately. Use `lwc work status
+<WORK_ID>` for progress or `lwc work watch <WORK_ID>` to wait. The completed
+`work.result` reports `busy` and `after_bytes`; if `busy` is true, an active
+reader prevented full reclamation and the maintenance should be retried later.
 
 ## Mutation recovery
 

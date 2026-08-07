@@ -135,7 +135,10 @@ fn search_benchmark_reports_json_for_local_corpus() {
     let before_compact = storage_snapshot(&wiki_dir, &db_path, &wal_path);
     let compact_output = world.command(&world.project, &["maintenance", "compact"]);
     let compact = if compact_output.status.success() {
-        Some(serde_json::from_slice::<Value>(&compact_output.stdout).unwrap())
+        let queued = serde_json::from_slice::<Value>(&compact_output.stdout).unwrap();
+        let work_id = queued["work"]["id"].as_str().unwrap();
+        let finished = world.ok(&world.project, &["work", "watch", work_id]);
+        Some(finished["work"]["result"].clone())
     } else {
         None
     };

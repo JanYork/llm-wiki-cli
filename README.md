@@ -673,6 +673,11 @@ lwc lint
 lwc maintenance reindex
 lwc maintenance materialize
 lwc maintenance compact
+lwc work list
+lwc work status <WORK_ID>
+lwc work watch <WORK_ID>
+lwc work cancel <WORK_ID>
+lwc work resume <WORK_ID>
 lwc checkpoint create before-large-update
 lwc checkpoint list
 lwc log --limit 20
@@ -680,6 +685,10 @@ lwc log --limit 20
 
 Notes:
 
+- Maintenance commands return a durable `work` immediately. Read progress with
+  `work status`, or use `work watch` and inspect `work.result` after success.
+  Schema v10 to v11 migration uses the same mechanism automatically, so normal
+  commands never perform that migration inline.
 - `lint` is read-only by default. Add `--record` only when the lint pass belongs
   in durable operation history.
 - `maintenance reindex` rebuilds derived search artifacts from SQLite.
