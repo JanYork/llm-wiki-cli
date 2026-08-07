@@ -309,7 +309,7 @@ pub fn list(store: &StorePath) -> Result<Value> {
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .filter_map(|entry| read_json::<WorkState>(&entry.path().join("state.json")).ok())
         .collect::<Vec<_>>();
-    states.sort_by(|left, right| right.updated_at_unix_ms.cmp(&left.updated_at_unix_ms));
+    states.sort_by_key(|state| std::cmp::Reverse(state.updated_at_unix_ms));
     Ok(json!({"works": states}))
 }
 
