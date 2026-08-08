@@ -13,7 +13,7 @@ use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
 use std::os::windows::process::CommandExt;
 use std::{
     env, fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -27,6 +27,8 @@ use std::{
 
 const CURRENT_SCHEMA_VERSION: u32 = 11;
 const RESUME_STALE_AFTER_MS: u128 = 30_000;
+const STATE_REPLACE_RETRIES: usize = 200;
+const STATE_REPLACE_RETRY_DELAY: Duration = Duration::from_millis(5);
 static WORK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -355,7 +357,17 @@ fn migrate_schema_shadow(
     drop(source);
     progress(1, 1, "snapshotting-live")?;
 
-    let migrated = Store::open_with_migration_progress(&request.scope, &pending, progress)?;
+    let signal_indexing = env::var_os("LWC_TEST_MIGRATION_READY").is_some();
+    let indexing_ready = directory.join("migration-indexing-ready");
+    let mut migration_progress = |completed: usize, total: usize, phase: &str| {
+        progress(completed, total, phase)?;
+        if signal_indexing && phase == "indexing" && !indexing_ready.exists() {
+            write_bytes(&indexing_ready, b"ready\n")?;
+        }
+        Ok(())
+    };
+    let migrated =
+        Store::open_with_migration_progress(&request.scope, &pending, &mut migration_progress)?;
     drop(migrated);
     let pending_connection = Connection::open(&pending)?;
     pending_connection.busy_timeout(Duration::from_secs(2))?;
@@ -737,13 +749,37 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = options.open(&temporary)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    fs::rename(&temporary, path)?;
+    if let Err(error) = replace_with_retry(|| fs::rename(&temporary, path)) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
     if let Some(parent) = path.parent()
         && let Ok(directory) = fs::File::open(parent)
     {
         let _ = directory.sync_all();
     }
     Ok(())
+}
+
+fn replace_with_retry(mut replace: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    for attempt in 0..=STATE_REPLACE_RETRIES {
+        match replace() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt < STATE_REPLACE_RETRIES
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::PermissionDenied
+                            | io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                thread::sleep(STATE_REPLACE_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("state replacement loop always returns")
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -834,6 +870,21 @@ mod tests {
             started.elapsed() < Duration::from_millis(500),
             "schema preflight must read only the SQLite header"
         );
+    }
+
+    #[test]
+    fn transient_state_replace_conflicts_are_retried() {
+        let mut attempts = 0;
+        replace_with_retry(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
     }
 
     #[cfg(unix)]

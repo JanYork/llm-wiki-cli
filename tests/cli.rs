@@ -3914,6 +3914,7 @@ fn shadow_schema_migration_never_holds_the_live_wiki_writer_lock() {
         .current_dir(&world.project)
         .env("HOME", &world.home)
         .env("LWC_TEST_MIGRATION_DELAY_MS", "5000")
+        .env("LWC_TEST_MIGRATION_READY", "1")
         .args(["context", "--limit", "5"])
         .output()
         .unwrap();
@@ -3921,19 +3922,22 @@ fn shadow_schema_migration_never_holds_the_live_wiki_writer_lock() {
     let queued = stdout_json(&output);
     let id = queued["work"]["id"].as_str().unwrap();
     let state_path = world.project.join(".lwc/work").join(id).join("state.json");
+    let indexing_ready = state_path
+        .parent()
+        .unwrap()
+        .join("migration-indexing-ready");
     (0..3_000)
         .find(|_| {
-            let state: Value = fs::read(&state_path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                .unwrap_or(Value::Null);
-            let ready = state["state"] == "running" && state["phase"] == "indexing";
+            let ready = indexing_ready.exists();
             if !ready {
                 thread::sleep(Duration::from_millis(10));
             }
             ready
         })
-        .expect("shadow migration did not enter its delayed indexing phase");
+        .unwrap_or_else(|| {
+            let state = fs::read_to_string(&state_path).unwrap_or_else(|error| error.to_string());
+            panic!("shadow migration did not enter its delayed indexing phase: {state}")
+        });
 
     let live = Connection::open(&database).unwrap();
     live.busy_timeout(Duration::from_millis(100)).unwrap();
