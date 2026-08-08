@@ -3913,17 +3913,21 @@ fn shadow_schema_migration_never_holds_the_live_wiki_writer_lock() {
     let output = Command::new(env!("CARGO_BIN_EXE_lwc"))
         .current_dir(&world.project)
         .env("HOME", &world.home)
-        .env("LWC_TEST_MIGRATION_DELAY_MS", "750")
+        .env("LWC_TEST_MIGRATION_DELAY_MS", "5000")
         .args(["context", "--limit", "5"])
         .output()
         .unwrap();
     assert!(output.status.success());
     let queued = stdout_json(&output);
     let id = queued["work"]["id"].as_str().unwrap();
-    (0..100)
+    let state_path = world.project.join(".lwc/work").join(id).join("state.json");
+    (0..3_000)
         .find(|_| {
-            let state = world.ok(&world.project, &["work", "status", id]);
-            let ready = state["work"]["state"] == "running" && state["work"]["phase"] == "indexing";
+            let state: Value = fs::read(&state_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or(Value::Null);
+            let ready = state["state"] == "running" && state["phase"] == "indexing";
             if !ready {
                 thread::sleep(Duration::from_millis(10));
             }
