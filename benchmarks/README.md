@@ -24,10 +24,12 @@ records OS, architecture, build mode, corpus size, counts, projection state,
 per-table canonical page usage, and separate canonical/delta/sidecar
 measurements. Generated inputs live only in a temporary directory.
 
-A verified macOS x86_64 release run on the default 100-document/30-sample
-fixture reported 1,275 ms canonical indexing for a 100 KiB replacement, 75 ms
-incremental GraphQLite projection, 162.5 ms net overview p95 (all other net
-query/traversal p95 values below 48 ms), and 3.76x canonical storage growth.
+A verified macOS x86_64 v0.10.0 release run on the default
+100-document/30-sample fixture reported 1,168 ms canonical command time for a
+100 KiB replacement, 151 ms asynchronous incremental GraphQLite projection,
+176 ms net overview p95 (all other net query/traversal p95 values below 53 ms),
+and 3.764x canonical storage growth. The fixture explicitly enables the optional
+physical projection; production defaults keep it disabled.
 The write budgets intentionally retain complete reverse-dependent co-occurrence
 updates and exact deltas; the user approved this bounded latency tradeoff because
 its correctness benefit outweighs the former 750/500 ms targets. The compact

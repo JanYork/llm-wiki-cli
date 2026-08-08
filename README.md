@@ -252,10 +252,13 @@ lwc graph relation retract page:implementation DEPENDS_ON page:policy \
 Relation reasons are durable content: never put credentials, secrets, or raw
 chain-of-thought in them.
 
-The physical graph is enabled by default. `auto` selects the pinned embedded
-GraphQLite runtime on supported macOS/Linux targets and rslg elsewhere. Windows
-uses rslg and does not embed or load GraphQLite. Configuration is layered from
-built-in defaults through global and project files; project values can inherit:
+The canonical SQLite graph is always available and is the only authority. The
+optional physical graph is disabled by default so a normal mutation never waits
+for a second graph engine. When explicitly enabled, `auto` selects the pinned
+embedded GraphQLite runtime on supported macOS/Linux targets and rslg elsewhere.
+Windows uses rslg and does not embed or load GraphQLite. Configuration is
+layered from built-in defaults through global and project files; project values
+can inherit:
 
 ```bash
 lwc config show
@@ -274,12 +277,14 @@ persisted to six decimal places while exact totals remain available for
 rebuilds.
 
 GraphQLite is a disposable, checksummed sidecar projection. Canonical mutations
-commit first; a projection failure returns `graph_projection_failed`, marks the
-projection stale, and graph reads fail closed. A subsequent writable open or
-`lwc config set --engine graphqlite` resumes/rebuilds it. Superseded sidecars are
-retained and reported by `graph status` for manual review rather than deleted
-automatically. Draft changesets always query their candidate canonical graph
-with rslg and never import deployment-local projection state.
+commit first and, when GraphQLite is enabled, coalesce projection into a durable
+background `graph-project` Work. Canonical graph reads remain available while
+that projection is pending or failed; `graph status` and `graph verify` report
+physical parity independently. Use `work list`, `work status`, or `work watch`
+to inspect progress and use `work resume` for a failed or interrupted Work. One
+stable sidecar is updated incrementally rather than cloned per generation.
+Draft changesets always query their candidate canonical graph with rslg and
+never import deployment-local projection state.
 
 ## Installation
 
@@ -556,9 +561,12 @@ lwc --scope project changeset commit architecture-refresh
 ```
 
 Draft reads see staged writes, while live SQLite and Markdown stay unchanged.
-`changeset show` reports staged operations, lint, revisions, conflicts, and
-readiness. Commit rejects empty drafts, lint issues, and any live/draft
-revision conflict; there is no force or automatic merge. Use
+The draft database starts as a small sparse overlay; it does not copy or
+checkpoint the live Wiki. `changeset show` reports staged operations, lint,
+revisions, conflicts, and readiness. Commit validates and applies only touched
+entities, so unrelated live writes survive; a same-entity fingerprint conflict
+fails without overwriting either side. Commit rejects empty drafts and lint
+issues; there is no force or automatic merge. Use
 `--allow-lint-issues --reason "reviewed pre-existing debt"` only for audited
 debt that the changeset did not introduce. After commit, rerun the same fixed
 retrieval checks against live state. Commit freezes the reviewed draft before
@@ -571,14 +579,20 @@ lwc --scope project changeset discard architecture-refresh
 lwc --scope project changeset rollback <CHANGESET_ID>
 ```
 
-Discard touches only an uncommitted draft. Commit creates a pre-commit
-checkpoint and returns the exact rollback ID; rollback is allowed only before
-the next live mutation and creates its own safety checkpoint. Project and
-global changesets are separate, `--scope all` is invalid, and `init`,
+Discard touches only an uncommitted draft. Commit writes a checksummed inverse
+patch containing only touched entities and returns the exact rollback ID;
+rollback restores only those entities and refuses if one changed again. Project
+and global changesets are separate, `--scope all` is invalid, and `init`,
 `maintenance`, `checkpoint`, and nested changeset commands reject
 `--changeset`. Drafts never create a second Markdown projection. If a structured
 error reports `committed=true` with cleanup or materialization work remaining,
 do not repeat the knowledge changes; run the returned recovery action.
+
+Sparse commit currently has exact patches for Source add/ingest, Page
+put/remove, schema, purpose, and recorded search operations. Retrieval-weight
+and explicit semantic-relation mutations fail before checkpointing or taking a
+live write lock with `changeset_sparse_unsupported`; apply those as direct
+single-entity transactions until their sparse inverse patches are available.
 
 ## Scopes
 
@@ -693,9 +707,10 @@ Notes:
   in durable operation history.
 - `maintenance reindex` rebuilds derived search artifacts from SQLite.
 - `maintenance materialize` rebuilds the projected Markdown tree from SQLite.
-- `maintenance compact` optimizes the contentless FTS5 index and attempts a
-  WAL truncate checkpoint. Run it while the Wiki is idle and inspect `busy`
-  plus `after_bytes`.
+- `maintenance compact` only attempts a WAL truncate checkpoint; it does not
+  hide a full FTS optimization. Run it while the Wiki is idle and inspect
+  `busy` plus `after_bytes`. A busy reader returns promptly without changing
+  canonical content.
 - Search queries are private by default; add `--record` only when you want the query wording stored in the durable operation log.
 
 `lwc checkpoint create <NAME>` uses SQLite's online backup API. Restore with
@@ -707,10 +722,10 @@ stops tracking that path instead of silently exposing an older revision as
 current.
 
 For a multi-source ingest or broad page replacement, prefer a changeset over a
-manual checkpoint: successful commit checkpoints automatically, publishes
-canonical SQLite in one transaction, and materializes live Markdown once. A
-returned `wal_checkpointed=false` means an active reader prevented immediate
-WAL truncation; the canonical commit still succeeded.
+manual checkpoint: successful commit writes a sparse inverse patch, publishes
+only touched canonical entities in one transaction, and incrementally
+materializes changed Markdown. `wal_checkpointed=false` is normal in v0.10.0:
+commit does not force a store-wide WAL truncate.
 
 For an external filesystem backup, stop active `lwc` commands and copy the
 complete `.lwc/` directory. Do not copy only `wiki.db` while a writer may still

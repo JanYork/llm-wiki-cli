@@ -222,8 +222,9 @@ lwc graph relation retract page:implementation DEPENDS_ON page:policy \
 
 关系理由是持久内容，不得写入凭证、秘密或原始思维链。
 
-物理图默认启用。`auto` 在受支持的 macOS/Linux 目标上选择内置且校验过的
-GraphQLite，在其他平台使用 rslg；Windows 不嵌入或加载 GraphQLite。配置按
+canonical SQLite 图始终可用，也是唯一权威数据。可选物理图默认禁用，因此普通写入
+不会等待第二个图引擎。显式启用后，`auto` 在受支持的 macOS/Linux 目标上选择内置且
+校验过的 GraphQLite，在其他平台使用 rslg；Windows 不嵌入或加载 GraphQLite。配置按
 内置、全局、项目三层解析，项目值可继承：
 
 ```bash
@@ -239,11 +240,12 @@ locator 确定性派生，因此不牺牲公开图语义，也无需把同一位
 共现证据使用按文档压缩 blob 和增量总量；持久化的归一化边权保留六位小数，精确总量
 仍用于重建。
 
-GraphQLite 是可丢弃的校验和 sidecar 投影。规范数据先提交；若投影失败，命令返回
-`graph_projection_failed`，状态变为 stale，图读取会失败关闭。下一次可写打开或
-`lwc config set --engine graphqlite` 会恢复/重建。旧 sidecar 不会自动删除，
-`graph status` 会列出它们供人工审查。Changeset 草稿始终使用候选规范表上的 rslg，
-不会读取或发布本机投影状态。
+GraphQLite 是可丢弃的校验和 sidecar 投影。canonical 数据先提交；显式启用
+GraphQLite 时，投影会合并到持久化后台 `graph-project` Work。投影 pending 或失败时，
+canonical 图查询仍然可用；`graph status` 和 `graph verify` 独立报告物理一致性。使用
+`work list/status/watch` 查看进度，失败或中断后使用 `work resume`。系统只增量更新一个
+稳定 sidecar，不再按 generation 复制。Changeset 草稿始终使用候选 canonical 表上的
+rslg，不会读取或发布本机投影状态。
 
 ## 安装
 
@@ -499,9 +501,11 @@ lwc --scope project changeset show architecture-refresh
 lwc --scope project changeset commit architecture-refresh
 ```
 
-草稿读取能看到同一批已暂存变更，而 live SQLite 与 Markdown 保持不变。
-`changeset show` 会报告暂存操作、lint、revision、冲突和可提交状态。空草稿、lint
-问题以及 live/draft revision 冲突都会阻止提交；没有强制提交或自动合并。只有经过
+草稿读取能看到同一批已暂存变更，而 live SQLite 与 Markdown 保持不变。草稿从小型
+稀疏 overlay 开始，不复制或 checkpoint 整个 live Wiki。`changeset show` 会报告
+暂存操作、lint、revision、冲突和可提交状态。commit 只校验和应用触达实体，因此无关
+live 写入会保留；同一实体的 fingerprint 冲突会失败，不覆盖任何一方。空草稿和 lint
+问题都会阻止提交；没有强制提交或自动合并。只有经过
 审计、且并非本批变更新增的既有债务，才能使用
 `--allow-lint-issues --reason "reviewed pre-existing debt"`。提交后，还要用原先
 固定的检索问题在 live 状态复验。commit 会在发布前冻结已审查的草稿；此后的暂存
@@ -513,12 +517,17 @@ lwc --scope project changeset discard architecture-refresh
 lwc --scope project changeset rollback <CHANGESET_ID>
 ```
 
-discard 只删除未提交草稿。commit 会自动创建提交前 checkpoint，并返回精确的回滚
-ID；rollback 只允许在下一次 live 变更之前执行，也会创建自己的安全 checkpoint。
+discard 只删除未提交草稿。commit 会为触达实体写入带校验和的 inverse patch，并返回
+精确的回滚 ID；rollback 只恢复这些实体，某个实体后来再次变化时会拒绝覆盖。
 project 与 global changeset 相互独立；`--scope all` 无效；`init`、`maintenance`、
 `checkpoint` 和嵌套 changeset 命令都会拒绝 `--changeset`。草稿不会生成第二套
 Markdown 投影。如果结构化错误返回 `committed=true`，但仍有 cleanup 或
 materialization 工作，不要重复执行知识变更；应执行响应中给出的恢复动作。
+
+稀疏 commit 当前为 Source 新增/ingest、Page put/remove、schema、purpose 和记录型
+search 提供精确 patch。检索权重与显式语义关系暂未提供稀疏 inverse patch，会在创建
+checkpoint、获取 live 写锁或修改 live Wiki 前返回 `changeset_sparse_unsupported`；
+当前应将它们作为直接的单实体事务执行。
 
 ## 作用域
 
@@ -624,8 +633,9 @@ lwc log --limit 20
 - `lint` 默认完全只读；只有这次检查确实需要进入持久操作历史时才加 `--record`。
 - `maintenance reindex` 从 SQLite 重建派生搜索产物。
 - `maintenance materialize` 从 SQLite 重建投影出来的 Markdown 树。
-- `maintenance compact` 优化 contentless FTS5 索引并尝试执行 WAL truncate
-  checkpoint。应在 Wiki 空闲时运行，并检查返回的 `busy` 与 `after_bytes`。
+- `maintenance compact` 只尝试执行 WAL truncate checkpoint，不再暗中执行全量 FTS
+  优化。应在 Wiki 空闲时运行，并检查返回的 `busy` 与 `after_bytes`；存在活动 reader
+  时会快速返回，不修改 canonical 内容。
 - 搜索查询默认是私有的；只有需要把查询文本写入持久化操作日志时，才加 `--record`。
 
 `lwc checkpoint create <NAME>` 使用 SQLite 在线备份 API。执行
@@ -635,9 +645,8 @@ checkpoint，再恢复数据库并重建投影。受保护删除使用 `source r
 路径的当前来源时，该路径会明确停止跟踪，不会把旧版本悄悄恢复成“当前版本”。
 
 多来源 ingest 或大范围页面替换应优先使用 changeset，而不是手动 checkpoint：
-commit 成功时会自动备份，在一个事务中发布规范 SQLite，并只重建一次 live
-Markdown。若返回 `wal_checkpointed=false`，表示活跃 reader 阻止了 WAL 立即
-截断；规范数据仍已成功提交。
+commit 使用稀疏 inverse patch，在短事务中只发布触达的 canonical 实体，并增量更新
+live Markdown；不会自动复制整库或强制截断 WAL。
 
 需要文件系统级外部备份时，应先停止正在运行的 `lwc` 命令并复制完整 `.lwc/`
 目录；写入进程可能仍在使用 WAL 文件时，不要只复制 `wiki.db`。

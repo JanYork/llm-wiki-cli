@@ -49,10 +49,11 @@ lwc changeset commit architecture-refresh
 ```
 
 Every supported command with `--changeset <NAME>` reads or writes only the
-draft, so later commands see earlier staged work without exposing a partial
-Wiki. Draft writes do not materialize Markdown. `changeset show` reports the
-base and draft revisions, staged operations by action, lint total, empty and
-conflict state, and whether commit is currently allowed.
+sparse draft overlay, so later commands see earlier staged work without
+exposing a partial Wiki or copying the complete live database. Draft writes do
+not materialize Markdown. `changeset show` reports the base and draft revisions,
+staged operations by action, lint total, empty and conflict state, and whether
+commit is currently allowed.
 
 Commit rejects an empty draft, a live/draft revision conflict, and lint issues.
 Repair new lint issues in the draft. Use
@@ -60,9 +61,10 @@ Repair new lint issues in the draft. Use
 the remaining issues existed before this changeset and the reason is auditable.
 On `changeset_conflict` or `changeset_changed`, do not force or merge: preserve
 live work, inspect or discard the stale draft, begin a fresh changeset, and
-reapply the reviewed update.
+reapply the reviewed update. Unrelated live mutations do not conflict; commit
+validates only touched entity fingerprints.
 
-Commit freezes the reviewed draft before checkpoint/publication. After that
+Commit freezes the reviewed draft before inverse-patch publication. After that
 point, every routed mutation fails transactionally with `changeset_frozen`,
 including when a committed draft remains only because WAL checkpoint or cleanup
 needs recovery. Retry the same commit, or discard after a reported conflict;
@@ -73,13 +75,18 @@ lwc changeset discard architecture-refresh
 lwc changeset rollback <CHANGESET_ID>
 ```
 
-Discard deletes only an uncommitted draft. Successful commit creates and
-records a pre-commit checkpoint, publishes canonical SQLite in one transaction,
-truncates WAL when no reader prevents it, removes owned draft files, and
-materializes live Markdown once. Rollback uses the exact returned ID and only
-succeeds while no later live mutation exists; it creates a pre-rollback
-checkpoint and has no force option. A committed cleanup or materialization
-error is not a database rollback—follow its structured recovery fields.
+Discard deletes only an uncommitted draft. Successful commit creates a
+checksummed inverse patch for touched entities, publishes only those entities in
+one short transaction, removes owned draft files, and incrementally materializes
+changed Markdown. Rollback uses the exact returned ID, restores only touched
+entities, and refuses an entity that changed again; unrelated later live writes
+survive. It has no force option. A committed cleanup or materialization error is
+not a database rollback—follow its structured recovery fields.
+
+Source add/ingest, Page put/remove, schema, purpose, and recorded search have
+exact sparse patches. Retrieval-weight and explicit semantic-relation mutations
+currently return `changeset_sparse_unsupported` before checkpointing, live
+locking, or mutation; run those as direct single-entity transactions.
 
 Use one explicit `project` or `global` scope consistently for begin, routed
 commands, show, commit, discard, and rollback. `--scope all` is invalid, and
@@ -262,9 +269,10 @@ lwc graph relation set page:implementation DEPENDS_ON page:policy \
 ```
 
 Never treat `CO_OCCURS` as semantic evidence or include it in impact by default.
-If `graph status` is pending/stale, do not bypass it with rslg: follow the
-structured recovery action. Superseded GraphQLite sidecars require manual review
-and are intentionally retained.
+Canonical graph reads remain available while optional GraphQLite is pending or
+failed. Use `graph status`/`graph verify` for physical parity and inspect the
+coalesced `graph-project` Work with `work list/status/watch`; resume a failed or
+interrupted Work. Do not edit or replace the sidecar manually.
 
 The default `--type auto` returns compiled pages first, hides the raw source
 paired with a matching `kind=source` page, and falls back to sources when
@@ -380,8 +388,8 @@ lwc maintenance reindex
 ## Storage maintenance
 
 The FTS5 table is contentless: canonical source and page text is stored once in
-the normal tables, while FTS retains only its index. During an idle maintenance
-window:
+the normal tables, while FTS retains only its index. To reclaim a WAL during an
+idle maintenance window:
 
 ```bash
 lwc maintenance compact
@@ -391,6 +399,7 @@ The command returns a durable `work` immediately. Use `lwc work status
 <WORK_ID>` for progress or `lwc work watch <WORK_ID>` to wait. The completed
 `work.result` reports `busy` and `after_bytes`; if `busy` is true, an active
 reader prevented full reclamation and the maintenance should be retried later.
+Compact does not run a full FTS optimization or rewrite canonical knowledge.
 
 ## Mutation recovery
 
