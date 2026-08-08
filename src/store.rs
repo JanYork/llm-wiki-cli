@@ -63,12 +63,14 @@ type MigrationProgress<'a> = dyn FnMut(usize, usize, &str) -> Result<()> + 'a;
 thread_local! {
     static TEST_GRAPH_DIGEST_CALLS: Cell<usize> = const { Cell::new(0) };
     static TEST_COOCCURRENCE_REBUILDS: Cell<usize> = const { Cell::new(0) };
+    static TEST_GLOBAL_TERM_PAIR_LOADS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
 fn reset_test_graph_build_counts() {
     TEST_GRAPH_DIGEST_CALLS.set(0);
     TEST_COOCCURRENCE_REBUILDS.set(0);
+    TEST_GLOBAL_TERM_PAIR_LOADS.set(0);
 }
 
 #[cfg(test)]
@@ -77,6 +79,11 @@ fn test_graph_build_counts() -> (usize, usize) {
         TEST_GRAPH_DIGEST_CALLS.get(),
         TEST_COOCCURRENCE_REBUILDS.get(),
     )
+}
+
+#[cfg(test)]
+fn test_global_term_pair_loads() -> usize {
+    TEST_GLOBAL_TERM_PAIR_LOADS.get()
 }
 pub const DEFAULT_SCHEMA: &str = r#"# Wiki Schema
 
@@ -2041,6 +2048,11 @@ impl Store {
         let explicit_provenance = normalize_explicit_provenance(input.provenance)?;
         let links = extract_links(&input.body);
         let structural_navigation = has_structural_navigation_marker(&input.body);
+        if let Ok(delay) = std::env::var("LWC_TEST_PAGE_PUT_PREWRITE_DELAY_MS")
+            && let Ok(delay) = delay.parse::<u64>()
+        {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4055,6 +4067,12 @@ fn artifact_snapshot(
     tx: &Transaction<'_>,
     include_source_content: bool,
 ) -> Result<artifacts::Snapshot> {
+    if std::env::var("LWC_TEST_FORBID_FULL_ARTIFACT_SNAPSHOT").as_deref() == Ok("1") {
+        return Err(AppError::new(
+            "forbidden_full_artifact_snapshot",
+            "injected guard rejected a complete artifact snapshot",
+        ));
+    }
     let meta = |key: &str, fallback: &str| -> Result<String> {
         Ok(tx
             .query_row(
@@ -8004,6 +8022,8 @@ fn rebuild_cooccurrence_edges_for(
 ) -> Result<()> {
     #[cfg(test)]
     TEST_COOCCURRENCE_REBUILDS.set(TEST_COOCCURRENCE_REBUILDS.get() + 1);
+    #[cfg(test)]
+    TEST_GLOBAL_TERM_PAIR_LOADS.set(TEST_GLOBAL_TERM_PAIR_LOADS.get() + 1);
     let contributions = {
         let mut statement = tx.prepare(
             "SELECT from_term_id, to_term_id, raw_strength, witness_count
@@ -11133,7 +11153,22 @@ mod tests {
         );
 
         reset_test_graph_build_counts();
-        migrate_hierarchical_graph(&mut conn, None).unwrap();
+        let mut progress_events = Vec::new();
+        migrate_hierarchical_graph(
+            &mut conn,
+            Some(&mut |completed, total, phase| {
+                progress_events.push((completed, total, phase.to_string()));
+                Ok(())
+            }),
+        )
+        .unwrap();
+
+        assert!(
+            !progress_events.iter().any(|(completed, total, phase)| {
+                phase == "finalizing-graph" && completed == total
+            }),
+            "migration reported 100% before graph finalization completed: {progress_events:?}"
+        );
 
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
@@ -11987,6 +12022,118 @@ mod tests {
             graph_verify_value(&store.conn, &store.scope, &store.database).unwrap()["valid"],
             true
         );
+    }
+
+    #[test]
+    fn point_page_mutation_never_recomputes_the_complete_graph_digest() {
+        let mut store = test_store();
+        reset_test_graph_build_counts();
+
+        store
+            .page_put(PagePutInput {
+                slug: "bounded-update".to_string(),
+                title: "Bounded update".to_string(),
+                kind: Some("concept".to_string()),
+                summary: None,
+                body: "alpha beta gamma local evidence.".to_string(),
+                source_ids: Vec::new(),
+                provenance: vec!["agent-observed".to_string()],
+            })
+            .unwrap();
+
+        let (complete_digest_calls, _) = test_graph_build_counts();
+        assert_eq!(
+            complete_digest_calls, 0,
+            "a one-page mutation must update digest state from its exact old/new records"
+        );
+    }
+
+    #[test]
+    fn point_page_mutation_never_loads_and_ranks_all_term_pairs() {
+        let mut store = test_store();
+        for index in 0..8 {
+            store
+                .page_put(PagePutInput {
+                    slug: format!("unrelated-{index}"),
+                    title: format!("Unrelated {index}"),
+                    kind: Some("concept".to_string()),
+                    summary: None,
+                    body: format!("unrelated{index} evidence{index} context{index}."),
+                    source_ids: Vec::new(),
+                    provenance: vec!["agent-observed".to_string()],
+                })
+                .unwrap();
+        }
+        reset_test_graph_build_counts();
+
+        store
+            .page_put(PagePutInput {
+                slug: "local-pairs".to_string(),
+                title: "Local pairs".to_string(),
+                kind: Some("concept".to_string()),
+                summary: None,
+                body: "localalpha localbeta localgamma.".to_string(),
+                source_ids: Vec::new(),
+                provenance: vec!["agent-observed".to_string()],
+            })
+            .unwrap();
+
+        assert_eq!(
+            test_global_term_pair_loads(),
+            0,
+            "a point mutation must query and rank only affected source terms"
+        );
+    }
+
+    #[test]
+    fn identical_page_put_is_a_true_noop() {
+        let mut store = test_store();
+        let input = PagePutInput {
+            slug: "stable-page".to_string(),
+            title: "Stable page".to_string(),
+            kind: Some("concept".to_string()),
+            summary: Some("Stable summary".to_string()),
+            body: "stable alpha beta evidence.".to_string(),
+            source_ids: Vec::new(),
+            provenance: vec!["agent-observed".to_string()],
+        };
+        store.page_put(input.clone()).unwrap();
+        let generation_before: i64 = store
+            .conn
+            .query_row("SELECT MAX(generation) FROM graph_generations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let operations_before: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM operations WHERE action = 'page_put'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        reset_test_graph_build_counts();
+
+        let response = store.page_put(input).unwrap();
+
+        let generation_after: i64 = store
+            .conn
+            .query_row("SELECT MAX(generation) FROM graph_generations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let operations_after: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM operations WHERE action = 'page_put'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!response.created);
+        assert_eq!(generation_after, generation_before);
+        assert_eq!(operations_after, operations_before);
+        assert_eq!(test_graph_build_counts(), (0, 0));
     }
 
     #[test]

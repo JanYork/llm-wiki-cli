@@ -280,6 +280,154 @@ fn changeset_stages_reads_and_discard_without_touching_live_wiki() {
 }
 
 #[test]
+fn changeset_begin_allocation_is_independent_of_live_wiki_size() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&world.project, &["init"]);
+    let database = PathBuf::from(initialized["database"].as_str().unwrap());
+    let conn = Connection::open(&database).unwrap();
+    conn.execute(
+        "INSERT INTO pages(
+             slug, title, kind, summary, body, structural_navigation,
+             created_at, updated_at
+         ) VALUES ('large-live-page', 'Large live page', 'concept', '', ?1, 0,
+                   'now', 'now')",
+        ["x".repeat(4 * 1024 * 1024)],
+    )
+    .unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    drop(conn);
+
+    let begun = world.ok(&world.project, &["changeset", "begin", "sparse-begin"]);
+    let draft = PathBuf::from(begun["database"].as_str().unwrap());
+    let allocated = [
+        draft.clone(),
+        PathBuf::from(format!("{}-wal", draft.display())),
+        PathBuf::from(format!("{}-shm", draft.display())),
+    ]
+    .into_iter()
+    .map(|path| fs::metadata(path).map(|value| value.len()).unwrap_or(0))
+    .sum::<u64>();
+
+    assert!(
+        allocated <= 1024 * 1024,
+        "empty sparse draft allocated {allocated} bytes from unrelated live content"
+    );
+}
+
+#[test]
+fn changeset_commit_preserves_unrelated_live_mutations() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(&world.project, &["changeset", "begin", "entity-local"]);
+    let staged = world.write("staged-local.md", "staged local alpha beta");
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "entity-local",
+            "page",
+            "put",
+            "staged-local",
+            "--title",
+            "Staged local",
+            "--summary",
+            "Staged local",
+            "--file",
+            as_str(&staged),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    put_page(
+        &world,
+        "unrelated-live",
+        "Unrelated live",
+        "unrelated live mutation must survive",
+    );
+
+    let committed = world.ok(
+        &world.project,
+        &[
+            "changeset",
+            "commit",
+            "entity-local",
+            "--allow-lint-issues",
+            "--reason",
+            "isolated concurrency regression fixture",
+        ],
+    );
+
+    assert_eq!(committed["status"], "committed");
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "unrelated-live"])["page"]["body"],
+        "unrelated live mutation must survive"
+    );
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "staged-local"])["page"]["body"],
+        "staged local alpha beta"
+    );
+}
+
+#[test]
+fn concurrent_same_entity_writes_return_one_typed_conflict() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let first = world.write("same-entity-first.md", "first concurrent body alpha beta");
+    let second = world.write(
+        "same-entity-second.md",
+        "second concurrent body gamma delta",
+    );
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let outputs = std::thread::scope(|scope| {
+        [first, second]
+            .into_iter()
+            .map(|body| {
+                let project = world.project.clone();
+                let home = world.home.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    Command::new(env!("CARGO_BIN_EXE_lwc"))
+                        .current_dir(project)
+                        .env("HOME", home)
+                        .env("LWC_TEST_PAGE_PUT_PREWRITE_DELAY_MS", "250")
+                        .args([
+                            "page",
+                            "put",
+                            "same-entity",
+                            "--title",
+                            "Same entity",
+                            "--file",
+                            as_str(&body),
+                            "--provenance",
+                            "agent-observed",
+                        ])
+                        .output()
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    let succeeded = outputs
+        .iter()
+        .filter(|output| output.status.success())
+        .count();
+    let conflicts = outputs
+        .iter()
+        .filter(|output| !output.status.success())
+        .map(stderr_json)
+        .filter(|error| error["error"]["code"] == "entity_conflict")
+        .count();
+    assert_eq!(succeeded, 1, "outputs: {outputs:?}");
+    assert_eq!(conflicts, 1, "outputs: {outputs:?}");
+}
+
+#[test]
 fn changeset_commit_is_atomic_conflict_aware_and_rollback_guarded() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
@@ -2381,6 +2529,89 @@ fn graph_config_resolves_layers_and_updates_project_atomically() {
     assert_eq!(layered["graph"]["engine"], "rslg");
     assert_eq!(layered["graph"]["engine_origin"], "global");
     assert_eq!(layered["graph"]["resolved_engine"], "rslg");
+}
+
+#[test]
+fn physical_projection_is_disabled_by_default() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+
+    let config = world.ok(&world.project, &["config", "show"]);
+
+    assert_eq!(config["graph"]["physical"], "disabled");
+    assert_eq!(config["graph"]["physical_origin"], "built-in");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn explicit_graphqlite_projection_uses_one_stable_sidecar() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(
+        &world.project,
+        &[
+            "config",
+            "set",
+            "--physical",
+            "enabled",
+            "--engine",
+            "graphqlite",
+        ],
+    );
+    for index in 0..3 {
+        put_page(
+            &world,
+            &format!("stable-sidecar-{index}"),
+            &format!("Stable sidecar {index}"),
+            &format!("generation {index} alpha beta gamma evidence"),
+        );
+    }
+
+    let sidecars = fs::read_dir(world.project.join(".lwc"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("graph-graphqlite-g") && name.ends_with(".db"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        sidecars.len(),
+        1,
+        "sidecars must not grow by generation: {sidecars:?}"
+    );
+}
+
+#[test]
+fn point_page_put_does_not_build_a_complete_artifact_snapshot() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let body = world.write(
+        "targeted-artifact.md",
+        "targeted artifact alpha beta evidence",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lwc"))
+        .current_dir(&world.project)
+        .env("HOME", &world.home)
+        .env("LWC_TEST_FORBID_FULL_ARTIFACT_SNAPSHOT", "1")
+        .args([
+            "page",
+            "put",
+            "targeted-artifact",
+            "--title",
+            "Targeted artifact",
+            "--file",
+            as_str(&body),
+            "--provenance",
+            "agent-observed",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "point mutation invoked complete artifact snapshot: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(unix)]

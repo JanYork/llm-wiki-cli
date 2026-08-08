@@ -1060,6 +1060,28 @@ mod tests {
     }
 
     #[test]
+    fn structured_markdown_does_not_create_natural_language_cooccurrence() {
+        for content in [
+            "| customer_field | varchar_value |\n| --- | --- |\n| account_status | enabled |",
+            "```sql\nSELECT customer_field FROM account_table WHERE account_status = 'enabled';\n```",
+            "<table><tr><td>customer_field</td><td>account_status</td></tr></table>",
+        ] {
+            let built = build_cooccurrence(&DocumentGraphInput {
+                document_type: DocumentType::Page,
+                identifier: "structured-snapshot",
+                label: "Structured snapshot",
+                content,
+            })
+            .unwrap();
+
+            assert!(
+                built.contributions.is_empty(),
+                "structured passage created prose co-occurrence: {content:?}"
+            );
+        }
+    }
+
+    #[test]
     fn cooccurrence_top_k_never_exceeds_the_outgoing_limit() {
         let mut contributions = Vec::new();
         for index in 0..40 {
