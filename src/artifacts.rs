@@ -4,6 +4,8 @@ use std::{
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 const FIXED_DIRS: &[&str] = &[
@@ -22,6 +24,9 @@ const FIXED_DIRS: &[&str] = &[
 ];
 const MANIFEST_PATH: &str = ".lwc-artifacts-manifest";
 const CURSOR_PATH: &str = ".lwc-artifacts-cursor";
+const LOCK_PATH: &str = ".lwc-artifacts-lock";
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+const LOCK_RETRY: Duration = Duration::from_millis(5);
 const SOURCE_ID_MAX: usize = 48;
 const BASENAME_MAX: usize = 120;
 const SLUG_SEGMENT_MAX: usize = 80;
@@ -75,6 +80,10 @@ pub struct Operation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
 
+pub(crate) struct ProjectionLock {
+    _file: fs::File,
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -82,6 +91,40 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+pub(crate) fn lock_projection(root: &Path) -> Result<ProjectionLock, Error> {
+    ensure_root(root)?;
+    reject_symlink_path(root, LOCK_PATH)?;
+    let path = join(root, LOCK_PATH)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| Error(format!("{}: {error}", path.display())))?;
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(ProjectionLock { _file: file }),
+            Err(fs::TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
+                thread::sleep(LOCK_RETRY);
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(Error(format!(
+                    "artifact projection remained busy for {} seconds",
+                    LOCK_WAIT.as_secs()
+                )));
+            }
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(Error(format!(
+                    "cannot lock artifact projection {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+}
 
 pub fn source_artifact_rel_path(source_id: &str, origin: &str) -> Result<String, Error> {
     Ok(format!(
@@ -1005,8 +1048,12 @@ mod tests {
     use super::*;
     use std::{
         fs,
-        sync::atomic::{AtomicU64, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        },
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -1029,6 +1076,27 @@ mod tests {
             source_artifact_rel_path("SRC 42", "/tmp/Foo Bar?.pdf").unwrap(),
             "raw/sources/src-42--Foo-Bar-.pdf"
         );
+    }
+
+    #[test]
+    fn projection_lock_serializes_writers() {
+        let root = temp_dir("projection-lock");
+        let first = lock_projection(&root).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let (acquired, receiver) = mpsc::channel();
+        let other_root = root.clone();
+        let other_barrier = Arc::clone(&barrier);
+        let handle = std::thread::spawn(move || {
+            other_barrier.wait();
+            let lock = lock_projection(&other_root).unwrap();
+            acquired.send(()).unwrap();
+            drop(lock);
+        });
+        barrier.wait();
+        assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(first);
+        receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        handle.join().unwrap();
     }
 
     #[test]

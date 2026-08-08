@@ -4091,6 +4091,8 @@ impl Store {
             .parent()
             .ok_or_else(|| AppError::new("invalid_store_path", "database has no parent"))?
             .to_path_buf();
+        let _projection_lock = artifacts::lock_projection(&root)
+            .map_err(|error| AppError::new("artifact_busy", error.to_string()))?;
         let snapshot = artifact_snapshot(&self.conn, include_raw_sources)?;
         let materialize = if include_raw_sources {
             artifacts::materialize_snapshot
@@ -4118,6 +4120,8 @@ impl Store {
             .database
             .parent()
             .ok_or_else(|| AppError::new("invalid_store_path", "database has no parent"))?;
+        let _projection_lock = artifacts::lock_projection(root)
+            .map_err(|error| AppError::new("artifact_busy", error.to_string()))?;
         let cursor = artifacts::load_cursor(root)
             .map_err(|error| AppError::new("artifact_write_failed", error.to_string()))?;
         let operations = {
