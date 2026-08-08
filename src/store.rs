@@ -3,9 +3,9 @@ use crate::{
     config::{self, EngineSetting, PhysicalSetting},
     error::{AppError, Result},
     graph::{
-        CanonicalEdge, DocumentGraphInput, DocumentGraphReplacement, DocumentType, GraphPage,
-        MAX_COOCCURRENCE_CONTRIBUTIONS, TermPairContribution, automatic_edge, build_cooccurrence,
-        build_document_graph, rank_cooccurrence, related,
+        CanonicalEdge, CooccurrenceBuild, DocumentGraphInput, DocumentGraphReplacement,
+        DocumentType, GraphPage, MAX_COOCCURRENCE_CONTRIBUTIONS, TermPairContribution,
+        automatic_edge, build_cooccurrence, build_document_graph, rank_cooccurrence, related,
     },
     graph_backend::{
         create_hierarchical_graph_schema, decode_positions, encode_positions,
@@ -841,6 +841,13 @@ struct SparseInverseEnvelope {
     checksum: String,
 }
 
+#[derive(Debug)]
+struct PreparedDocumentGraph {
+    graph: DocumentGraphReplacement,
+    cooccurrence: CooccurrenceBuild,
+    encoded_contributions: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ContextStore {
     pub scope: String,
@@ -1128,6 +1135,54 @@ impl Store {
     }
 
     pub fn reconcile_graph_projection(&mut self) -> Result<()> {
+        let effective = config::resolve(&self.scope, &self.database)?;
+        let changeset = self
+            .database
+            .components()
+            .any(|component| component.as_os_str() == "changesets");
+        if changeset
+            || effective.physical == PhysicalSetting::Disabled
+            || effective.resolved_engine == EngineSetting::Rslg
+        {
+            return self.reconcile_graph_projection_now();
+        }
+        let generation: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(generation), 0) FROM graph_generations",
+            [],
+            |row| row.get(0),
+        )?;
+        let fresh: bool = self.conn.query_row(
+            "SELECT engine = 'graphlite' AND status = 'fresh'
+                    AND canonical_generation = ?1 AND projected_generation = ?1
+             FROM graph_projection_state WHERE projection = 'physical'",
+            params![generation],
+            |row| row.get(0),
+        )?;
+        if fresh {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            &format!(
+                "UPDATE graph_projection_state
+                 SET engine = 'graphlite', canonical_generation = ?1,
+                     status = 'pending', last_error_code = NULL,
+                     last_error_message = NULL, updated_at = {TIMESTAMP_SQL}
+                 WHERE projection = 'physical'"
+            ),
+            params![generation],
+        )?;
+        tx.commit()?;
+        match crate::work::start_graph_projection(&self.scope, &self.database) {
+            Ok(_) => Ok(()),
+            Err(error) if error.code == "work_busy" => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn reconcile_graph_projection_now(&mut self) -> Result<()> {
         let mut effective = config::resolve(&self.scope, &self.database)?;
         if self
             .database
@@ -1171,6 +1226,11 @@ impl Store {
         if already_resolved {
             return Ok(());
         }
+        if effective.physical == PhysicalSetting::Enabled
+            && effective.resolved_engine == EngineSetting::Graphqlite
+        {
+            return self.project_graphqlite_until_current();
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1209,72 +1269,84 @@ impl Store {
             tx.commit()?;
             return Ok(());
         }
-        let digest = if generation == 0 {
-            current_graph_digest(&tx)?
-        } else {
-            tx.query_row(
-                "SELECT canonical_digest FROM graph_generations WHERE generation = ?1",
-                params![generation],
-                |row| row.get::<_, String>(0),
-            )?
-        };
-        let already_fresh = tx.query_row(
-            "SELECT engine = 'graphlite' AND canonical_generation = ?1
-                    AND projected_generation = ?1 AND status = 'fresh'
-             FROM graph_projection_state WHERE projection = 'physical'",
-            params![generation],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        if already_fresh {
-            tx.commit()?;
-            return Ok(());
-        }
-        tx.execute(
-            &format!(
-                "UPDATE graph_projection_state
-                 SET engine = 'graphlite', canonical_generation = ?1,
-                     status = 'pending', last_error_code = NULL,
-                     last_error_message = NULL, updated_at = {TIMESTAMP_SQL}
-                 WHERE projection = 'physical'"
-            ),
-            params![generation],
-        )?;
-        match project_graphqlite_snapshot(&tx, &self.database, generation, &digest) {
-            Ok(_) => {
-                tx.execute(
-                    &format!(
-                        "UPDATE graph_projection_state
-                         SET projected_generation = ?1, status = 'fresh',
-                             last_error_code = NULL, last_error_message = NULL,
-                             updated_at = {TIMESTAMP_SQL}
-                         WHERE projection = 'physical' AND engine = 'graphlite'"
-                    ),
-                    params![generation],
+        unreachable!("physical projection engine was resolved before opening the write transaction")
+    }
+
+    fn project_graphqlite_until_current(&mut self) -> Result<()> {
+        loop {
+            let (generation, digest, projection) = {
+                let tx = self
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Deferred)?;
+                let generation: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(generation), 0) FROM graph_generations",
+                    [],
+                    |row| row.get(0),
                 )?;
+                let digest = if generation == 0 {
+                    current_graph_digest(&tx)?
+                } else {
+                    tx.query_row(
+                        "SELECT canonical_digest FROM graph_generations WHERE generation = ?1",
+                        params![generation],
+                        |row| row.get::<_, String>(0),
+                    )?
+                };
+                let projection =
+                    project_graphqlite_snapshot(&tx, &self.database, generation, &digest);
                 tx.commit()?;
-                Ok(())
-            }
-            Err(error) => {
+                (generation, digest, projection)
+            };
+            if let Err(error) = projection {
+                let tx = self
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 tx.execute(
                     &format!(
                         "UPDATE graph_projection_state
-                         SET status = 'stale', last_error_code = ?1,
+                         SET engine = 'graphlite', canonical_generation = ?1,
+                             status = 'stale', last_error_code = ?2,
                              last_error_message = 'GraphQLite projection failed',
                              updated_at = {TIMESTAMP_SQL}
-                         WHERE projection = 'physical' AND engine = 'graphlite'"
+                         WHERE projection = 'physical'"
                     ),
-                    params![error.code],
+                    params![generation, error.code],
                 )?;
                 tx.commit()?;
-                Err(AppError::new(
+                return Err(AppError::new(
                     "graph_projection_failed",
-                    "canonical mutation committed but GraphQLite projection failed",
+                    "GraphQLite projection work failed; canonical graph remains available",
                 )
                 .with_details(json!({
                     "canonical_committed": true,
                     "generation": generation,
+                    "digest": digest,
                     "cause": error.code,
-                })))
+                })));
+            }
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(generation), 0) FROM graph_generations",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                &format!(
+                    "UPDATE graph_projection_state
+                     SET engine = 'graphlite', canonical_generation = ?1,
+                         projected_generation = ?2,
+                         status = CASE WHEN ?1 = ?2 THEN 'fresh' ELSE 'pending' END,
+                         last_error_code = NULL, last_error_message = NULL,
+                         updated_at = {TIMESTAMP_SQL}
+                     WHERE projection = 'physical'"
+                ),
+                params![current, generation],
+            )?;
+            tx.commit()?;
+            if current == generation {
+                return Ok(());
             }
         }
     }
@@ -2456,18 +2528,12 @@ impl Store {
                 )?,
             });
         }
-        let before_graph = base
-            .as_ref()
-            .map(|base| {
-                build_document_graph(&DocumentGraphInput {
-                    document_type: DocumentType::Page,
-                    identifier: &input.slug,
-                    label: &base.title,
-                    content: &base.body,
-                })
-                .map_err(segment_error)
-            })
-            .transpose()?;
+        let prepared_graph = prepare_document_graph(&DocumentGraphInput {
+            document_type: DocumentType::Page,
+            identifier: &input.slug,
+            label: &input.title,
+            content: &input.body,
+        })?;
         if let Ok(delay) = std::env::var("LWC_TEST_PAGE_PUT_PREWRITE_DELAY_MS")
             && let Ok(delay) = delay.parse::<u64>()
         {
@@ -2579,7 +2645,7 @@ impl Store {
             &input.slug,
             &json!({ "created": !existed }),
         )?;
-        let graph_generation = persist_document_graph(
+        let graph_generation = persist_prepared_document_graph(
             &tx,
             &DocumentGraphInput {
                 document_type: DocumentType::Page,
@@ -2587,7 +2653,7 @@ impl Store {
                 label: &input.title,
                 content: &input.body,
             },
-            before_graph.as_ref(),
+            prepared_graph,
             &page_relation_edges(&tx, &input.slug, &source_ids, &links)?,
             true,
         )?;
@@ -2954,7 +3020,6 @@ impl Store {
         direction: &str,
         edge_types: &[String],
     ) -> Result<Value> {
-        ensure_graph_projection_fresh(&self.conn, &self.database)?;
         graph_explore_value(
             &self.conn,
             &self.scope,
@@ -2972,12 +3037,10 @@ impl Store {
         limit: usize,
         edge_types: &[String],
     ) -> Result<Value> {
-        ensure_graph_projection_fresh(&self.conn, &self.database)?;
         graph_macro_explore_value(&self.conn, &self.scope, depth, limit, edge_types)
     }
 
     pub fn graph_node(&self, identifier: &str) -> Result<Value> {
-        ensure_graph_projection_fresh(&self.conn, &self.database)?;
         let identifier = resolve_graph_node(&self.conn, identifier)?;
         let mut node = graph_node_json(&self.conn, &identifier)?;
         node["outgoing_degree"] = json!(self.conn.query_row(
@@ -3000,7 +3063,6 @@ impl Store {
         direction: &str,
         edge_types: &[String],
     ) -> Result<Value> {
-        ensure_graph_projection_fresh(&self.conn, &self.database)?;
         let mut response = graph_explore_value(
             &self.conn,
             &self.scope,
@@ -3035,7 +3097,6 @@ impl Store {
         direction: &str,
         edge_types: &[String],
     ) -> Result<Value> {
-        ensure_graph_projection_fresh(&self.conn, &self.database)?;
         graph_path_value(
             &self.conn,
             &self.scope,
@@ -3049,12 +3110,10 @@ impl Store {
     }
 
     pub fn graph_impact(&self, identifier: &str, max_depth: usize, limit: usize) -> Result<Value> {
-        ensure_graph_projection_fresh(&self.conn, &self.database)?;
         graph_impact_value(&self.conn, &self.scope, identifier, max_depth, limit)
     }
 
     pub fn graph_overview(&self, limit: usize) -> Result<Value> {
-        ensure_graph_projection_fresh(&self.conn, &self.database)?;
         graph_overview_value(&self.conn, &self.scope, limit)
     }
 
@@ -9214,8 +9273,12 @@ fn persist_document_graph(
     extra_edges: &[CanonicalEdge],
     finalize_generation: bool,
 ) -> Result<i64> {
-    let mut graph = build_document_graph(input).map_err(segment_error)?;
-    graph.edges.extend_from_slice(extra_edges);
+    let prepared = prepare_document_graph(input)?;
+    persist_prepared_document_graph(tx, input, prepared, extra_edges, finalize_generation)
+}
+
+fn prepare_document_graph(input: &DocumentGraphInput<'_>) -> Result<PreparedDocumentGraph> {
+    let graph = build_document_graph(input).map_err(segment_error)?;
     let mut cooccurrence = build_cooccurrence(input).map_err(segment_error)?;
     let encoded_contributions = if cooccurrence.contributions.is_empty() {
         None
@@ -9230,6 +9293,26 @@ fn persist_document_graph(
             Err(error) => return Err(error),
         }
     };
+    Ok(PreparedDocumentGraph {
+        graph,
+        cooccurrence,
+        encoded_contributions,
+    })
+}
+
+fn persist_prepared_document_graph(
+    tx: &Transaction<'_>,
+    input: &DocumentGraphInput<'_>,
+    prepared: PreparedDocumentGraph,
+    extra_edges: &[CanonicalEdge],
+    finalize_generation: bool,
+) -> Result<i64> {
+    let PreparedDocumentGraph {
+        mut graph,
+        cooccurrence,
+        encoded_contributions,
+    } = prepared;
+    graph.edges.extend_from_slice(extra_edges);
     let document_type = match input.document_type {
         DocumentType::Page => "page",
         DocumentType::Source => "source",
@@ -10312,7 +10395,7 @@ fn search_index(
         .map_err(Into::into)
 }
 
-fn ensure_graph_projection_fresh(conn: &Connection, database: &Path) -> Result<()> {
+fn verify_graph_projection(conn: &Connection, database: &Path) -> Result<()> {
     let (engine, status, canonical, projected): (String, String, i64, i64) = conn.query_row(
         "SELECT engine, status, canonical_generation, projected_generation
          FROM graph_projection_state WHERE projection = 'physical'",
@@ -11851,7 +11934,7 @@ fn graph_verify_value(conn: &Connection, scope: &str, database: &Path) -> Result
             }));
         }
     }
-    if let Err(error) = ensure_graph_projection_fresh(conn, database) {
+    if let Err(error) = verify_graph_projection(conn, database) {
         issues.push(json!({"code": error.code, "details": error.details}));
     }
     Ok(json!({

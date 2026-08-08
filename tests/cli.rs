@@ -2591,6 +2591,16 @@ fn explicit_graphqlite_projection_uses_one_stable_sidecar() {
             &format!("generation {index} alpha beta gamma evidence"),
         );
     }
+    (0..200)
+        .find(|_| {
+            let fresh =
+                world.ok(&world.project, &["graph", "status"])["projection"]["status"] == "fresh";
+            if !fresh {
+                thread::sleep(Duration::from_millis(25));
+            }
+            fresh
+        })
+        .expect("coalesced GraphQLite projection did not finish");
 
     let sidecars = fs::read_dir(world.project.join(".lwc"))
         .unwrap()
@@ -2673,7 +2683,7 @@ fn graph_config_rejects_symlink_all_scope_and_changeset_mutation() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn graphqlite_projection_failure_commits_canonical_fails_closed_and_recovers() {
+fn graphqlite_projection_failure_never_blocks_canonical_reads_and_recovers_async() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
     world.ok(
@@ -2687,6 +2697,23 @@ fn graphqlite_projection_failure_commits_canonical_fails_closed_and_recovers() {
             "graphqlite",
         ],
     );
+    (0..200)
+        .find(|_| {
+            let works = world.ok(&world.project, &["work", "list"]);
+            let idle = works["works"].as_array().is_some_and(|works| {
+                works.iter().all(|work| {
+                    matches!(
+                        work["state"].as_str(),
+                        Some("succeeded" | "failed" | "cancelled")
+                    )
+                })
+            });
+            if !idle {
+                thread::sleep(Duration::from_millis(25));
+            }
+            idle
+        })
+        .expect("initial GraphQLite projection work did not become idle");
     let body = world.write("projection.md", "Committed projection evidence.");
     let output = Command::new(env!("CARGO_BIN_EXE_lwc"))
         .current_dir(&world.project)
@@ -2703,21 +2730,41 @@ fn graphqlite_projection_failure_commits_canonical_fails_closed_and_recovers() {
         ])
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    let error = stderr_json(&output);
-    assert_eq!(error["error"]["code"], "graph_projection_failed");
-    assert_eq!(error["error"]["details"]["canonical_committed"], true);
-
-    let status = world.ok(&world.project, &["graph", "status"]);
+    assert!(
+        output.status.success(),
+        "canonical page write was blocked by derived projection: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = (0..100)
+        .find_map(|_| {
+            let status = world.ok(&world.project, &["graph", "status"]);
+            if status["projection"]["status"] == "stale" {
+                Some(status)
+            } else {
+                thread::sleep(Duration::from_millis(25));
+                None
+            }
+        })
+        .expect("injected background projection failure did not become observable");
     assert_eq!(status["projection"]["status"], "stale");
-    let stale = world.err(
+    let canonical = world.ok(
         &world.project,
         &["graph", "explore", "page:projection-page"],
     );
-    assert_eq!(stale["error"]["code"], "graph_projection_stale");
+    assert_eq!(canonical["start"]["identifier"], "page:projection-page");
 
     world.ok(&world.project, &["config", "set", "--engine", "graphqlite"]);
-    let status = world.ok(&world.project, &["graph", "status"]);
+    let status = (0..200)
+        .find_map(|_| {
+            let status = world.ok(&world.project, &["graph", "status"]);
+            if status["projection"]["status"] == "fresh" {
+                Some(status)
+            } else {
+                thread::sleep(Duration::from_millis(25));
+                None
+            }
+        })
+        .expect("background projection recovery did not finish");
     assert_eq!(status["projection"]["status"], "fresh");
     let page = world.ok(&world.project, &["page", "show", "projection-page"]);
     assert_eq!(page["page"]["title"], "Projection page");

@@ -71,7 +71,7 @@ pub struct CooccurrenceBuild {
     pub capacity_exceeded: bool,
 }
 
-pub const MAX_COOCCURRENCE_CONTRIBUTIONS: usize = 250_000;
+pub const MAX_COOCCURRENCE_CONTRIBUTIONS: usize = 32_768;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankedCooccurrence {

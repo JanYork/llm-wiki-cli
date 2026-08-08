@@ -49,6 +49,12 @@ pub struct WorkState {
     percent: Option<f64>,
     sequence: u64,
     updated_at_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_at_unix_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    items_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    eta_seconds: Option<u64>,
     cancel_requested: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
@@ -73,6 +79,9 @@ impl WorkState {
             percent: None,
             sequence: 1,
             updated_at_unix_ms: now_ms(),
+            started_at_unix_ms: None,
+            items_per_second: None,
+            eta_seconds: None,
             cancel_requested: false,
             pid: None,
             message: format!("{} queued", request.kind),
@@ -116,8 +125,16 @@ pub fn start_materialize(store: &StorePath) -> Result<Value> {
     start(store, "maintenance-materialize")
 }
 
+pub fn start_graph_projection(scope: &str, database: &Path) -> Result<Value> {
+    start_at(scope, database, "graph-project")
+}
+
 fn start(store: &StorePath, kind: &str) -> Result<Value> {
-    let root = work_root(&store.path)?;
+    start_at(scope_name(store.scope), &store.path, kind)
+}
+
+fn start_at(scope: &str, database: &Path, kind: &str) -> Result<Value> {
+    let root = work_root(database)?;
     ensure_root(&root)?;
     if let Some(state) = active_state(&root)? {
         if state.kind == kind && !terminal(&state.state) {
@@ -130,10 +147,10 @@ fn start(store: &StorePath, kind: &str) -> Result<Value> {
     }
 
     let request = WorkRequest {
-        id: work_id(&store.path),
+        id: work_id(database),
         kind: kind.into(),
-        scope: scope_name(store.scope).into(),
-        database: store.path.clone(),
+        scope: scope.into(),
+        database: database.to_path_buf(),
     };
     let directory = root.join(&request.id);
     fs::create_dir(&directory)?;
@@ -168,6 +185,7 @@ pub fn run(root: &Path, id: &str) -> Result<Value> {
     }
     let mut initial: WorkState = read_json(&directory.join("state.json"))?;
     initial.pid = Some(std::process::id());
+    initial.started_at_unix_ms = Some(now_ms());
     initial.update("running", "starting", format!("{} started", request.kind));
     write_json(&directory.join("state.json"), &initial)?;
     let state = Arc::new(Mutex::new(initial));
@@ -203,6 +221,15 @@ pub fn run(root: &Path, id: &str) -> Result<Value> {
         state.completed = completed as u64;
         state.total = Some(total as u64);
         state.percent = (total > 0).then(|| completed as f64 * 100.0 / total as f64);
+        let elapsed_ms = state
+            .started_at_unix_ms
+            .map(|started| now_ms().saturating_sub(started))
+            .unwrap_or_default();
+        state.items_per_second = (completed > 0 && elapsed_ms > 0)
+            .then(|| completed as f64 * 1_000.0 / elapsed_ms as f64);
+        state.eta_seconds = state.items_per_second.and_then(|rate| {
+            (rate > 0.0).then(|| ((total.saturating_sub(completed)) as f64 / rate).ceil() as u64)
+        });
         state.update(
             "running",
             phase,
@@ -256,6 +283,14 @@ pub fn run(root: &Path, id: &str) -> Result<Value> {
                 )
             })?)
         }
+        "graph-project" => {
+            progress(0, 1, "opening")?;
+            let mut store = Store::open(&request.scope, &request.database)?;
+            progress(0, 1, "projecting-graph")?;
+            store.reconcile_graph_projection_now()?;
+            progress(1, 1, "projecting-graph")?;
+            Ok(store.graph_status()?)
+        }
         other => Err(AppError::new(
             "work_invalid",
             format!("unsupported work kind: {other}"),
@@ -295,6 +330,11 @@ pub fn run(root: &Path, id: &str) -> Result<Value> {
     state.pid = None;
     write_json(&directory.join("state.json"), &*state)?;
     release_active(root, id)?;
+    if request.kind != "graph-project"
+        && let Ok(mut store) = Store::open(&request.scope, &request.database)
+    {
+        let _ = store.reconcile_graph_projection();
+    }
     Ok(json!({"work": &*state}))
 }
 
