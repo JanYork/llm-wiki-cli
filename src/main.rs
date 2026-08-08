@@ -2203,14 +2203,14 @@ fn resolve_effective_read_store_paths(
 
 fn materialize_if_live(store: &mut Store, selected_changeset: Option<&str>) -> Result<()> {
     if selected_changeset.is_none() {
-        store.materialize()?;
+        store.materialize_incremental(true)?;
     }
     Ok(())
 }
 
 fn materialize_wiki_if_live(store: &mut Store, selected_changeset: Option<&str>) -> Result<()> {
     if selected_changeset.is_none() {
-        store.materialize_wiki()?;
+        store.materialize_incremental(false)?;
     }
     Ok(())
 }

@@ -3,6 +3,7 @@ use std::{
     fmt, fs,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 const FIXED_DIRS: &[&str] = &[
@@ -20,10 +21,12 @@ const FIXED_DIRS: &[&str] = &[
     ".obsidian",
 ];
 const MANIFEST_PATH: &str = ".lwc-artifacts-manifest";
+const CURSOR_PATH: &str = ".lwc-artifacts-cursor";
 const SOURCE_ID_MAX: usize = 48;
 const BASENAME_MAX: usize = 120;
 const SLUG_SEGMENT_MAX: usize = 80;
 const REL_PATH_MAX: usize = 240;
+static ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(0);
 const PROVENANCE_ORDER: [&str; 4] = [
     "source-grounded",
     "user-provided",
@@ -94,6 +97,222 @@ pub fn materialize_snapshot(root: &Path, snapshot: &Snapshot) -> Result<Vec<Stri
 
 pub fn materialize_wiki_snapshot(root: &Path, snapshot: &Snapshot) -> Result<Vec<String>, Error> {
     materialize_snapshot_mode(root, snapshot, false)
+}
+
+pub fn load_cursor(root: &Path) -> Result<i64, Error> {
+    let target = join(root, CURSOR_PATH)?;
+    reject_symlink_path(root, CURSOR_PATH)?;
+    match fs::read_to_string(&target) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .map_err(|_| Error(format!("invalid artifact cursor in {}", target.display()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(Error(format!("{}: {error}", target.display()))),
+    }
+}
+
+pub fn save_cursor(root: &Path, cursor: i64) -> Result<(), Error> {
+    write(root, CURSOR_PATH, &format!("{cursor}\n"))
+}
+
+pub fn materialize_page(root: &Path, page: &Page) -> Result<Vec<String>, Error> {
+    let planned = plan_pages(std::slice::from_ref(page))?
+        .pop()
+        .ok_or_else(|| Error("missing planned page".into()))?;
+    ensure_projection_dirs(root)?;
+    write(root, &planned.path, &render_page(&planned))?;
+    update_index(root, &planned, false)?;
+    update_manifest(root, &[planned.path.clone(), "wiki/index.md".into()], &[])?;
+    Ok(vec![planned.path, "wiki/index.md".into()])
+}
+
+pub fn remove_page(root: &Path, slug: &str) -> Result<Vec<String>, Error> {
+    let slug = normalize_slug(slug)?;
+    let mut removed = Vec::new();
+    for folder in [
+        "entities",
+        "concepts",
+        "sources",
+        "queries",
+        "comparisons",
+        "synthesis",
+        "other",
+    ] {
+        let path = format!("wiki/{folder}/{slug}.md");
+        if remove_owned_file(root, &path)? {
+            removed.push(path);
+        }
+    }
+    update_index_slug(root, &slug)?;
+    update_manifest(root, &["wiki/index.md".into()], &removed)?;
+    removed.push("wiki/index.md".into());
+    Ok(removed)
+}
+
+pub fn materialize_source(root: &Path, source: &Source) -> Result<Vec<String>, Error> {
+    ensure_projection_dirs(root)?;
+    let path = source_artifact_rel_path(&source.id, &source.origin)?;
+    write(root, &path, &source.content)?;
+    update_manifest(root, std::slice::from_ref(&path), &[])?;
+    Ok(vec![path])
+}
+
+pub fn remove_source(root: &Path, source_id: &str) -> Result<Vec<String>, Error> {
+    let prefix = format!("raw/sources/{}--", normalize_source_id(source_id)?);
+    let removed = load_manifest(root)?
+        .into_iter()
+        .filter(|path| path.starts_with(&prefix))
+        .filter_map(|path| match remove_owned_file(root, &path) {
+            Ok(true) => Some(Ok(path)),
+            Ok(false) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    update_manifest(root, &[], &removed)?;
+    Ok(removed)
+}
+
+pub fn materialize_text(root: &Path, path: &str, content: &str) -> Result<(), Error> {
+    ensure_projection_dirs(root)?;
+    write(root, path, content)?;
+    update_manifest(root, &[path.to_string()], &[])
+}
+
+pub fn append_operations(root: &Path, operations: &[Operation]) -> Result<(), Error> {
+    if operations.is_empty() {
+        return Ok(());
+    }
+    ensure_projection_dirs(root)?;
+    let path = "wiki/log.md";
+    let target = join(root, path)?;
+    let mut current = match fs::read_to_string(&target) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "# Wiki Log\n".into(),
+        Err(error) => return Err(Error(format!("{}: {error}", target.display()))),
+    };
+    let rendered = render_log(operations);
+    current.push_str(rendered.strip_prefix("# Wiki Log\n").unwrap_or(&rendered));
+    write(root, path, &current)?;
+    update_manifest(root, &[path.into()], &[])
+}
+
+fn ensure_projection_dirs(root: &Path) -> Result<(), Error> {
+    ensure_root(root)?;
+    for dir in FIXED_DIRS {
+        mkdir(root, dir)?;
+    }
+    Ok(())
+}
+
+fn update_manifest(root: &Path, added: &[String], removed: &[String]) -> Result<(), Error> {
+    let mut entries = load_manifest(root)?.into_iter().collect::<BTreeSet<_>>();
+    for path in removed {
+        entries.remove(path);
+    }
+    entries.extend(added.iter().cloned());
+    save_manifest(root, &entries.into_iter().collect::<Vec<_>>())
+}
+
+fn remove_owned_file(root: &Path, relative: &str) -> Result<bool, Error> {
+    let target = join(root, relative)?;
+    reject_symlink_path(root, relative)?;
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error(format!(
+            "refusing symlink target {}",
+            target.display()
+        ))),
+        Ok(metadata) if metadata.is_file() => {
+            fs::remove_file(&target)
+                .map_err(|error| Error(format!("{}: {error}", target.display())))?;
+            Ok(true)
+        }
+        Ok(_) => Err(Error(format!("expected file at {}", target.display()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error(format!("{}: {error}", target.display()))),
+    }
+}
+
+fn update_index(root: &Path, page: &PlannedPage, remove_only: bool) -> Result<(), Error> {
+    let mut index = read_or_empty_index(root)?;
+    let target = format!(
+        "{}/{}",
+        page.folder,
+        page.path
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(".md")
+    );
+    remove_index_target(&mut index, &target);
+    if !remove_only {
+        let mut line = format!("- [[{}|{}]]", target, wiki_label(&page.title));
+        if let Some(summary) = page.summary.as_deref().and_then(inline_log_value) {
+            line.push_str(&format!(" — {summary}"));
+        }
+        insert_index_line(&mut index, page.folder, line)?;
+    }
+    write(root, "wiki/index.md", &index.join("\n"))
+}
+
+fn update_index_slug(root: &Path, slug: &str) -> Result<(), Error> {
+    let mut index = read_or_empty_index(root)?;
+    index.retain(|line| {
+        !line.starts_with("- [[")
+            || !line
+                .split("|")
+                .next()
+                .is_some_and(|target| target.ends_with(&format!("/{slug}")))
+    });
+    write(root, "wiki/index.md", &index.join("\n"))
+}
+
+fn read_or_empty_index(root: &Path) -> Result<Vec<String>, Error> {
+    let target = join(root, "wiki/index.md")?;
+    let content = match fs::read_to_string(&target) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => render_index(&[]),
+        Err(error) => return Err(Error(format!("{}: {error}", target.display()))),
+    };
+    Ok(content.lines().map(str::to_string).collect())
+}
+
+fn remove_index_target(index: &mut Vec<String>, target: &str) {
+    let prefix = format!("- [[{target}|");
+    index.retain(|line| !line.starts_with(&prefix));
+}
+
+fn insert_index_line(index: &mut Vec<String>, folder: &str, line: String) -> Result<(), Error> {
+    let label = match folder {
+        "entities" => "Entities",
+        "concepts" => "Concepts",
+        "sources" => "Sources",
+        "queries" => "Queries",
+        "comparisons" => "Comparisons",
+        "synthesis" => "Synthesis",
+        "other" => "Other",
+        _ => return Err(Error(format!("unsupported page folder: {folder}"))),
+    };
+    let heading = format!("## {label}");
+    let start = index
+        .iter()
+        .position(|value| value == &heading)
+        .ok_or_else(|| Error(format!("missing index section: {heading}")))?
+        + 1;
+    let end = index[start..]
+        .iter()
+        .position(|value| value.starts_with("## "))
+        .map_or(index.len(), |offset| start + offset);
+    let mut lines = index[start..end]
+        .iter()
+        .filter(|value| value.starts_with("- [["))
+        .cloned()
+        .collect::<Vec<_>>();
+    lines.push(line);
+    lines.sort();
+    lines.dedup();
+    index.splice(start..end, std::iter::once(String::new()).chain(lines));
+    Ok(())
 }
 
 fn materialize_snapshot_mode(
@@ -296,15 +515,28 @@ fn write(root: &Path, relative: &str, content: &str) -> Result<(), Error> {
             return Ok(());
         }
     }
+    let temporary = target.with_extension(format!(
+        "lwc-tmp-{}-{}",
+        std::process::id(),
+        ARTIFACT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
-        .open(&target)
-        .map_err(|e| Error(format!("{}: {}", target.display(), e)))?;
-    file.write_all(content.as_bytes())
-        .and_then(|_| file.flush())
-        .map_err(|e| Error(format!("{}: {}", target.display(), e)))
+        .open(&temporary)
+        .map_err(|e| Error(format!("{}: {}", temporary.display(), e)))?;
+    if let Err(error) = file
+        .write_all(content.as_bytes())
+        .and_then(|_| file.sync_all())
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(Error(format!("{}: {}", temporary.display(), error)));
+    }
+    if let Err(error) = fs::rename(&temporary, &target) {
+        let _ = fs::remove_file(&temporary);
+        return Err(Error(format!("{}: {}", target.display(), error)));
+    }
+    Ok(())
 }
 
 fn file_matches(path: &Path, expected: &[u8]) -> Result<bool, Error> {

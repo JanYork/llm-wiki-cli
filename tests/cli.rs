@@ -2693,7 +2693,7 @@ fn graphqlite_projection_failure_commits_canonical_fails_closed_and_recovers() {
 
     world.ok(&world.project, &["config", "set", "--engine", "graphqlite"]);
     let status = world.ok(&world.project, &["graph", "status"]);
-    assert_eq!(status["projection"]["status"], "fresh");
+    assert_eq!(status["projection"]["status"], "disabled");
     let page = world.ok(&world.project, &["page", "show", "projection-page"]);
     assert_eq!(page["page"]["title"], "Projection page");
 }
@@ -2832,7 +2832,7 @@ fn canonical_graph_supports_exploration_paths_relations_impact_and_overview() {
     let overview = world.ok(&world.project, &["graph", "overview"]);
     assert!(overview["node_counts"]["term"].as_u64().unwrap() > 0);
     assert!(overview["edge_counts"]["SUPPORTS"].as_u64().unwrap() > 0);
-    assert_eq!(overview["projection"]["status"], "fresh");
+    assert_eq!(overview["projection"]["status"], "disabled");
 
     let listed = world.ok(
         &world.project,

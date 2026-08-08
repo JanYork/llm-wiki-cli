@@ -4,8 +4,8 @@ use crate::{
     error::{AppError, Result},
     graph::{
         CanonicalEdge, DocumentGraphInput, DocumentGraphReplacement, DocumentType, GraphPage,
-        TermPairContribution, automatic_edge, build_cooccurrence, build_document_graph,
-        rank_cooccurrence, related,
+        MAX_COOCCURRENCE_CONTRIBUTIONS, TermPairContribution, automatic_edge, build_cooccurrence,
+        build_document_graph, rank_cooccurrence, related,
     },
     graph_backend::{
         create_hierarchical_graph_schema, decode_positions, encode_positions,
@@ -58,7 +58,6 @@ const MANUAL_WEIGHT: f64 = 2.0;
 const FEEDBACK_WEIGHT: f64 = 1.5;
 const MAX_COOCCURRENCE_BLOB_BYTES: usize = 16 * 1024 * 1024;
 const MAX_COOCCURRENCE_TERMS: usize = 100_000;
-const MAX_COOCCURRENCE_CONTRIBUTIONS: usize = 250_000;
 static SOURCE_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 type MigrationProgress<'a> = dyn FnMut(usize, usize, &str) -> Result<()> + 'a;
 
@@ -1175,7 +1174,7 @@ impl Store {
             return Ok(());
         }
         let digest = if generation == 0 {
-            database_graph_digest(&tx)?
+            current_graph_digest(&tx)?
         } else {
             tx.query_row(
                 "SELECT canonical_digest FROM graph_generations WHERE generation = ?1",
@@ -3504,10 +3503,7 @@ impl Store {
             .parent()
             .ok_or_else(|| AppError::new("invalid_store_path", "database has no parent"))?
             .to_path_buf();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let snapshot = artifact_snapshot(&tx, include_raw_sources)?;
+        let snapshot = artifact_snapshot(&self.conn, include_raw_sources)?;
         let materialize = if include_raw_sources {
             artifacts::materialize_snapshot
         } else {
@@ -3515,12 +3511,193 @@ impl Store {
         };
         let files = materialize(&root, &snapshot)
             .map_err(|error| AppError::new("artifact_write_failed", error.to_string()))?;
-        tx.commit()?;
+        let cursor: i64 =
+            self.conn
+                .query_row("SELECT COALESCE(MAX(id), 0) FROM operations", [], |row| {
+                    row.get(0)
+                })?;
+        artifacts::save_cursor(&root, cursor)
+            .map_err(|error| AppError::new("artifact_write_failed", error.to_string()))?;
         Ok(MaterializeResponse {
             scope: self.scope.clone(),
             database: self.database_string(),
             files,
         })
+    }
+
+    pub fn materialize_incremental(&self, include_raw_sources: bool) -> Result<Vec<String>> {
+        let root = self
+            .database
+            .parent()
+            .ok_or_else(|| AppError::new("invalid_store_path", "database has no parent"))?;
+        let cursor = artifacts::load_cursor(root)
+            .map_err(|error| AppError::new("artifact_write_failed", error.to_string()))?;
+        let operations = {
+            let mut statement = self.conn.prepare(
+                "SELECT id, created_at, action, target, detail_json
+                 FROM operations WHERE id > ?1 ORDER BY id",
+            )?;
+            statement
+                .query_map(params![cursor], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        artifacts::Operation {
+                            created_at: row.get(1)?,
+                            action: row.get(2)?,
+                            target: row.get(3)?,
+                            detail: row.get(4)?,
+                        },
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if operations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut written = Vec::new();
+        for (_, operation) in &operations {
+            match operation.action.as_str() {
+                "page_put" => {
+                    if let Some(page) = self.load_artifact_page(&operation.target)? {
+                        written.extend(artifacts::materialize_page(root, &page).map_err(
+                            |error| AppError::new("artifact_write_failed", error.to_string()),
+                        )?);
+                    }
+                }
+                "page_remove" => {
+                    written.extend(artifacts::remove_page(root, &operation.target).map_err(
+                        |error| AppError::new("artifact_write_failed", error.to_string()),
+                    )?);
+                }
+                "source_add" if include_raw_sources => {
+                    let detail = operation
+                        .detail
+                        .as_deref()
+                        .and_then(|value| serde_json::from_str::<Value>(value).ok());
+                    if let Some(source_id) = detail
+                        .as_ref()
+                        .and_then(|value| value.get("source_id"))
+                        .and_then(Value::as_i64)
+                        && let Some(source) = self.load_artifact_source(source_id)?
+                    {
+                        written.extend(artifacts::materialize_source(root, &source).map_err(
+                            |error| AppError::new("artifact_write_failed", error.to_string()),
+                        )?);
+                    }
+                }
+                "source_remove" if include_raw_sources => {
+                    written.extend(artifacts::remove_source(root, &operation.target).map_err(
+                        |error| AppError::new("artifact_write_failed", error.to_string()),
+                    )?);
+                }
+                "schema_set" => {
+                    let content = self
+                        .schema_text()?
+                        .unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
+                    artifacts::materialize_text(root, "schema.md", &content).map_err(|error| {
+                        AppError::new("artifact_write_failed", error.to_string())
+                    })?;
+                    written.push("schema.md".into());
+                }
+                "purpose_set" => {
+                    let content = self
+                        .purpose_text()?
+                        .unwrap_or_else(|| DEFAULT_PURPOSE.to_string());
+                    artifacts::materialize_text(root, "purpose.md", &content).map_err(|error| {
+                        AppError::new("artifact_write_failed", error.to_string())
+                    })?;
+                    written.push("purpose.md".into());
+                }
+                _ => {}
+            }
+        }
+        artifacts::append_operations(
+            root,
+            &operations
+                .iter()
+                .map(|(_, operation)| operation.clone())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| AppError::new("artifact_write_failed", error.to_string()))?;
+        written.push("wiki/log.md".into());
+        let cursor = operations.last().map(|(id, _)| *id).unwrap_or(cursor);
+        artifacts::save_cursor(root, cursor)
+            .map_err(|error| AppError::new("artifact_write_failed", error.to_string()))?;
+        written.sort();
+        written.dedup();
+        Ok(written)
+    }
+
+    fn load_artifact_page(&self, slug: &str) -> Result<Option<artifacts::Page>> {
+        let page = self
+            .conn
+            .query_row(
+                "SELECT slug, title, kind, summary, body, created_at, updated_at
+                 FROM pages WHERE slug = ?1",
+                params![slug],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((slug, title, kind, summary, body, created, updated)) = page else {
+            return Ok(None);
+        };
+        let source_artifact_paths = {
+            let mut statement = self.conn.prepare(
+                "SELECT s.id, s.origin FROM page_sources ps
+                 JOIN sources s ON s.id = ps.source_id
+                 WHERE ps.page_slug = ?1 ORDER BY s.id",
+            )?;
+            statement
+                .query_map(params![&slug], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .map(|row| {
+                    let (id, origin) = row?;
+                    artifacts::source_artifact_rel_path(&id.to_string(), &origin)
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(Some(artifacts::Page {
+            slug: slug.clone(),
+            title,
+            kind,
+            summary,
+            body,
+            source_artifact_paths,
+            provenance: self
+                .load_page_provenance(&slug, !self.load_page_source_ids(&slug)?.is_empty())?,
+            created,
+            updated,
+        }))
+    }
+
+    fn load_artifact_source(&self, id: i64) -> Result<Option<artifacts::Source>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, title, origin, content FROM sources WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(artifacts::Source {
+                        id: row.get::<_, i64>(0)?.to_string(),
+                        title: row.get(1)?,
+                        origin: row.get(2)?,
+                        content: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     pub fn context_store(&self, limit: usize) -> Result<ContextStore> {
@@ -4110,10 +4287,7 @@ fn fresh_checkpoint_name(database: &Path, prefix: &str) -> Result<String> {
     ))
 }
 
-fn artifact_snapshot(
-    tx: &Transaction<'_>,
-    include_source_content: bool,
-) -> Result<artifacts::Snapshot> {
+fn artifact_snapshot(tx: &Connection, include_source_content: bool) -> Result<artifacts::Snapshot> {
     if std::env::var("LWC_TEST_FORBID_FULL_ARTIFACT_SNAPSHOT").as_deref() == Ok("1") {
         return Err(AppError::new(
             "forbidden_full_artifact_snapshot",
@@ -4370,6 +4544,7 @@ fn prepare_store(
             ),
         ));
     }
+    ensure_graph_digest_accumulator(conn)?;
     validate_store(conn)?;
     Ok(false)
 }
@@ -4741,7 +4916,8 @@ fn migrate_hierarchical_graph(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let total = sources.len() + pages.len();
+    const FINALIZATION_UNITS: usize = 3;
+    let total = sources.len() + pages.len() + FINALIZATION_UNITS;
     let mut completed = 0;
     report_migration_progress(&mut progress, completed, total, "indexing")?;
     for (source_id, title, origin, content) in &sources {
@@ -4795,6 +4971,8 @@ fn migrate_hierarchical_graph(
     if initial_generation == 1 {
         report_migration_progress(&mut progress, completed, total, "finalizing-graph")?;
         rebuild_cooccurrence_edges(&tx)?;
+        completed += 1;
+        report_migration_progress(&mut progress, completed, total, "finalizing-cooccurrence")?;
         let store_revision: String = tx.query_row(
             "SELECT value FROM meta WHERE key = 'store_revision'",
             [],
@@ -4923,6 +5101,11 @@ fn migrate_hierarchical_graph(
             ),
             [],
         )?;
+        completed += 1;
+        report_migration_progress(&mut progress, completed, total, "finalizing-digest")?;
+    } else {
+        completed += FINALIZATION_UNITS - 1;
+        report_migration_progress(&mut progress, completed, total, "finalizing-empty")?;
     }
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
@@ -4935,7 +5118,9 @@ fn migrate_hierarchical_graph(
             "store_migration_failed",
             format!("failed to commit v{USER_VERSION} hierarchical graph migration: {error}"),
         )
-    })
+    })?;
+    completed += 1;
+    report_migration_progress(&mut progress, completed, total, "complete")
 }
 
 fn report_migration_progress(
@@ -5185,6 +5370,7 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
     ))?;
     create_changeset_state(&tx)?;
     create_hierarchical_graph_schema(&tx)?;
+    save_graph_digest_accumulator(&tx, &GraphDigestAccumulator::default())?;
     tx.execute(
         &format!(
             "INSERT INTO graph_projection_state(
@@ -7072,131 +7258,281 @@ fn persist_migration_relation_edge(
 fn database_graph_digest(conn: &Connection) -> Result<String> {
     #[cfg(test)]
     TEST_GRAPH_DIGEST_CALLS.set(TEST_GRAPH_DIGEST_CALLS.get() + 1);
+    Ok(graph_digest_accumulator(&canonical_database_records(conn)?).digest())
+}
+
+const GRAPH_DIGEST_ALGORITHM: &str = "canonical-multiset-v1";
+const GRAPH_DIGEST_ALGORITHM_KEY: &str = "graph_digest_algorithm";
+const GRAPH_DIGEST_XOR_KEY: &str = "graph_digest_xor";
+const GRAPH_DIGEST_SUM_KEY: &str = "graph_digest_sum";
+const GRAPH_DIGEST_COUNT_KEY: &str = "graph_digest_count";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct GraphDigestAccumulator {
+    xor: [u8; 32],
+    sum: [u8; 32],
+    count: u64,
+}
+
+impl GraphDigestAccumulator {
+    fn insert(&mut self, key: &(String, String), record: &str) -> Result<()> {
+        let hash = graph_record_hash(key, record);
+        for (target, byte) in self.xor.iter_mut().zip(hash) {
+            *target ^= byte;
+        }
+        add_256(&mut self.sum, &hash);
+        self.count = self.count.checked_add(1).ok_or_else(|| {
+            AppError::new(
+                "graph_index_capacity_exceeded",
+                "graph record count overflow",
+            )
+        })?;
+        Ok(())
+    }
+
+    fn remove(&mut self, key: &(String, String), record: &str) -> Result<()> {
+        let hash = graph_record_hash(key, record);
+        for (target, byte) in self.xor.iter_mut().zip(hash) {
+            *target ^= byte;
+        }
+        subtract_256(&mut self.sum, &hash);
+        self.count = self.count.checked_sub(1).ok_or_else(|| {
+            AppError::new("graph_index_corrupt", "graph digest record count underflow")
+        })?;
+        Ok(())
+    }
+
+    fn digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(GRAPH_DIGEST_ALGORITHM.as_bytes());
+        hasher.update(self.count.to_be_bytes());
+        hasher.update(self.xor);
+        hasher.update(self.sum);
+        hex_bytes(&hasher.finalize())
+    }
+}
+
+fn graph_record_hash(key: &(String, String), record: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    let mut hash_record = |record: String| {
-        hasher.update((record.len() as u64).to_be_bytes());
-        hasher.update(record.as_bytes());
-    };
-    {
-        let mut statement = conn.prepare(
-            "SELECT node_id, node_type, document_type, document_identifier,
-                    parent_node_id, ordinal, byte_start, byte_end,
-                    content_fingerprint, segmenter_version, label, properties_json
-             FROM graph_nodes ORDER BY node_id",
-        )?;
-        let records = statement.query_map([], |row| {
-            Ok(json!({
-                "node_id": row.get::<_, String>(0)?,
-                "node_type": row.get::<_, String>(1)?,
-                "document_type": row.get::<_, Option<String>>(2)?,
-                "document_identifier": row.get::<_, Option<String>>(3)?,
-                "parent_node_id": row.get::<_, Option<String>>(4)?,
-                "ordinal": row.get::<_, Option<i64>>(5)?,
-                "byte_start": row.get::<_, Option<i64>>(6)?,
-                "byte_end": row.get::<_, Option<i64>>(7)?,
-                "content_fingerprint": row.get::<_, Option<String>>(8)?,
-                "segmenter_version": row.get::<_, Option<i64>>(9)?,
-                "label": row.get::<_, String>(10)?,
-                "properties_json": row.get::<_, String>(11)?,
-            })
-            .to_string())
-        })?;
-        for record in records {
-            hash_record(record?);
+    for part in [key.0.as_bytes(), key.1.as_bytes(), record.as_bytes()] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+fn add_256(target: &mut [u8; 32], value: &[u8; 32]) {
+    let mut carry = 0_u16;
+    for index in (0..32).rev() {
+        let sum = u16::from(target[index]) + u16::from(value[index]) + carry;
+        target[index] = sum as u8;
+        carry = sum >> 8;
+    }
+}
+
+fn subtract_256(target: &mut [u8; 32], value: &[u8; 32]) {
+    let mut borrow = 0_i16;
+    for index in (0..32).rev() {
+        let difference = i16::from(target[index]) - i16::from(value[index]) - borrow;
+        if difference < 0 {
+            target[index] = (difference + 256) as u8;
+            borrow = 1;
+        } else {
+            target[index] = difference as u8;
+            borrow = 0;
         }
     }
-    {
-        let mut statement = conn.prepare(
-            "SELECT edge_id, edge_type, from_node_id, to_node_id,
-                    owner_type, owner_identifier, weight, confidence,
-                    provenance, reason, frequency, HEX(positions), first_position,
-                    properties_json
-             FROM graph_edges ORDER BY edge_id",
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn decode_digest_bytes(value: &str, key: &str) -> Result<[u8; 32]> {
+    if value.len() != 64 {
+        return Err(AppError::new(
+            "graph_index_corrupt",
+            format!("{key} has an invalid length"),
+        ));
+    }
+    let mut output = [0_u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let encoded = std::str::from_utf8(chunk)
+            .map_err(|_| AppError::new("graph_index_corrupt", format!("{key} is invalid")))?;
+        output[index] = u8::from_str_radix(encoded, 16)
+            .map_err(|_| AppError::new("graph_index_corrupt", format!("{key} is invalid")))?;
+    }
+    Ok(output)
+}
+
+fn graph_digest_accumulator(
+    records: &BTreeMap<(String, String), String>,
+) -> GraphDigestAccumulator {
+    let mut accumulator = GraphDigestAccumulator::default();
+    for (key, record) in records {
+        accumulator
+            .insert(key, record)
+            .expect("canonical record count fits in u64");
+    }
+    accumulator
+}
+
+fn load_graph_digest_accumulator(conn: &Connection) -> Result<Option<GraphDigestAccumulator>> {
+    let values = conn.query_row(
+        "SELECT
+                MAX(CASE WHEN key = ?1 THEN value END),
+                MAX(CASE WHEN key = ?2 THEN value END),
+                MAX(CASE WHEN key = ?3 THEN value END),
+                MAX(CASE WHEN key = ?4 THEN value END)
+             FROM meta WHERE key IN (?1, ?2, ?3, ?4)",
+        params![
+            GRAPH_DIGEST_ALGORITHM_KEY,
+            GRAPH_DIGEST_XOR_KEY,
+            GRAPH_DIGEST_SUM_KEY,
+            GRAPH_DIGEST_COUNT_KEY,
+        ],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        },
+    )?;
+    match values {
+        (None, None, None, None) => Ok(None),
+        (Some(algorithm), Some(xor), Some(sum), Some(count))
+            if algorithm == GRAPH_DIGEST_ALGORITHM =>
+        {
+            Ok(Some(GraphDigestAccumulator {
+                xor: decode_digest_bytes(&xor, GRAPH_DIGEST_XOR_KEY)?,
+                sum: decode_digest_bytes(&sum, GRAPH_DIGEST_SUM_KEY)?,
+                count: count.parse().map_err(|_| {
+                    AppError::new(
+                        "graph_index_corrupt",
+                        "graph digest record count is invalid",
+                    )
+                })?,
+            }))
+        }
+        _ => Err(AppError::new(
+            "graph_index_corrupt",
+            "graph digest metadata is incomplete or incompatible",
+        )),
+    }
+}
+
+fn save_graph_digest_accumulator(
+    conn: &Connection,
+    accumulator: &GraphDigestAccumulator,
+) -> Result<()> {
+    for (key, value) in [
+        (
+            GRAPH_DIGEST_ALGORITHM_KEY,
+            GRAPH_DIGEST_ALGORITHM.to_string(),
+        ),
+        (GRAPH_DIGEST_XOR_KEY, hex_bytes(&accumulator.xor)),
+        (GRAPH_DIGEST_SUM_KEY, hex_bytes(&accumulator.sum)),
+        (GRAPH_DIGEST_COUNT_KEY, accumulator.count.to_string()),
+    ] {
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
         )?;
-        let records = statement.query_map([], |row| {
-            Ok(json!({
-                "edge_id": row.get::<_, String>(0)?,
-                "edge_type": row.get::<_, String>(1)?,
-                "from_node_id": row.get::<_, String>(2)?,
-                "to_node_id": row.get::<_, String>(3)?,
-                "owner_type": row.get::<_, String>(4)?,
-                "owner_identifier": row.get::<_, String>(5)?,
-                "weight": row.get::<_, Option<f64>>(6)?,
-                "confidence": row.get::<_, Option<f64>>(7)?,
-                "provenance": row.get::<_, Option<String>>(8)?,
-                "reason": row.get::<_, Option<String>>(9)?,
-                "frequency": row.get::<_, Option<i64>>(10)?,
-                "positions": row.get::<_, String>(11)?,
-                "first_position": row.get::<_, Option<i64>>(12)?,
-                "properties_json": row.get::<_, String>(13)?,
-            })
-            .to_string())
-        })?;
-        for record in records {
-            hash_record(record?);
+    }
+    Ok(())
+}
+
+fn current_graph_digest(conn: &Connection) -> Result<String> {
+    match load_graph_digest_accumulator(conn)? {
+        Some(accumulator) => Ok(accumulator.digest()),
+        None => database_graph_digest(conn),
+    }
+}
+
+fn ensure_graph_digest_accumulator(conn: &mut Connection) -> Result<()> {
+    if load_graph_digest_accumulator(conn)?.is_some() {
+        return Ok(());
+    }
+    for _ in 0..3 {
+        let baseline_generation: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(generation), 0) FROM graph_generations",
+            [],
+            |row| row.get(0),
+        )?;
+        let accumulator = graph_digest_accumulator(&canonical_database_records(conn)?);
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if load_graph_digest_accumulator(&tx)?.is_some() {
+            tx.commit()?;
+            return Ok(());
+        }
+        let observed_generation: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(generation), 0) FROM graph_generations",
+            [],
+            |row| row.get(0),
+        )?;
+        if observed_generation != baseline_generation {
+            tx.rollback()?;
+            continue;
+        }
+        save_graph_digest_accumulator(&tx, &accumulator)?;
+        if observed_generation > 0 {
+            tx.execute(
+                "UPDATE graph_generations SET canonical_digest = ?1 WHERE generation = ?2",
+                params![accumulator.digest(), observed_generation],
+            )?;
+            tx.execute(
+                &format!(
+                    "UPDATE graph_projection_state
+                     SET status = CASE WHEN engine = 'graphlite' THEN 'pending' ELSE status END,
+                         updated_at = {TIMESTAMP_SQL}
+                     WHERE projection = 'physical'"
+                ),
+                [],
+            )?;
+        }
+        tx.commit()?;
+        return Ok(());
+    }
+    Err(AppError::new(
+        "database_busy",
+        "graph changed repeatedly while initializing digest metadata; retry",
+    ))
+}
+
+fn apply_graph_digest_patch(
+    conn: &Connection,
+    before: &BTreeMap<(String, String), String>,
+    after: &BTreeMap<(String, String), String>,
+) -> Result<String> {
+    let mut accumulator = load_graph_digest_accumulator(conn)?.ok_or_else(|| {
+        AppError::new(
+            "graph_digest_uninitialized",
+            "graph digest metadata has not been initialized",
+        )
+    })?;
+    let keys = before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for key in keys {
+        let old = before.get(&key);
+        let new = after.get(&key);
+        if old == new {
+            continue;
+        }
+        if let Some(record) = old {
+            accumulator.remove(&key, record)?;
+        }
+        if let Some(record) = new {
+            accumulator.insert(&key, record)?;
         }
     }
-    {
-        let mut statement = conn.prepare(
-            "SELECT term_node_id, document_type, document_identifier,
-                    frequency, HEX(positions), first_position
-             FROM graph_occurrences
-             ORDER BY term_node_id, document_type, document_identifier",
-        )?;
-        let records = statement.query_map([], |row| {
-            Ok(json!({
-                "term_node_id": row.get::<_, String>(0)?,
-                "document_type": row.get::<_, String>(1)?,
-                "document_identifier": row.get::<_, String>(2)?,
-                "frequency": row.get::<_, i64>(3)?,
-                "positions": row.get::<_, String>(4)?,
-                "first_position": row.get::<_, i64>(5)?,
-            })
-            .to_string())
-        })?;
-        for record in records {
-            hash_record(record?);
-        }
-    }
-    {
-        let mut statement = conn.prepare(
-            "SELECT document_type, document_identifier, HEX(contributions)
-             FROM term_pair_contributions
-             ORDER BY document_type, document_identifier",
-        )?;
-        for record in statement.query_map([], |row| {
-            Ok(json!({
-                "document_type": row.get::<_, String>(0)?,
-                "document_identifier": row.get::<_, String>(1)?,
-                "contributions": row.get::<_, String>(2)?,
-            })
-            .to_string())
-        })? {
-            hash_record(record?);
-        }
-    }
-    {
-        let mut statement = conn.prepare(
-            "SELECT from_term_id, to_term_id, raw_strength, witness_count
-             FROM term_pair_totals ORDER BY from_term_id, to_term_id",
-        )?;
-        for record in statement.query_map([], |row| {
-            Ok(json!({
-                "from_term_id": row.get::<_, String>(0)?,
-                "to_term_id": row.get::<_, String>(1)?,
-                "raw_strength": row.get::<_, f64>(2)?,
-                "witness_count": row.get::<_, i64>(3)?,
-            })
-            .to_string())
-        })? {
-            hash_record(record?);
-        }
-    }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    save_graph_digest_accumulator(conn, &accumulator)?;
+    Ok(accumulator.digest())
 }
 
 fn persist_revision_edge(
@@ -7268,6 +7604,15 @@ fn persist_revision_edge(
             json!({"tracked_path": tracked_path, "revision": revision}).to_string(),
         ],
     )?;
+    let digest = apply_graph_digest_patch(
+        tx,
+        &BTreeMap::new(),
+        &singleton_graph_record(
+            "edge",
+            &edge_id,
+            canonical_graph_record(tx, "edge", &edge_id)?,
+        ),
+    )?;
     let after_json = json!({
         "edge_id": &edge_id,
         "edge_type": "REVISION_OF",
@@ -7289,7 +7634,7 @@ fn persist_revision_edge(
     )?;
     tx.execute(
         "UPDATE graph_generations SET canonical_digest = ?1 WHERE generation = ?2",
-        params![database_graph_digest(tx)?, generation],
+        params![digest, generation],
     )?;
     tx.execute(
         &format!(
@@ -7371,6 +7716,58 @@ fn canonical_database_records(conn: &Connection) -> Result<BTreeMap<(String, Str
     }
     insert_occurrence_records(conn, &mut records, None)?;
     Ok(records)
+}
+
+fn canonical_graph_record(
+    conn: &Connection,
+    entity_type: &str,
+    entity_id: &str,
+) -> Result<Option<String>> {
+    let sql = match entity_type {
+        "node" => {
+            "SELECT json_object(
+                'node_id', node_id, 'node_type', node_type,
+                'document_type', document_type,
+                'document_identifier', document_identifier,
+                'parent_node_id', parent_node_id, 'ordinal', ordinal,
+                'byte_start', byte_start, 'byte_end', byte_end,
+                'content_fingerprint', content_fingerprint,
+                'segmenter_version', segmenter_version,
+                'label', label, 'properties_json', properties_json
+             ) FROM graph_nodes WHERE node_id = ?1"
+        }
+        "edge" => {
+            "SELECT json_object(
+                'edge_id', edge_id, 'edge_type', edge_type,
+                'from_node_id', from_node_id, 'to_node_id', to_node_id,
+                'owner_type', owner_type, 'owner_identifier', owner_identifier,
+                'weight', weight, 'confidence', confidence,
+                'provenance', provenance, 'reason', reason,
+                'frequency', frequency, 'positions', HEX(positions),
+                'first_position', first_position,
+                'properties_json', properties_json
+             ) FROM graph_edges WHERE edge_id = ?1"
+        }
+        _ => {
+            return Err(AppError::new(
+                "graph_index_corrupt",
+                "unsupported canonical graph record type",
+            ));
+        }
+    };
+    Ok(conn
+        .query_row(sql, params![entity_id], |row| row.get(0))
+        .optional()?)
+}
+
+fn singleton_graph_record(
+    entity_type: &str,
+    entity_id: &str,
+    record: Option<String>,
+) -> BTreeMap<(String, String), String> {
+    record
+        .map(|record| BTreeMap::from([((entity_type.to_string(), entity_id.to_string()), record)]))
+        .unwrap_or_default()
 }
 
 fn insert_occurrence_records(
@@ -7545,7 +7942,40 @@ fn remove_document_graph(
     document_type: &str,
     document_identifier: &str,
 ) -> Result<()> {
-    let before = canonical_database_records(tx)?;
+    let previous_contributions = tx
+        .query_row(
+            "SELECT contributions FROM term_pair_contributions
+             WHERE document_type = ?1 AND document_identifier = ?2",
+            params![document_type, document_identifier],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .map(|encoded| decode_term_pair_contributions(&encoded))
+        .transpose()?
+        .unwrap_or_default();
+    let mut affected_terms = previous_contributions
+        .iter()
+        .flat_map(|contribution| {
+            [
+                contribution.from_term_id.clone(),
+                contribution.to_term_id.clone(),
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    {
+        let mut statement = tx.prepare(
+            "SELECT term_node_id FROM graph_occurrences
+             WHERE document_type = ?1 AND document_identifier = ?2",
+        )?;
+        for row in statement.query_map(params![document_type, document_identifier], |row| {
+            row.get::<_, String>(0)
+        })? {
+            affected_terms.insert(row?);
+        }
+    }
+    expand_affected_cooccurrence_sources(tx, &mut affected_terms)?;
+    let before =
+        canonical_document_records(tx, document_type, document_identifier, &affected_terms)?;
     tx.execute(
         "DELETE FROM graph_occurrences
          WHERE document_type = ?1 AND document_identifier = ?2",
@@ -7556,17 +7986,7 @@ fn remove_document_graph(
          WHERE owner_type = ?1 AND owner_identifier = ?2",
         params![document_type, document_identifier],
     )?;
-    if let Some(encoded) = tx
-        .query_row(
-            "SELECT contributions FROM term_pair_contributions
-             WHERE document_type = ?1 AND document_identifier = ?2",
-            params![document_type, document_identifier],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .optional()?
-    {
-        apply_term_pair_totals(tx, &decode_term_pair_contributions(&encoded)?, -1.0)?;
-    }
+    apply_term_pair_totals(tx, &previous_contributions, -1.0)?;
     tx.execute(
         "DELETE FROM term_pair_contributions
          WHERE document_type = ?1 AND document_identifier = ?2",
@@ -7587,8 +8007,11 @@ fn remove_document_graph(
          WHERE document_type = ?1 AND document_identifier = ?2",
         params![document_type, document_identifier],
     )?;
-    rebuild_cooccurrence_edges(tx)?;
-    let after = canonical_database_records(tx)?;
+    expand_affected_cooccurrence_sources(tx, &mut affected_terms)?;
+    rebuild_cooccurrence_edges_for(tx, Some(&affected_terms))?;
+    let after =
+        canonical_document_records(tx, document_type, document_identifier, &affected_terms)?;
+    let digest = apply_graph_digest_patch(tx, &before, &after)?;
     let generation: i64 = tx.query_row(
         "SELECT COALESCE(MAX(generation), 0) + 1 FROM graph_generations",
         [],
@@ -7606,7 +8029,7 @@ fn remove_document_graph(
                 changed_document_count, created_at
              ) VALUES (?1, ?2, ?3, 1, {TIMESTAMP_SQL})"
         ),
-        params![generation, store_revision, database_graph_digest(tx)?],
+        params![generation, store_revision, digest],
     )?;
     let keys = before
         .keys()
@@ -7677,7 +8100,8 @@ fn persist_inbound_link_edges(
             .query_map(params![target_slug], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let mut changed = false;
+    let before_records = BTreeMap::new();
+    let mut after_records = BTreeMap::new();
     for from_slug in from_slugs {
         let edge = automatic_edge(
             "LINKS_TO",
@@ -7703,7 +8127,10 @@ fn persist_inbound_link_edges(
         if inserted == 0 {
             continue;
         }
-        changed = true;
+        let key = ("edge".to_string(), edge.edge_id.clone());
+        if let Some(record) = canonical_graph_record(tx, "edge", &edge.edge_id)? {
+            after_records.insert(key, record);
+        }
         tx.execute(
             &format!(
                 "INSERT INTO graph_deltas(
@@ -7728,10 +8155,11 @@ fn persist_inbound_link_edges(
             ],
         )?;
     }
-    if changed {
+    if !after_records.is_empty() {
+        let digest = apply_graph_digest_patch(tx, &before_records, &after_records)?;
         tx.execute(
             "UPDATE graph_generations SET canonical_digest = ?1 WHERE generation = ?2",
-            params![database_graph_digest(tx)?, generation],
+            params![digest, generation],
         )?;
     }
     Ok(())
@@ -7746,7 +8174,20 @@ fn persist_document_graph(
 ) -> Result<i64> {
     let mut graph = build_document_graph(input).map_err(segment_error)?;
     graph.edges.extend_from_slice(extra_edges);
-    let cooccurrence = build_cooccurrence(input).map_err(segment_error)?;
+    let mut cooccurrence = build_cooccurrence(input).map_err(segment_error)?;
+    let encoded_contributions = if cooccurrence.contributions.is_empty() {
+        None
+    } else {
+        match encode_term_pair_contributions(&cooccurrence.contributions) {
+            Ok(encoded) => Some(encoded),
+            Err(error) if error.code == "graph_index_capacity_exceeded" => {
+                cooccurrence.contributions.clear();
+                cooccurrence.capacity_exceeded = true;
+                None
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let document_type = match input.document_type {
         DocumentType::Page => "page",
         DocumentType::Source => "source",
@@ -7942,16 +8383,12 @@ fn persist_document_graph(
         }
     }
 
-    if !cooccurrence.contributions.is_empty() {
+    if let Some(encoded_contributions) = encoded_contributions {
         tx.execute(
             "INSERT INTO term_pair_contributions(
                 document_type, document_identifier, contributions
              ) VALUES (?1, ?2, ?3)",
-            params![
-                document_type,
-                input.identifier,
-                encode_term_pair_contributions(&cooccurrence.contributions)?,
-            ],
+            params![document_type, input.identifier, encoded_contributions,],
         )?;
     }
     apply_term_pair_totals(tx, &cooccurrence.contributions, 1.0)?;
@@ -7964,6 +8401,19 @@ fn persist_document_graph(
             [],
             |row| row.get(0),
         )?;
+        upsert_document_index_state(
+            tx,
+            document_type,
+            input.identifier,
+            &graph.document_node_id,
+            &graph.content_fingerprint,
+            generation,
+            cooccurrence.truncated_sentence_count + usize::from(cooccurrence.capacity_exceeded),
+        )?;
+
+        let after_records =
+            canonical_document_records(tx, document_type, input.identifier, &affected_terms)?;
+        let digest = apply_graph_digest_patch(tx, &before_records, &after_records)?;
         let store_revision: String = tx.query_row(
             "SELECT value FROM meta WHERE key = 'store_revision'",
             [],
@@ -7976,10 +8426,8 @@ fn persist_document_graph(
                     changed_document_count, created_at
                  ) VALUES (?1, ?2, ?3, 1, {TIMESTAMP_SQL})"
             ),
-            params![generation, store_revision, database_graph_digest(tx)?],
+            params![generation, store_revision, digest],
         )?;
-        let after_records =
-            canonical_document_records(tx, document_type, input.identifier, &affected_terms)?;
         let record_keys = before_records
             .keys()
             .chain(after_records.keys())
@@ -8021,6 +8469,44 @@ fn persist_document_graph(
     } else {
         1
     };
+    if !finalize_generation {
+        upsert_document_index_state(
+            tx,
+            document_type,
+            input.identifier,
+            &graph.document_node_id,
+            &graph.content_fingerprint,
+            generation,
+            cooccurrence.truncated_sentence_count + usize::from(cooccurrence.capacity_exceeded),
+        )?;
+    }
+    if finalize_generation {
+        tx.execute(
+            &format!(
+                "UPDATE graph_projection_state
+                 SET canonical_generation = ?1,
+                     projected_generation = CASE
+                         WHEN engine = 'rslg' THEN ?1 ELSE projected_generation END,
+                     status = CASE WHEN engine = 'rslg' THEN 'fresh' ELSE 'pending' END,
+                     updated_at = {TIMESTAMP_SQL}
+                 WHERE projection = 'physical'"
+            ),
+            params![generation],
+        )?;
+    }
+    Ok(generation)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_document_index_state(
+    tx: &Transaction<'_>,
+    document_type: &str,
+    document_identifier: &str,
+    document_node_id: &str,
+    content_fingerprint: &str,
+    generation: i64,
+    cooccurrence_truncated: usize,
+) -> Result<()> {
     tx.execute(
         &format!(
             "INSERT INTO document_index_state(
@@ -8038,29 +8524,15 @@ fn persist_document_graph(
         ),
         params![
             document_type,
-            input.identifier,
-            &graph.document_node_id,
-            &graph.content_fingerprint,
+            document_identifier,
+            document_node_id,
+            content_fingerprint,
             i64::from(crate::segment::SEGMENTER_VERSION),
             generation,
-            cooccurrence.truncated_sentence_count as i64,
+            cooccurrence_truncated as i64,
         ],
     )?;
-    if finalize_generation {
-        tx.execute(
-            &format!(
-                "UPDATE graph_projection_state
-                 SET canonical_generation = ?1,
-                     projected_generation = CASE
-                         WHEN engine = 'rslg' THEN ?1 ELSE projected_generation END,
-                     status = CASE WHEN engine = 'rslg' THEN 'fresh' ELSE 'pending' END,
-                     updated_at = {TIMESTAMP_SQL}
-                 WHERE projection = 'physical'"
-            ),
-            params![generation],
-        )?;
-    }
-    Ok(generation)
+    Ok(())
 }
 
 fn apply_term_pair_totals(
@@ -8821,7 +9293,7 @@ fn ensure_graph_projection_fresh(conn: &Connection, database: &Path) -> Result<(
     }
     if engine == "graphlite" {
         let digest = if canonical == 0 {
-            database_graph_digest(conn)?
+            current_graph_digest(conn)?
         } else {
             conn.query_row(
                 "SELECT canonical_digest FROM graph_generations WHERE generation = ?1",
@@ -10421,6 +10893,11 @@ fn graph_relation_set_value(
     );
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     validate_sources(&tx, &source_ids)?;
+    let before_record = singleton_graph_record(
+        "edge",
+        &edge_id,
+        canonical_graph_record(&tx, "edge", &edge_id)?,
+    );
     let before_json = tx
         .query_row(
             "SELECT json_object(
@@ -10459,6 +10936,11 @@ fn graph_relation_set_value(
             json!({"source_ids": source_ids}).to_string(),
         ],
     )?;
+    let after_record = singleton_graph_record(
+        "edge",
+        &edge_id,
+        canonical_graph_record(&tx, "edge", &edge_id)?,
+    );
     let after_json = json!({
         "identifier": edge_id,
         "type": relation_type,
@@ -10481,7 +10963,7 @@ fn graph_relation_set_value(
         [],
         |row| row.get(0),
     )?;
-    let digest = database_graph_digest(&tx)?;
+    let digest = apply_graph_digest_patch(&tx, &before_record, &after_record)?;
     tx.execute(
         &format!(
             "INSERT INTO graph_generations(
@@ -10635,6 +11117,11 @@ fn graph_relation_retract_value(
         hash_content(&format!("manual\0{relation_type}\0{from}\0{to}"))
     );
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let before_record = singleton_graph_record(
+        "edge",
+        &edge_id,
+        canonical_graph_record(&tx, "edge", &edge_id)?,
+    );
     let before_json = tx
         .query_row(
             "SELECT json_object(
@@ -10658,6 +11145,7 @@ fn graph_relation_retract_value(
         "DELETE FROM graph_edges WHERE edge_id = ?1 AND owner_type = 'manual'",
         params![&edge_id],
     )?;
+    let digest = apply_graph_digest_patch(&tx, &before_record, &BTreeMap::new())?;
     let store_revision = record_operation(
         &tx,
         "graph_relation_retract",
@@ -10676,7 +11164,7 @@ fn graph_relation_retract_value(
                 changed_document_count, created_at
              ) VALUES (?1, ?2, ?3, 0, {TIMESTAMP_SQL})"
         ),
-        params![generation, store_revision, database_graph_digest(&tx)?],
+        params![generation, store_revision, digest],
     )?;
     tx.execute(
         &format!(
@@ -11565,7 +12053,7 @@ mod tests {
                     )),
                 )
                 .unwrap(),
-            (1, 1, "fresh".to_string())
+            (1, 1, "disabled".to_string())
         );
         assert_eq!(
             store

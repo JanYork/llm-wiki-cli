@@ -68,7 +68,10 @@ pub struct TermPairContribution {
 pub struct CooccurrenceBuild {
     pub contributions: Vec<TermPairContribution>,
     pub truncated_sentence_count: usize,
+    pub capacity_exceeded: bool,
 }
+
+pub const MAX_COOCCURRENCE_CONTRIBUTIONS: usize = 250_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankedCooccurrence {
@@ -261,8 +264,9 @@ pub fn build_cooccurrence(
     let segmented = segment_document(input.content)?;
     let mut totals: BTreeMap<(String, String), (f64, f64, usize)> = BTreeMap::new();
     let mut truncated_sentence_count = 0usize;
+    let mut capacity_exceeded = false;
 
-    for passage in segmented.passages {
+    'passages: for passage in segmented.passages {
         if matches!(
             passage.kind,
             PassageKind::TableRow | PassageKind::CodeBlock | PassageKind::Html
@@ -294,7 +298,10 @@ pub fn build_cooccurrence(
                         continue;
                     }
                     let weight = 1.0 / (1.0 + (right - left) as f64);
-                    add_pair_weight(&mut totals, &tokens[left], &tokens[right], weight, 0.0);
+                    if !add_pair_weight(&mut totals, &tokens[left], &tokens[right], weight, 0.0) {
+                        capacity_exceeded = true;
+                        break 'passages;
+                    }
                 }
             }
         }
@@ -310,14 +317,19 @@ pub fn build_cooccurrence(
                     }
                     let distance = left.len() - left_index + right_index;
                     let weight = 0.25 / (1.0 + distance as f64);
-                    add_pair_weight(&mut totals, &left[left_index], right_term, 0.0, weight);
+                    if !add_pair_weight(&mut totals, &left[left_index], right_term, 0.0, weight) {
+                        capacity_exceeded = true;
+                        break 'passages;
+                    }
                 }
             }
         }
     }
 
     Ok(CooccurrenceBuild {
-        contributions: totals
+        contributions: (!capacity_exceeded)
+            .then_some(totals)
+            .unwrap_or_default()
             .into_iter()
             .map(
                 |((from_term_id, to_term_id), (sentence_weight, passage_weight, witness_count))| {
@@ -332,6 +344,7 @@ pub fn build_cooccurrence(
             )
             .collect(),
         truncated_sentence_count,
+        capacity_exceeded,
     })
 }
 
@@ -341,15 +354,18 @@ fn add_pair_weight(
     right: &str,
     sentence_weight: f64,
     passage_weight: f64,
-) {
+) -> bool {
     for (from, to) in [(left, right), (right, left)] {
-        let total = totals
-            .entry((from.to_string(), to.to_string()))
-            .or_default();
+        let key = (from.to_string(), to.to_string());
+        if !totals.contains_key(&key) && totals.len() >= MAX_COOCCURRENCE_CONTRIBUTIONS {
+            return false;
+        }
+        let total = totals.entry(key).or_default();
         total.0 += sentence_weight;
         total.1 += passage_weight;
         total.2 += 1;
     }
+    true
 }
 
 pub fn build_document_graph(
