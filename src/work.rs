@@ -640,6 +640,8 @@ fn claim_active(root: &Path, id: &str) -> Result<()> {
 }
 
 fn spawn(root: &Path, id: &str) -> Result<()> {
+    #[cfg(windows)]
+    disable_standard_handle_inheritance()?;
     let executable = env::current_exe()?;
     let mut command = Command::new(executable);
     command
@@ -661,6 +663,41 @@ fn spawn(root: &Path, id: &str) -> Result<()> {
             format!("failed to start work: {error}"),
         )
     })
+}
+
+#[cfg(windows)]
+fn disable_standard_handle_inheritance() -> Result<()> {
+    use std::ffi::c_void;
+
+    const STD_INPUT_HANDLE: u32 = -10_i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11_i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12_i32 as u32;
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    const INVALID_HANDLE_VALUE: *mut c_void = -1_isize as *mut c_void;
+
+    unsafe extern "system" {
+        #[link_name = "GetStdHandle"]
+        fn get_std_handle(n_std_handle: u32) -> *mut c_void;
+        #[link_name = "SetHandleInformation"]
+        fn set_handle_information(handle: *mut c_void, mask: u32, flags: u32) -> i32;
+    }
+
+    for standard_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe { get_std_handle(standard_handle) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        if unsafe { set_handle_information(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(AppError::new(
+                "work_spawn_failed",
+                format!(
+                    "failed to detach Work standard handles: {}",
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn release_active(root: &Path, id: &str) -> Result<()> {
