@@ -47,7 +47,7 @@ const INGEST_WORKFLOW_VERSION: i32 = 5;
 const TOKENIZER_ID: &str = "cjk-bigram@1/bounded-terms";
 const SOURCE_GROUNDED: &str = "source-grounded";
 const EXPLICIT_PROVENANCE: [&str; 3] = ["user-provided", "agent-observed", "hypothesis"];
-const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
+const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const TIMESTAMP_SQL: &str = "STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')";
 const TITLE_WEIGHT: f64 = 32.0;
 const PATH_WEIGHT: f64 = 16.0;
@@ -828,11 +828,59 @@ struct SparsePageInverse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SparseMetaInverse {
+    key: String,
+    before: String,
+    after_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SparseIngestSnapshot {
+    status: String,
+    attempts: i64,
+    analysis: Option<String>,
+    last_error: Option<String>,
+    no_derived_pages_reason: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SparseSourcePathSnapshot {
+    tracked_path: String,
+    revision: i64,
+    observed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SparseSourceSnapshot {
+    id: i64,
+    content_hash: String,
+    title: Option<String>,
+    origin: String,
+    content: String,
+    structural_navigation: bool,
+    created_at: String,
+    ingest: SparseIngestSnapshot,
+    paths: Vec<SparseSourcePathSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SparseSourceInverse {
+    source_id: i64,
+    before: Option<SparseSourceSnapshot>,
+    after_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SparseInversePayload {
     version: u32,
     changeset_id: String,
     store_id: String,
     pages: Vec<SparsePageInverse>,
+    #[serde(default)]
+    meta: Vec<SparseMetaInverse>,
+    #[serde(default)]
+    sources: Vec<SparseSourceInverse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1431,12 +1479,16 @@ impl Store {
              WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'sources')",
             params![max_source_id],
         )?;
+        let schema_fingerprint = hash_content(schema);
+        let purpose_fingerprint = hash_content(purpose);
         for (key, value) in [
             ("store_id", base.store_id.as_str()),
             ("store_revision", base.revision.as_str()),
             ("schema", schema),
             ("purpose", purpose),
             ("changeset_storage", "sparse-v1"),
+            ("changeset_base_meta:schema", schema_fingerprint.as_str()),
+            ("changeset_base_meta:purpose", purpose_fingerprint.as_str()),
         ] {
             tx.execute(
                 "INSERT INTO meta(key, value) VALUES (?1, ?2)
@@ -1480,6 +1532,35 @@ impl Store {
         Ok(statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn changeset_touched_meta(&self) -> Result<Vec<(String, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT touched.key, m.value
+             FROM (
+                SELECT DISTINCT CASE o.action
+                    WHEN 'schema_set' THEN 'schema'
+                    WHEN 'purpose_set' THEN 'purpose'
+                END AS key
+                FROM operations o
+                JOIN changesets c ON o.id > c.begin_operation_id AND c.status = 'draft'
+                WHERE o.action IN ('schema_set', 'purpose_set')
+             ) touched
+             JOIN meta m ON m.key = 'changeset_base_meta:' || touched.key
+             ORDER BY touched.key",
+        )?;
+        Ok(statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn meta_fingerprint(&self, key: &str) -> Result<String> {
+        let value: String = self.conn.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )?;
+        Ok(hash_content(&value))
     }
 
     pub fn page_mutation_fingerprint(&self, slug: &str) -> Result<Option<String>> {
@@ -1737,11 +1818,53 @@ impl Store {
                 after_fingerprint,
             });
         }
+        let mut meta = Vec::new();
+        for (key, _) in draft.changeset_touched_meta()? {
+            let before: String = self.conn.query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![&key],
+                |row| row.get(0),
+            )?;
+            let after: String = draft.conn.query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![&key],
+                |row| row.get(0),
+            )?;
+            meta.push(SparseMetaInverse {
+                key,
+                before,
+                after_fingerprint: hash_content(&after),
+            });
+        }
+        let mut sources = Vec::new();
+        for source_id in changeset_created_source_ids(&draft.conn)? {
+            let before = load_sparse_source_snapshot(&self.conn, source_id)?;
+            if before.is_some() {
+                return Err(AppError::new(
+                    "changeset_conflict",
+                    format!("source identifier {source_id} was allocated by another write"),
+                )
+                .with_details(json!({"entity_type": "source", "identifier": source_id})));
+            }
+            let after = load_sparse_source_snapshot(&draft.conn, source_id)?.ok_or_else(|| {
+                AppError::new(
+                    "changeset_corrupt",
+                    format!("staged source {source_id} is missing"),
+                )
+            })?;
+            sources.push(SparseSourceInverse {
+                source_id,
+                before,
+                after_fingerprint: sparse_source_fingerprint(&after),
+            });
+        }
         let payload = SparseInversePayload {
             version: 1,
             changeset_id: changeset_id.to_string(),
             store_id: identity.store_id,
             pages,
+            meta,
+            sources,
         };
         let encoded = serde_json::to_vec(&payload)
             .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?;
@@ -1911,11 +2034,47 @@ impl Store {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let meta = inverse
+            .payload
+            .meta
+            .iter()
+            .map(|entry| {
+                let current: String = self.conn.query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    params![&entry.key],
+                    |row| row.get(0),
+                )?;
+                Ok(SparseMetaInverse {
+                    key: entry.key.clone(),
+                    before: current,
+                    after_fingerprint: hash_content(&entry.before),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let sources = inverse
+            .payload
+            .sources
+            .iter()
+            .map(|entry| {
+                let before = load_sparse_source_snapshot(&self.conn, entry.source_id)?;
+                Ok(SparseSourceInverse {
+                    source_id: entry.source_id,
+                    before,
+                    after_fingerprint: entry
+                        .before
+                        .as_ref()
+                        .map(sparse_source_fingerprint)
+                        .unwrap_or_else(|| "absent".into()),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let payload = SparseInversePayload {
             version: 1,
             changeset_id: history.id.clone(),
             store_id: identity.store_id,
             pages,
+            meta,
+            sources,
         };
         let encoded = serde_json::to_vec(&payload)
             .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?;
@@ -3804,16 +3963,16 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("INSERT INTO search_fts(search_fts) VALUES('optimize')", [])?;
         record_operation(
             &tx,
             "maintenance_compact",
             "wiki.db",
-            &json!({ "wal_before_bytes": before_bytes }),
+            &json!({
+                "wal_before_bytes": before_bytes,
+            }),
         )?;
         tx.commit()?;
-
-        let (busy, log_frames, checkpointed_frames) = wal_checkpoint_truncate(&self.conn, true)?;
+        let (busy, log_frames, checkpointed_frames) = wal_checkpoint_truncate(&self.conn, false)?;
         let after_bytes = fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0);
         Ok(CompactResponse {
             scope: self.scope.clone(),
@@ -4805,6 +4964,92 @@ fn sparse_page_fingerprint(page: &SparsePageSnapshot) -> String {
     )
 }
 
+fn changeset_created_source_ids(conn: &Connection) -> Result<Vec<i64>> {
+    let mut statement = conn.prepare(
+        "SELECT o.detail_json
+         FROM operations o
+         JOIN changesets c ON o.id > c.begin_operation_id
+         WHERE c.status = 'draft' AND o.action = 'source_add'
+         ORDER BY o.id",
+    )?;
+    let mut ids = BTreeSet::new();
+    for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+        let detail: Value = serde_json::from_str(&row?)
+            .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?;
+        if detail.get("created").and_then(Value::as_bool) == Some(true) {
+            let id = detail
+                .get("source_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| {
+                    AppError::new("changeset_corrupt", "source_add operation lacks source_id")
+                })?;
+            ids.insert(id);
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
+fn load_sparse_source_snapshot(
+    conn: &Connection,
+    source_id: i64,
+) -> Result<Option<SparseSourceSnapshot>> {
+    let source = conn
+        .query_row(
+            "SELECT s.id, s.content_hash, s.title, s.origin, s.content,
+                    s.structural_navigation, s.created_at,
+                    j.status, j.attempts, j.analysis, j.last_error,
+                    j.no_derived_pages_reason, j.updated_at
+             FROM sources s JOIN ingest_jobs j ON j.source_id = s.id
+             WHERE s.id = ?1",
+            params![source_id],
+            |row| {
+                Ok(SparseSourceSnapshot {
+                    id: row.get(0)?,
+                    content_hash: row.get(1)?,
+                    title: row.get(2)?,
+                    origin: row.get(3)?,
+                    content: row.get(4)?,
+                    structural_navigation: row.get(5)?,
+                    created_at: row.get(6)?,
+                    ingest: SparseIngestSnapshot {
+                        status: row.get(7)?,
+                        attempts: row.get(8)?,
+                        analysis: row.get(9)?,
+                        last_error: row.get(10)?,
+                        no_derived_pages_reason: row.get(11)?,
+                        updated_at: row.get(12)?,
+                    },
+                    paths: Vec::new(),
+                })
+            },
+        )
+        .optional()?;
+    let Some(mut source) = source else {
+        return Ok(None);
+    };
+    source.paths = {
+        let mut statement = conn.prepare(
+            "SELECT tracked_path, revision, observed_at
+             FROM source_path_revisions WHERE source_id = ?1
+             ORDER BY tracked_path, revision",
+        )?;
+        statement
+            .query_map(params![source_id], |row| {
+                Ok(SparseSourcePathSnapshot {
+                    tracked_path: row.get(0)?,
+                    revision: row.get(1)?,
+                    observed_at: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok(Some(source))
+}
+
+fn sparse_source_fingerprint(source: &SparseSourceSnapshot) -> String {
+    hash_content(&serde_json::to_string(source).unwrap_or_default())
+}
+
 fn fresh_checkpoint_name(database: &Path, prefix: &str) -> Result<String> {
     validate_checkpoint_name(prefix)?;
     let millis = SystemTime::now()
@@ -5460,6 +5705,11 @@ fn migrate_hierarchical_graph(
     let total = sources.len() + pages.len() + FINALIZATION_UNITS;
     let mut completed = 0;
     report_migration_progress(&mut progress, completed, total, "indexing")?;
+    if let Ok(delay) = std::env::var("LWC_TEST_MIGRATION_DELAY_MS")
+        && let Ok(delay) = delay.parse::<u64>()
+    {
+        std::thread::sleep(Duration::from_millis(delay));
+    }
     for (source_id, title, origin, content) in &sources {
         persist_document_graph(
             &tx,
@@ -5509,10 +5759,7 @@ fn migrate_hierarchical_graph(
         1
     };
     if initial_generation == 1 {
-        report_migration_progress(&mut progress, completed, total, "finalizing-graph")?;
-        rebuild_cooccurrence_edges(&tx)?;
-        completed += 1;
-        report_migration_progress(&mut progress, completed, total, "finalizing-cooccurrence")?;
+        rebuild_cooccurrence_edges(&tx, &mut progress)?;
         let store_revision: String = tx.query_row(
             "SELECT value FROM meta WHERE key = 'store_revision'",
             [],
@@ -5641,11 +5888,9 @@ fn migrate_hierarchical_graph(
             ),
             [],
         )?;
-        completed += 1;
-        report_migration_progress(&mut progress, completed, total, "finalizing-digest")?;
+        report_migration_progress(&mut progress, 1, 1, "finalizing-digest")?;
     } else {
-        completed += FINALIZATION_UNITS - 1;
-        report_migration_progress(&mut progress, completed, total, "finalizing-empty")?;
+        report_migration_progress(&mut progress, 1, 1, "finalizing-empty")?;
     }
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
@@ -5659,8 +5904,7 @@ fn migrate_hierarchical_graph(
             format!("failed to commit v{USER_VERSION} hierarchical graph migration: {error}"),
         )
     })?;
-    completed += 1;
-    report_migration_progress(&mut progress, completed, total, "complete")
+    report_migration_progress(&mut progress, 1, 1, "complete")
 }
 
 fn report_migration_progress(
@@ -6609,6 +6853,30 @@ fn merge_sparse_candidate(tx: &Transaction<'_>, begin_operation_id: i64) -> Resu
         .filter(|(action, _, _)| matches!(action.as_str(), "page_put" | "page_remove"))
         .map(|(_, target, _)| target.clone())
         .collect::<BTreeSet<_>>();
+    for (action, _, _) in &operations {
+        let key = match action.as_str() {
+            "schema_set" => "schema",
+            "purpose_set" => "purpose",
+            _ => continue,
+        };
+        let expected: String = tx.query_row(
+            "SELECT value FROM candidate.meta WHERE key = ?1",
+            params![format!("changeset_base_meta:{key}")],
+            |row| row.get(0),
+        )?;
+        let observed: String = tx.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )?;
+        if hash_content(&observed) != expected {
+            return Err(AppError::new(
+                "changeset_conflict",
+                format!("{key} changed after the changeset began"),
+            )
+            .with_details(json!({"entity_type": "meta", "identifier": key})));
+        }
+    }
     for slug in &page_targets {
         let candidate_exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM candidate.pages WHERE slug = ?1)",
@@ -6702,7 +6970,7 @@ fn merge_sparse_sources(
     for source_id in source_ids {
         let source = tx
             .query_row(
-                "SELECT content_hash, title, origin, content, structural_navigation
+                "SELECT content_hash, title, origin, content, structural_navigation, created_at
                  FROM candidate.sources WHERE id = ?1",
                 params![source_id],
                 |row| {
@@ -6712,6 +6980,7 @@ fn merge_sparse_sources(
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, bool>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
@@ -6740,10 +7009,28 @@ fn merge_sparse_sources(
                 "INSERT OR IGNORE INTO sources(
                     id, content_hash, title, origin, content,
                     structural_navigation, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, {TIMESTAMP_SQL})"
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
             ),
-            params![source_id, source.0, source.1, source.2, source.3, source.4],
+            params![
+                source_id, source.0, source.1, source.2, source.3, source.4, source.5
+            ],
         )?;
+        let resolved_id: i64 = tx.query_row(
+            "SELECT id FROM sources WHERE content_hash = ?1",
+            params![&source.0],
+            |row| row.get(0),
+        )?;
+        if resolved_id != source_id {
+            return Err(AppError::new(
+                "changeset_conflict",
+                "the staged source content was added concurrently under another identifier",
+            )
+            .with_details(json!({
+                "entity_type": "source",
+                "identifier": source_id,
+                "live_identifier": resolved_id,
+            })));
+        }
         tx.execute(
             &format!(
                 "INSERT OR IGNORE INTO ingest_jobs(source_id, status, updated_at)
@@ -6751,6 +7038,58 @@ fn merge_sparse_sources(
             ),
             params![source_id],
         )?;
+        tx.execute(
+            "INSERT INTO ingest_jobs(
+                source_id, status, attempts, analysis, last_error,
+                no_derived_pages_reason, updated_at
+             ) SELECT source_id, status, attempts, analysis, last_error,
+                      no_derived_pages_reason, updated_at
+               FROM candidate.ingest_jobs WHERE source_id = ?1
+             ON CONFLICT(source_id) DO UPDATE SET
+                status = excluded.status, attempts = excluded.attempts,
+                analysis = excluded.analysis, last_error = excluded.last_error,
+                no_derived_pages_reason = excluded.no_derived_pages_reason,
+                updated_at = excluded.updated_at",
+            params![source_id],
+        )?;
+        let paths = {
+            let mut statement = tx.prepare(
+                "SELECT tracked_path, revision, observed_at
+                 FROM candidate.source_path_revisions
+                 WHERE source_id = ?1 ORDER BY tracked_path, revision",
+            )?;
+            statement
+                .query_map(params![source_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (tracked_path, revision, observed_at) in paths {
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT source_id FROM source_path_revisions
+                     WHERE tracked_path = ?1 AND revision = ?2",
+                    params![&tracked_path, revision],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing.is_some_and(|existing| existing != source_id) {
+                return Err(AppError::new(
+                    "changeset_conflict",
+                    format!("source path {tracked_path} advanced while the changeset was open"),
+                ));
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO source_path_revisions(
+                    tracked_path, revision, source_id, observed_at
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![tracked_path, revision, source_id, observed_at],
+            )?;
+        }
         index_source(
             tx,
             None,
@@ -6966,6 +7305,39 @@ fn rollback_sparse_changeset(
             .with_details(json!({"entity_type": "page", "identifier": page.slug})));
         }
     }
+    for entry in &inverse.payload.meta {
+        let observed: String = tx.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![&entry.key],
+            |row| row.get(0),
+        )?;
+        if hash_content(&observed) != entry.after_fingerprint {
+            return Err(AppError::new(
+                "changeset_rollback_conflict",
+                format!("{} changed after this changeset committed", entry.key),
+            )
+            .with_details(json!({"entity_type": "meta", "identifier": entry.key})));
+        }
+    }
+    for source in &inverse.payload.sources {
+        let observed = load_sparse_source_snapshot(&tx, source.source_id)?
+            .as_ref()
+            .map(sparse_source_fingerprint)
+            .unwrap_or_else(|| "absent".into());
+        if observed != source.after_fingerprint {
+            return Err(AppError::new(
+                "changeset_rollback_conflict",
+                format!(
+                    "source {} changed after this changeset committed",
+                    source.source_id
+                ),
+            )
+            .with_details(json!({
+                "entity_type": "source",
+                "identifier": source.source_id,
+            })));
+        }
+    }
     for page in &inverse.payload.pages {
         tx.execute(
             "DELETE FROM links WHERE from_slug = ?1",
@@ -6974,6 +7346,21 @@ fn rollback_sparse_changeset(
     }
     for page in &inverse.payload.pages {
         restore_sparse_page(&tx, page)?;
+    }
+    for entry in &inverse.payload.meta {
+        tx.execute(
+            "UPDATE meta SET value = ?2 WHERE key = ?1",
+            params![&entry.key, &entry.before],
+        )?;
+        let action = if entry.key == "schema" {
+            "schema_set"
+        } else {
+            "purpose_set"
+        };
+        record_operation(&tx, action, &entry.key, &json!({"rollback": true}))?;
+    }
+    for source in &inverse.payload.sources {
+        restore_sparse_source(&tx, source)?;
     }
     let mut rollback_detail = json!({
         "name": input.history.name,
@@ -7118,6 +7505,134 @@ fn restore_sparse_page(tx: &Transaction<'_>, inverse: &SparsePageInverse) -> Res
         true,
     )?;
     persist_inbound_link_edges(tx, slug, generation)
+}
+
+fn restore_sparse_source(tx: &Transaction<'_>, inverse: &SparseSourceInverse) -> Result<()> {
+    let source_id = inverse.source_id;
+    let Some(source) = inverse.before.as_ref() else {
+        let references: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM page_sources WHERE source_id = ?1",
+            params![source_id],
+            |row| row.get(0),
+        )?;
+        if references > 0 {
+            return Err(AppError::new(
+                "changeset_rollback_conflict",
+                format!("source {source_id} gained {references} page reference(s) after commit"),
+            ));
+        }
+        record_operation(
+            tx,
+            "source_remove",
+            &source_id.to_string(),
+            &json!({"rollback": true}),
+        )?;
+        tx.execute(
+            "DELETE FROM search_fts WHERE doc_type = 'source' AND identifier = ?1",
+            params![source_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM retrieval_weights
+             WHERE target_type = 'source' AND target_identifier = ?1",
+            params![source_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM retrieval_feedback
+             WHERE target_type = 'source' AND target_identifier = ?1",
+            params![source_id.to_string()],
+        )?;
+        remove_document_graph(tx, "source", &source_id.to_string())?;
+        tx.execute(
+            "DELETE FROM source_path_revisions WHERE source_id = ?1",
+            params![source_id],
+        )?;
+        tx.execute("DELETE FROM sources WHERE id = ?1", params![source_id])?;
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT INTO sources(
+            id, content_hash, title, origin, content,
+            structural_navigation, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(id) DO UPDATE SET
+            content_hash = excluded.content_hash, title = excluded.title,
+            origin = excluded.origin, content = excluded.content,
+            structural_navigation = excluded.structural_navigation,
+            created_at = excluded.created_at",
+        params![
+            source.id,
+            &source.content_hash,
+            source.title.as_deref(),
+            &source.origin,
+            &source.content,
+            source.structural_navigation,
+            &source.created_at,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO ingest_jobs(
+            source_id, status, attempts, analysis, last_error,
+            no_derived_pages_reason, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(source_id) DO UPDATE SET
+            status = excluded.status, attempts = excluded.attempts,
+            analysis = excluded.analysis, last_error = excluded.last_error,
+            no_derived_pages_reason = excluded.no_derived_pages_reason,
+            updated_at = excluded.updated_at",
+        params![
+            source.id,
+            &source.ingest.status,
+            source.ingest.attempts,
+            source.ingest.analysis.as_deref(),
+            source.ingest.last_error.as_deref(),
+            source.ingest.no_derived_pages_reason.as_deref(),
+            &source.ingest.updated_at,
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM source_path_revisions WHERE source_id = ?1",
+        params![source.id],
+    )?;
+    for path in &source.paths {
+        tx.execute(
+            "INSERT INTO source_path_revisions(
+                tracked_path, revision, source_id, observed_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &path.tracked_path,
+                path.revision,
+                source.id,
+                &path.observed_at
+            ],
+        )?;
+    }
+    index_source(
+        tx,
+        None,
+        source.id,
+        source.title.as_deref(),
+        &source.origin,
+        &source.content,
+    )?;
+    record_operation(
+        tx,
+        "source_add",
+        &source.origin,
+        &json!({"source_id": source.id, "rollback": true}),
+    )?;
+    persist_document_graph(
+        tx,
+        &DocumentGraphInput {
+            document_type: DocumentType::Source,
+            identifier: &source.id.to_string(),
+            label: source.title.as_deref().unwrap_or(&source.origin),
+            content: &source.content,
+        },
+        None,
+        &[],
+        true,
+    )?;
+    Ok(())
 }
 
 fn rollback_attached_changeset(
@@ -9750,16 +10265,45 @@ fn persisted_cooccurrence_weight(value: f64) -> f64 {
     (value * 1_000_000.0).round() / 1_000_000.0
 }
 
-fn rebuild_cooccurrence_edges(tx: &Transaction<'_>) -> Result<()> {
-    rebuild_cooccurrence_edges_for(tx, None)
+fn rebuild_cooccurrence_edges(
+    tx: &Transaction<'_>,
+    progress: &mut Option<&mut MigrationProgress<'_>>,
+) -> Result<()> {
+    #[cfg(test)]
+    TEST_COOCCURRENCE_REBUILDS.set(TEST_COOCCURRENCE_REBUILDS.get() + 1);
+    #[cfg(test)]
+    TEST_GLOBAL_TERM_PAIR_LOADS.set(TEST_GLOBAL_TERM_PAIR_LOADS.get() + 1);
+    let terms = {
+        let mut statement =
+            tx.prepare("SELECT DISTINCT from_term_id FROM term_pair_totals ORDER BY from_term_id")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let total = terms.len().max(1);
+    report_migration_progress(progress, 0, total, "ranking-cooccurrence")?;
+    tx.execute(
+        "DELETE FROM graph_edges
+         WHERE owner_type = 'global' AND edge_type = 'CO_OCCURS'",
+        [],
+    )?;
+    for (index, term) in terms.iter().enumerate() {
+        rebuild_affected_cooccurrence_edges(tx, &BTreeSet::from([term.clone()]))?;
+        let completed = index + 1;
+        if completed == terms.len() || completed % 64 == 0 {
+            report_migration_progress(progress, completed, total, "ranking-cooccurrence")?;
+        }
+    }
+    if terms.is_empty() {
+        report_migration_progress(progress, 1, 1, "ranking-cooccurrence")?;
+    }
+    Ok(())
 }
 
 fn rebuild_cooccurrence_edges_for(
     tx: &Transaction<'_>,
     affected_terms: Option<&BTreeSet<String>>,
 ) -> Result<()> {
-    #[cfg(test)]
-    TEST_COOCCURRENCE_REBUILDS.set(TEST_COOCCURRENCE_REBUILDS.get() + 1);
     if let Some(affected_terms) = affected_terms {
         return rebuild_affected_cooccurrence_edges(tx, affected_terms);
     }

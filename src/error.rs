@@ -1,4 +1,5 @@
-use serde_json::Value;
+use rusqlite::{Error as SqliteError, ErrorCode};
+use serde_json::{Value, json};
 use std::fmt;
 
 pub type Result<T> = std::result::Result<T, AppError>;
@@ -41,6 +42,21 @@ impl From<std::io::Error> for AppError {
 
 impl From<rusqlite::Error> for AppError {
     fn from(error: rusqlite::Error) -> Self {
+        if matches!(
+            &error,
+            SqliteError::SqliteFailure(inner, _)
+                if matches!(inner.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        ) {
+            return Self::new(
+                "database_busy",
+                "another short Wiki write is active; retry this exact operation",
+            )
+            .with_details(json!({
+                "retryable": true,
+                "retry_after_ms": 100,
+                "work_command": "lwc work list",
+            }));
+        }
         Self::new("database_error", error.to_string())
     }
 }

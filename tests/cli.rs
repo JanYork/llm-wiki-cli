@@ -1,13 +1,14 @@
 use rusqlite::Connection;
 use serde_json::Value;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
-    time::Instant,
+    thread,
+    time::{Duration, Instant},
 };
-#[cfg(unix)]
-use std::{process::Stdio, thread, time::Duration};
 use tempfile::TempDir;
 
 struct TestWorld {
@@ -178,6 +179,10 @@ fn put_page(world: &TestWorld, slug: &str, title: &str, body: &str) {
 
 fn stage_clean_linked_pages(world: &TestWorld, changeset: &str, prefix: &str) {
     world.ok(&world.project, &["changeset", "begin", changeset]);
+    stage_pages_in_existing_changeset(world, changeset, prefix);
+}
+
+fn stage_pages_in_existing_changeset(world: &TestWorld, changeset: &str, prefix: &str) {
     let first_slug = format!("{prefix}-first");
     let second_slug = format!("{prefix}-second");
     for (slug, title, body) in [
@@ -427,6 +432,55 @@ fn concurrent_same_entity_writes_return_one_typed_conflict() {
     assert_eq!(conflicts, 1, "outputs: {outputs:?}");
 }
 
+#[cfg(unix)]
+#[test]
+fn concurrent_different_page_writes_complete_without_a_store_wide_conflict() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(&world.project, &["changeset", "begin", "parallel-pages"]);
+    let outputs = thread::scope(|scope| {
+        (0..4)
+            .map(|index| {
+                let body = world.write(
+                    &format!("parallel-{index}.md"),
+                    &format!("independent page {index} alpha beta gamma"),
+                );
+                let project = world.project.clone();
+                let home = world.home.clone();
+                scope.spawn(move || {
+                    Command::new(env!("CARGO_BIN_EXE_lwc"))
+                        .current_dir(project)
+                        .env("HOME", home)
+                        .env("LWC_TEST_PAGE_PUT_PREWRITE_DELAY_MS", "100")
+                        .args([
+                            "--changeset",
+                            "parallel-pages",
+                            "page",
+                            "put",
+                            &format!("parallel-{index}"),
+                            "--title",
+                            &format!("Parallel {index}"),
+                            "--file",
+                            as_str(&body),
+                            "--provenance",
+                            "agent-observed",
+                        ])
+                        .output()
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    assert!(
+        outputs.iter().all(|output| output.status.success()),
+        "different entity writes must serialize cleanly: {outputs:?}"
+    );
+}
+
 #[test]
 fn changeset_commit_is_atomic_conflict_aware_and_rollback_guarded() {
     let world = TestWorld::new();
@@ -669,6 +723,76 @@ fn changeset_rollback_conflicts_only_when_a_touched_page_changed_later() {
     assert_eq!(
         world.ok(&world.project, &["page", "show", "rollback-entity-first"])["page"]["body"],
         "the touched entity changed after commit"
+    );
+}
+
+#[test]
+fn changeset_meta_updates_commit_and_rollback_without_touching_unrelated_pages() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let original_schema = world.ok(&world.project, &["schema", "show"])["schema"].clone();
+    let original_purpose = world.ok(&world.project, &["purpose", "show"])["purpose"].clone();
+    world.ok(&world.project, &["changeset", "begin", "meta-patch"]);
+    let schema = world.write(
+        "sparse-schema.md",
+        "# Sparse schema\n\nOnly changed metadata.",
+    );
+    let purpose = world.write("sparse-purpose.md", "# Sparse purpose\n\nMinimal publish.");
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "meta-patch",
+            "schema",
+            "set",
+            as_str(&schema),
+        ],
+    );
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "meta-patch",
+            "purpose",
+            "set",
+            as_str(&purpose),
+        ],
+    );
+    stage_pages_in_existing_changeset(&world, "meta-patch", "meta-patch-page");
+    let committed = world.ok(&world.project, &["changeset", "commit", "meta-patch"]);
+    assert_eq!(
+        world.ok(&world.project, &["schema", "show"])["schema"],
+        "# Sparse schema\n\nOnly changed metadata."
+    );
+    assert_eq!(
+        world.ok(&world.project, &["purpose", "show"])["purpose"],
+        "# Sparse purpose\n\nMinimal publish."
+    );
+    put_page(
+        &world,
+        "meta-unrelated",
+        "Unrelated",
+        "must survive meta rollback",
+    );
+    world.ok(
+        &world.project,
+        &[
+            "changeset",
+            "rollback",
+            committed["changeset_id"].as_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        world.ok(&world.project, &["schema", "show"])["schema"],
+        original_schema
+    );
+    assert_eq!(
+        world.ok(&world.project, &["purpose", "show"])["purpose"],
+        original_purpose
+    );
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "meta-unrelated"])["page"]["body"],
+        "must survive meta rollback"
     );
 }
 
@@ -980,7 +1104,7 @@ fn changeset_locked_recheck_rejects_a_draft_writer_that_finishes_during_commit()
         .spawn()
         .unwrap();
     let checkpoint_dir = world.project.join(".lwc/checkpoints");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_millis(500);
     while (!checkpoint_dir.is_dir() || fs::read_dir(&checkpoint_dir).unwrap().next().is_none())
         && child.try_wait().unwrap().is_none()
         && Instant::now() < deadline
@@ -1310,6 +1434,117 @@ fn changeset_stages_a_complete_ingest_then_discards_every_candidate_row() {
             .unwrap()
             .len(),
         0
+    );
+}
+
+#[test]
+fn changeset_commits_and_rolls_back_only_its_new_source_ingest_and_pages() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(&world.project, &["changeset", "begin", "source-patch"]);
+    let source = world.write("source-patch.md", "bounded source patch evidence");
+    let added = world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "source-patch",
+            "source",
+            "add",
+            as_str(&source),
+        ],
+    );
+    let source_id = added["source"]["id"].as_i64().unwrap().to_string();
+    world.ok(
+        &world.project,
+        &["--changeset", "source-patch", "ingest", "claim", &source_id],
+    );
+    let analysis = world.write("source-patch-analysis.md", "bounded analysis");
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "source-patch",
+            "ingest",
+            "analyze",
+            &source_id,
+            "--file",
+            as_str(&analysis),
+        ],
+    );
+    for (slug, title, kind, body) in [
+        (
+            "source-patch-summary",
+            "Source Patch Summary",
+            "source",
+            "source summary [[source-patch-synthesis]]",
+        ),
+        (
+            "source-patch-synthesis",
+            "Source Patch Synthesis",
+            "synthesis",
+            "derived knowledge [[source-patch-summary]]",
+        ),
+    ] {
+        let file = world.write(&format!("{slug}.md"), body);
+        world.ok(
+            &world.project,
+            &[
+                "--changeset",
+                "source-patch",
+                "page",
+                "put",
+                slug,
+                "--title",
+                title,
+                "--kind",
+                kind,
+                "--summary",
+                title,
+                "--file",
+                as_str(&file),
+                "--source",
+                &source_id,
+            ],
+        );
+    }
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "source-patch",
+            "ingest",
+            "complete",
+            &source_id,
+        ],
+    );
+    let committed = world.ok(&world.project, &["changeset", "commit", "source-patch"]);
+    assert_eq!(
+        world.ok(&world.project, &["ingest", "list", "--status", "completed"])["jobs"][0]["source_id"],
+        source_id.parse::<i64>().unwrap()
+    );
+    put_page(
+        &world,
+        "source-unrelated",
+        "Unrelated",
+        "survives source rollback",
+    );
+    world.ok(
+        &world.project,
+        &[
+            "changeset",
+            "rollback",
+            committed["changeset_id"].as_str().unwrap(),
+        ],
+    );
+    assert!(
+        world.ok(&world.project, &["source", "list"])["sources"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "source-unrelated"])["page"]["body"],
+        "survives source rollback"
     );
 }
 
@@ -3648,6 +3883,49 @@ fn v10_commands_return_schema_migration_work_without_blocking_inline() {
             .unwrap(),
         11
     );
+}
+
+#[test]
+fn shadow_schema_migration_never_holds_the_live_wiki_writer_lock() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    put_page(
+        &world,
+        "shadow-migration",
+        "Shadow migration",
+        "alpha beta gamma",
+    );
+    let database = world.project.join(".lwc/wiki.db");
+    downgrade_to_v10(&database);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lwc"))
+        .current_dir(&world.project)
+        .env("HOME", &world.home)
+        .env("LWC_TEST_MIGRATION_DELAY_MS", "750")
+        .args(["context", "--limit", "5"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let queued = stdout_json(&output);
+    let id = queued["work"]["id"].as_str().unwrap();
+    (0..100)
+        .find(|_| {
+            let state = world.ok(&world.project, &["work", "status", id]);
+            let ready = state["work"]["state"] == "running" && state["work"]["phase"] == "indexing";
+            if !ready {
+                thread::sleep(Duration::from_millis(10));
+            }
+            ready
+        })
+        .expect("shadow migration did not enter its delayed indexing phase");
+
+    let live = Connection::open(&database).unwrap();
+    live.busy_timeout(Duration::from_millis(100)).unwrap();
+    live.execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+        .expect("shadow graph construction must not lock the live Wiki writer");
+    drop(live);
+    let watched = world.ok(&world.project, &["work", "watch", id]);
+    assert_eq!(watched["work"]["state"], "succeeded", "{watched}");
 }
 
 #[test]

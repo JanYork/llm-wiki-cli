@@ -272,6 +272,15 @@ pub fn commit(
                 .with_details(json!({"entity_type": "page", "identifier": slug})));
             }
         }
+        for (key, expected) in draft.changeset_touched_meta()? {
+            if live_reader.meta_fingerprint(&key)? != expected {
+                return Err(AppError::new(
+                    "changeset_conflict",
+                    format!("{key} changed after the changeset began"),
+                )
+                .with_details(json!({"entity_type": "meta", "identifier": key})));
+            }
+        }
     }
     draft.validate_changeset_integrity()?;
     let lint_issues = draft.lint(1, 0)?.total;
