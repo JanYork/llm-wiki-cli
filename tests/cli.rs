@@ -1690,6 +1690,18 @@ fn changeset_routes_schema_purpose_graph_weight_context_search_lint_and_log() {
         world.ok(&world.project, &["schema", "show"])["schema"],
         live_schema
     );
+    let unsupported = world.err(
+        &world.project,
+        &[
+            "changeset",
+            "commit",
+            "command-matrix",
+            "--allow-lint-issues",
+            "--reason",
+            "sparse semantic mutation guard",
+        ],
+    );
+    assert_eq!(unsupported["error"]["code"], "changeset_sparse_unsupported");
     world.ok(&world.project, &["changeset", "discard", "command-matrix"]);
 }
 

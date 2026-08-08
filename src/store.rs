@@ -47,7 +47,7 @@ const INGEST_WORKFLOW_VERSION: i32 = 5;
 const TOKENIZER_ID: &str = "cjk-bigram@1/bounded-terms";
 const SOURCE_GROUNDED: &str = "source-grounded";
 const EXPLICIT_PROVENANCE: [&str; 3] = ["user-provided", "agent-observed", "hypothesis"];
-const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
+const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const TIMESTAMP_SQL: &str = "STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')";
 const TITLE_WEIGHT: f64 = 32.0;
 const PATH_WEIGHT: f64 = 16.0;
@@ -1179,7 +1179,11 @@ impl Store {
     }
 
     pub fn validate_changeset_integrity(&self) -> Result<()> {
-        validate_database_integrity(&self.conn)
+        validate_database_integrity(&self.conn)?;
+        if self.changeset_storage_kind()?.as_deref() == Some("sparse-v1") {
+            validate_sparse_changeset_operations(&self.conn)?;
+        }
+        Ok(())
     }
 
     pub fn reconcile_graph_projection(&mut self) -> Result<()> {
@@ -6848,6 +6852,7 @@ fn merge_sparse_candidate(tx: &Transaction<'_>, begin_operation_id: i64) -> Resu
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
+    validate_sparse_operation_actions(operations.iter().map(|(action, _, _)| action.as_str()))?;
     let page_targets = operations
         .iter()
         .filter(|(action, _, _)| matches!(action.as_str(), "page_put" | "page_remove"))
@@ -6931,6 +6936,7 @@ fn merge_sparse_candidate(tx: &Transaction<'_>, begin_operation_id: i64) -> Resu
             .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?;
         record_operation(tx, action, target, &detail)?;
     }
+    changeset_test_fault("mid_copy")?;
     for slug in page_targets {
         merge_sparse_page(tx, &slug)?;
     }
@@ -6953,6 +6959,55 @@ fn merge_sparse_candidate(tx: &Transaction<'_>, begin_operation_id: i64) -> Resu
              WHERE key = 'purpose'",
             [],
         )?;
+    }
+    Ok(())
+}
+
+fn validate_sparse_changeset_operations(conn: &Connection) -> Result<()> {
+    let begin_operation_id = conn
+        .query_row(
+            "SELECT begin_operation_id FROM changesets
+             WHERE status = 'draft' ORDER BY created_at DESC LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(begin_operation_id) = begin_operation_id else {
+        return Ok(());
+    };
+    let mut statement = conn.prepare("SELECT action FROM operations WHERE id > ?1 ORDER BY id")?;
+    let actions = statement
+        .query_map(params![begin_operation_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    validate_sparse_operation_actions(actions.iter().map(String::as_str))
+}
+
+fn validate_sparse_operation_actions<'a>(actions: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    for action in actions {
+        if !matches!(
+            action,
+            "source_add"
+                | "ingest_claim"
+                | "ingest_analyze"
+                | "ingest_complete"
+                | "ingest_fail"
+                | "ingest_retry"
+                | "page_put"
+                | "page_remove"
+                | "schema_set"
+                | "purpose_set"
+                | "search"
+        ) {
+            return Err(AppError::new(
+                "changeset_sparse_unsupported",
+                format!("{action} does not yet have an exact sparse Changeset patch"),
+            )
+            .with_details(json!({
+                "action": action,
+                "mutated": false,
+                "reason": "refusing to report a partial Changeset commit",
+            })));
+        }
     }
     Ok(())
 }
@@ -7005,12 +7060,10 @@ fn merge_sparse_sources(
             ));
         }
         tx.execute(
-            &format!(
-                "INSERT OR IGNORE INTO sources(
+            "INSERT OR IGNORE INTO sources(
                     id, content_hash, title, origin, content,
                     structural_navigation, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-            ),
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 source_id, source.0, source.1, source.2, source.3, source.4, source.5
             ],
@@ -8684,6 +8737,7 @@ fn load_page_mutation_base(conn: &Connection, slug: &str) -> Result<Option<PageM
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn page_content_fingerprint(
     title: &str,
     kind: Option<&str>,

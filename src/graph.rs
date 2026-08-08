@@ -327,22 +327,24 @@ pub fn build_cooccurrence(
     }
 
     Ok(CooccurrenceBuild {
-        contributions: (!capacity_exceeded)
-            .then_some(totals)
-            .unwrap_or_default()
-            .into_iter()
-            .map(
-                |((from_term_id, to_term_id), (sentence_weight, passage_weight, witness_count))| {
-                    TermPairContribution {
-                        from_term_id,
-                        to_term_id,
-                        sentence_weight,
-                        passage_weight,
-                        witness_count,
-                    }
-                },
-            )
-            .collect(),
+        contributions: if capacity_exceeded {
+            BTreeMap::new()
+        } else {
+            totals
+        }
+        .into_iter()
+        .map(
+            |((from_term_id, to_term_id), (sentence_weight, passage_weight, witness_count))| {
+                TermPairContribution {
+                    from_term_id,
+                    to_term_id,
+                    sentence_weight,
+                    passage_weight,
+                    witness_count,
+                }
+            },
+        )
+        .collect(),
         truncated_sentence_count,
         capacity_exceeded,
     })

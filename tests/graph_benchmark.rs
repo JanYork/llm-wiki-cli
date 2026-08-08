@@ -5,6 +5,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
+    thread,
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
@@ -44,6 +45,18 @@ impl BenchWorld {
             String::from_utf8_lossy(&output.stderr)
         );
         (serde_json::from_slice(&output.stdout).unwrap(), elapsed)
+    }
+
+    fn wait_for_projection(&self) -> Value {
+        for _ in 0..4_000 {
+            let status = self.run(&["graph", "status"]).0;
+            match status["projection"]["status"].as_str() {
+                Some("fresh") => return status,
+                Some("failed") => panic!("physical projection failed: {status}"),
+                _ => thread::sleep(Duration::from_millis(25)),
+            }
+        }
+        panic!("physical projection did not become fresh within 100 seconds")
     }
 }
 
@@ -111,7 +124,7 @@ fn graph_benchmark_reports_latency_growth_projection_and_bounds() {
         .clamp(10, 200);
     let world = BenchWorld::new();
     world.run(&["init"]);
-    world.run(&["config", "set", "--engine", "rslg"]);
+    world.run(&["config", "set", "--physical", "enabled", "--engine", "rslg"]);
 
     let mut startup_samples = Vec::new();
     for _ in 0..samples {
@@ -271,6 +284,7 @@ fn graph_benchmark_reports_latency_growth_projection_and_bounds() {
 
     let graphqlite_started = Instant::now();
     world.run(&["config", "set", "--engine", "graphqlite"]);
+    world.wait_for_projection();
     let graphqlite_full_projection_ms = graphqlite_started.elapsed().as_secs_f64() * 1000.0;
     write_replacement(&replacement, 2);
     let replacement_started = Instant::now();
@@ -284,10 +298,16 @@ fn graph_benchmark_reports_latency_growth_projection_and_bounds() {
         replacement.to_str().unwrap(),
     ]);
     let graphqlite_replacement_total_ms = replacement_started.elapsed().as_secs_f64() * 1000.0;
-    let graphqlite_replacement_ms = graphqlite_response.0["graph"]["projection_duration_ms"]
-        .as_u64()
-        .unwrap() as f64;
-    let status = world.run(&["graph", "status"]).0;
+    assert!(
+        graphqlite_response.0["graph"]["projection_duration_ms"]
+            .as_u64()
+            .unwrap()
+            < 100,
+        "canonical write waited for physical projection"
+    );
+    let graphqlite_projection_started = Instant::now();
+    let status = world.wait_for_projection();
+    let graphqlite_replacement_ms = graphqlite_projection_started.elapsed().as_secs_f64() * 1000.0;
     let final_database_bytes = fs::metadata(&database).unwrap().len();
     let final_conn = Connection::open(&database).unwrap();
     let final_delta_bytes: i64 = final_conn.query_row(
