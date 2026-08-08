@@ -1563,6 +1563,10 @@ fn run(cli: Cli) -> Result<Value> {
                     source_ids,
                     provenance,
                 } => {
+                    if let Some(name) = selected_changeset.as_deref() {
+                        let live = resolve_live_store_path(cli.scope, &cwd)?;
+                        changeset::prepare_page_touch(&live, name, &slug, &source_ids)?;
+                    }
                     let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                     require_text("slug", &slug)?;
                     require_text("title", &title)?;
@@ -1602,6 +1606,10 @@ fn run(cli: Cli) -> Result<Value> {
                     to_json(store.page_links(&slug)?)
                 }
                 PageCommand::Remove { slug } => {
+                    if let Some(name) = selected_changeset.as_deref() {
+                        let live = resolve_live_store_path(cli.scope, &cwd)?;
+                        changeset::prepare_page_touch(&live, name, &slug, &[])?;
+                    }
                     let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                     let response = store.page_remove(&slug)?;
                     materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;

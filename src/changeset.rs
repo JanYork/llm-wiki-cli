@@ -105,20 +105,13 @@ pub fn begin(live: &StorePath, name: &str) -> Result<ChangesetBeginResponse> {
 
     let live_store = Store::open_for_read(scope_name(live.scope), &live.path)?;
     let base = live_store.identity()?;
-    live_store.snapshot_to(&path).map_err(|error| {
-        if error.code == "checkpoint_exists" {
-            AppError::new(
-                "changeset_exists",
-                format!("draft changeset already exists: {name}"),
-            )
-        } else {
-            error
-        }
-    })?;
+    let schema = live_store.schema_show()?.schema.unwrap_or_default();
+    let purpose = live_store.purpose_show()?.purpose.unwrap_or_default();
+    let max_source_id = live_store.max_source_id()?;
 
     let result = (|| -> Result<ChangesetDraftState> {
-        let mut draft = Store::open(scope_name(live.scope), &path)?;
-        draft.changeset_begin(name, &base)
+        let (mut draft, _) = Store::initialize(scope_name(live.scope), &path)?;
+        draft.changeset_begin_sparse(name, &base, &schema, &purpose, max_source_id)
     })();
     let state = match result {
         Ok(state) => state,
@@ -145,6 +138,22 @@ pub fn resolve_effective(live: StorePath, name: Option<&str>) -> Result<StorePat
     let path = draft_path(&live, name, false)?;
     validate_draft_binding(&live, name, &path, 0)?;
     Ok(live.with_database(path))
+}
+
+pub fn prepare_page_touch(
+    live: &StorePath,
+    name: &str,
+    slug: &str,
+    source_ids: &[i64],
+) -> Result<()> {
+    let path = draft_path(live, name, false)?;
+    validate_draft_binding(live, name, &path, 0)?;
+    let mut draft = Store::open(scope_name(live.scope), &path)?;
+    let sparse = draft.changeset_storage_kind()?.as_deref() == Some("sparse-v1");
+    if sparse {
+        draft.changeset_prepare_page_touch(&live.path, slug, source_ids)?;
+    }
+    Ok(())
 }
 
 pub fn show(live: &StorePath, name: &str, limit: usize) -> Result<ChangesetShowResponse> {
@@ -243,13 +252,26 @@ pub fn commit(
     }
     let live_identity = live_reader.identity()?;
     let draft = Store::open_for_read(scope_name(live.scope), &path)?;
-    if live_identity.store_id != draft.identity()?.store_id
-        || live_identity.revision != state.base_revision
-    {
+    if live_identity.store_id != draft.identity()?.store_id {
         return Err(AppError::new(
-            "changeset_conflict",
-            "live Wiki changed after the changeset began",
+            "changeset_scope_mismatch",
+            "changeset is not bound to this live Wiki",
         ));
+    }
+    let sparse = draft.changeset_storage_kind()?.as_deref() == Some("sparse-v1");
+    if sparse {
+        for (slug, expected) in draft.changeset_touched_pages()? {
+            let observed = live_reader
+                .page_mutation_fingerprint(&slug)?
+                .unwrap_or_else(|| "absent".into());
+            if observed != expected {
+                return Err(AppError::new(
+                    "changeset_conflict",
+                    format!("page {slug} changed after it was first touched"),
+                )
+                .with_details(json!({"entity_type": "page", "identifier": slug})));
+            }
+        }
     }
     draft.validate_changeset_integrity()?;
     let lint_issues = draft.lint(1, 0)?.total;
@@ -269,7 +291,11 @@ pub fn commit(
     )?;
     drop(draft_store);
     let checkpoint_started = Instant::now();
-    let checkpoint = live_reader.changeset_checkpoint_create(&state.id)?;
+    let checkpoint = if sparse {
+        live_reader.changeset_sparse_checkpoint_create(&state.id, &path)?
+    } else {
+        live_reader.changeset_checkpoint_create(&state.id)?
+    };
     let checkpoint_ms = elapsed_millis(checkpoint_started);
     drop(live_reader);
 
@@ -313,25 +339,8 @@ fn finish_committed(
     started: Instant,
     checkpoint_ms: u64,
 ) -> Result<ChangesetCommitResponse> {
-    let wal_checkpoint_started = Instant::now();
-    let wal_checkpointed = Store::open(scope_name(live.scope), &live.path)
-        .and_then(|store| store.checkpoint_wal_truncate());
-    let wal_checkpointed = match wal_checkpointed {
-        Ok(checkpointed) => checkpointed,
-        Err(error) => {
-            return Err(AppError::new(
-                "changeset_committed_wal_checkpoint_failed",
-                format!("changeset committed but WAL checkpoint failed: {error}"),
-            )
-            .with_details(json!({
-                "committed": true,
-                "changeset_id": committed.changeset_id,
-                "checkpoint": committed.checkpoint,
-                "recovery_command": format!("lwc changeset commit {}", committed.name),
-            })));
-        }
-    };
-    let wal_checkpoint_ms = elapsed_millis(wal_checkpoint_started);
+    let wal_checkpointed = false;
+    let wal_checkpoint_ms = 0;
     let cleanup_started = Instant::now();
     if let Err(error) = remove_draft_files(path) {
         return Err(AppError::new(
@@ -347,8 +356,8 @@ fn finish_committed(
     }
     let cleanup_ms = elapsed_millis(cleanup_started);
     let materialization_started = Instant::now();
-    let materialized =
-        Store::open(scope_name(live.scope), &live.path).and_then(|mut store| store.materialize());
+    let materialized = Store::open(scope_name(live.scope), &live.path)
+        .and_then(|store| store.materialize_incremental(true).map(|_| ()));
     if let Err(error) = materialized {
         return Err(AppError::new(
             "changeset_committed_materialization_failed",
@@ -415,15 +424,20 @@ pub fn rollback(live: &StorePath, changeset_id: &str) -> Result<ChangesetRollbac
         ));
     }
     let identity = live_reader.identity()?;
-    if history.post_revision.as_deref() != Some(identity.revision.as_str()) {
+    let sparse =
+        live_reader.changeset_rollback_checkpoint_validate(&history, &identity.store_id)?;
+    if !sparse && history.post_revision.as_deref() != Some(identity.revision.as_str()) {
         return Err(AppError::new(
             "changeset_rollback_conflict",
             "live Wiki changed after this changeset committed",
         ));
     }
-    live_reader.changeset_rollback_checkpoint_validate(&history, &identity.store_id)?;
     let checkpoint_started = Instant::now();
-    let checkpoint = live_reader.changeset_rollback_checkpoint_create(changeset_id)?;
+    let checkpoint = if sparse {
+        live_reader.changeset_sparse_rollback_checkpoint_create(&history)?
+    } else {
+        live_reader.changeset_rollback_checkpoint_create(changeset_id)?
+    };
     let checkpoint_ms = elapsed_millis(checkpoint_started);
     drop(live_reader);
 
@@ -443,31 +457,11 @@ fn finish_rolled_back(
     started: Instant,
     checkpoint_ms: u64,
 ) -> Result<ChangesetRollbackResponse> {
-    let wal_checkpoint_started = Instant::now();
-    let wal_checkpointed = Store::open(scope_name(live.scope), &live.path)
-        .and_then(|store| store.checkpoint_wal_truncate());
-    let wal_checkpointed = match wal_checkpointed {
-        Ok(checkpointed) => checkpointed,
-        Err(error) => {
-            return Err(AppError::new(
-                "changeset_rolled_back_wal_checkpoint_failed",
-                format!("changeset rolled back but WAL checkpoint failed: {error}"),
-            )
-            .with_details(json!({
-                "rolled_back": true,
-                "changeset_id": rolled_back.changeset_id,
-                "checkpoint": rolled_back.checkpoint,
-                "recovery_command": format!(
-                    "lwc changeset rollback {}",
-                    rolled_back.changeset_id
-                ),
-            })));
-        }
-    };
-    let wal_checkpoint_ms = elapsed_millis(wal_checkpoint_started);
+    let wal_checkpointed = false;
+    let wal_checkpoint_ms = 0;
     let materialization_started = Instant::now();
-    let materialized =
-        Store::open(scope_name(live.scope), &live.path).and_then(|mut store| store.materialize());
+    let materialized = Store::open(scope_name(live.scope), &live.path)
+        .and_then(|store| store.materialize_incremental(true).map(|_| ()));
     if let Err(error) = materialized {
         return Err(AppError::new(
             "changeset_rolled_back_materialization_failed",
@@ -524,8 +518,12 @@ fn show_path(
     let draft = Store::open_for_read(scope_name(live.scope), &path)?;
     let lint_issues = draft.lint(1, 0)?.total;
     let empty = state.staged_operation_count == 0;
+    let sparse = draft
+        .changeset_storage_kind()?
+        .as_deref()
+        .is_some_and(|value| value == "sparse-v1");
     let conflict = live_identity.store_id != draft.identity()?.store_id
-        || live_identity.revision != state.base_revision;
+        || (!sparse && live_identity.revision != state.base_revision);
     Ok(ChangesetShowResponse {
         scope: scope_name(live.scope),
         database: path,

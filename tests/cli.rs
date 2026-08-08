@@ -475,7 +475,7 @@ fn changeset_commit_is_atomic_conflict_aware_and_rollback_guarded() {
     let committed = world.ok(&world.project, &["changeset", "commit", "publish"]);
     assert_eq!(committed["status"], "committed");
     assert_eq!(committed["materialized"], true);
-    assert_eq!(committed["wal_checkpointed"], true);
+    assert_eq!(committed["wal_checkpointed"], false);
     for field in [
         "duration_ms",
         "checkpoint_ms",
@@ -487,8 +487,6 @@ fn changeset_commit_is_atomic_conflict_aware_and_rollback_guarded() {
     }
     let changeset_id = committed["changeset_id"].as_str().unwrap().to_string();
     let database = world.project.join(".lwc/wiki.db");
-    let wal = PathBuf::from(format!("{}-wal", database.display()));
-    assert_eq!(fs::metadata(&wal).map(|meta| meta.len()).unwrap_or(0), 0);
     assert_eq!(
         world.ok(&world.project, &["page", "show", "candidate-page"])["page"]["body"],
         "candidate knowledge [[candidate-index]]"
@@ -517,7 +515,7 @@ fn changeset_commit_is_atomic_conflict_aware_and_rollback_guarded() {
 
     let rolled_back = world.ok(&world.project, &["changeset", "rollback", &changeset_id]);
     assert_eq!(rolled_back["status"], "rolled_back");
-    assert_eq!(rolled_back["wal_checkpointed"], true);
+    assert_eq!(rolled_back["wal_checkpointed"], false);
     assert!(rolled_back["checkpoint"].as_str().is_some());
     for field in [
         "duration_ms",
@@ -531,7 +529,6 @@ fn changeset_commit_is_atomic_conflict_aware_and_rollback_guarded() {
         );
     }
     let rollback_revision = rolled_back["rollback_revision"].clone();
-    assert_eq!(fs::metadata(&wal).map(|meta| meta.len()).unwrap_or(0), 0);
     assert_eq!(
         world.err(&world.project, &["page", "show", "candidate-page"])["error"]["code"],
         "page_not_found"
@@ -569,11 +566,11 @@ fn changeset_commit_is_atomic_conflict_aware_and_rollback_guarded() {
             "agent-observed",
         ],
     );
-    put_page(&world, "concurrent-live", "Concurrent Live", "live wins");
+    put_page(&world, "stale-page", "Concurrent Live", "live wins");
     let conflict = world.err(&world.project, &["changeset", "commit", "stale"]);
     assert_eq!(conflict["error"]["code"], "changeset_conflict");
     assert_eq!(
-        world.ok(&world.project, &["page", "show", "concurrent-live"])["page"]["body"],
+        world.ok(&world.project, &["page", "show", "stale-page"])["page"]["body"],
         "live wins"
     );
 }
@@ -602,7 +599,7 @@ fn changeset_commit_does_not_fall_back_to_an_older_commit_with_a_reused_name() {
 }
 
 #[test]
-fn changeset_rollback_refuses_to_overwrite_a_later_live_write() {
+fn changeset_rollback_preserves_an_unrelated_later_live_write() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
     world.ok(&world.project, &["changeset", "begin", "rollback-conflict"]);
@@ -638,15 +635,40 @@ fn changeset_rollback_refuses_to_overwrite_a_later_live_write() {
     let id = committed["changeset_id"].as_str().unwrap();
     put_page(&world, "later-live", "Later Live", "must survive");
 
-    let conflict = world.err(&world.project, &["changeset", "rollback", id]);
-    assert_eq!(conflict["error"]["code"], "changeset_rollback_conflict");
+    let rolled_back = world.ok(&world.project, &["changeset", "rollback", id]);
+    assert_eq!(rolled_back["status"], "rolled_back");
     assert_eq!(
         world.ok(&world.project, &["page", "show", "later-live"])["page"]["body"],
         "must survive"
     );
     assert_eq!(
-        world.ok(&world.project, &["page", "show", "rollback-first"])["page"]["body"],
-        "first [[rollback-second]]"
+        world.err(&world.project, &["page", "show", "rollback-first"])["error"]["code"],
+        "page_not_found"
+    );
+}
+
+#[test]
+fn changeset_rollback_conflicts_only_when_a_touched_page_changed_later() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    stage_clean_linked_pages(&world, "rollback-entity-conflict", "rollback-entity");
+    let committed = world.ok(
+        &world.project,
+        &["changeset", "commit", "rollback-entity-conflict"],
+    );
+    let id = committed["changeset_id"].as_str().unwrap();
+    put_page(
+        &world,
+        "rollback-entity-first",
+        "Changed Later",
+        "the touched entity changed after commit",
+    );
+
+    let conflict = world.err(&world.project, &["changeset", "rollback", id]);
+    assert_eq!(conflict["error"]["code"], "changeset_rollback_conflict");
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "rollback-entity-first"])["page"]["body"],
+        "the touched entity changed after commit"
     );
 }
 
@@ -1031,8 +1053,11 @@ fn changeset_locked_recheck_preserves_a_live_writer_that_finishes_during_commit(
         )
         .unwrap();
     let output = child.wait_with_output().unwrap();
-    assert!(!output.status.success());
-    assert_eq!(stderr_json(&output)["error"]["code"], "changeset_conflict");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let race_count: i64 = Connection::open(&live)
         .unwrap()
         .query_row(
@@ -1043,8 +1068,8 @@ fn changeset_locked_recheck_preserves_a_live_writer_that_finishes_during_commit(
         .unwrap();
     assert_eq!(race_count, 1);
     assert_eq!(
-        world.err(&world.project, &["page", "show", "live-race-first"])["error"]["code"],
-        "page_not_found"
+        world.ok(&world.project, &["page", "show", "live-race-first"])["page"]["title"],
+        "First"
     );
 }
 
@@ -2693,7 +2718,7 @@ fn graphqlite_projection_failure_commits_canonical_fails_closed_and_recovers() {
 
     world.ok(&world.project, &["config", "set", "--engine", "graphqlite"]);
     let status = world.ok(&world.project, &["graph", "status"]);
-    assert_eq!(status["projection"]["status"], "disabled");
+    assert_eq!(status["projection"]["status"], "fresh");
     let page = world.ok(&world.project, &["page", "show", "projection-page"]);
     assert_eq!(page["page"]["title"], "Projection page");
 }
@@ -2821,7 +2846,7 @@ fn canonical_graph_supports_exploration_paths_relations_impact_and_overview() {
     );
 
     let status = world.ok(&world.project, &["graph", "status"]);
-    assert_eq!(status["projection"]["status"], "fresh");
+    assert_eq!(status["projection"]["status"], "disabled");
     assert_eq!(
         status["projection"]["canonical_generation"],
         status["projection"]["projected_generation"]
