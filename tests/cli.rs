@@ -3845,7 +3845,13 @@ fn v10_commands_return_schema_migration_work_without_blocking_inline() {
     downgrade_to_v10(&database);
 
     let started = Instant::now();
-    let output = world.command(&world.project, &["context", "--limit", "5"]);
+    let output = Command::new(env!("CARGO_BIN_EXE_lwc"))
+        .current_dir(&world.project)
+        .env("HOME", &world.home)
+        .env("LWC_TEST_MIGRATION_DELAY_MS", "5000")
+        .args(["context", "--limit", "5"])
+        .output()
+        .unwrap();
     let elapsed = started.elapsed();
     assert!(
         output.status.success(),
@@ -3865,8 +3871,8 @@ fn v10_commands_return_schema_migration_work_without_blocking_inline() {
     assert_eq!(work_id.len(), 64);
     assert!(work_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert!(
-        elapsed.as_millis() <= 500,
-        "foreground migration preflight took {} ms",
+        elapsed < Duration::from_secs(2),
+        "foreground migration preflight waited {} ms on five seconds of background work",
         elapsed.as_millis()
     );
 
