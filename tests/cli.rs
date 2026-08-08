@@ -2490,7 +2490,7 @@ fn graph_config_resolves_layers_and_updates_project_atomically() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
     let defaults = world.ok(&world.project, &["config", "show"]);
-    assert_eq!(defaults["graph"]["physical"], "enabled");
+    assert_eq!(defaults["graph"]["physical"], "disabled");
     assert_eq!(defaults["graph"]["engine"], "auto");
     assert_eq!(defaults["graph"]["physical_origin"], "built-in");
     assert_eq!(defaults["graph"]["engine_origin"], "built-in");
@@ -2517,7 +2517,7 @@ fn graph_config_resolves_layers_and_updates_project_atomically() {
         &world.project,
         &["config", "unset", "--physical", "--engine"],
     );
-    assert_eq!(inherited["graph"]["physical"], "enabled");
+    assert_eq!(inherited["graph"]["physical"], "disabled");
     assert_eq!(inherited["graph"]["engine"], "auto");
 
     world.ok(&world.project, &["--scope", "global", "init"]);
@@ -2570,7 +2570,7 @@ fn explicit_graphqlite_projection_uses_one_stable_sidecar() {
     let sidecars = fs::read_dir(world.project.join(".lwc"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with("graph-graphqlite-g") && name.ends_with(".db"))
+        .filter(|name| name.starts_with("graph-graphqlite") && name.ends_with(".db"))
         .collect::<Vec<_>>();
 
     assert_eq!(
@@ -2651,6 +2651,17 @@ fn graph_config_rejects_symlink_all_scope_and_changeset_mutation() {
 fn graphqlite_projection_failure_commits_canonical_fails_closed_and_recovers() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
+    world.ok(
+        &world.project,
+        &[
+            "config",
+            "set",
+            "--physical",
+            "enabled",
+            "--engine",
+            "graphqlite",
+        ],
+    );
     let body = world.write("projection.md", "Committed projection evidence.");
     let output = Command::new(env!("CARGO_BIN_EXE_lwc"))
         .current_dir(&world.project)

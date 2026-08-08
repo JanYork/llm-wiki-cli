@@ -56,6 +56,9 @@ const GRAPH_MATCH_WEIGHT: f64 = 0.25;
 const GRAPH_HUB_WEIGHT: f64 = 4.0;
 const MANUAL_WEIGHT: f64 = 2.0;
 const FEEDBACK_WEIGHT: f64 = 1.5;
+const MAX_COOCCURRENCE_BLOB_BYTES: usize = 16 * 1024 * 1024;
+const MAX_COOCCURRENCE_TERMS: usize = 100_000;
+const MAX_COOCCURRENCE_CONTRIBUTIONS: usize = 250_000;
 static SOURCE_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 type MigrationProgress<'a> = dyn FnMut(usize, usize, &str) -> Result<()> + 'a;
 
@@ -276,6 +279,14 @@ pub struct PagePutInput {
     pub body: String,
     pub source_ids: Vec<i64>,
     pub provenance: Vec<String>,
+}
+
+#[derive(Debug)]
+struct PageMutationBase {
+    title: String,
+    body: String,
+    content_fingerprint: String,
+    version_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -2048,6 +2059,46 @@ impl Store {
         let explicit_provenance = normalize_explicit_provenance(input.provenance)?;
         let links = extract_links(&input.body);
         let structural_navigation = has_structural_navigation_marker(&input.body);
+        let base = load_page_mutation_base(&self.conn, &input.slug)?;
+        let desired_fingerprint = page_content_fingerprint(
+            &input.title,
+            input.kind.as_deref(),
+            input.summary.as_deref(),
+            &input.body,
+            structural_navigation,
+            &source_ids,
+            &explicit_provenance,
+            &links,
+        );
+        if base
+            .as_ref()
+            .is_some_and(|base| base.content_fingerprint == desired_fingerprint)
+        {
+            return Ok(PagePutResponse {
+                scope: self.scope.clone(),
+                database: self.database_string(),
+                page: self.load_page_write(&input.slug)?,
+                created: false,
+                graph: self.load_graph_mutation_summary(
+                    "page",
+                    &input.slug,
+                    elapsed_millis(mutation_started),
+                    0,
+                )?,
+            });
+        }
+        let before_graph = base
+            .as_ref()
+            .map(|base| {
+                build_document_graph(&DocumentGraphInput {
+                    document_type: DocumentType::Page,
+                    identifier: &input.slug,
+                    label: &base.title,
+                    content: &base.body,
+                })
+                .map_err(segment_error)
+            })
+            .transpose()?;
         if let Ok(delay) = std::env::var("LWC_TEST_PAGE_PUT_PREWRITE_DELAY_MS")
             && let Ok(delay) = delay.parse::<u64>()
         {
@@ -2056,28 +2107,24 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_sources(&tx, &source_ids)?;
-
-        let previous = tx
-            .query_row(
-                "SELECT title, body FROM pages WHERE slug = ?1",
-                params![&input.slug],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        let locked_base = load_page_mutation_base(&tx, &input.slug)?;
+        if locked_base.as_ref().map(|base| &base.version_fingerprint)
+            != base.as_ref().map(|base| &base.version_fingerprint)
+        {
+            return Err(AppError::new(
+                "entity_conflict",
+                format!(
+                    "page {} changed while the replacement was prepared",
+                    input.slug
+                ),
             )
-            .optional()?;
-        let before_graph = previous
-            .as_ref()
-            .map(|(title, body)| {
-                build_document_graph(&DocumentGraphInput {
-                    document_type: DocumentType::Page,
-                    identifier: &input.slug,
-                    label: title,
-                    content: body,
-                })
-                .map_err(segment_error)
-            })
-            .transpose()?;
-        let existed = previous.is_some();
+            .with_details(json!({
+                "entity_type": "page",
+                "identifier": input.slug,
+            })));
+        }
+        validate_sources(&tx, &source_ids)?;
+        let existed = base.is_some();
 
         if existed {
             tx.execute(
@@ -6766,6 +6813,100 @@ fn claim_ingest_job(tx: &Transaction<'_>, source_id: i64) -> Result<()> {
     record_operation(tx, "ingest_claim", &source_id.to_string(), &json!({})).map(|_| ())
 }
 
+fn load_page_mutation_base(conn: &Connection, slug: &str) -> Result<Option<PageMutationBase>> {
+    let Some((title, kind, summary, body, structural_navigation, updated_at)) = conn
+        .query_row(
+            "SELECT title, kind, summary, body, structural_navigation, updated_at
+             FROM pages WHERE slug = ?1",
+            [slug],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let source_ids = {
+        let mut statement = conn.prepare(
+            "SELECT source_id FROM page_sources WHERE page_slug = ?1 ORDER BY source_id",
+        )?;
+        statement
+            .query_map([slug], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let provenance = {
+        let mut statement = conn.prepare(
+            "SELECT provenance FROM page_provenance
+             WHERE page_slug = ?1
+             ORDER BY CASE provenance
+                 WHEN 'user-provided' THEN 0
+                 WHEN 'agent-observed' THEN 1
+                 WHEN 'hypothesis' THEN 2
+                 ELSE 3 END",
+        )?;
+        statement
+            .query_map([slug], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let links = {
+        let mut statement =
+            conn.prepare("SELECT to_slug FROM links WHERE from_slug = ?1 ORDER BY to_slug")?;
+        statement
+            .query_map([slug], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let content_fingerprint = page_content_fingerprint(
+        &title,
+        kind.as_deref(),
+        summary.as_deref(),
+        &body,
+        structural_navigation,
+        &source_ids,
+        &provenance,
+        &links,
+    );
+    let version_fingerprint = hash_content(&format!("{content_fingerprint}\0{updated_at}"));
+    Ok(Some(PageMutationBase {
+        title,
+        body,
+        content_fingerprint,
+        version_fingerprint,
+    }))
+}
+
+fn page_content_fingerprint(
+    title: &str,
+    kind: Option<&str>,
+    summary: Option<&str>,
+    body: &str,
+    structural_navigation: bool,
+    source_ids: &[i64],
+    provenance: &[String],
+    links: &[String],
+) -> String {
+    hash_content(
+        &json!({
+            "title": title,
+            "kind": kind,
+            "summary": summary,
+            "body": body,
+            "structural_navigation": structural_navigation,
+            "source_ids": source_ids,
+            "provenance": provenance,
+            "links": links,
+        })
+        .to_string(),
+    )
+}
+
 fn validate_page_slug(slug: &str) -> Result<()> {
     if slug.trim().is_empty()
         || slug != slug.trim()
@@ -7997,8 +8138,8 @@ fn expand_affected_cooccurrence_sources(
 ) -> Result<()> {
     let targets = affected_terms.iter().cloned().collect::<Vec<_>>();
     let mut statement = tx.prepare(
-        "SELECT DISTINCT from_term_id FROM term_pair_totals
-         WHERE to_term_id = ?1 ORDER BY from_term_id",
+        "SELECT to_term_id FROM term_pair_totals
+         WHERE from_term_id = ?1 ORDER BY to_term_id",
     )?;
     for target in targets {
         for source in statement.query_map([target], |row| row.get::<_, String>(0))? {
@@ -8022,6 +8163,9 @@ fn rebuild_cooccurrence_edges_for(
 ) -> Result<()> {
     #[cfg(test)]
     TEST_COOCCURRENCE_REBUILDS.set(TEST_COOCCURRENCE_REBUILDS.get() + 1);
+    if let Some(affected_terms) = affected_terms {
+        return rebuild_affected_cooccurrence_edges(tx, affected_terms);
+    }
     #[cfg(test)]
     TEST_GLOBAL_TERM_PAIR_LOADS.set(TEST_GLOBAL_TERM_PAIR_LOADS.get() + 1);
     let contributions = {
@@ -8041,25 +8185,11 @@ fn rebuild_cooccurrence_edges_for(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    match affected_terms {
-        Some(affected) => {
-            let mut statement = tx.prepare(
-                "DELETE FROM graph_edges
-                 WHERE owner_type = 'global' AND edge_type = 'CO_OCCURS'
-                   AND from_node_id = ?1",
-            )?;
-            for term in affected {
-                statement.execute([term])?;
-            }
-        }
-        None => {
-            tx.execute(
-                "DELETE FROM graph_edges
-                 WHERE owner_type = 'global' AND edge_type = 'CO_OCCURS'",
-                [],
-            )?;
-        }
-    }
+    tx.execute(
+        "DELETE FROM graph_edges
+         WHERE owner_type = 'global' AND edge_type = 'CO_OCCURS'",
+        [],
+    )?;
     let ranked = rank_cooccurrence(&contributions, 32);
     let mut insert_statement = tx.prepare(&format!(
         "INSERT INTO graph_edges(
@@ -8072,9 +8202,6 @@ fn rebuild_cooccurrence_edges_for(
          )"
     ))?;
     for edge in ranked {
-        if affected_terms.is_some_and(|affected| !affected.contains(&edge.from_term_id)) {
-            continue;
-        }
         let edge_id = format!(
             "edge:{}",
             hash_content(&format!(
@@ -8105,6 +8232,110 @@ fn rebuild_cooccurrence_edges_for(
            )",
         [],
     )?;
+    Ok(())
+}
+
+fn rebuild_affected_cooccurrence_edges(
+    tx: &Transaction<'_>,
+    affected_terms: &BTreeSet<String>,
+) -> Result<()> {
+    let mut delete_edges = tx.prepare(
+        "DELETE FROM graph_edges
+         WHERE owner_type = 'global' AND edge_type = 'CO_OCCURS'
+           AND from_node_id = ?1",
+    )?;
+    let mut load_neighbors = tx.prepare(
+        "SELECT to_term_id, raw_strength, witness_count
+         FROM term_pair_totals
+         WHERE from_term_id = ?1
+         ORDER BY to_term_id",
+    )?;
+    let mut load_mass = tx.prepare(
+        "SELECT COALESCE(SUM(raw_strength), 0.0)
+         FROM term_pair_totals WHERE from_term_id = ?1",
+    )?;
+    let mut insert_edge = tx.prepare(&format!(
+        "INSERT INTO graph_edges(
+            edge_id, edge_type, from_node_id, to_node_id,
+            owner_type, owner_identifier, weight, provenance,
+            properties_json, created_at, updated_at
+         ) VALUES (
+            ?1, 'CO_OCCURS', ?2, ?3, 'global', 'cooccurrence', ?4,
+            'automatic', ?5, {TIMESTAMP_SQL}, {TIMESTAMP_SQL}
+         )"
+    ))?;
+    let mut masses = BTreeMap::new();
+    for source in affected_terms {
+        delete_edges.execute([source])?;
+        let neighbors = load_neighbors
+            .query_map([source], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let source_mass = neighbors
+            .iter()
+            .map(|(_, strength, _)| strength)
+            .sum::<f64>();
+        masses.insert(source.clone(), source_mass);
+        let mut ranked = Vec::with_capacity(neighbors.len());
+        for (target, raw_strength, witness_count) in neighbors {
+            let target_mass = if let Some(value) = masses.get(&target) {
+                *value
+            } else {
+                let value = load_mass.query_row([&target], |row| row.get::<_, f64>(0))?;
+                masses.insert(target.clone(), value);
+                value
+            };
+            let denominator = source_mass + target_mass;
+            let normalized_strength = if denominator > 0.0 {
+                (2.0 * raw_strength / denominator).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            ranked.push((target, normalized_strength, witness_count));
+        }
+        ranked.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| right.2.cmp(&left.2))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        ranked.truncate(32);
+        for (rank, (target, normalized_strength, _)) in ranked.into_iter().enumerate() {
+            let edge_id = format!(
+                "edge:{}",
+                hash_content(&format!("CO_OCCURS\0{source}\0{target}"))
+            );
+            insert_edge.execute(params![
+                edge_id,
+                source,
+                target,
+                persisted_cooccurrence_weight(normalized_strength),
+                json!({"rank": rank + 1}).to_string(),
+            ])?;
+        }
+    }
+    let mut delete_orphan = tx.prepare(
+        "DELETE FROM graph_nodes
+         WHERE node_id = ?1 AND node_type = 'term'
+           AND NOT EXISTS (
+               SELECT 1 FROM graph_edges
+               WHERE from_node_id = graph_nodes.node_id
+                  OR to_node_id = graph_nodes.node_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM graph_occurrences
+               WHERE term_node_id = graph_nodes.node_id
+           )",
+    )?;
+    for term in affected_terms {
+        delete_orphan.execute([term])?;
+    }
     Ok(())
 }
 
@@ -8145,30 +8376,50 @@ fn read_compact_u64(input: &[u8], cursor: &mut usize) -> Result<u64> {
 }
 
 fn encode_term_pair_contributions(contributions: &[TermPairContribution]) -> Result<Vec<u8>> {
+    if contributions.len() > MAX_COOCCURRENCE_CONTRIBUTIONS {
+        return Err(cooccurrence_capacity_error());
+    }
     let terms = contributions
         .iter()
         .flat_map(|contribution| {
             [
-                contribution.from_term_id.clone(),
-                contribution.to_term_id.clone(),
+                contribution.from_term_id.as_str(),
+                contribution.to_term_id.as_str(),
             ]
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    if terms.len() > MAX_COOCCURRENCE_TERMS {
+        return Err(cooccurrence_capacity_error());
+    }
     let term_indexes = terms
         .iter()
         .enumerate()
-        .map(|(index, term)| (term.as_str(), index as u64))
+        .map(|(index, term)| (*term, index as u64))
         .collect::<BTreeMap<_, _>>();
     let mut output = vec![1];
     write_compact_u64(&mut output, terms.len() as u64);
     for term in &terms {
+        if output
+            .len()
+            .checked_add(term.len() + 10)
+            .is_none_or(|size| size > MAX_COOCCURRENCE_BLOB_BYTES)
+        {
+            return Err(cooccurrence_capacity_error());
+        }
         write_compact_u64(&mut output, term.len() as u64);
         output.extend_from_slice(term.as_bytes());
     }
     write_compact_u64(&mut output, contributions.len() as u64);
     for contribution in contributions {
+        if output
+            .len()
+            .checked_add(46)
+            .is_none_or(|size| size > MAX_COOCCURRENCE_BLOB_BYTES)
+        {
+            return Err(cooccurrence_capacity_error());
+        }
         write_compact_u64(
             &mut output,
             term_indexes[contribution.from_term_id.as_str()],
@@ -8181,11 +8432,15 @@ fn encode_term_pair_contributions(contributions: &[TermPairContribution]) -> Res
     Ok(output)
 }
 
+fn cooccurrence_capacity_error() -> AppError {
+    AppError::new(
+        "graph_index_capacity_exceeded",
+        "co-occurrence contribution exceeds the bounded storage budget",
+    )
+}
+
 fn decode_term_pair_contributions(input: &[u8]) -> Result<Vec<TermPairContribution>> {
-    const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
-    const MAX_TERMS: usize = 100_000;
-    const MAX_CONTRIBUTIONS: usize = 1_000_000;
-    if input.len() > MAX_BLOB_BYTES {
+    if input.len() > MAX_COOCCURRENCE_BLOB_BYTES {
         return Err(AppError::new(
             "graph_index_corrupt",
             "co-occurrence contribution blob exceeds the safety limit",
@@ -8204,7 +8459,7 @@ fn decode_term_pair_contributions(input: &[u8]) -> Result<Vec<TermPairContributi
             "co-occurrence term count is too large",
         )
     })?;
-    if term_count > MAX_TERMS || term_count > input.len() {
+    if term_count > MAX_COOCCURRENCE_TERMS || term_count > input.len() {
         return Err(AppError::new(
             "graph_index_corrupt",
             "co-occurrence term count exceeds the safety limit",
@@ -8238,7 +8493,7 @@ fn decode_term_pair_contributions(input: &[u8]) -> Result<Vec<TermPairContributi
                 "co-occurrence contribution count is too large",
             )
         })?;
-    if contribution_count > MAX_CONTRIBUTIONS
+    if contribution_count > MAX_COOCCURRENCE_CONTRIBUTIONS
         || contribution_count > input.len().saturating_sub(cursor) / 19
     {
         return Err(AppError::new(
@@ -11399,6 +11654,18 @@ mod tests {
                 .unwrap_err()
                 .code,
             "graph_index_corrupt"
+        );
+
+        let oversized = vec![TermPairContribution {
+            from_term_id: format!("term:{}", "x".repeat(16 * 1024 * 1024)),
+            to_term_id: "term:bounded".to_string(),
+            sentence_weight: 1.0,
+            passage_weight: 0.0,
+            witness_count: 1,
+        }];
+        assert_eq!(
+            encode_term_pair_contributions(&oversized).unwrap_err().code,
+            "graph_index_capacity_exceeded"
         );
     }
 

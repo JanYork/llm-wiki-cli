@@ -112,7 +112,7 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
 }
 
 pub fn resolve(scope: &str, database: &Path) -> Result<EffectiveGraphConfig> {
-    let mut physical = PhysicalSetting::Enabled;
+    let mut physical = PhysicalSetting::Disabled;
     let mut engine = EngineSetting::Auto;
     let mut physical_origin = "built-in".to_string();
     let mut engine_origin = "built-in".to_string();

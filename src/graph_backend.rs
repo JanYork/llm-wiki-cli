@@ -414,36 +414,11 @@ fn project_graphqlite_deltas(
     Ok(())
 }
 
-fn previous_graphqlite_sidecar(
-    canonical: &Connection,
-    parent: &Path,
-    generation: i64,
-) -> AppResult<Option<(i64, PathBuf)>> {
-    let mut statement = canonical.prepare(
-        "SELECT generation, canonical_digest FROM graph_generations
-         WHERE generation < ?1 ORDER BY generation DESC",
-    )?;
-    for row in statement.query_map([generation], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })? {
-        let (candidate_generation, digest) = row?;
-        let path = parent.join(format!(
-            "graph-graphqlite-g{candidate_generation}-{}.db",
-            &digest[..16]
-        ));
-        if path.is_file() {
-            reject_symlink(&path)?;
-            return Ok(Some((candidate_generation, path)));
-        }
-    }
-    Ok(None)
-}
-
 pub fn project_graphqlite_snapshot(
     canonical: &Connection,
     database: &Path,
     generation: i64,
-    digest: &str,
+    _digest: &str,
 ) -> AppResult<PathBuf> {
     if std::env::var("LWC_TEST_GRAPHQLITE_FAIL_AT").as_deref() == Ok("before") {
         return Err(AppError::new(
@@ -458,23 +433,35 @@ pub fn project_graphqlite_snapshot(
             "wiki database has no parent directory",
         )
     })?;
-    let sidecar = parent.join(format!(
-        "graph-graphqlite-g{generation}-{}.db",
-        &digest[..16]
-    ));
+    let sidecar = parent.join("graph-graphqlite.db");
     let canonical_nodes: i64 =
         canonical.query_row("SELECT COUNT(*) FROM graph_nodes", [], |row| row.get(0))?;
     let canonical_edges: i64 =
         canonical.query_row("SELECT COUNT(*) FROM graph_edges", [], |row| row.get(0))?;
     if sidecar.exists() {
         reject_symlink(&sidecar)?;
-        let counts = graphqlite_projection_counts(database, generation, digest)?;
-        if counts == (canonical_nodes, canonical_edges) {
+        let previous_generation: i64 = canonical.query_row(
+            "SELECT projected_generation FROM graph_projection_state
+             WHERE projection = 'physical'",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut incremental = Connection::open(&sidecar)?;
+        validate_graphqlite_storage_schema(&incremental)?;
+        incremental.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA temp_store = MEMORY;",
+        )?;
+        project_graphqlite_deltas(&mut incremental, canonical, previous_generation, generation)?;
+        let projected_nodes: i64 =
+            incremental.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))?;
+        let projected_edges: i64 =
+            incremental.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))?;
+        if projected_nodes == canonical_nodes && projected_edges == canonical_edges {
             return Ok(sidecar);
         }
         return Err(AppError::new(
             "graphqlite_projection_mismatch",
-            "existing GraphQLite projection does not match canonical graph",
+            "incremental GraphQLite projection row counts do not match canonical graph",
         ));
     }
     let suffix = std::time::SystemTime::now()
@@ -482,36 +469,9 @@ pub fn project_graphqlite_snapshot(
         .unwrap_or_default()
         .as_nanos();
     let pending = parent.join(format!(
-        ".graph-graphqlite-g{generation}-{}-{}-{suffix}.pending.db",
-        &digest[..16],
+        ".graph-graphqlite-{}-{suffix}.pending.db",
         std::process::id(),
     ));
-    if let Some((previous_generation, previous)) =
-        previous_graphqlite_sidecar(canonical, parent, generation)?
-    {
-        fs::copy(previous, &pending)?;
-        #[cfg(unix)]
-        fs::set_permissions(&pending, fs::Permissions::from_mode(0o600))?;
-        let mut incremental = Connection::open(&pending)?;
-        validate_graphqlite_storage_schema(&incremental)?;
-        incremental.execute_batch(
-            "PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; PRAGMA temp_store = MEMORY;",
-        )?;
-        project_graphqlite_deltas(&mut incremental, canonical, previous_generation, generation)?;
-        let projected_nodes: i64 =
-            incremental.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))?;
-        let projected_edges: i64 =
-            incremental.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))?;
-        if projected_nodes != canonical_nodes || projected_edges != canonical_edges {
-            return Err(AppError::new(
-                "graphqlite_projection_mismatch",
-                "incremental GraphQLite projection row counts do not match canonical graph",
-            ));
-        }
-        drop(incremental);
-        fs::rename(&pending, &sidecar)?;
-        return Ok(sidecar);
-    }
     let mut conn = Connection::open(&pending)?;
     #[cfg(unix)]
     fs::set_permissions(&pending, fs::Permissions::from_mode(0o600))?;
@@ -905,8 +865,8 @@ fn derived_projection_edges(canonical: &Connection) -> AppResult<Vec<Value>> {
 
 pub fn graphqlite_projection_edges(
     database: &Path,
-    generation: i64,
-    digest: &str,
+    _generation: i64,
+    _digest: &str,
 ) -> AppResult<Value> {
     let extension = materialize_graphqlite_runtime(database)?;
     let parent = database.parent().ok_or_else(|| {
@@ -915,10 +875,7 @@ pub fn graphqlite_projection_edges(
             "wiki database has no parent",
         )
     })?;
-    let sidecar = parent.join(format!(
-        "graph-graphqlite-g{generation}-{}.db",
-        &digest[..16]
-    ));
+    let sidecar = parent.join("graph-graphqlite.db");
     reject_symlink(&sidecar)?;
     let conn = Connection::open_with_flags(&sidecar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     load_graphqlite(&conn, &extension)?;
@@ -972,8 +929,8 @@ pub fn graphqlite_projection_edges(
 
 pub fn graphqlite_projection_counts(
     database: &Path,
-    generation: i64,
-    digest: &str,
+    _generation: i64,
+    _digest: &str,
 ) -> AppResult<(i64, i64)> {
     let parent = database.parent().ok_or_else(|| {
         AppError::new(
@@ -981,10 +938,7 @@ pub fn graphqlite_projection_counts(
             "wiki database has no parent",
         )
     })?;
-    let sidecar = parent.join(format!(
-        "graph-graphqlite-g{generation}-{}.db",
-        &digest[..16]
-    ));
+    let sidecar = parent.join("graph-graphqlite.db");
     reject_symlink(&sidecar)?;
     let conn = Connection::open_with_flags(&sidecar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     Ok((

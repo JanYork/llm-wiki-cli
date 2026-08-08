@@ -263,6 +263,12 @@ pub fn build_cooccurrence(
     let mut truncated_sentence_count = 0usize;
 
     for passage in segmented.passages {
+        if matches!(
+            passage.kind,
+            PassageKind::TableRow | PassageKind::CodeBlock | PassageKind::Html
+        ) {
+            continue;
+        }
         let mut passage_remaining = MAX_PASSAGE_TOKENS;
         let mut sentences = Vec::with_capacity(passage.sentences.len());
         for sentence in passage.sentences {
