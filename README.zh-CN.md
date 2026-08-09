@@ -16,9 +16,17 @@
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
+<p align="center">
+  <img src="docs/images/lwc-agent-memory.png" alt="LWC Agent Memory" width="100%">
+</p>
+
 `lwc` 是一个面向 Agent 的 CLI，它把经过筛选的文档转化为可长期维护的
 Wiki。Agent 负责理解与综合，`lwc` 负责保存来源、页面、引用、链接、索引和历史，
 让知识持续积累，而不是每次查询都重新拼接原始片段。
+
+<p align="center">
+  <img src="docs/images/lwc-overview-zh.png" alt="LWC 产品概览" width="820">
+</p>
 
 ## LWC 是 Agent 记忆，不是 RAG
 
@@ -40,6 +48,10 @@ LWC 会把已经完成的有效工作保留下来：
 持续修订的 Wiki，其中的页面、引用、链接、矛盾和历史会随着认识变化而更新。因此，
 LWC 不依赖 embedding 或向量数据库，也不会在回答完成后丢弃本次综合结果。它可以
 与 RAG 配合，但它本身不是查询时 RAG。
+
+<p align="center">
+  <img src="docs/images/lwc-source-grounding-zh.png" alt="LWC 来源追溯与可靠回答" width="820">
+</p>
 
 ### LWC 应当由 Agent 操作
 
@@ -125,6 +137,10 @@ Skill 与别名路径、全局 Wiki 路径、修改过的 Hook/配置文件、�
 `lwc` 在此基础上采用 Rust 与 SQLite，实现面向 Agent 的本地命令行工具。
 
 ## 核心设计
+
+<p align="center">
+  <img src="docs/images/lwc-architecture-zh.png" alt="LWC 架构图" width="100%">
+</p>
 
 ```text
 +-----------------------------------------------------------------------+

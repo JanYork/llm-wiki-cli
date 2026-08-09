@@ -16,10 +16,18 @@
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
+<p align="center">
+  <img src="docs/images/lwc-agent-memory.png" alt="LWC Agent Memory" width="100%">
+</p>
+
 `lwc` is an agent-first CLI that turns curated documents into a durable Wiki.
 The agent reasons and synthesizes; `lwc` preserves sources, pages, citations,
 links, indexes, and history so knowledge compounds instead of being rediscovered
 from raw chunks on every query.
+
+<p align="center">
+  <img src="docs/images/lwc-overview-zh.png" alt="LWC product overview" width="820">
+</p>
 
 ## LWC Is Agent Memory, Not RAG
 
@@ -43,6 +51,10 @@ artifact is a source-grounded Wiki whose pages, citations, links,
 contradictions, and history are revised as knowledge changes. LWC therefore
 does not require embeddings or a vector database, and it does not discard each
 synthesis after answering. It can complement RAG, but it is not query-time RAG.
+
+<p align="center">
+  <img src="docs/images/lwc-source-grounding-zh.png" alt="LWC source grounding and traceability" width="820">
+</p>
 
 ### The Agent operates LWC
 
@@ -149,6 +161,10 @@ details also draw inspiration from
 This project adapts those ideas into an agent-first Rust CLI backed by SQLite.
 
 ## Core Design
+
+<p align="center">
+  <img src="docs/images/lwc-architecture-zh.png" alt="LWC architecture" width="100%">
+</p>
 
 ```text
 +-----------------------------------------------------------------------+
