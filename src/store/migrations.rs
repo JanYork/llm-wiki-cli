@@ -1,0 +1,619 @@
+fn configure_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    enable_wal(conn)?;
+    enable_persistent_wal(conn, MAIN_DB)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
+    Ok(())
+}
+
+fn configure_read_only_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    Ok(())
+}
+
+fn enable_persistent_wal(conn: &Connection, database_name: &CStr) -> Result<()> {
+    let mut enabled = 1_i32;
+    // SAFETY: the connection and static database-name pointer remain valid for this call.
+    let rc = unsafe {
+        ffi::sqlite3_file_control(
+            conn.handle(),
+            database_name.as_ptr(),
+            ffi::SQLITE_FCNTL_PERSIST_WAL,
+            (&mut enabled as *mut i32).cast(),
+        )
+    };
+    if rc == ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            "database_error",
+            format!("failed to enable persistent WAL mode (sqlite rc {rc})"),
+        ))
+    }
+}
+
+fn enable_wal(conn: &Connection) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        }) {
+            Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
+            Ok(mode) => {
+                return Err(AppError::new(
+                    "database_error",
+                    format!("SQLite refused WAL mode and returned {mode}"),
+                ));
+            }
+            Err(error)
+                if started.elapsed() < BUSY_TIMEOUT
+                    && matches!(
+                        &error,
+                        rusqlite::Error::SqliteFailure(inner, _)
+                            if matches!(
+                                inner.code,
+                                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+                            )
+                    ) =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn prepare_store(
+    conn: &mut Connection,
+    allow_create: bool,
+    _migration_progress: Option<&mut MigrationProgress<'_>>,
+) -> Result<bool> {
+    let mut version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == 0 {
+        return if allow_create {
+            bootstrap_schema(conn)
+        } else {
+            Err(AppError::new(
+                "unsupported_store_version",
+                "wiki database has no recognized schema; run `lwc init` in a new directory",
+            ))
+        };
+    }
+    if !(1..=USER_VERSION).contains(&version) {
+        return Err(AppError::new(
+            "unsupported_store_version",
+            format!(
+                "wiki database version {version} is not supported by this lwc build (expected {USER_VERSION})"
+            ),
+        ));
+    }
+    if version < SEARCH_INDEX_VERSION {
+        migrate_search_index(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
+    if version == SEARCH_INDEX_VERSION {
+        migrate_ingest_workflow(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
+    if version == INGEST_WORKFLOW_VERSION {
+        migrate_compound_wiki(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
+    if version == COMPOUND_WIKI_VERSION {
+        migrate_page_provenance(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
+    if version == PAGE_PROVENANCE_VERSION {
+        migrate_source_path_revisions(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
+    if version == SOURCE_PATH_REVISIONS_VERSION {
+        migrate_retrieval_weighting(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
+    if version == RETRIEVAL_WEIGHTING_VERSION {
+        migrate_changesets(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
+    if matches!(version, CHANGESETS_VERSION | 11) {
+        migrate_external_graph_schema(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
+    if version != USER_VERSION {
+        return Err(AppError::new(
+            "unsupported_store_version",
+            format!(
+                "wiki database version {version} is not supported by this lwc build (expected {USER_VERSION})"
+            ),
+        ));
+    }
+    validate_store(conn)?;
+    Ok(false)
+}
+
+fn prepare_store_read_only(conn: &Connection) -> Result<()> {
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == 0 {
+        return Err(AppError::new(
+            "unsupported_store_version",
+            "wiki database has no recognized schema; run `lwc init` in a new directory",
+        ));
+    }
+    if !(1..=USER_VERSION).contains(&version) || version != USER_VERSION {
+        return Err(AppError::new(
+            "unsupported_store_version",
+            format!(
+                "wiki database version {version} is not supported by this lwc build (expected {USER_VERSION})"
+            ),
+        ));
+    }
+    validate_store_read_only(conn)
+}
+
+fn migrate_ingest_workflow(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match current {
+        INGEST_WORKFLOW_VERSION..=USER_VERSION => {
+            tx.commit()?;
+            return Ok(());
+        }
+        SEARCH_INDEX_VERSION => {}
+        other => {
+            return Err(AppError::new(
+                "unsupported_store_version",
+                format!("cannot migrate wiki database version {other} to {USER_VERSION}"),
+            ));
+        }
+    }
+
+    tx.execute_batch(&format!(
+        "
+        CREATE TABLE ingest_jobs(
+            source_id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL CHECK(
+                status IN ('pending', 'analyzing', 'generating', 'completed', 'failed')
+            ),
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+            analysis TEXT,
+            last_error TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX ingest_jobs_status_source
+        ON ingest_jobs(status, source_id);
+
+        INSERT INTO ingest_jobs(source_id, status, updated_at)
+        SELECT id, 'pending', {TIMESTAMP_SQL}
+        FROM sources;
+        "
+    ))?;
+    tx.execute(
+        "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema', ?1)",
+        params![DEFAULT_SCHEMA],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO meta(key, value) VALUES ('purpose', ?1)",
+        params![DEFAULT_PURPOSE],
+    )?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![INGEST_WORKFLOW_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", INGEST_WORKFLOW_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to commit v{INGEST_WORKFLOW_VERSION} workflow migration: {error}"),
+        )
+    })
+}
+
+fn migrate_compound_wiki(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match current {
+        COMPOUND_WIKI_VERSION..=USER_VERSION => {
+            tx.commit()?;
+            return Ok(());
+        }
+        INGEST_WORKFLOW_VERSION => {}
+        other => {
+            return Err(AppError::new(
+                "unsupported_store_version",
+                format!("cannot migrate wiki database version {other} to {USER_VERSION}"),
+            ));
+        }
+    }
+
+    tx.execute_batch(
+        "ALTER TABLE ingest_jobs
+         ADD COLUMN no_derived_pages_reason TEXT;
+
+         UPDATE sources
+         SET title = origin
+         WHERE title IS NULL OR TRIM(title) = '';",
+    )?;
+    rebuild_search_index(&tx).map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to prepare v{COMPOUND_WIKI_VERSION} compact search index: {error}"),
+        )
+    })?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![COMPOUND_WIKI_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", COMPOUND_WIKI_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to commit v{COMPOUND_WIKI_VERSION} Wiki migration: {error}"),
+        )
+    })
+}
+
+fn migrate_page_provenance(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match current {
+        PAGE_PROVENANCE_VERSION..=USER_VERSION => {
+            tx.commit()?;
+            return Ok(());
+        }
+        COMPOUND_WIKI_VERSION => {}
+        other => {
+            return Err(AppError::new(
+                "unsupported_store_version",
+                format!("cannot migrate wiki database version {other} to {USER_VERSION}"),
+            ));
+        }
+    }
+
+    tx.execute_batch(
+        "CREATE TABLE page_provenance(
+            page_slug TEXT NOT NULL,
+            provenance TEXT NOT NULL CHECK(
+                provenance IN ('user-provided', 'agent-observed', 'hypothesis')
+            ),
+            PRIMARY KEY(page_slug, provenance),
+            FOREIGN KEY(page_slug) REFERENCES pages(slug) ON DELETE CASCADE
+        );",
+    )?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![PAGE_PROVENANCE_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", PAGE_PROVENANCE_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to commit v{PAGE_PROVENANCE_VERSION} provenance migration: {error}"),
+        )
+    })
+}
+
+fn migrate_source_path_revisions(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match current {
+        SOURCE_PATH_REVISIONS_VERSION..=USER_VERSION => {
+            tx.commit()?;
+            return Ok(());
+        }
+        PAGE_PROVENANCE_VERSION => {}
+        other => {
+            return Err(AppError::new(
+                "unsupported_store_version",
+                format!("cannot migrate wiki database version {other} to {USER_VERSION}"),
+            ));
+        }
+    }
+
+    create_source_path_revisions(&tx)?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![SOURCE_PATH_REVISIONS_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", SOURCE_PATH_REVISIONS_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!(
+                "failed to commit v{SOURCE_PATH_REVISIONS_VERSION} source path migration: {error}"
+            ),
+        )
+    })
+}
+
+fn migrate_retrieval_weighting(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match current {
+        RETRIEVAL_WEIGHTING_VERSION..=USER_VERSION => {
+            tx.commit()?;
+            return Ok(());
+        }
+        SOURCE_PATH_REVISIONS_VERSION => {}
+        other => {
+            return Err(AppError::new(
+                "unsupported_store_version",
+                format!("cannot migrate wiki database version {other} to {USER_VERSION}"),
+            ));
+        }
+    }
+
+    add_structural_navigation_state(&tx).map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to prepare v{RETRIEVAL_WEIGHTING_VERSION} retrieval features: {error}"),
+        )
+    })?;
+    create_retrieval_state(&tx).map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to prepare v{RETRIEVAL_WEIGHTING_VERSION} retrieval state: {error}"),
+        )
+    })?;
+    rebuild_search_index(&tx).map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!(
+                "failed to prepare v{RETRIEVAL_WEIGHTING_VERSION} weighted search index: {error}"
+            ),
+        )
+    })?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![RETRIEVAL_WEIGHTING_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", RETRIEVAL_WEIGHTING_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to commit v{RETRIEVAL_WEIGHTING_VERSION} retrieval migration: {error}"),
+        )
+    })
+}
+
+fn migrate_changesets(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match current {
+        CHANGESETS_VERSION..=USER_VERSION => {
+            tx.commit()?;
+            return Ok(());
+        }
+        RETRIEVAL_WEIGHTING_VERSION => {}
+        other => {
+            return Err(AppError::new(
+                "unsupported_store_version",
+                format!("cannot migrate wiki database version {other} to {USER_VERSION}"),
+            ));
+        }
+    }
+
+    create_changeset_state(&tx).map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to prepare v{USER_VERSION} changeset state: {error}"),
+        )
+    })?;
+    tx.execute_batch(
+        "INSERT OR IGNORE INTO meta(key, value)
+         VALUES ('store_id', LOWER(HEX(RANDOMBLOB(32))));
+         INSERT OR IGNORE INTO meta(key, value)
+         VALUES ('store_revision', LOWER(HEX(RANDOMBLOB(32))));",
+    )?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![CHANGESETS_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", CHANGESETS_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to commit v{CHANGESETS_VERSION} changeset migration: {error}"),
+        )
+    })
+}
+
+fn migrate_external_graph_schema(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if current == USER_VERSION {
+        tx.commit()?;
+        return Ok(());
+    }
+    if !matches!(current, CHANGESETS_VERSION | 11) {
+        return Err(AppError::new(
+            "unsupported_store_version",
+            format!("cannot migrate wiki database version {current} to {USER_VERSION}"),
+        ));
+    }
+    tx.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS semantic_relations(
+            id TEXT PRIMARY KEY,
+            relation_type TEXT NOT NULL,
+            from_identifier TEXT NOT NULL,
+            to_identifier TEXT NOT NULL,
+            confidence REAL,
+            provenance TEXT NOT NULL,
+            reason TEXT,
+            source_ids_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT ({TIMESTAMP_SQL}),
+            updated_at TEXT NOT NULL DEFAULT ({TIMESTAMP_SQL})
+        );"
+    ))?;
+    let has_legacy_graph: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'graph_edges')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_legacy_graph {
+        tx.execute(
+            "INSERT OR IGNORE INTO semantic_relations(
+                id, relation_type, from_identifier, to_identifier,
+                confidence, provenance, reason, source_ids_json, created_at, updated_at
+             )
+             SELECT edge_id, edge_type, from_node_id, to_node_id,
+                    confidence, COALESCE(provenance, 'agent-observed'), reason,
+                    COALESCE(json_extract(properties_json, '$.source_ids'), '[]'),
+                    created_at, updated_at
+             FROM graph_edges WHERE owner_type = 'manual'",
+            [],
+        )?;
+    }
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS graph_occurrences;
+         DROP TABLE IF EXISTS graph_edges;
+         DROP TABLE IF EXISTS graph_deltas;
+         DROP TABLE IF EXISTS graph_generations;
+         DROP TABLE IF EXISTS graph_projection_state;
+         DROP TABLE IF EXISTS term_pair_contributions;
+         DROP TABLE IF EXISTS term_pair_totals;
+         DROP TABLE IF EXISTS document_index_state;
+         DROP TABLE IF EXISTS span_fts;
+         DROP TABLE IF EXISTS span_fts_data;
+         DROP TABLE IF EXISTS span_fts_idx;
+         DROP TABLE IF EXISTS span_fts_content;
+         DROP TABLE IF EXISTS span_fts_docsize;
+         DROP TABLE IF EXISTS span_fts_config;
+         DROP TABLE IF EXISTS search_spans;
+         DROP TABLE IF EXISTS graph_nodes;
+         DELETE FROM meta WHERE key LIKE 'graph_digest_%';
+         CREATE TABLE search_spans(
+            span_id TEXT PRIMARY KEY,
+            span_type TEXT NOT NULL CHECK(span_type IN ('passage', 'sentence')),
+            document_type TEXT NOT NULL CHECK(document_type IN ('page', 'source')),
+            document_identifier TEXT NOT NULL,
+            parent_identifier TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            byte_start INTEGER NOT NULL,
+            byte_end INTEGER NOT NULL,
+            content_fingerprint TEXT NOT NULL,
+            segmenter_version INTEGER NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1))
+         );
+         CREATE INDEX search_spans_document
+         ON search_spans(document_type, document_identifier, active);
+         CREATE VIRTUAL TABLE span_fts USING fts5(
+            span_id UNINDEXED, span_type UNINDEXED,
+            document_type UNINDEXED, document_identifier UNINDEXED,
+            title_terms, path_terms, body_terms,
+            content='', contentless_delete=1, contentless_unindexed=1
+         );",
+    )?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![USER_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", USER_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to remove legacy graph schema: {error}"),
+        )
+    })
+}
+
+fn add_structural_navigation_state(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "ALTER TABLE sources ADD COLUMN structural_navigation INTEGER NOT NULL DEFAULT 0
+             CHECK(structural_navigation IN (0, 1));
+         ALTER TABLE pages ADD COLUMN structural_navigation INTEGER NOT NULL DEFAULT 0
+             CHECK(structural_navigation IN (0, 1));
+         UPDATE sources
+         SET structural_navigation = CASE
+             WHEN INSTR(LOWER(content), '总览文档') > 0
+               OR INSTR(LOWER(content), '文档目录') > 0
+               OR INSTR(LOWER(content), 'table of contents') > 0
+               OR INSTR(LOWER(content), 'navigation index') > 0
+               OR INSTR(LOWER(content), 'document index') > 0
+             THEN 1 ELSE 0 END;
+         UPDATE pages
+         SET structural_navigation = CASE
+             WHEN INSTR(LOWER(body), '总览文档') > 0
+               OR INSTR(LOWER(body), '文档目录') > 0
+               OR INSTR(LOWER(body), 'table of contents') > 0
+               OR INSTR(LOWER(body), 'navigation index') > 0
+               OR INSTR(LOWER(body), 'document index') > 0
+             THEN 1 ELSE 0 END;",
+    )?;
+    Ok(())
+}
+
+fn create_source_path_revisions(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE source_path_revisions(
+            tracked_path TEXT NOT NULL CHECK(TRIM(tracked_path) <> ''),
+            revision INTEGER NOT NULL CHECK(revision >= 1),
+            source_id INTEGER NOT NULL,
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY(tracked_path, revision),
+            FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX source_path_revisions_source
+        ON source_path_revisions(source_id, tracked_path, revision);",
+    )?;
+    Ok(())
+}
+
+fn create_retrieval_state(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(&format!(
+        "CREATE TABLE retrieval_weights(
+            target_type TEXT NOT NULL CHECK(target_type IN ('page', 'source')),
+            target_identifier TEXT NOT NULL CHECK(TRIM(target_identifier) <> ''),
+            provenance TEXT NOT NULL CHECK(provenance IN ('user-provided', 'agent-observed')),
+            weight INTEGER NOT NULL CHECK(weight IN (-2, -1, 1, 2)),
+            reason TEXT NOT NULL CHECK(TRIM(reason) <> ''),
+            updated_at TEXT NOT NULL DEFAULT ({TIMESTAMP_SQL}),
+            PRIMARY KEY(target_type, target_identifier, provenance)
+        );
+
+        CREATE TABLE retrieval_feedback(
+            query_fingerprint TEXT NOT NULL CHECK(LENGTH(query_fingerprint) = 64),
+            target_type TEXT NOT NULL CHECK(target_type IN ('page', 'source')),
+            target_identifier TEXT NOT NULL CHECK(TRIM(target_identifier) <> ''),
+            provenance TEXT NOT NULL CHECK(provenance IN ('user-provided', 'agent-observed')),
+            signal INTEGER NOT NULL CHECK(signal IN (-1, 1)),
+            reason TEXT NOT NULL CHECK(TRIM(reason) <> ''),
+            updated_at TEXT NOT NULL DEFAULT ({TIMESTAMP_SQL}),
+            PRIMARY KEY(query_fingerprint, target_type, target_identifier, provenance)
+        );
+
+        CREATE INDEX retrieval_feedback_target
+        ON retrieval_feedback(target_type, target_identifier, query_fingerprint);"
+    ))?;
+    Ok(())
+}
+
+fn create_changeset_state(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS changesets(
+            id TEXT PRIMARY KEY CHECK(LENGTH(id) = 64),
+            name TEXT NOT NULL CHECK(TRIM(name) <> ''),
+            status TEXT NOT NULL CHECK(status IN ('draft', 'committed', 'rolled_back')),
+            base_revision TEXT NOT NULL CHECK(LENGTH(base_revision) = 64),
+            base_operation_id INTEGER NOT NULL CHECK(base_operation_id >= 0),
+            begin_operation_id INTEGER NOT NULL CHECK(begin_operation_id > base_operation_id),
+            pre_commit_checkpoint TEXT,
+            post_revision TEXT CHECK(post_revision IS NULL OR LENGTH(post_revision) = 64),
+            created_at TEXT NOT NULL,
+            committed_at TEXT,
+            rolled_back_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS changesets_name_created ON changesets(name, created_at);",
+    )?;
+    Ok(())
+}

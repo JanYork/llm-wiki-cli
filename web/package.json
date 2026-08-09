@@ -1,0 +1,25 @@
+{
+  "name": "@i-xor/lwc-view",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dompurify": "3.4.13",
+    "graphology": "0.26.0",
+    "graphology-layout-forceatlas2": "0.10.1",
+    "lit": "3.3.3",
+    "marked": "18.0.9",
+    "sigma": "3.0.3"
+  },
+  "devDependencies": {
+    "@types/dompurify": "3.0.5",
+    "jsdom": "30.0.1",
+    "typescript": "7.0.2",
+    "vite": "8.2.1",
+    "vitest": "4.1.10"
+  }
+}

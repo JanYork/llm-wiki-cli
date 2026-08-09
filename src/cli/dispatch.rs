@@ -1,0 +1,1063 @@
+fn run(cli: Cli) -> Result<Value> {
+    let cwd = env::current_dir()?;
+    let selected_changeset = cli.changeset.clone();
+    if !matches!(
+        &cli.command,
+        Command::Init { .. }
+            | Command::Work { .. }
+            | Command::WorkRun { .. }
+            | Command::Cg { .. }
+            | Command::View { .. }
+    ) {
+        let paths = if cli.scope == Scope::All {
+            resolve_live_read_store_paths(cli.scope, &cwd, true)?
+        } else {
+            vec![resolve_live_store_path(cli.scope, &cwd)?]
+        };
+        for path in paths {
+            if work::schema_migration_needed(&path.path)? {
+                Store::open(scope_name(path.scope), &path.path)?;
+            }
+        }
+    }
+    match cli.command {
+        Command::Init { no_git_exclude } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "init")?;
+            ensure_scope_supported(cli.scope, false, "init")?;
+            let store_path = init_store_path(cli.scope, &cwd)?;
+            let git_exclude =
+                configure_git_exclude(store_path.scope, &store_path.path, no_git_exclude)?;
+            let (mut store, created) =
+                Store::initialize(scope_name(store_path.scope), &store_path.path)?;
+            store.materialize()?;
+            Ok(json!({
+                "scope": scope_name(store_path.scope),
+                "database": store_path.path,
+                "created": created,
+                "git_exclude": git_exclude
+            }))
+        }
+        Command::Work { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "work")?;
+            ensure_scope_supported(cli.scope, false, "work")?;
+            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
+            match command {
+                WorkCommand::List => work::list(&store_path),
+                WorkCommand::Status { id } => work::status(&store_path, &id),
+                WorkCommand::Watch { id } => work::watch(&store_path, &id),
+                WorkCommand::Cancel { id } => work::cancel(&store_path, &id),
+                WorkCommand::Resume { id } => work::resume(&store_path, &id),
+            }
+        }
+        Command::WorkRun { root, id } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "work runner")?;
+            work::run(&root, &id)
+        }
+        Command::Cg { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "cg")?;
+            ensure_scope_supported(cli.scope, false, "cg")?;
+            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
+            match command {
+                CgCommand::Init { verbose } => codegraph::init(&store_path, verbose),
+                CgCommand::Status => Ok(codegraph::status(&store_path)),
+                CgCommand::Run(args) => codegraph::run(&store_path, &args),
+            }
+        }
+        Command::View { port, no_open } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "view")?;
+            ensure_scope_supported(cli.scope, false, "view")?;
+            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
+            view::run(store_path, port, no_open)
+        }
+        Command::Changeset { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "changeset")?;
+            ensure_scope_supported(cli.scope, false, "changeset")?;
+            let live = resolve_live_store_path(cli.scope, &cwd)?;
+            match command {
+                ChangesetCommand::Begin { name } => to_json(changeset::begin(&live, &name)?),
+                ChangesetCommand::List => to_json(changeset::list(&live, 1000)?),
+                ChangesetCommand::Show { name, limit } => {
+                    validate_limit(limit)?;
+                    to_json(changeset::show(&live, &name, limit)?)
+                }
+                ChangesetCommand::Commit {
+                    name,
+                    allow_lint_issues,
+                    reason,
+                } => to_json(changeset::commit(
+                    &live,
+                    &name,
+                    allow_lint_issues,
+                    reason.as_deref(),
+                )?),
+                ChangesetCommand::Discard { name } => to_json(changeset::discard(&live, &name)?),
+                ChangesetCommand::Rollback { changeset_id } => {
+                    to_json(changeset::rollback(&live, &changeset_id)?)
+                }
+            }
+        }
+        Command::Schema { command } => {
+            ensure_scope_supported(cli.scope, false, "schema")?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
+            match command {
+                SchemaCommand::Set { file } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let schema = read_utf8(&file, true)?;
+                    require_text("schema", &schema)?;
+                    let response = store.schema_set(&schema)?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+                SchemaCommand::Show => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    to_json(store.schema_show()?)
+                }
+            }
+        }
+        Command::Purpose { command } => {
+            ensure_scope_supported(cli.scope, false, "purpose")?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
+            match command {
+                PurposeCommand::Set { file } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let purpose = read_utf8(&file, true)?;
+                    require_text("purpose", &purpose)?;
+                    let response = store.purpose_set(&purpose)?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+                PurposeCommand::Show => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    to_json(store.purpose_show()?)
+                }
+            }
+        }
+        Command::Source { command } => {
+            ensure_scope_supported(cli.scope, false, "source")?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
+            match command {
+                SourceCommand::Add {
+                    file,
+                    title,
+                    allow_external_source,
+                    acknowledge_sensitive_source,
+                } => {
+                    let input = prepare_source_input(
+                        &store_path,
+                        &file,
+                        title,
+                        allow_external_source,
+                        acknowledge_sensitive_source,
+                    )?;
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.source_add(input)?;
+                    materialize_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+                SourceCommand::AddDir {
+                    directory,
+                    allow_external_source,
+                    acknowledge_sensitive_source,
+                } => {
+                    validate_source_scope(&store_path, &directory, allow_external_source)?;
+                    let files = collect_documents(&directory).map_err(|error| {
+                        AppError::new("invalid_source_directory", error.to_string())
+                    })?;
+                    let discovered = files.len();
+                    let mut skipped_files = Vec::new();
+                    let inputs = files.into_iter().map(|file| {
+                        let resolved = match validate_source_scope(
+                            &store_path,
+                            &file,
+                            allow_external_source,
+                        ) {
+                            Ok(path) => path,
+                            Err(error) if error.code == "io_error" => {
+                                skipped_files.push(file.display().to_string());
+                                return Ok(None);
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        let content = match read_utf8(&resolved, false) {
+                            Ok(content) if !content.trim().is_empty() => content,
+                            _ => {
+                                skipped_files.push(file.display().to_string());
+                                return Ok(None);
+                            }
+                        };
+                        validate_sensitive_source(
+                            &resolved,
+                            &content,
+                            acknowledge_sensitive_source,
+                        )?;
+                        let title = file
+                            .strip_prefix(&directory)
+                            .unwrap_or(&file)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        Ok(Some(SourceAddInput {
+                            title: Some(title),
+                            origin: file.display().to_string(),
+                            tracked_path: Some(tracked_source_path(&store_path, &resolved)?),
+                            content,
+                        }))
+                    });
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let responses = store.source_add_stream(inputs)?;
+                    let created = responses.iter().filter(|response| response.created).count();
+                    let duplicates = responses.len() - created;
+                    if !responses.is_empty() {
+                        materialize_if_live(&mut store, selected_changeset.as_deref())?;
+                    }
+                    if !skipped_files.is_empty() {
+                        let examples = skipped_files
+                            .iter()
+                            .take(10)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(AppError::new(
+                            "partial_import",
+                            format!(
+                                "imported {created} new and reused {duplicates} sources, but skipped {} files: {examples}; fix them and rerun (the import is idempotent)",
+                                skipped_files.len()
+                            ),
+                        ));
+                    }
+                    Ok(json!({
+                        "scope": scope_name(store_path.scope),
+                        "database": store_path.path,
+                        "discovered": discovered,
+                        "created": created,
+                        "duplicates": duplicates,
+                        "skipped": skipped_files.len(),
+                        "skipped_files": skipped_files,
+                    }))
+                }
+                SourceCommand::AddManifest {
+                    manifest,
+                    allow_external_source,
+                    acknowledge_sensitive_source,
+                } => {
+                    let raw = read_utf8(&manifest, false)?;
+                    let parsed: SourceManifest = serde_json::from_str(&raw)
+                        .map_err(|error| AppError::new("invalid_manifest", error.to_string()))?;
+                    if parsed.sources.is_empty() {
+                        return Err(AppError::new(
+                            "invalid_manifest",
+                            "manifest sources must not be empty",
+                        ));
+                    }
+                    let base = manifest.parent().unwrap_or_else(|| Path::new("."));
+                    let mut paths = Vec::with_capacity(parsed.sources.len());
+                    let mut inputs = Vec::with_capacity(parsed.sources.len());
+                    for entry in parsed.sources {
+                        let path = base.join(entry.path);
+                        let input = prepare_source_input(
+                            &store_path,
+                            &path,
+                            entry.title,
+                            allow_external_source,
+                            acknowledge_sensitive_source,
+                        )?;
+                        paths.push(path);
+                        inputs.push(input);
+                    }
+
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let responses = store.source_add_many(inputs)?;
+                    let created = responses.iter().filter(|response| response.created).count();
+                    let duplicates = responses.len() - created;
+                    let sources = paths
+                        .into_iter()
+                        .zip(responses)
+                        .map(|(path, response)| {
+                            json!({
+                                "path": path,
+                                "source": response.source,
+                                "created": response.created
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    materialize_if_live(&mut store, selected_changeset.as_deref())?;
+                    Ok(json!({
+                        "scope": scope_name(store_path.scope),
+                        "database": store_path.path,
+                        "created": created,
+                        "duplicates": duplicates,
+                        "sources": sources
+                    }))
+                }
+                SourceCommand::List { limit, offset } => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    validate_limit(limit)?;
+                    validate_offset(offset)?;
+                    to_json(store.source_list(limit, offset)?)
+                }
+                SourceCommand::Status {
+                    source_ids,
+                    all,
+                    allow_external_source,
+                } => {
+                    let mut store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    let selected = store.source_status_targets(source_ids.clone(), all)?;
+                    let mut resolved = BTreeMap::new();
+                    for target in &selected.targets {
+                        if !resolved.contains_key(&target.tracked_path) {
+                            resolved.insert(
+                                target.tracked_path.clone(),
+                                resolve_tracked_source_path(
+                                    &store_path,
+                                    &target.tracked_path,
+                                    allow_external_source,
+                                )?,
+                            );
+                        }
+                    }
+                    let mut live = BTreeMap::new();
+                    for (tracked_path, path) in resolved {
+                        let source = prepare_live_source(
+                            &store_path,
+                            path,
+                            allow_external_source,
+                            MAX_INPUT_BYTES,
+                        )?;
+                        live.insert(tracked_path, inspect_prepared_source(source));
+                    }
+                    let current = store.source_status_targets(source_ids, all)?;
+                    ensure_source_status_unchanged(&selected, &current)?;
+                    let checks = selected
+                        .targets
+                        .into_iter()
+                        .map(|target| {
+                            let live = live
+                                .get(&target.tracked_path)
+                                .expect("every preflighted path is inspected");
+                            let filesystem_state = if live.state == "hashed" {
+                                if live.content_hash.as_deref()
+                                    == Some(target.head_content_hash.as_str())
+                                {
+                                    "current"
+                                } else {
+                                    "modified"
+                                }
+                            } else {
+                                live.state
+                            };
+                            SourceStatusCheck {
+                                requested_source_id: target.requested_source_id,
+                                tracked_path: target.tracked_path,
+                                head_source_id: target.head_source_id,
+                                head_revision: target.head_revision,
+                                lineage_state: if target.requested_source_id
+                                    == target.head_source_id
+                                {
+                                    "current"
+                                } else {
+                                    "superseded"
+                                },
+                                filesystem_state,
+                                head_content_hash: target.head_content_hash,
+                                live_content_hash: live.content_hash.clone(),
+                                live_bytes: live.bytes,
+                                message: live.message.clone(),
+                            }
+                        })
+                        .collect();
+                    to_json(SourceStatusResponse {
+                        scope: scope_name(store_path.scope).to_string(),
+                        database: store_path.path.display().to_string(),
+                        checked_at_unix_ms: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|error| AppError::new("system_time_error", error.to_string()))?
+                            .as_millis(),
+                        checks,
+                        untracked_source_ids: selected.untracked_source_ids,
+                    })
+                }
+                SourceCommand::Diff {
+                    id,
+                    path,
+                    to_source,
+                    max_chars,
+                    allow_external_source,
+                    acknowledge_sensitive_source,
+                } => run_source_diff(
+                    &store_path,
+                    id,
+                    path.as_deref(),
+                    to_source,
+                    max_chars,
+                    allow_external_source,
+                    acknowledge_sensitive_source,
+                ),
+                SourceCommand::Show {
+                    id,
+                    offset_chars,
+                    max_chars,
+                } => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    validate_offset(offset_chars)?;
+                    if max_chars == Some(0) {
+                        return Err(AppError::new(
+                            "invalid_limit",
+                            "max-chars must be greater than zero",
+                        ));
+                    }
+                    to_json(store.source_show(id, offset_chars, max_chars)?)
+                }
+                SourceCommand::Refs { id, limit, offset } => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    validate_limit(limit)?;
+                    validate_offset(offset)?;
+                    to_json(store.source_refs(id, limit, offset)?)
+                }
+                SourceCommand::Remove { id } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.source_remove(id)?;
+                    materialize_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+            }
+        }
+        Command::Page { command } => {
+            ensure_scope_supported(cli.scope, false, "page")?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
+            match command {
+                PageCommand::Put {
+                    slug,
+                    title,
+                    kind,
+                    summary,
+                    file,
+                    source_ids,
+                    provenance,
+                } => {
+                    if let Some(name) = selected_changeset.as_deref() {
+                        let live = resolve_live_store_path(cli.scope, &cwd)?;
+                        changeset::prepare_page_touch(&live, name, &slug, &source_ids)?;
+                    }
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    require_text("slug", &slug)?;
+                    require_text("title", &title)?;
+                    require_text("kind", &kind)?;
+                    let body = read_utf8(&file, true)?;
+                    require_text("page body", &body)?;
+                    let response = store.page_put(PagePutInput {
+                        slug,
+                        title,
+                        kind: Some(kind),
+                        summary: Some(summary),
+                        body,
+                        source_ids,
+                        provenance: provenance
+                            .into_iter()
+                            .map(|value| value.as_str().to_string())
+                            .collect(),
+                    })?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+                PageCommand::List { limit, offset } => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    validate_limit(limit)?;
+                    validate_offset(offset)?;
+                    to_json(store.page_list(limit, offset)?)
+                }
+                PageCommand::Show { slug } => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    to_json(store.page_show(&slug)?)
+                }
+                PageCommand::Links { slug } => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    to_json(store.page_links(&slug)?)
+                }
+                PageCommand::Remove { slug } => {
+                    if let Some(name) = selected_changeset.as_deref() {
+                        let live = resolve_live_store_path(cli.scope, &cwd)?;
+                        changeset::prepare_page_touch(&live, name, &slug, &[])?;
+                    }
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.page_remove(&slug)?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+            }
+        }
+        Command::Ingest { command } => {
+            ensure_scope_supported(cli.scope, false, "ingest")?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
+            match command {
+                IngestCommand::List {
+                    status,
+                    limit,
+                    offset,
+                } => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    validate_limit(limit)?;
+                    validate_offset(offset)?;
+                    to_json(store.ingest_list(status.as_deref(), limit, offset)?)
+                }
+                IngestCommand::Next {
+                    context_limit,
+                    source_max_chars,
+                } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    validate_limit(context_limit)?;
+                    if source_max_chars == Some(0) {
+                        return Err(AppError::new(
+                            "invalid_limit",
+                            "source-max-chars must be greater than zero",
+                        ));
+                    }
+                    let response = store.ingest_next(context_limit, source_max_chars)?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+                IngestCommand::Claim {
+                    source_id,
+                    context_limit,
+                    source_max_chars,
+                } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    validate_limit(context_limit)?;
+                    if source_max_chars == Some(0) {
+                        return Err(AppError::new(
+                            "invalid_limit",
+                            "source-max-chars must be greater than zero",
+                        ));
+                    }
+                    let response =
+                        store.ingest_claim(source_id, context_limit, source_max_chars)?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+                IngestCommand::Analyze { source_id, file } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let analysis = read_utf8(&file, true)?;
+                    require_text("analysis", &analysis)?;
+                    let response = store.ingest_analyze(source_id, &analysis)?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+                IngestCommand::Complete {
+                    source_id,
+                    no_derived_pages_reason,
+                } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    if let Some(reason) = no_derived_pages_reason.as_deref() {
+                        require_text("no-derived-pages-reason", reason)?;
+                    }
+                    let response =
+                        store.ingest_complete(source_id, no_derived_pages_reason.as_deref())?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+                IngestCommand::Fail { source_id, message } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    require_text("message", &message)?;
+                    let response = store.ingest_fail(source_id, &message)?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+                IngestCommand::Retry { source_id } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.ingest_retry(source_id)?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+            }
+        }
+        Command::Config { command } => {
+            ensure_scope_supported(cli.scope, false, "config")?;
+            if selected_changeset.is_some() {
+                return Err(AppError::new(
+                    "changeset_command_not_supported",
+                    "graph configuration is deployment-local and cannot be changed in a changeset",
+                ));
+            }
+            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
+            match command {
+                ConfigCommand::Show => {
+                    config::response(scope_name(store_path.scope), &store_path.path)
+                }
+                ConfigCommand::Set { graph } => {
+                    let setting = config::parse_setting(&graph)?;
+                    config::update(&store_path.path, setting)?;
+                    Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let mut response =
+                        config::response(scope_name(store_path.scope), &store_path.path)?;
+                    if setting != config::GraphSetting::Disabled
+                        && setting != config::GraphSetting::Inherit
+                    {
+                        response["work"] = work::start_graph_projection(
+                            scope_name(store_path.scope),
+                            &store_path.path,
+                        )?["work"]
+                            .clone();
+                    }
+                    Ok(response)
+                }
+                ConfigCommand::Unset { graph } => {
+                    if !graph {
+                        return Err(AppError::new(
+                            "invalid_input",
+                            "config unset requires --graph",
+                        ));
+                    }
+                    config::update(&store_path.path, config::GraphSetting::Inherit)?;
+                    Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    config::response(scope_name(store_path.scope), &store_path.path)
+                }
+            }
+        }
+        Command::Graph { command } => {
+            ensure_scope_supported(cli.scope, false, "graph")?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
+            match command {
+                GraphCommand::Related { slug, limit } => {
+                    validate_limit(limit)?;
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    to_json(store.graph_related(&slug, limit)?)
+                }
+                GraphCommand::Explore {
+                    identifier,
+                    depth,
+                    limit,
+                    direction,
+                    edge_types,
+                } => {
+                    validate_graph_depth(depth)?;
+                    validate_graph_limit(limit)?;
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    match identifier {
+                        Some(identifier) => Ok(store.graph_explore(
+                            &identifier,
+                            depth,
+                            limit,
+                            direction.as_str(),
+                            &edge_types,
+                        )?),
+                        None => Ok(store.graph_explore_macro(depth, limit, &edge_types)?),
+                    }
+                }
+                GraphCommand::Node { identifier } => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    Ok(store.graph_node(&identifier)?)
+                }
+                GraphCommand::Neighbors {
+                    identifier,
+                    limit,
+                    direction,
+                    edge_types,
+                } => {
+                    validate_graph_limit(limit)?;
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    Ok(store.graph_neighbors(
+                        &identifier,
+                        limit,
+                        direction.as_str(),
+                        &edge_types,
+                    )?)
+                }
+                GraphCommand::Path {
+                    from,
+                    to,
+                    max_depth,
+                    limit,
+                    direction,
+                    edge_types,
+                } => {
+                    validate_graph_depth(max_depth)?;
+                    validate_graph_limit(limit)?;
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    Ok(store.graph_path(
+                        &from,
+                        &to,
+                        max_depth,
+                        limit,
+                        direction.as_str(),
+                        &edge_types,
+                    )?)
+                }
+                GraphCommand::Impact {
+                    identifier,
+                    max_depth,
+                    limit,
+                } => {
+                    validate_graph_depth(max_depth)?;
+                    validate_graph_limit(limit)?;
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    Ok(store.graph_impact(&identifier, max_depth, limit)?)
+                }
+                GraphCommand::Overview { limit } => {
+                    validate_limit(limit)?;
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    Ok(store.graph_overview(limit)?)
+                }
+                GraphCommand::Status => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    Ok(store.graph_status()?)
+                }
+                GraphCommand::Verify => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    Ok(store.graph_verify()?)
+                }
+                GraphCommand::Relation { command } => match command {
+                    GraphRelationCommand::Set {
+                        from,
+                        relation_type,
+                        to,
+                        provenance,
+                        reason,
+                        confidence,
+                        source_ids,
+                    } => {
+                        let mut store =
+                            Store::open(scope_name(store_path.scope), &store_path.path)?;
+                        Ok(store.graph_relation_set(
+                            &from,
+                            &relation_type,
+                            &to,
+                            &provenance,
+                            &reason,
+                            confidence,
+                            &source_ids,
+                        )?)
+                    }
+                    GraphRelationCommand::List {
+                        from,
+                        to,
+                        relation_type,
+                        limit,
+                    } => {
+                        validate_limit(limit)?;
+                        let store =
+                            Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                        Ok(store.graph_relation_list(
+                            from.as_deref(),
+                            to.as_deref(),
+                            relation_type.as_deref(),
+                            limit,
+                        )?)
+                    }
+                    GraphRelationCommand::Retract {
+                        from,
+                        relation_type,
+                        to,
+                        reason,
+                    } => {
+                        let mut store =
+                            Store::open(scope_name(store_path.scope), &store_path.path)?;
+                        Ok(store.graph_relation_retract(&from, &relation_type, &to, &reason)?)
+                    }
+                },
+            }
+        }
+        Command::Weight { command } => {
+            ensure_scope_supported(cli.scope, false, "weight")?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
+            match command {
+                WeightCommand::List { target, identifier } => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    to_json(store.retrieval_weight_list(target.as_str(), &identifier)?)
+                }
+                WeightCommand::Set {
+                    target,
+                    identifier,
+                    value,
+                    reason,
+                    provenance,
+                } => {
+                    let value = value.parse::<i32>().map_err(|_| {
+                        AppError::new("invalid_weight", "weight must be one of -2, -1, 1, or 2")
+                    })?;
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.retrieval_weight_set(
+                        target.as_str(),
+                        &identifier,
+                        value,
+                        &reason,
+                        provenance.as_str(),
+                    )?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+                WeightCommand::Clear {
+                    target,
+                    identifier,
+                    provenance,
+                } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.retrieval_weight_clear(
+                        target.as_str(),
+                        &identifier,
+                        provenance.as_str(),
+                    )?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+                WeightCommand::Feedback {
+                    target,
+                    identifier,
+                    query,
+                    signal,
+                    reason,
+                    provenance,
+                } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.retrieval_feedback_set(
+                        target.as_str(),
+                        &identifier,
+                        &query,
+                        signal.value(),
+                        &reason,
+                        provenance.as_str(),
+                    )?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+                WeightCommand::FeedbackClear {
+                    target,
+                    identifier,
+                    query,
+                    provenance,
+                } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.retrieval_feedback_clear(
+                        target.as_str(),
+                        &identifier,
+                        &query,
+                        provenance.as_str(),
+                    )?;
+                    materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                    to_json(response)
+                }
+            }
+        }
+        Command::Maintenance { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "maintenance")?;
+            ensure_scope_supported(cli.scope, false, "maintenance")?;
+            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
+            match command {
+                MaintenanceCommand::Materialize => work::start_materialize(&store_path),
+                MaintenanceCommand::Reindex => work::start_reindex(&store_path),
+                MaintenanceCommand::Compact => work::start_compact(&store_path),
+            }
+        }
+        Command::Checkpoint { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "checkpoint")?;
+            ensure_scope_supported(cli.scope, false, "checkpoint")?;
+            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
+            match command {
+                CheckpointCommand::Create { name } => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    to_json(store.checkpoint_create(&name)?)
+                }
+                CheckpointCommand::List => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    to_json(store.checkpoint_list()?)
+                }
+                CheckpointCommand::Restore { name } => {
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    let response = store.checkpoint_restore(&name)?;
+                    store.materialize()?;
+                    to_json(response)
+                }
+            }
+        }
+        Command::Search {
+            query,
+            target,
+            granularity,
+            group_by,
+            kinds,
+            limit,
+            record,
+            explain,
+        } => {
+            require_text("query", &query)?;
+            validate_limit(limit)?;
+            for kind in &kinds {
+                require_text("kind", kind)?;
+            }
+            if matches!(target, SearchTarget::Source) && !kinds.is_empty() {
+                return Err(AppError::new(
+                    "invalid_input",
+                    "--kind filters Wiki pages and cannot be combined with --type source",
+                ));
+            }
+            let mode = match target {
+                SearchTarget::Auto => SearchMode::Auto,
+                SearchTarget::Page => SearchMode::Page,
+                SearchTarget::Source => SearchMode::Source,
+                SearchTarget::All => SearchMode::All,
+            };
+            let granularity = match granularity {
+                SearchGranularityArg::Document => SearchGranularity::Document,
+                SearchGranularityArg::Passage => SearchGranularity::Passage,
+                SearchGranularityArg::Sentence => SearchGranularity::Sentence,
+                SearchGranularityArg::All => SearchGranularity::All,
+            };
+            let grouping = match group_by {
+                SearchGroupArg::Auto if granularity == SearchGranularity::All => {
+                    SearchGrouping::Document
+                }
+                SearchGroupArg::Auto | SearchGroupArg::None => SearchGrouping::None,
+                SearchGroupArg::Document if granularity == SearchGranularity::All => {
+                    SearchGrouping::Document
+                }
+                SearchGroupArg::Document => {
+                    return Err(AppError::new(
+                        "invalid_input",
+                        "--group-by document requires --granularity all",
+                    ));
+                }
+            };
+            let options = SearchOptions {
+                mode,
+                granularity,
+                grouping,
+                kinds,
+                explain,
+            };
+            let paths =
+                resolve_effective_read_store_paths(cli.scope, &cwd, selected_changeset.as_deref())?;
+            let mut stores = if record {
+                paths
+                    .into_iter()
+                    .map(|store_path| Store::open(scope_name(store_path.scope), &store_path.path))
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                paths
+                    .into_iter()
+                    .map(|store_path| {
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            let mut results = Vec::new();
+            for store in &stores {
+                results.extend(store.search_with_options(&query, limit, &options)?.results);
+            }
+            if record {
+                for store in &mut stores {
+                    store.record_search(&query, limit)?;
+                    materialize_wiki_if_live(store, selected_changeset.as_deref())?;
+                }
+            }
+            results.sort_by(|left, right| {
+                search_type_priority(&left.result_type, mode)
+                    .cmp(&search_type_priority(&right.result_type, mode))
+                    .then_with(|| left.rank.total_cmp(&right.rank))
+                    .then_with(|| scope_priority(&left.scope).cmp(&scope_priority(&right.scope)))
+                    .then_with(|| left.result_type.cmp(&right.result_type))
+                    .then_with(|| left.identifier.cmp(&right.identifier))
+            });
+            results.truncate(limit);
+            Ok(json!({"results": results}))
+        }
+        Command::Span { command } => {
+            ensure_scope_supported(cli.scope, false, "span")?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
+            let store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+            match command {
+                SpanCommand::Get { identifier } => {
+                    require_text("identifier", &identifier)?;
+                    to_json(store.span_get(&identifier)?)
+                }
+                SpanCommand::Expand {
+                    identifier,
+                    before,
+                    after,
+                    children,
+                } => {
+                    require_text("identifier", &identifier)?;
+                    if before > 20 || after > 20 {
+                        return Err(AppError::new(
+                            "invalid_limit",
+                            "before and after must not exceed 20",
+                        ));
+                    }
+                    if !(1..=200).contains(&children) {
+                        return Err(AppError::new(
+                            "invalid_limit",
+                            "children must be between 1 and 200",
+                        ));
+                    }
+                    to_json(store.span_expand(&identifier, before, after, children)?)
+                }
+            }
+        }
+        Command::Context { limit } => {
+            validate_limit(limit)?;
+            let paths =
+                resolve_effective_read_store_paths(cli.scope, &cwd, selected_changeset.as_deref())?;
+            let mut stores = Vec::new();
+            for store_path in paths {
+                let store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                stores.push(store.context_store(limit)?);
+            }
+            Ok(json!({"stores": stores}))
+        }
+        Command::Lint {
+            limit,
+            offset,
+            record,
+        } => {
+            ensure_scope_supported(cli.scope, false, "lint")?;
+            validate_limit(limit)?;
+            validate_offset(offset)?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
+            if record {
+                let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                let response = store.lint(limit, offset)?;
+                store.record_lint(response.total)?;
+                materialize_wiki_if_live(&mut store, selected_changeset.as_deref())?;
+                to_json(response)
+            } else {
+                let store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                to_json(store.lint(limit, offset)?)
+            }
+        }
+        Command::Log { limit } => {
+            ensure_scope_supported(cli.scope, false, "log")?;
+            validate_limit(limit)?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
+            let store = Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+            to_json(store.log(limit)?)
+        }
+    }
+}

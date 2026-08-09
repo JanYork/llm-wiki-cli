@@ -36,12 +36,12 @@ test('all release targets map exactly', () => {
 
 test('archive and checksum selection are exact', () => {
   assert.equal(
-    archiveFor('0.11.0', 'linux', 'x64'),
-    'lwc-0.11.0-x86_64-unknown-linux-gnu.tar.gz',
+    archiveFor('0.12.0', 'linux', 'x64'),
+    'lwc-0.12.0-x86_64-unknown-linux-gnu.tar.gz',
   )
   assert.equal(
-    archiveFor('0.11.0', 'win32', 'arm64'),
-    'lwc-0.11.0-aarch64-pc-windows-msvc.zip',
+    archiveFor('0.12.0', 'win32', 'arm64'),
+    'lwc-0.12.0-aarch64-pc-windows-msvc.zip',
   )
   const hash = 'a'.repeat(64)
   assert.equal(checksumFor(`${hash}  wanted.tar.gz\n`, 'wanted.tar.gz'), hash)

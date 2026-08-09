@@ -36,6 +36,15 @@ jobs:
           key: release-quality
           cache-targets: false
 
+      - name: Viewer
+        working-directory: web
+        run: |
+          npm ci
+          npm test
+          npm run typecheck
+          npm run build
+          git diff --exit-code -- dist
+
       - name: Format
         run: cargo fmt --all -- --check
 

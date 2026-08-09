@@ -157,7 +157,7 @@ Skill 与别名路径、全局 Wiki 路径、修改过的 Hook/配置文件、�
 +-----------------------------------------------------------------------+
 | clap command router                                                   |
 | init | schema | purpose | source | page | ingest | search | context   |
-| graph | lint | changeset | maintenance | checkpoint | log             |
+| graph | cg | view | lint | changeset | maintenance | checkpoint | log |
 +-----------------------------------------------------------------------+
                                    |
                                    v
@@ -623,6 +623,41 @@ lwc weight clear page payment-rules --provenance agent-observed
 查询，也不会泛化到 token 不同的改写。原因和操作记录会持久化，因此不要把敏感
 查询复制到 `--reason`。变更必须明确使用 `project` 或 `global`；`--scope all`
 会被拒绝。
+
+## 只读预览与 CodeGraph
+
+`lwc view` 会以前台方式在本机回环地址启动项目预览并打开浏览器。Web
+应用使用 TS + Lit 构建并嵌入二进制，运行时不依赖 CDN 或 Node；服务只
+接受 GET/HEAD。页面、来源、Markdown、知识图以及可选代码图均从当前项目
+只读加载，不会触发迁移、刷新或建图：
+
+```bash
+lwc view
+lwc view --port 4173 --no-open
+```
+
+代码索引只支持项目级，默认不启用。首次显式执行 `lwc cg init` 时，LWC
+会从 GitHub Release 下载锁定版本的 CodeGraph 分支包，校验 SHA-256，
+运行时放在 `.lwc/runtime/codegraph`，索引放在 `.lwc/codegraph`。遥测始终
+关闭，不创建 `.codegraph`，也不使用用户级 CodeGraph 状态。
+
+```bash
+lwc cg status
+lwc cg init                 # 仅下载一次，随后逐个完整文件建立索引
+lwc cg sync
+lwc cg query UserService
+lwc cg node UserService
+lwc cg callers UserService
+lwc cg callees UserService
+lwc cg impact UserService
+lwc cg files
+```
+
+CodeGraph 的查询能力均可通过 `lwc cg` 使用。全局生命周期命令
+（`install`、`uninstall`、`upgrade`、`telemetry`、`daemon`、`serve`）会被
+拒绝，因为运行时由 LWC 管理且必须保持项目边界。首次、增量、全量、更新、
+删除、引用解析和恢复写入都以所属文件为事务：一篇文件完全可用后才处理下一
+篇；当前图保持可读，历史文档版本永不刷新。
 
 ## 维护与投影
 

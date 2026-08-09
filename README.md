@@ -181,7 +181,7 @@ This project adapts those ideas into an agent-first Rust CLI backed by SQLite.
 +-----------------------------------------------------------------------+
 | clap command router                                                   |
 | init | schema | purpose | source | page | ingest | search | context   |
-| graph | lint | changeset | maintenance | checkpoint | log             |
+| graph | cg | view | lint | changeset | maintenance | checkpoint | log |
 +-----------------------------------------------------------------------+
                                    |
                                    v
@@ -690,6 +690,44 @@ fingerprint, not the raw query, and does not transfer to paraphrases with
 different tokens. Reasons and operation records are durable, so never copy a
 sensitive query into `--reason`. Mutations require an explicit `project` or
 `global` scope; `--scope all` is rejected.
+
+## Read-only Viewer and CodeGraph
+
+`lwc view` starts a foreground, loopback-only project inspector and opens the
+browser. It serves one embedded TS + Lit application—no CDN and no Node runtime
+at use time—and exposes GET/HEAD APIs only. Pages, sources, Markdown, the
+knowledge graph, and the optional code graph are read from the current project
+without migration, refresh, or graph construction:
+
+```bash
+lwc view
+lwc view --port 4173 --no-open
+```
+
+Code indexing is project-only and disabled until explicitly initialized. The
+pinned LWC CodeGraph fork is then downloaded from its GitHub Release, verified
+with SHA-256, and kept under `.lwc/runtime/codegraph`; its index lives under
+`.lwc/codegraph`. Telemetry is always off and no `.codegraph` or user-global
+CodeGraph state is used.
+
+```bash
+lwc cg status
+lwc cg init                 # download once, then index one complete file at a time
+lwc cg sync
+lwc cg query UserService
+lwc cg node UserService
+lwc cg callers UserService
+lwc cg callees UserService
+lwc cg impact UserService
+lwc cg files
+```
+
+All CodeGraph query capabilities are forwarded by `lwc cg`. Global lifecycle
+commands (`install`, `uninstall`, `upgrade`, `telemetry`, `daemon`, `serve`) are
+blocked because LWC owns the runtime and enforces the project boundary. Initial,
+incremental, full, update, delete, reference-resolution, and recovery writes
+commit one owner file completely before the next; the current graph remains
+readable and historical document revisions are never refreshed.
 
 ## Maintenance and Projection
 

@@ -1,6 +1,6 @@
 [package]
 name = "lwc"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 description = "Agent-first CLI for building persistent, source-grounded wikis from local documents"
 license = "Apache-2.0"
@@ -12,6 +12,7 @@ categories = ["command-line-utilities", "database"]
 exclude = [".agent/**", ".local-benchmarks/**", ".pi-subagents/**"]
 
 [dependencies]
+axum = "0.8.9"
 clap = { version = "4.6", features = ["derive"] }
 grafeo = { version = "0.5.42", default-features = false, features = ["edge", "wal", "grafeo-file"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
@@ -21,7 +22,7 @@ serde_json = "1.0"
 sha2 = "0.11"
 similar = "=3.1.1"
 surrealdb = { version = "3.2.4", default-features = false, features = ["kv-surrealkv"] }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "signal"] }
 unicode-segmentation = "1.13.3"
 
 [dev-dependencies]

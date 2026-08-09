@@ -3,3 +3,4 @@
 .codegraph/
 .DS_Store
 *.swp
+web/node_modules/

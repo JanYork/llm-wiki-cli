@@ -244,6 +244,68 @@ Disable without deleting sidecars:
 Never copy, edit, compact, or delete live graph sidecars. A failed graph does
 not invalidate canonical pages/sources; ordinary reads remain available.
 
+## Project code intelligence (`lwc cg`)
+
+CodeGraph is separate from the optional Wiki graph engines. Use it only when
+the task needs structural code answers (symbol definitions, callers, callees,
+flow, impact, or file topology). It is project-only, stores everything below
+the active project's `.lwc`, and keeps telemetry disabled.
+
+Start with the non-mutating check:
+
+```bash
+"$LWC" --scope project cg status
+```
+
+If `initialized=false`, explain that CodeGraph provides tree-sitter-derived
+symbol/call/dependency answers that are faster and more precise than repeatedly
+scanning files. Ask once whether the user wants the project code index. Do not
+download or index silently. On consent:
+
+```bash
+"$LWC" --scope project cg init
+```
+
+This downloads the pinned SHA-256-verified runtime into
+`.lwc/runtime/codegraph` and builds `.lwc/codegraph`. Initial indexing, sync,
+full rebuild, deletion, reference resolution, and recovery all commit one owner
+file completely before selecting the next. Current indexed files remain
+queryable while later files run; historical file versions are not refreshed.
+
+Choose the narrowest structural command:
+
+```bash
+"$LWC" cg query <WORDS>
+"$LWC" cg node <SYMBOL_OR_FILE>
+"$LWC" cg callers <SYMBOL>
+"$LWC" cg callees <SYMBOL>
+"$LWC" cg impact <SYMBOL>
+"$LWC" cg files
+"$LWC" cg sync
+```
+
+Use `sync` only after relevant working-tree files changed or status reports
+pending changes. Do not run `index` as a routine freshness check. Never invoke
+global CodeGraph lifecycle commands through another binary; LWC deliberately
+blocks install/uninstall/upgrade/telemetry/daemon/serve so project ownership,
+runtime pinning, and telemetry policy cannot be bypassed.
+
+## Read-only project viewer (`lwc view`)
+
+Use the viewer when the user asks to inspect the Wiki, current sources,
+Markdown, status, knowledge graph, or code graph visually:
+
+```bash
+"$LWC" --scope project view
+"$LWC" --scope project view --port 4173 --no-open
+```
+
+It stays in the foreground, binds only `127.0.0.1`, accepts GET/HEAD only, and
+does not migrate, sync, lint, refresh, or build either graph. Stop it with
+Ctrl-C. Treat its graph limits (1000 nodes, 5000 edges) as visualization bounds,
+not database totals. Never expose it on a public interface or infer write
+acceptance from a rendered page.
+
 ## Maintenance and checkpoints
 
 Maintenance returns Work:

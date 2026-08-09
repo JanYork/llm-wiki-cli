@@ -156,6 +156,8 @@ Choose the minimum operation:
 | Authoritative external document | Run the complete Source -> ingest -> cited page lifecycle. |
 | Two or more dependent mutations, or ingest state plus pages | Use one sparse changeset and validate the draft. |
 | Optional relationship traversal | If disabled, explain the benefits and ask consent; then enable one selected engine and watch Work. |
+| Structural code question | Check `cg status`; if absent, explain benefits and ask consent before `cg init`, then use the narrowest `cg` query. |
+| Visual inspection | Run foreground `view`; it is read-only and must stay loopback-only. |
 
 Read `references/operations-manual.md` completely before an unfamiliar command,
 graph configuration, recovery, checkpoint/restore, multi-source ingest, or
