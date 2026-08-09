@@ -18,6 +18,7 @@ test('both READMEs advertise the npm package and runtime contract', () => {
   for (const readme of ['README.md', 'README.zh-CN.md']) {
     const contents = readFileSync(readme, 'utf8')
     assert.match(contents, /npm-%40i--xor%2Flwc/)
+    assert.match(contents, /alt="Node\.js 22 or newer"/)
     assert.match(contents, /node-%3E%3D22/)
     assert.match(contents, /npm install --global @i-xor\/lwc/)
   }
