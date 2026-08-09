@@ -1,0 +1,29 @@
+{
+  "name": "@i-xor/lwc",
+  "version": "0.11.0",
+  "description": "Persistent, source-grounded wikis for LLM agents",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JanYork/llm-wiki-cli.git"
+  },
+  "homepage": "https://github.com/JanYork/llm-wiki-cli",
+  "bugs": "https://github.com/JanYork/llm-wiki-cli/issues",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "lwc": "bin/lwc.mjs"
+  },
+  "files": [
+    "README.md",
+    "bin/lwc.mjs",
+    "install.mjs"
+  ],
+  "scripts": {
+    "postinstall": "node install.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

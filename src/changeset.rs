@@ -4,7 +4,7 @@ use crate::{
     store::{ChangesetDraftState, ChangesetPublishInput, ChangesetRollbackInput, Store},
 };
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -34,10 +34,8 @@ pub struct ChangesetShowResponse {
     pub staged_operation_count: usize,
     pub action_counts: std::collections::BTreeMap<String, usize>,
     pub operations: Vec<crate::store::OperationRecord>,
-    pub lint_issues: usize,
     pub empty: bool,
     pub conflict: bool,
-    pub committable: bool,
     pub created_at: String,
 }
 
@@ -77,6 +75,8 @@ pub struct ChangesetCommitResponse {
     pub wal_checkpoint_ms: u64,
     pub cleanup_ms: u64,
     pub materialization_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_work: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -248,7 +248,7 @@ pub fn commit(
     let live_reader = Store::open_for_read(scope_name(live.scope), &live.path)?;
     if let Some(committed) = live_reader.changeset_committed_by_id(&state.id)? {
         drop(live_reader);
-        return finish_committed(live, &path, committed, started, 0);
+        return finish_committed(live, &path, committed, started, 0, None);
     }
     let live_identity = live_reader.identity()?;
     let draft = Store::open_for_read(scope_name(live.scope), &path)?;
@@ -290,6 +290,12 @@ pub fn commit(
             format!("changeset has {lint_issues} lint issue(s); repair it before commit"),
         ));
     }
+    let mut graph_documents = draft.changeset_graph_documents()?;
+    for path in draft.changeset_touched_source_paths()? {
+        if let Some(source_id) = live_reader.source_path_head(&path)? {
+            graph_documents.push(("source".to_string(), source_id.to_string()));
+        }
+    }
     drop(draft);
     let mut draft_store = Store::open(scope_name(live.scope), &path)?;
     draft_store.changeset_freeze(
@@ -324,21 +330,23 @@ pub fn commit(
             lint_override_reason: reason.map(str::to_string),
         },
     )?;
-    if let Err(error) = live_store.reconcile_graph_projection() {
-        return Err(AppError::new(
-            "graph_projection_failed",
-            "changeset committed canonically but physical graph projection failed",
-        )
-        .with_details(json!({
-            "canonical_committed": true,
-            "changeset_id": committed.changeset_id,
-            "checkpoint": committed.checkpoint,
-            "cause": error.code,
-            "recovery_command": format!("lwc changeset commit {}", committed.name),
-        })));
-    }
+    let graph_work = live_store
+        .schedule_graph_documents(&graph_documents)
+        .map_err(|error| {
+            AppError::new(
+                "graph_projection_failed",
+                "changeset committed canonically but graph Work could not be queued",
+            )
+            .with_details(json!({
+                "canonical_committed": true,
+                "changeset_id": committed.changeset_id,
+                "checkpoint": committed.checkpoint,
+                "cause": error.code,
+                "recovery_command": format!("lwc changeset commit {}", committed.name),
+            }))
+        })?;
     drop(live_store);
-    finish_committed(live, &path, committed, started, checkpoint_ms)
+    finish_committed(live, &path, committed, started, checkpoint_ms, graph_work)
 }
 
 fn finish_committed(
@@ -347,9 +355,8 @@ fn finish_committed(
     committed: crate::store::ChangesetCommitState,
     started: Instant,
     checkpoint_ms: u64,
+    graph_work: Option<Value>,
 ) -> Result<ChangesetCommitResponse> {
-    let wal_checkpointed = false;
-    let wal_checkpoint_ms = 0;
     let cleanup_started = Instant::now();
     if let Err(error) = remove_draft_files(path) {
         return Err(AppError::new(
@@ -380,6 +387,10 @@ fn finish_committed(
         })));
     }
     let materialization_ms = elapsed_millis(materialization_started);
+    let wal_checkpoint_started = Instant::now();
+    let wal_checkpointed = Store::open(scope_name(live.scope), &live.path)
+        .is_ok_and(|store| store.try_checkpoint_wal());
+    let wal_checkpoint_ms = elapsed_millis(wal_checkpoint_started);
     Ok(ChangesetCommitResponse {
         scope: scope_name(live.scope),
         database: live.path.clone(),
@@ -399,6 +410,7 @@ fn finish_committed(
         wal_checkpoint_ms,
         cleanup_ms,
         materialization_ms,
+        graph_work,
     })
 }
 
@@ -466,8 +478,6 @@ fn finish_rolled_back(
     started: Instant,
     checkpoint_ms: u64,
 ) -> Result<ChangesetRollbackResponse> {
-    let wal_checkpointed = false;
-    let wal_checkpoint_ms = 0;
     let materialization_started = Instant::now();
     let materialized = Store::open(scope_name(live.scope), &live.path)
         .and_then(|store| store.materialize_incremental(true).map(|_| ()));
@@ -484,6 +494,10 @@ fn finish_rolled_back(
         })));
     }
     let materialization_ms = elapsed_millis(materialization_started);
+    let wal_checkpoint_started = Instant::now();
+    let wal_checkpointed = Store::open(scope_name(live.scope), &live.path)
+        .is_ok_and(|store| store.try_checkpoint_wal());
+    let wal_checkpoint_ms = elapsed_millis(wal_checkpoint_started);
     Ok(ChangesetRollbackResponse {
         scope: scope_name(live.scope),
         database: live.path.clone(),
@@ -525,7 +539,6 @@ fn show_path(
     let state = validate_draft_binding(live, name, &path, limit)?;
     let live_identity = Store::open_for_read(scope_name(live.scope), &live.path)?.identity()?;
     let draft = Store::open_for_read(scope_name(live.scope), &path)?;
-    let lint_issues = draft.lint(1, 0)?.total;
     let empty = state.staged_operation_count == 0;
     let sparse = draft
         .changeset_storage_kind()?
@@ -544,10 +557,8 @@ fn show_path(
         staged_operation_count: state.staged_operation_count,
         action_counts: state.action_counts,
         operations: state.operations,
-        lint_issues,
         empty,
         conflict,
-        committable: !empty && !conflict && lint_issues == 0,
         created_at: state.created_at,
     })
 }

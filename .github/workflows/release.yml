@@ -26,6 +26,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-quality
@@ -40,13 +45,16 @@ jobs:
       - name: Full test suite
         run: cargo test --locked --all-targets --all-features
 
+      - name: npm package
+        run: node --test tests/npm_package.mjs
+
       - name: Fallback build and tests
         run: cargo test --locked --all-targets --no-default-features
 
       - name: Release graph benchmark budgets
         run: >-
           cargo test --locked --release --test graph_benchmark
-          graph_benchmark_reports_latency_growth_projection_and_bounds
+          external_graph_rebuild_and_update_are_document_granular
           -- --ignored --nocapture
 
       - name: Package verification
@@ -204,6 +212,11 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
       - name: Validate annotated release notes
         shell: bash
         run: |
@@ -225,3 +238,8 @@ jobs:
             release-assets/*.zip \
             release-assets/SHA256SUMS \
             install.sh
+
+      - name: Smoke npm installer against release assets
+        run: |
+          npm install --global ./npm --prefix "${RUNNER_TEMP}/lwc-npm"
+          "${RUNNER_TEMP}/lwc-npm/bin/lwc" --version

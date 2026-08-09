@@ -14,26 +14,17 @@ Include:
 
 Please wait for a coordinated response before publishing full details.
 
-## Local knowledge and native graph boundary
+## Local knowledge and graph-engine boundary
 
-- SQLite content remains authoritative. GraphQLite databases are disposable
-  sidecar projections and must never be used as the only copy of knowledge.
-- Supported macOS/Linux builds embed a pinned GraphQLite 0.6.0 runtime. At first
-  use LWC writes it only under the owned `.lwc/runtime/` directory, verifies its
-  SHA-256 identity, loads the explicit `sqlite3_graphqlite_init` entry point,
-  and runs the extension self-test. Windows builds exclude the runtime and use
-  rslg. LWC does not load an arbitrary runtime path from configuration or the
-  process environment.
+- SQLite documents, provenance, frozen revisions, and explicit relation facts
+  remain authoritative. Grafeo and embedded SurrealDB stores are disposable
+  sidecar projections and must never be the only copy of knowledge.
 - Existing config, runtime, or sidecar symlinks are rejected. Projection errors
-  are sanitized and must not disclose loader search paths, environment values,
+  are sanitized and must not disclose storage paths, environment values,
   document text, or credentials.
-- A canonical mutation may commit before its rebuildable physical projection.
-  In that case LWC returns `graph_projection_failed`, records stale state, and
-  fails graph reads closed until a writable recovery succeeds. Do not edit the
-  sidecar or `graph_projection_state` manually.
-- Superseded GraphQLite sidecars are retained and listed by `lwc graph status`.
-  LWC intentionally does not delete them automatically; review backup and
-  retention requirements before any manual cleanup.
+- A document mutation may commit before its rebuildable projection Work.
+  Graph reads fail closed when the selected sidecar is unavailable. Do not edit
+  engine sidecars or Work queue files manually.
 - Search and graph reads are local and unrecorded by default. Semantic relation
   reasons are durable content, so do not place secrets, credentials, sensitive
   prompts, or raw chain-of-thought in them.

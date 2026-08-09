@@ -1,4 +1,4 @@
 interface:
   display_name: "LWC Memory"
-  short_description: "Use lwc as durable Agent memory"
-  default_prompt: "Use $using-lwc to recall and preserve durable knowledge for this task."
+  short_description: "Recall and maintain durable Agent memory"
+  default_prompt: "Use $using-lwc to recall relevant context, complete this task, and preserve only verified reusable knowledge."

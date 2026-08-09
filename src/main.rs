@@ -2,8 +2,8 @@ mod artifacts;
 mod changeset;
 mod config;
 mod error;
+mod external_graph;
 pub mod graph;
-pub mod graph_backend;
 mod import;
 mod scope;
 pub mod segment;
@@ -249,14 +249,14 @@ enum Command {
         #[command(subcommand)]
         command: IngestCommand,
     },
-    /// Inspect and update layered graph engine configuration.
+    /// Inspect and update the layered graph engine setting.
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Explore, explain, verify, and maintain the typed canonical knowledge graph.
+    /// Explore, explain, verify, and maintain the selected document graph.
     #[command(
-        long_about = "Explore deterministic document, passage, sentence, term, evidence, co-occurrence, and explicit semantic relationships. Reads are bounded and fail closed while an enabled physical projection is stale.",
+        long_about = "Explore current Page and Source documents, wikilinks, citations, and explicit semantic relationships in the selected Grafeo or SurrealDB graph. Graph storage is disabled by default; enabled rebuilds and updates commit one document before the next.",
         after_help = "Examples:\n  lwc graph explore\n  lwc graph neighbors page:policy --direction outgoing\n  lwc graph path page:implementation page:policy\n  lwc graph impact page:policy\n  lwc graph overview\n  lwc graph status\n  lwc graph verify\n\nSemantic claims are explicit: use `graph relation set/list/retract` with provenance, reason, confidence, and supporting Source IDs."
     )]
     Graph {
@@ -375,7 +375,7 @@ enum ChangesetCommand {
     Begin { name: String },
     /// List isolated drafts for the selected Wiki.
     List,
-    /// Inspect staged operations, lint, and conflict state.
+    /// Inspect staged operation metadata without running lint.
     Show {
         name: String,
         #[arg(long, default_value_t = 20)]
@@ -679,56 +679,17 @@ This prevents completion after merely indexing raw text or writing a detached su
 enum ConfigCommand {
     /// Show effective graph configuration and value origins.
     Show,
-    /// Atomically set one or both graph configuration values.
+    /// Atomically set the graph engine setting.
     Set {
-        #[arg(long, value_enum)]
-        physical: Option<ConfigPhysicalArg>,
-        #[arg(long, value_enum)]
-        engine: Option<ConfigEngineArg>,
+        /// Select disabled, grafeo, surrealdb, or inherit.
+        #[arg(long)]
+        graph: String,
     },
-    /// Restore one or both graph configuration values to inherited defaults.
+    /// Restore the graph engine setting to its inherited default.
     Unset {
         #[arg(long)]
-        physical: bool,
-        #[arg(long)]
-        engine: bool,
+        graph: bool,
     },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ConfigPhysicalArg {
-    Enabled,
-    Disabled,
-    Inherit,
-}
-
-impl From<ConfigPhysicalArg> for config::PhysicalSetting {
-    fn from(value: ConfigPhysicalArg) -> Self {
-        match value {
-            ConfigPhysicalArg::Enabled => Self::Enabled,
-            ConfigPhysicalArg::Disabled => Self::Disabled,
-            ConfigPhysicalArg::Inherit => Self::Inherit,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ConfigEngineArg {
-    Auto,
-    Graphqlite,
-    Rslg,
-    Inherit,
-}
-
-impl From<ConfigEngineArg> for config::EngineSetting {
-    fn from(value: ConfigEngineArg) -> Self {
-        match value {
-            ConfigEngineArg::Auto => Self::Auto,
-            ConfigEngineArg::Graphqlite => Self::Graphqlite,
-            ConfigEngineArg::Rslg => Self::Rslg,
-            ConfigEngineArg::Inherit => Self::Inherit,
-        }
-    }
 }
 
 #[derive(Subcommand)]
@@ -746,7 +707,7 @@ The result exposes each scoring signal so Agents can explain why pages are relat
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// Traverse typed canonical relationships from a node.
+    /// Traverse typed document relationships from a node.
     Explore {
         identifier: Option<String>,
         #[arg(long, default_value_t = 2)]
@@ -791,14 +752,14 @@ The result exposes each scoring signal so Agents can explain why pages are relat
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
-    /// Summarize graph size, types, hubs, and projection freshness.
+    /// Summarize current document and relationship counts and hubs.
     Overview {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
-    /// Report projection freshness, generation history, and bounded diagnostics.
+    /// Report the selected engine and projected document count.
     Status,
-    /// Verify canonical graph invariants, digest, and physical parity.
+    /// Verify current document identities and fingerprints against SQLite.
     Verify,
     /// Persist explicit semantic relationships with provenance.
     Relation {
@@ -1151,8 +1112,7 @@ fn run(cli: Cli) -> Result<Value> {
         };
         for path in paths {
             if work::schema_migration_needed(&path.path)? {
-                changeset::reject_selector(selected_changeset.as_deref(), "schema migration")?;
-                return work::start_schema_migration(&path);
+                Store::open(scope_name(path.scope), &path.path)?;
             }
         }
     }
@@ -1716,33 +1676,31 @@ fn run(cli: Cli) -> Result<Value> {
                 ConfigCommand::Show => {
                     config::response(scope_name(store_path.scope), &store_path.path)
                 }
-                ConfigCommand::Set { physical, engine } => {
-                    if physical.is_none() && engine.is_none() {
-                        return Err(AppError::new(
-                            "invalid_input",
-                            "config set requires --physical and/or --engine",
-                        ));
-                    }
-                    config::update(
-                        &store_path.path,
-                        physical.map(Into::into),
-                        engine.map(Into::into),
-                    )?;
+                ConfigCommand::Set { graph } => {
+                    let setting = config::parse_setting(&graph)?;
+                    config::update(&store_path.path, setting)?;
                     Store::open(scope_name(store_path.scope), &store_path.path)?;
-                    config::response(scope_name(store_path.scope), &store_path.path)
+                    let mut response =
+                        config::response(scope_name(store_path.scope), &store_path.path)?;
+                    if setting != config::GraphSetting::Disabled
+                        && setting != config::GraphSetting::Inherit
+                    {
+                        response["work"] = work::start_graph_projection(
+                            scope_name(store_path.scope),
+                            &store_path.path,
+                        )?["work"]
+                            .clone();
+                    }
+                    Ok(response)
                 }
-                ConfigCommand::Unset { physical, engine } => {
-                    if !physical && !engine {
+                ConfigCommand::Unset { graph } => {
+                    if !graph {
                         return Err(AppError::new(
                             "invalid_input",
-                            "config unset requires --physical and/or --engine",
+                            "config unset requires --graph",
                         ));
                     }
-                    config::update(
-                        &store_path.path,
-                        physical.then_some(config::PhysicalSetting::Inherit),
-                        engine.then_some(config::EngineSetting::Inherit),
-                    )?;
+                    config::update(&store_path.path, config::GraphSetting::Inherit)?;
                     Store::open(scope_name(store_path.scope), &store_path.path)?;
                     config::response(scope_name(store_path.scope), &store_path.path)
                 }

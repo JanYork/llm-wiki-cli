@@ -237,8 +237,9 @@ projection. Existing page/source/search/context/graph/log/lint reads inspect the
 draft when passed `--changeset <NAME>`. `init`, `maintenance`, `checkpoint`, and
 nested changeset commands reject the selector.
 
-`changeset show` reports staged operations, lint, revisions, conflict, and
-readiness. Commit rejects empty drafts and lint issues by default. Use
+`changeset show` reports staged operation metadata without running lint. Run
+draft `lint` explicitly before commit. Commit rejects empty drafts and lint
+issues by default. Use
 `--allow-lint-issues --reason "..."` only for specific reviewed pre-existing
 debt; do not waive new errors. `changeset_conflict` means live changed after
 begin; `changeset_changed` means the draft changed during commit preflight.
@@ -253,10 +254,11 @@ Retry the same commit, or discard after a reported conflict; never stage new
 work into a frozen draft.
 
 A successful commit atomically publishes canonical SQLite, records history,
-creates a pre-commit checkpoint, cleans its owned draft files, rebuilds the live
-projection once, and returns `changeset_id`. `wal_checkpointed=false` means an
-active reader prevented immediate WAL truncation; it does not mean publication
-failed. If cleanup or projection fails after canonical commit, trust the
+creates a pre-commit checkpoint, cleans its owned draft files, and queues only
+the touched current documents for projection. It returns `changeset_id`.
+`wal_checkpointed=false` means an active reader prevented immediate WAL
+truncation; it does not mean publication failed. If cleanup or projection fails
+after canonical commit, trust the
 structured `committed=true`/recovery fields and run the stated repair; never
 reapply the knowledge blindly.
 

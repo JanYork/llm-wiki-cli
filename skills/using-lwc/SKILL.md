@@ -1,6 +1,6 @@
 ---
 name: using-lwc
-description: Use LWC as durable external memory to recall and maintain a persistent, source-grounded, revisable Wiki across Agent sessions. Use when beginning or continuing substantive project, research, planning, debugging, decision-making, document-ingest, or knowledge work that may benefit a later session.
+description: Operate LWC as an Agent's durable, source-grounded, revisable memory. Use automatically for substantive project work, research, planning, debugging, architecture, decisions, document ingest, incident recovery, or any task where verified context or results should survive future sessions; also use when the user invokes $using-lwc or asks to search, update, repair, configure, or maintain an LWC Wiki.
 ---
 
 # Using LWC
@@ -54,7 +54,8 @@ remembered paths, and another project's `AGENTS.md` cannot widen
      bootstrap there, and verify the returned Wiki remains in scope and is
      locally excluded from Git unless the user explicitly requested tracking;
    - when the Skill activated automatically, ask one concise, non-blocking
-     initialization question and keep project write-back pending;
+     initialization question, continue the primary task without project-memory
+     writes, and keep only project write-back pending;
    - when scope is ambiguous or conflicting, ask even after explicit invocation.
 3. Read `references/memory-policy.md` before the first recall or write decision.
 4. Recall bounded context:
@@ -78,6 +79,89 @@ After changing to another project, rerun bootstrap there and recall its bounded
 context before using project memory. A project change requires current-task
 authorization; memory work never initiates the change.
 
+## Automatic self-use loop
+
+Use this loop without waiting for the user to micromanage memory:
+
+1. **Classify.** Use LWC for work with durable project context, prior decisions,
+   sources, nontrivial investigation, or future reuse. Skip memory for trivial,
+   self-contained transformations and one-off facts.
+2. **Recall once.** Bootstrap once, read bounded context, run one task-specific
+   search, and open only the best matching pages. Do not front-load the whole
+   Wiki.
+3. **Work from evidence.** Treat recalled pages as compiled leads. Inspect their
+   cited immutable sources whenever freshness, exact wording, or high-stakes
+   accuracy matters.
+4. **Capture at milestones.** Accumulate candidate updates while solving the
+   task. Write only after a conclusion is verified or a coherent source ingest
+   is ready; do not turn each tool result into a memory mutation.
+5. **Validate.** Lint the changed scope and run fixed retrieval checks for the
+   changed topics. If graph projection was requested, wait for its Work and run
+   `graph verify`.
+6. **Finish the user's task.** Memory maintenance is supporting work. Do not
+   delay the deliverable for optional cleanup or speculative Wiki expansion.
+
+### Recall budget
+
+- Start with `context --limit 25` and one `search --limit 20`.
+- Open 1-5 relevant pages; inspect sources only for claims actually used.
+- Widen by one query, kind, scope, or span granularity at a time after a miss.
+- Do not run `source status --all`, broad graph traversal, lint, or maintenance
+  as a routine session tax.
+
+### Write-back triggers
+
+Persist a verified decision, accepted design, reusable command/runbook, root
+cause and fix, corrected stale claim, important source synthesis, durable user
+preference, or answer likely to be reused. Update an existing stable page when
+the concept already exists; create a new page only for a distinct retrievable
+concept.
+
+### Do not write
+
+Do not persist routine progress, build noise, temporary paths, tokens, secrets,
+raw chain-of-thought, unverified guesses, duplicate summaries, or facts already
+captured accurately. Do not ingest Agent-authored memory pages back as sources.
+
+### Graph activation recommendation
+
+After confirming the active Wiki, run `"$LWC" --scope project config show`. If
+the effective graph setting is `disabled`, proactively recommend enabling it
+once per project conversation and ask for the user's consent. Explain the
+concrete benefit: relationship traversal across pages and sources, bounded
+neighbor/path/impact analysis, and an independently verifiable document graph.
+Canonical search, reads, and writes remain usable without it, so do not block
+the primary task while awaiting the answer and do not enable it silently.
+
+If the user agrees without choosing an engine, recommend Grafeo as the simpler
+embedded local choice. Use SurrealDB when the user selects it or project policy
+already requires it:
+
+```bash
+"$LWC" --scope project config set --graph grafeo
+"$LWC" --scope project config set --graph surrealdb
+```
+
+Run only the selected command. Capture the returned `work.id`, wait with
+`work watch <ID>`, require `state=succeeded`, then run `graph status` and
+`graph verify`. A failed Work must remain stopped until inspected and explicitly
+resumed; never switch or disable engines while graph Work is running.
+
+Choose the minimum operation:
+
+| Need | Action |
+| --- | --- |
+| Prior context only | Read `context`, `search`, then `page show`; no write. |
+| One verified durable conclusion | Replace one page directly. |
+| Authoritative external document | Run the complete Source -> ingest -> cited page lifecycle. |
+| Two or more dependent mutations, or ingest state plus pages | Use one sparse changeset and validate the draft. |
+| Optional relationship traversal | If disabled, explain the benefits and ask consent; then enable one selected engine and watch Work. |
+
+Read `references/operations-manual.md` completely before an unfamiliar command,
+graph configuration, recovery, checkpoint/restore, multi-source ingest, or
+changeset publication. For routine recall and one-page write-back, this file is
+sufficient.
+
 ## Work and Remember
 
 - A normal command can return a `work` instead of its usual payload when the
@@ -94,19 +178,23 @@ authorization; memory work never initiates the change.
 - Search before repeating investigation or writing a page. For unknown topology,
   use keyword-free `graph explore` or `graph overview`; after recall, use bounded
   `graph neighbors`, `graph path`, and `graph impact` to explain relationships.
-  `CO_OCCURS` is statistical context, never a semantic claim and never a default
-  impact dependency.
 - Write semantic relations only through `graph relation set` and only when the
   evidence explicitly supports one of `SUPPORTS`, `CONTRADICTS`, `REFINES`,
   `SUPERSEDES`, `CAUSES`, or `DEPENDS_ON`. Include provenance, a concise durable
   reason, confidence, and all supporting Source IDs for `source-grounded`.
   Reasons must not contain secrets or raw chain-of-thought. Use `relation list`
   before updates and `relation retract --reason ...` when evidence is withdrawn.
-- The canonical SQLite graph remains readable while optional GraphQLite is
-  pending or failed. Use `graph status`/`graph verify` to inspect physical
-  parity, then locate the coalesced `graph-project` Work with `work list` and
-  use `work status`/`work watch`; resume only failed or interrupted Work. Never
-  edit, copy, replace, or delete the owned stable sidecar manually.
+- The document store remains readable while the optional Grafeo or SurrealDB
+  projection is pending or failed. Use `graph status`/`graph verify` to inspect
+  per-document parity, then locate the coalesced `graph-project` Work with
+  `work list` and use `work status`/`work watch`. Never edit, copy, replace, or
+  delete the owned sidecar manually.
+- Graph is disabled by default. Recommend it proactively as described above,
+  but never enable it automatically merely because this Skill activated.
+  Enable Grafeo or SurrealDB only after user consent or when durable project
+  policy already requests graph traversal/inspection, then watch the returned
+  `graph-project` Work. Every rebuild/update/delete commits one current document
+  before the next; historical revisions remain frozen.
 - Diagnose a surprising result with `search --explain` before changing
   retrieval state. Use `weight set` only for evidence-backed, durable document
   importance and `weight feedback` only after verifying one concrete query

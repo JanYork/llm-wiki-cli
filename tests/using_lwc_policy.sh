@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 skill="$repo_root/skills/using-lwc/SKILL.md"
 policy="$repo_root/skills/using-lwc/references/memory-policy.md"
+manual="$repo_root/skills/using-lwc/references/operations-manual.md"
 
 for expected in \
   'source diff <OLD_SOURCE_ID>' \
@@ -16,6 +17,32 @@ for expected in \
   'review candidates'; do
   grep -Fq -- "$expected" "$skill" "$policy" || {
     printf 'missing using-lwc policy contract: %s\n' "$expected" >&2
+    exit 1
+  }
+done
+
+for expected in \
+  'Automatic self-use loop' \
+  'Recall budget' \
+  'Write-back triggers' \
+  'Do not write' \
+  'Graph activation recommendation' \
+  'config show' \
+  'config set --graph grafeo' \
+  'config set --graph surrealdb'; do
+  grep -Fq -- "$expected" "$skill" || {
+    printf 'missing automatic LWC guidance: %s\n' "$expected" >&2
+    exit 1
+  }
+done
+
+for expected in \
+  'Command families' \
+  'Graph engine and document-granular Work' \
+  'Structured failure recovery' \
+  'Safe recipes'; do
+  grep -Fq -- "$expected" "$manual" || {
+    printf 'missing LWC operations manual contract: %s\n' "$expected" >&2
     exit 1
   }
 done
@@ -61,7 +88,7 @@ for document in "$repo_root/README.md" "$repo_root/README.zh-CN.md"; do
     '--allow-lint-issues' \
     'committed=true' \
     'changeset_frozen' \
-    'wal_checkpointed=false' \
+    'wal_checkpointed' \
     'checkpoint' \
     '--scope all'; do
     grep -Fq -- "$expected" "$document" || {

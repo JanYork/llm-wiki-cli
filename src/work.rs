@@ -12,6 +12,7 @@ use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::{
+    collections::BTreeSet,
     env, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -25,11 +26,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const CURRENT_SCHEMA_VERSION: u32 = 11;
+const CURRENT_SCHEMA_VERSION: u32 = 12;
 const RESUME_STALE_AFTER_MS: u128 = 30_000;
 const STATE_REPLACE_RETRIES: usize = 200;
 const STATE_REPLACE_RETRY_DELAY: Duration = Duration::from_millis(5);
 static WORK_COUNTER: AtomicU64 = AtomicU64::new(0);
+const GRAPH_PENDING_FILE: &str = "graph-pending.json";
+const GRAPH_PENDING_LOCK: &str = "graph-pending.lock";
 
 #[derive(Clone, Deserialize, Serialize)]
 struct WorkRequest {
@@ -109,11 +112,7 @@ pub fn schema_migration_needed(database: &Path) -> Result<bool> {
         return Ok(false);
     }
     let version = u32::from_be_bytes(header[60..64].try_into().unwrap());
-    Ok(version == CURRENT_SCHEMA_VERSION - 1)
-}
-
-pub fn start_schema_migration(store: &StorePath) -> Result<Value> {
-    start(store, "schema-migrate")
+    Ok(matches!(version, 10 | 11))
 }
 
 pub fn start_compact(store: &StorePath) -> Result<Value> {
@@ -129,7 +128,163 @@ pub fn start_materialize(store: &StorePath) -> Result<Value> {
 }
 
 pub fn start_graph_projection(scope: &str, database: &Path) -> Result<Value> {
-    start_at(scope, database, "graph-project")
+    let documents = crate::external_graph::projection_keys(scope, database)?;
+    start_graph_documents(scope, database, &documents)
+}
+
+pub fn start_graph_documents(
+    scope: &str,
+    database: &Path,
+    documents: &[(String, String)],
+) -> Result<Value> {
+    let root = work_root(database)?;
+    ensure_root(&root)?;
+    append_graph_pending(&root, documents)?;
+    if let Some(state) = active_state(&root)?
+        && state.kind == "graph-project"
+        && !terminal(&state.state)
+    {
+        return Ok(json!({"work": state}));
+    }
+    if documents.is_empty() {
+        return Ok(json!({"work": null}));
+    }
+    match start_at_with_options(scope, database, "graph-project") {
+        Ok(work) => Ok(work),
+        Err(error) if error.code == "work_busy" => {
+            for _ in 0..=STATE_REPLACE_RETRIES {
+                if let Some(state) = active_state(&root)?
+                    && state.kind == "graph-project"
+                    && !terminal(&state.state)
+                {
+                    return Ok(json!({"work": state}));
+                }
+                thread::sleep(STATE_REPLACE_RETRY_DELAY);
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+struct GraphPendingLock(PathBuf);
+
+impl Drop for GraphPendingLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn lock_graph_pending(root: &Path) -> Result<GraphPendingLock> {
+    let path = root.join(GRAPH_PENDING_LOCK);
+    for attempt in 0..=STATE_REPLACE_RETRIES {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
+            Ok(_) => return Ok(GraphPendingLock(path)),
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    && attempt < STATE_REPLACE_RETRIES =>
+            {
+                thread::sleep(STATE_REPLACE_RETRY_DELAY);
+            }
+            Err(error) => {
+                return Err(AppError::new(
+                    "work_busy",
+                    format!("graph document queue is busy: {error}"),
+                ));
+            }
+        }
+    }
+    unreachable!("graph queue lock loop always returns")
+}
+
+fn append_graph_pending(root: &Path, documents: &[(String, String)]) -> Result<()> {
+    let _lock = lock_graph_pending(root)?;
+    let path = root.join(GRAPH_PENDING_FILE);
+    let mut pending = match fs::metadata(&path) {
+        Ok(_) => read_json::<BTreeSet<(String, String)>>(&path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeSet::new(),
+        Err(error) => return Err(error.into()),
+    };
+    pending.extend(documents.iter().cloned());
+    write_json(&path, &pending)
+}
+
+fn drain_graph_pending(root: &Path) -> Result<Vec<(String, String)>> {
+    let _lock = lock_graph_pending(root)?;
+    let path = root.join(GRAPH_PENDING_FILE);
+    let pending = match fs::metadata(&path) {
+        Ok(_) => read_json::<BTreeSet<(String, String)>>(&path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeSet::new(),
+        Err(error) => return Err(error.into()),
+    };
+    write_json(&path, &BTreeSet::<(String, String)>::new())?;
+    Ok(pending.into_iter().collect())
+}
+
+fn has_graph_pending(root: &Path) -> Result<bool> {
+    let _lock = lock_graph_pending(root)?;
+    let path = root.join(GRAPH_PENDING_FILE);
+    match fs::metadata(&path) {
+        Ok(_) => Ok(!read_json::<BTreeSet<(String, String)>>(&path)?.is_empty()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn run_graph_projection(
+    request: &WorkRequest,
+    root: &Path,
+    progress: &mut dyn FnMut(usize, usize, &str) -> Result<()>,
+) -> Result<Value> {
+    let mut completed = 0;
+    let mut result = json!({"status": "ready", "documents": 0});
+    loop {
+        let documents = drain_graph_pending(root)?;
+        if documents.is_empty() {
+            break;
+        }
+        let base = completed;
+        let mut batch_completed = 0;
+        let batch = crate::external_graph::project_documents(
+            &request.scope,
+            &request.database,
+            Some(&documents),
+            &mut |done, total, phase| {
+                batch_completed = done;
+                progress(base + done, base + total, phase)?;
+                if done > 0
+                    && env::var("LWC_TEST_GRAPH_FAIL_AFTER_DOCUMENTS")
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        == Some(done)
+                    && fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(root.join("graph-test-failure-injected"))
+                        .is_ok()
+                {
+                    return Err(AppError::new(
+                        "graph_test_failure",
+                        "injected graph projection failure",
+                    ));
+                }
+                Ok(())
+            },
+        );
+        result = match batch {
+            Ok(result) => result,
+            Err(error) => {
+                append_graph_pending(root, &documents[batch_completed..])?;
+                return Err(error);
+            }
+        };
+        completed += documents.len();
+    }
+    Ok(result)
 }
 
 fn start(store: &StorePath, kind: &str) -> Result<Value> {
@@ -137,6 +292,10 @@ fn start(store: &StorePath, kind: &str) -> Result<Value> {
 }
 
 fn start_at(scope: &str, database: &Path, kind: &str) -> Result<Value> {
+    start_at_with_options(scope, database, kind)
+}
+
+fn start_at_with_options(scope: &str, database: &Path, kind: &str) -> Result<Value> {
     let root = work_root(database)?;
     ensure_root(&root)?;
     if let Some(state) = active_state(&root)? {
@@ -161,7 +320,10 @@ fn start_at(scope: &str, database: &Path, kind: &str) -> Result<Value> {
     let state = WorkState::queued(&request);
     write_json(&directory.join("request.json"), &request)?;
     write_json(&directory.join("state.json"), &state)?;
-    claim_active(&root, &request.id)?;
+    if let Err(error) = claim_active(&root, &request.id) {
+        let _ = fs::remove_dir_all(&directory);
+        return Err(error);
+    }
 
     if let Err(error) = spawn(&root, &request.id) {
         let mut failed = state.clone();
@@ -278,19 +440,15 @@ pub fn run(root: &Path, id: &str) -> Result<Value> {
                 )
             })?)
         }
-        "graph-project" => {
-            progress(0, 1, "opening")?;
-            let mut store = Store::open(&request.scope, &request.database)?;
-            progress(0, 1, "projecting-graph")?;
-            store.reconcile_graph_projection_now()?;
-            progress(1, 1, "projecting-graph")?;
-            Ok(store.graph_status()?)
-        }
+        "graph-project" => run_graph_projection(&request, root, &mut progress),
         other => Err(AppError::new(
             "work_invalid",
             format!("unsupported work kind: {other}"),
         )),
     })();
+    let continue_graph_projection = result.is_ok()
+        && crate::config::resolve(&request.scope, &request.database)
+            .is_ok_and(|config| config.setting != crate::config::GraphSetting::Disabled);
     let _ = stop_heartbeat.send(());
     let _ = heartbeat.join();
     let mut state = state
@@ -298,8 +456,10 @@ pub fn run(root: &Path, id: &str) -> Result<Value> {
         .map_err(|_| AppError::new("work_invalid", "work state lock poisoned"))?;
     match result {
         Ok(result) => {
-            state.completed = 1;
-            state.total = Some(1);
+            if state.total.is_none() {
+                state.completed = 1;
+                state.total = Some(1);
+            }
             state.percent = Some(100.0);
             state.result = Some(result);
             state.update(
@@ -325,6 +485,12 @@ pub fn run(root: &Path, id: &str) -> Result<Value> {
     state.pid = None;
     write_json(&directory.join("state.json"), &*state)?;
     release_active(root, id)?;
+    if request.kind == "graph-project"
+        && continue_graph_projection
+        && has_graph_pending(root).unwrap_or(false)
+    {
+        let _ = start_at_with_options(&request.scope, &request.database, "graph-project");
+    }
     if request.kind != "graph-project"
         && let Ok(mut store) = Store::open(&request.scope, &request.database)
     {

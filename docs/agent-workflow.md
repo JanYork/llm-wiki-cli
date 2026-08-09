@@ -268,11 +268,10 @@ lwc graph relation set page:implementation DEPENDS_ON page:policy \
   --reason "Source 12 states the dependency" --confidence 0.95
 ```
 
-Never treat `CO_OCCURS` as semantic evidence or include it in impact by default.
-Canonical graph reads remain available while optional GraphQLite is pending or
-failed. Use `graph status`/`graph verify` for physical parity and inspect the
-coalesced `graph-project` Work with `work list/status/watch`; resume a failed or
-interrupted Work. Do not edit or replace the sidecar manually.
+Graph storage is disabled by default. Enable it with `config set --graph grafeo`
+or `config set --graph surrealdb`. Inspect the document-granular
+`graph-project` Work with `work list/status/watch`; resume interrupted Work.
+Do not edit or replace an engine sidecar manually.
 
 The default `--type auto` returns compiled pages first, hides the raw source
 paired with a matching `kind=source` page, and falls back to sources when
@@ -436,8 +435,9 @@ under the same conditions.
 ## Projection contract
 
 - Draft changeset mutations never write a second projection tree.
-- Successful changeset commit and rollback rebuild the live projection once;
-  structured post-commit errors distinguish committed SQLite from repairable
+- Successful changeset commit and rollback incrementally materialize touched
+  Markdown and queue only touched current documents for graph Work; structured
+  post-commit errors distinguish committed SQLite from repairable
   projection/cleanup work.
 - `lwc init`, source/page writes and removals, schema/purpose writes,
   checkpoint restores, and successful ingest completion refresh the Markdown

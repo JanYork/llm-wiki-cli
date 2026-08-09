@@ -6,36 +6,16 @@ ranking and workflow correctness.
 
 It is intentionally ignored in normal test runs.
 
-`tests/graph_benchmark.rs` additionally builds a deterministic generated Wiki
-and reports hierarchy indexing time, graph/node/span/delta counts, database and
-retained-sidecar growth, sentence/passage search, span expansion,
-neighbors/path/impact/overview p95 latency, GraphQLite full projection, and one
-document-replacement projection. Run a release benchmark with:
+`tests/graph_benchmark.rs` builds 100 current documents, then verifies that both
+Grafeo and SurrealDB rebuild progress is document-based and a replacement Work
+contains exactly one document. Run it with:
 
 ```bash
-LWC_GRAPH_BENCH_DOCS=100 LWC_GRAPH_BENCH_SAMPLES=30 \
-  cargo test --release --test graph_benchmark \
-  graph_benchmark_reports_latency_growth_projection_and_bounds \
+cargo test --release --test graph_benchmark \
+  external_graph_rebuild_and_update_are_document_granular \
   -- --ignored --nocapture
 ```
-
-The release-mode assertions enforce the documented latency budgets. The JSON
-records OS, architecture, build mode, corpus size, counts, projection state,
-per-table canonical page usage, and separate canonical/delta/sidecar
-measurements. Generated inputs live only in a temporary directory.
-
-A verified macOS x86_64 v0.10.0 release run on the default
-100-document/30-sample fixture reported 1,168 ms canonical command time for a
-100 KiB replacement, 151 ms asynchronous incremental GraphQLite projection,
-176 ms net overview p95 (all other net query/traversal p95 values below 53 ms),
-and 3.764x canonical storage growth. The fixture explicitly enables the optional
-physical projection; production defaults keep it disabled.
-The write budgets intentionally retain complete reverse-dependent co-occurrence
-updates and exact deltas; the user approved this bounded latency tradeoff because
-its correctness benefit outweighs the former 750/500 ms targets. The compact
-representation otherwise trades only persisted co-occurrence display precision
-(six decimal places); exact position bytes, exact aggregate evidence, rank
-order, locators, and rebuild semantics remain intact.
+Generated inputs and both sidecars live only in a temporary directory.
 
 ## Inputs
 
@@ -83,7 +63,7 @@ internal source id.
 | Compiled retrieval | page-first ranking, paired-source suppression, type/kind filters | `tests/cli.rs` |
 | Ingest quality gate | source + non-source integration, explicit exception | `tests/cli.rs`, `tests/core_parity.rs` |
 | Large sources | Unicode-safe resumable windows | `tests/cli.rs` |
-| Graph | hierarchy, semantic lifecycle, bounded traversal, rslg/GraphQLite parity, p95 budgets | `tests/cli.rs`, `src/graph_backend.rs`, ignored graph benchmark |
+| Graph | external-engine parity, semantic lifecycle, bounded traversal, document Work | `tests/cli.rs`, `src/external_graph.rs`, ignored graph benchmark |
 | Storage | contentless FTS5, migrations, lint, WAL compaction | `tests/storage_regressions.rs`, production tests |
 
 Because the benchmark creates no Wiki pages, default search is a raw-only

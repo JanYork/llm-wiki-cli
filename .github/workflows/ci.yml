@@ -29,6 +29,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
 
@@ -46,6 +51,9 @@ jobs:
 
       - name: Validate release workflow contract
         run: ./tests/release_workflow.sh
+
+      - name: Test npm package
+        run: node --test tests/npm_package.mjs
 
       # Companion Agent Skill checks are local-only; do not add them to repository CI.
 

@@ -5,6 +5,10 @@
 </p>
 
 <p align="center">
+  <a href="https://www.npmjs.com/package/@i-xor/lwc"><img alt="npm: @i-xor/lwc" src="https://img.shields.io/badge/npm-%40i--xor%2Flwc-CB3837?logo=npm"></a>
+  <img alt="Node.js >=22" src="https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs">
+  <img alt="平台：macOS、Linux、Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-666666">
+  <a href="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
 </p>
 
@@ -199,7 +203,6 @@ Span locator 绑定文档指纹和切分器版本。页面正文替换后，旧 
 
 ```bash
 lwc graph explore
-lwc graph explore term:一致性 --depth 2 --edge-type CO_OCCURS
 lwc graph node page:projection-policy
 lwc graph neighbors page:projection-policy --direction outgoing
 lwc graph path page:implementation page:policy --max-depth 6
@@ -222,35 +225,34 @@ lwc graph relation retract page:implementation DEPENDS_ON page:policy \
 
 关系理由是持久内容，不得写入凭证、秘密或原始思维链。
 
-canonical SQLite 图始终可用，也是唯一权威数据。可选物理图默认禁用，因此普通写入
-不会等待第二个图引擎。显式启用后，`auto` 在受支持的 macOS/Linux 目标上选择内置且
-校验过的 GraphQLite，在其他平台使用 rslg；Windows 不嵌入或加载 GraphQLite。配置按
-内置、全局、项目三层解析，项目值可继承：
+SQLite 文档仍是唯一权威数据。图默认禁用；需要图遍历时显式选择一个外部引擎。
+配置按内置、全局、项目三层解析，项目值可继承：
 
 ```bash
 lwc config show
-lwc config set --physical enabled --engine auto
-lwc config set --engine rslg
-lwc config unset --physical --engine
+lwc config set --graph grafeo
+lwc config set --graph surrealdb
+lwc config set --graph disabled
+lwc config unset --graph
 ```
 
-规范 schema 将每个“词×文档”的精确位置只保存一次，采用紧凑 posting blob。
-段/句 `OCCURS_IN` 以及 `CONTAINS`/`NEXT`/`PREVIOUS` 结构边均由 posting 与 span
-locator 确定性派生，因此不牺牲公开图语义，也无需把同一位置和索引重复保存三份。
-共现证据使用按文档压缩 blob 和增量总量；持久化的归一化边权保留六位小数，精确总量
-仍用于重建。
-
-GraphQLite 是可丢弃的校验和 sidecar 投影。canonical 数据先提交；显式启用
-GraphQLite 时，投影会合并到持久化后台 `graph-project` Work。投影 pending 或失败时，
-canonical 图查询仍然可用；`graph status` 和 `graph verify` 独立报告物理一致性。使用
-`work list/status/watch` 查看进度，失败或中断后使用 `work resume`。系统只增量更新一个
-稳定 sidecar，不再按 generation 复制。Changeset 草稿始终使用候选 canonical 表上的
-rslg，不会读取或发布本机投影状态。
+Grafeo 与嵌入式 SurrealDB 使用 `.lwc/` 下可重建的 sidecar。每个
+`graph-project` Work 会先完整提交一篇当前 Source/Page 及其自有链接、引用和显式关系，
+确认可用后才开始下一篇。更新和删除只排入实际触及的文档；重建和恢复也使用相同的
+单文档单元。历史 source 版本保持不可变，永不重新分词或投影。使用
+`work list/status/watch` 查看进度，中断后使用 `work resume`；`graph status` 显示当前
+引擎与文档数，`graph verify` 对照 SQLite 的当前文档键。
 
 ## 安装
 
 大多数用户应直接使用上面的 Agent 配置提示词。下面的手动命令主要用于维护、排障，
 或无法安装配套 Skill 的 Agent 环境。
+
+使用 npm 安装（Node.js 22+）：
+
+```bash
+npm install --global @i-xor/lwc
+```
 
 从 GitHub 安装：
 
@@ -502,9 +504,9 @@ lwc --scope project changeset commit architecture-refresh
 ```
 
 草稿读取能看到同一批已暂存变更，而 live SQLite 与 Markdown 保持不变。草稿从小型
-稀疏 overlay 开始，不复制或 checkpoint 整个 live Wiki。`changeset show` 会报告
-暂存操作、lint、revision、冲突和可提交状态。commit 只校验和应用触达实体，因此无关
-live 写入会保留；同一实体的 fingerprint 冲突会失败，不覆盖任何一方。空草稿和 lint
+稀疏 overlay 开始，不复制或 checkpoint 整个 live Wiki。`changeset show` 只报告
+暂存操作、revision 和可提交状态，不运行 lint。commit 只校验和应用触达实体，因此无关
+live 写入会保留；同一实体的 revision 冲突会失败，不覆盖任何一方。空草稿和 lint
 问题都会阻止提交；没有强制提交或自动合并。只有经过
 审计、且并非本批变更新增的既有债务，才能使用
 `--allow-lint-issues --reason "reviewed pre-existing debt"`。提交后，还要用原先
@@ -646,7 +648,9 @@ checkpoint，再恢复数据库并重建投影。受保护删除使用 `source r
 
 多来源 ingest 或大范围页面替换应优先使用 changeset，而不是手动 checkpoint：
 commit 使用稀疏 inverse patch，在短事务中只发布触达的 canonical 实体，并增量更新
-live Markdown；不会自动复制整库或强制截断 WAL。
+live Markdown；不会自动复制整库。发布后会尝试 WAL truncate；
+`wal_checkpointed=false` 表示活动 reader 阻止了立即截断，不表示 canonical commit
+失败。
 
 需要文件系统级外部备份时，应先停止正在运行的 `lwc` 命令并复制完整 `.lwc/`
 目录；写入进程可能仍在使用 WAL 文件时，不要只复制 `wiki.db`。

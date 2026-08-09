@@ -19,4 +19,21 @@ if grep -Fq -- '--notes-from-tag' "$workflow"; then
   exit 1
 fi
 
+grep -Fq 'node --test tests/npm_package.mjs' "$workflow" || {
+  echo 'release workflow must test the npm package' >&2
+  exit 1
+}
+grep -Fq 'external_graph_rebuild_and_update_are_document_granular' "$workflow" || {
+  echo 'release workflow must run the current graph benchmark' >&2
+  exit 1
+}
+grep -Fq 'Smoke npm installer against release assets' "$workflow" || {
+  echo 'release workflow must smoke the npm installer after asset publication' >&2
+  exit 1
+}
+if grep -Fq 'npm publish' "$workflow"; then
+  echo 'npm publication must remain a local maintainer action' >&2
+  exit 1
+fi
+
 echo 'release workflow contract: PASS'

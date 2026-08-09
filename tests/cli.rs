@@ -89,21 +89,22 @@ fn downgrade_to_v10(database: &Path) {
     let conn = Connection::open(database).unwrap();
     conn.execute_batch(
         "PRAGMA foreign_keys = OFF;
-         DROP TABLE span_fts;
+         DROP TABLE IF EXISTS span_fts;
          DROP TABLE IF EXISTS span_fts_data;
          DROP TABLE IF EXISTS span_fts_idx;
          DROP TABLE IF EXISTS span_fts_content;
          DROP TABLE IF EXISTS span_fts_docsize;
          DROP TABLE IF EXISTS span_fts_config;
-         DROP TABLE graph_deltas;
-         DROP TABLE graph_generations;
-         DROP TABLE graph_projection_state;
-         DROP TABLE term_pair_totals;
-         DROP TABLE term_pair_contributions;
-         DROP TABLE graph_occurrences;
-         DROP TABLE graph_edges;
-         DROP TABLE graph_nodes;
-         DROP TABLE document_index_state;
+         DROP TABLE IF EXISTS graph_deltas;
+         DROP TABLE IF EXISTS graph_generations;
+         DROP TABLE IF EXISTS graph_projection_state;
+         DROP TABLE IF EXISTS term_pair_totals;
+         DROP TABLE IF EXISTS term_pair_contributions;
+         DROP TABLE IF EXISTS graph_occurrences;
+         DROP TABLE IF EXISTS graph_edges;
+         DROP TABLE IF EXISTS graph_nodes;
+         DROP TABLE IF EXISTS document_index_state;
+         DROP TABLE IF EXISTS semantic_relations;
          UPDATE meta SET value = '10' WHERE key = 'format_version';
          PRAGMA user_version = 10;
          PRAGMA foreign_keys = ON;",
@@ -529,7 +530,7 @@ fn changeset_commit_is_atomic_conflict_aware_and_rollback_guarded() {
     let committed = world.ok(&world.project, &["changeset", "commit", "publish"]);
     assert_eq!(committed["status"], "committed");
     assert_eq!(committed["materialized"], true);
-    assert_eq!(committed["wal_checkpointed"], false);
+    assert_eq!(committed["wal_checkpointed"], true);
     for field in [
         "duration_ms",
         "checkpoint_ms",
@@ -569,7 +570,7 @@ fn changeset_commit_is_atomic_conflict_aware_and_rollback_guarded() {
 
     let rolled_back = world.ok(&world.project, &["changeset", "rollback", &changeset_id]);
     assert_eq!(rolled_back["status"], "rolled_back");
-    assert_eq!(rolled_back["wal_checkpointed"], false);
+    assert_eq!(rolled_back["wal_checkpointed"], true);
     assert!(rolled_back["checkpoint"].as_str().is_some());
     for field in [
         "duration_ms",
@@ -1948,6 +1949,18 @@ fn help_documents_the_agent_workflow_and_command_side_effects() {
             vec!["lint", "--help"],
             vec!["--record", "Read-only by default"],
         ),
+        (
+            vec!["graph", "--help"],
+            vec!["Grafeo", "SurrealDB", "one document before the next"],
+        ),
+        (
+            vec!["changeset", "show", "--help"],
+            vec!["without running lint"],
+        ),
+        (
+            vec!["config", "set", "--help"],
+            vec!["disabled, grafeo, surrealdb, or inherit"],
+        ),
     ] {
         let output = world.command(&world.project, &args);
         assert!(
@@ -2762,103 +2775,241 @@ fn graph_config_resolves_layers_and_updates_project_atomically() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
     let defaults = world.ok(&world.project, &["config", "show"]);
-    assert_eq!(defaults["graph"]["physical"], "disabled");
-    assert_eq!(defaults["graph"]["engine"], "auto");
-    assert_eq!(defaults["graph"]["physical_origin"], "built-in");
-    assert_eq!(defaults["graph"]["engine_origin"], "built-in");
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    assert_eq!(defaults["graph"]["resolved_engine"], "graphqlite");
+    assert_eq!(defaults["graph"]["setting"], "disabled");
+    assert_eq!(defaults["graph"]["origin"], "built-in");
 
-    let set = world.ok(
-        &world.project,
-        &[
-            "config",
-            "set",
-            "--physical",
-            "disabled",
-            "--engine",
-            "rslg",
-        ],
-    );
-    assert_eq!(set["graph"]["physical"], "disabled");
-    assert_eq!(set["graph"]["resolved_engine"], "rslg");
-    assert_eq!(set["graph"]["physical_origin"], "project");
-    assert_eq!(set["graph"]["engine_origin"], "project");
+    let set = world.ok(&world.project, &["config", "set", "--graph", "grafeo"]);
+    assert_eq!(set["graph"]["setting"], "grafeo");
+    assert_eq!(set["graph"]["origin"], "project");
 
-    let inherited = world.ok(
-        &world.project,
-        &["config", "unset", "--physical", "--engine"],
-    );
-    assert_eq!(inherited["graph"]["physical"], "disabled");
-    assert_eq!(inherited["graph"]["engine"], "auto");
+    let inherited = world.ok(&world.project, &["config", "unset", "--graph"]);
+    assert_eq!(inherited["graph"]["setting"], "disabled");
+    assert_eq!(inherited["graph"]["origin"], "built-in");
 
     world.ok(&world.project, &["--scope", "global", "init"]);
     world.ok(
         &world.project,
-        &["--scope", "global", "config", "set", "--engine", "rslg"],
+        &["--scope", "global", "config", "set", "--graph", "surrealdb"],
     );
     let layered = world.ok(&world.project, &["config", "show"]);
-    assert_eq!(layered["graph"]["engine"], "rslg");
-    assert_eq!(layered["graph"]["engine_origin"], "global");
-    assert_eq!(layered["graph"]["resolved_engine"], "rslg");
+    assert_eq!(layered["graph"]["setting"], "surrealdb");
+    assert_eq!(layered["graph"]["origin"], "global");
 }
 
 #[test]
-fn physical_projection_is_disabled_by_default() {
+fn graph_is_disabled_by_default_and_removed_engines_are_rejected() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
 
     let config = world.ok(&world.project, &["config", "show"]);
+    assert_eq!(config["graph"]["setting"], "disabled");
+    assert_eq!(config["graph"]["origin"], "built-in");
 
-    assert_eq!(config["graph"]["physical"], "disabled");
-    assert_eq!(config["graph"]["physical_origin"], "built-in");
+    for removed in ["rslg", "graphqlite", "auto"] {
+        let error = world.err(&world.project, &["config", "set", "--graph", removed]);
+        assert_eq!(error["error"]["code"], "invalid_graph_engine");
+    }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn explicit_graphqlite_projection_uses_one_stable_sidecar() {
+fn external_graph_engines_build_current_documents_through_observable_work() {
+    for engine in ["grafeo", "surrealdb"] {
+        let world = TestWorld::new();
+        world.ok(&world.project, &["init"]);
+        put_page(
+            &world,
+            "engine-a",
+            "Engine A",
+            "Current document A links to [[engine-b]].",
+        );
+        put_page(&world, "engine-b", "Engine B", "Current document B.");
+        let configured = world.ok(&world.project, &["config", "set", "--graph", engine]);
+        assert_eq!(configured["graph"]["setting"], engine);
+        let work_id = configured["work"]["id"]
+            .as_str()
+            .expect("enabling an external graph engine must return observable Work");
+        let completed = world.ok(&world.project, &["work", "watch", work_id]);
+        assert_eq!(completed["work"]["state"], "succeeded", "{completed}");
+        assert_eq!(completed["work"]["completed"], 2, "{completed}");
+        assert_eq!(completed["work"]["total"], 2, "{completed}");
+
+        let status = world.ok(&world.project, &["graph", "status"]);
+        assert_eq!(status["engine"], engine, "{status}");
+        assert_eq!(status["status"], "ready", "{status}");
+        assert_eq!(status["documents"], 2, "{status}");
+
+        let update = world.write(
+            &format!("{engine}-update.md"),
+            &format!("Updated current document A through {engine}."),
+        );
+        let updated = world.ok(
+            &world.project,
+            &[
+                "page",
+                "put",
+                "engine-a",
+                "--title",
+                "Engine A",
+                "--file",
+                as_str(&update),
+                "--provenance",
+                "agent-observed",
+            ],
+        );
+        let work_id = updated["graph"]["work"]["id"]
+            .as_str()
+            .expect("one changed document must enqueue observable graph Work");
+        let completed = world.ok(&world.project, &["work", "watch", work_id]);
+        assert_eq!(completed["work"]["state"], "succeeded", "{completed}");
+        assert_eq!(completed["work"]["completed"], 1, "{completed}");
+        assert_eq!(completed["work"]["total"], 1, "{completed}");
+        assert_eq!(
+            world.ok(&world.project, &["graph", "node", "page:engine-a"])["node"]["label"],
+            "Engine A"
+        );
+
+        let removed = world.ok(&world.project, &["page", "remove", "engine-b"]);
+        let work_id = removed["graph_work"]["id"].as_str().unwrap();
+        let completed = world.ok(&world.project, &["work", "watch", work_id]);
+        assert_eq!(completed["work"]["completed"], 1, "{completed}");
+        assert_eq!(completed["work"]["total"], 1, "{completed}");
+        assert_eq!(
+            world.err(&world.project, &["graph", "node", "page:engine-b"])["error"]["code"],
+            "graph_node_not_found"
+        );
+    }
+}
+
+#[test]
+fn external_graph_deletes_removed_pages_and_freezes_superseded_sources() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
+    let source_path = world.write("tracked.md", "first immutable version");
+    let first = world.ok(&world.project, &["source", "add", as_str(&source_path)]);
+    let first_id = first["source"]["id"].as_i64().unwrap().to_string();
+    put_page(&world, "temporary", "Temporary", "Temporary current page.");
+
+    let enabled = world.ok(&world.project, &["config", "set", "--graph", "grafeo"]);
+    let work_id = enabled["work"]["id"].as_str().unwrap();
+    assert_eq!(
+        world.ok(&world.project, &["work", "watch", work_id])["work"]["state"],
+        "succeeded"
+    );
+
+    fs::write(&source_path, "second immutable version").unwrap();
+    let second = world.ok(&world.project, &["source", "add", as_str(&source_path)]);
+    let second_id = second["source"]["id"].as_i64().unwrap().to_string();
+    let work_id = second["graph"]["work"]["id"].as_str().unwrap();
+    assert_eq!(
+        world.ok(&world.project, &["work", "watch", work_id])["work"]["state"],
+        "succeeded"
+    );
+    assert_eq!(
+        world.ok(&world.project, &["source", "show", &first_id])["source"]["content"],
+        "first immutable version"
+    );
+    assert_eq!(
+        world.err(
+            &world.project,
+            &["graph", "node", &format!("source:{first_id}")]
+        )["error"]["code"],
+        "graph_node_not_found"
+    );
+    assert_eq!(
+        world.ok(
+            &world.project,
+            &["graph", "node", &format!("source:{second_id}")]
+        )["node"]["identifier"],
+        format!("source:{second_id}")
+    );
+
+    world.ok(&world.project, &["page", "remove", "temporary"]);
+    let works = world.ok(&world.project, &["work", "list"]);
+    let work_id = works["works"][0]["id"].as_str().unwrap();
+    assert_eq!(
+        world.ok(&world.project, &["work", "watch", work_id])["work"]["state"],
+        "succeeded"
+    );
+    assert_eq!(
+        world.err(&world.project, &["graph", "node", "page:temporary"])["error"]["code"],
+        "graph_node_not_found"
+    );
+}
+
+#[test]
+fn graph_work_resumes_only_uncommitted_documents_after_a_document_failure() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    for slug in ["resume-a", "resume-b", "resume-c"] {
+        put_page(&world, slug, slug, "document-granular projection");
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lwc"))
+        .current_dir(&world.project)
+        .env("HOME", &world.home)
+        .env("LWC_TEST_GRAPH_FAIL_AFTER_DOCUMENTS", "1")
+        .args(["config", "set", "--graph", "grafeo"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let configured: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let first_id = configured["work"]["id"].as_str().unwrap();
+    let first = world.ok(&world.project, &["work", "watch", first_id]);
+    assert_eq!(first["work"]["state"], "failed", "{first}");
+    assert_eq!(first["work"]["completed"], 1, "{first}");
+    assert_eq!(first["work"]["total"], 3, "{first}");
+
+    thread::sleep(Duration::from_millis(100));
+    let works = world.ok(&world.project, &["work", "list"]);
+    assert_eq!(
+        works["works"].as_array().unwrap().len(),
+        1,
+        "failed graph Work must stop until explicitly resumed: {works}"
+    );
+
+    world.ok(&world.project, &["work", "resume", first_id]);
+    let completed = world.ok(&world.project, &["work", "watch", first_id]);
+    assert_eq!(completed["work"]["state"], "succeeded", "{completed}");
+    assert_eq!(completed["work"]["completed"], 2, "{completed}");
+    assert_eq!(completed["work"]["total"], 2, "{completed}");
+    assert_eq!(
+        world.ok(&world.project, &["graph", "status"])["documents"],
+        3
+    );
+}
+
+#[test]
+fn changeset_show_is_metadata_only_and_does_not_run_lint() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(&world.project, &["changeset", "begin", "metadata-only"]);
+    let body = world.write("draft-lint.md", "Real draft link [[missing-target]].");
     world.ok(
         &world.project,
         &[
-            "config",
-            "set",
-            "--physical",
-            "enabled",
-            "--engine",
-            "graphqlite",
+            "--changeset",
+            "metadata-only",
+            "page",
+            "put",
+            "draft-lint",
+            "--title",
+            "Draft lint",
+            "--file",
+            as_str(&body),
+            "--provenance",
+            "agent-observed",
         ],
     );
-    for index in 0..3 {
-        put_page(
-            &world,
-            &format!("stable-sidecar-{index}"),
-            &format!("Stable sidecar {index}"),
-            &format!("generation {index} alpha beta gamma evidence"),
-        );
-    }
-    (0..200)
-        .find(|_| {
-            let fresh =
-                world.ok(&world.project, &["graph", "status"])["projection"]["status"] == "fresh";
-            if !fresh {
-                thread::sleep(Duration::from_millis(25));
-            }
-            fresh
-        })
-        .expect("coalesced GraphQLite projection did not finish");
 
-    let sidecars = fs::read_dir(world.project.join(".lwc"))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with("graph-graphqlite") && name.ends_with(".db"))
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        sidecars.len(),
-        1,
-        "sidecars must not grow by generation: {sidecars:?}"
+    let shown = world.ok(&world.project, &["changeset", "show", "metadata-only"]);
+    assert_eq!(shown["staged_operation_count"], 1);
+    assert!(
+        shown.get("lint_issues").is_none(),
+        "changeset show must not perform or report implicit lint: {shown}"
     );
 }
 
@@ -2904,7 +3055,7 @@ fn graph_config_rejects_symlink_all_scope_and_changeset_mutation() {
     let outside = world.home.join("outside-config.json");
     fs::write(&outside, "sentinel").unwrap();
     std::os::unix::fs::symlink(&outside, world.project.join(".lwc/config.json")).unwrap();
-    let error = world.err(&world.project, &["config", "set", "--engine", "rslg"]);
+    let error = world.err(&world.project, &["config", "set", "--graph", "grafeo"]);
     assert_eq!(error["error"]["code"], "unsafe_config_path");
     assert_eq!(fs::read_to_string(&outside).unwrap(), "sentinel");
 
@@ -2921,162 +3072,39 @@ fn graph_config_rejects_symlink_all_scope_and_changeset_mutation() {
             "config-guard",
             "config",
             "set",
-            "--engine",
-            "rslg",
+            "--graph",
+            "grafeo",
         ],
     );
     assert_eq!(staged["error"]["code"], "changeset_command_not_supported");
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[test]
-fn graphqlite_projection_failure_never_blocks_canonical_reads_and_recovers_async() {
-    let world = TestWorld::new();
-    world.ok(&world.project, &["init"]);
-    world.ok(
-        &world.project,
-        &[
-            "config",
-            "set",
-            "--physical",
-            "enabled",
-            "--engine",
-            "graphqlite",
-        ],
-    );
-    (0..200)
-        .find(|_| {
-            let works = world.ok(&world.project, &["work", "list"]);
-            let idle = works["works"].as_array().is_some_and(|works| {
-                works.iter().all(|work| {
-                    matches!(
-                        work["state"].as_str(),
-                        Some("succeeded" | "failed" | "cancelled")
-                    )
-                })
-            });
-            if !idle {
-                thread::sleep(Duration::from_millis(25));
-            }
-            idle
-        })
-        .expect("initial GraphQLite projection work did not become idle");
-    let body = world.write("projection.md", "Committed projection evidence.");
-    let output = Command::new(env!("CARGO_BIN_EXE_lwc"))
-        .current_dir(&world.project)
-        .env("HOME", &world.home)
-        .env("LWC_TEST_GRAPHQLITE_FAIL_AT", "before")
-        .args([
-            "page",
-            "put",
-            "projection-page",
-            "--title",
-            "Projection page",
-            "--file",
-            as_str(&body),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "canonical page write was blocked by derived projection: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let status = (0..100)
-        .find_map(|_| {
-            let status = world.ok(&world.project, &["graph", "status"]);
-            if status["projection"]["status"] == "stale" {
-                Some(status)
-            } else {
-                thread::sleep(Duration::from_millis(25));
-                None
-            }
-        })
-        .expect("injected background projection failure did not become observable");
-    assert_eq!(status["projection"]["status"], "stale");
-    let canonical = world.ok(
-        &world.project,
-        &["graph", "explore", "page:projection-page"],
-    );
-    assert_eq!(canonical["start"]["identifier"], "page:projection-page");
-
-    world.ok(&world.project, &["config", "set", "--engine", "graphqlite"]);
-    let status = (0..200)
-        .find_map(|_| {
-            let status = world.ok(&world.project, &["graph", "status"]);
-            if status["projection"]["status"] == "fresh" {
-                Some(status)
-            } else {
-                thread::sleep(Duration::from_millis(25));
-                None
-            }
-        })
-        .expect("background projection recovery did not finish");
-    assert_eq!(status["projection"]["status"], "fresh");
-    let page = world.ok(&world.project, &["page", "show", "projection-page"]);
-    assert_eq!(page["page"]["title"], "Projection page");
 }
 
 #[test]
 fn canonical_graph_supports_exploration_paths_relations_impact_and_overview() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
-    put_page(&world, "beta", "Beta", "SharedTerm target knowledge.");
-    put_page(
-        &world,
-        "alpha",
-        "Alpha",
-        "SharedTerm source knowledge. [[beta]]",
+    put_page(&world, "beta", "Beta", "Target knowledge.");
+    put_page(&world, "alpha", "Alpha", "Source knowledge. [[beta]]");
+    let enabled = world.ok(&world.project, &["config", "set", "--graph", "grafeo"]);
+    let work_id = enabled["work"]["id"].as_str().unwrap();
+    assert_eq!(
+        world.ok(&world.project, &["work", "watch", work_id])["work"]["state"],
+        "succeeded"
     );
 
-    let explored = world.ok(
-        &world.project,
-        &[
-            "graph",
-            "explore",
-            "term:sharedterm",
-            "--depth",
-            "2",
-            "--limit",
-            "100",
-        ],
-    );
-    assert_eq!(explored["start"]["identifier"], "term:sharedterm");
-    assert!(explored["nodes"].as_array().unwrap().len() >= 3);
-    let occurrence = explored["edges"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|edge| edge["type"] == "OCCURS_IN")
-        .unwrap();
-    assert!(occurrence["frequency"].as_u64().unwrap() > 0);
-    assert_eq!(
-        occurrence["positions"].as_array().unwrap().len() as u64,
-        occurrence["frequency"].as_u64().unwrap()
-    );
-    assert_eq!(
-        occurrence["positions"][0]["byte_start"],
-        occurrence["first_position"]
-    );
-    world.ok(&world.project, &["config", "set", "--engine", "rslg"]);
-    let rslg_explored = world.ok(
-        &world.project,
-        &[
-            "graph",
-            "explore",
-            "term:sharedterm",
-            "--depth",
-            "2",
-            "--limit",
-            "100",
-        ],
-    );
-    assert_eq!(rslg_explored["nodes"], explored["nodes"]);
-    assert_eq!(rslg_explored["edges"], explored["edges"]);
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    world.ok(&world.project, &["config", "set", "--engine", "graphqlite"]);
     let node = world.ok(&world.project, &["graph", "node", "page:alpha"]);
     assert_eq!(node["node"]["label"], "Alpha");
+    let explored = world.ok(
+        &world.project,
+        &["graph", "explore", "page:alpha", "--direction", "outgoing"],
+    );
+    assert!(
+        explored["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["type"] == "LINKS_TO")
+    );
     let neighbors = world.ok(
         &world.project,
         &[
@@ -3087,29 +3115,13 @@ fn canonical_graph_supports_exploration_paths_relations_impact_and_overview() {
             "outgoing",
         ],
     );
-    assert!(
-        neighbors["edges"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|edge| edge["type"] == "LINKS_TO")
-    );
-    let keyword_free = world.ok(&world.project, &["graph", "explore"]);
-    assert_eq!(keyword_free["keyword_free"], true);
-    assert!(
-        !keyword_free["representatives"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-
+    assert_eq!(neighbors["neighbors"][0]["identifier"], "page:beta");
     let path = world.ok(
         &world.project,
         &["graph", "path", "page:alpha", "page:beta"],
     );
     assert_eq!(path["found"], true);
-    assert_eq!(path["edges"][0]["type"], "LINKS_TO");
-
+    assert_eq!(path["path"], serde_json::json!(["page:alpha", "page:beta"]));
     let relation = world.ok(
         &world.project,
         &[
@@ -3122,70 +3134,47 @@ fn canonical_graph_supports_exploration_paths_relations_impact_and_overview() {
             "--provenance",
             "agent-observed",
             "--reason",
-            "Alpha explicitly supports beta",
+            "verified relation",
             "--confidence",
             "0.9",
         ],
     );
-    assert_eq!(relation["relation"]["type"], "SUPPORTS");
-    assert_eq!(relation["relation"]["provenance"], "agent-observed");
-
+    let work_id = relation["work"]["id"].as_str().unwrap();
+    assert_eq!(
+        world.ok(&world.project, &["work", "watch", work_id])["work"]["state"],
+        "succeeded"
+    );
+    let explored = world.ok(
+        &world.project,
+        &["graph", "explore", "page:alpha", "--direction", "outgoing"],
+    );
+    assert!(
+        explored["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["type"] == "SUPPORTS")
+    );
     let impact = world.ok(&world.project, &["graph", "impact", "page:beta"]);
     assert!(
-        impact["review"]
+        impact["nodes"]
             .as_array()
             .unwrap()
             .iter()
             .any(|node| node["identifier"] == "page:alpha")
     );
-
-    let status = world.ok(&world.project, &["graph", "status"]);
-    assert_eq!(status["projection"]["status"], "disabled");
-    assert_eq!(
-        status["projection"]["canonical_generation"],
-        status["projection"]["projected_generation"]
-    );
-    let verified = world.ok(&world.project, &["graph", "verify"]);
-    assert_eq!(verified["valid"], true, "{verified}");
-
     let overview = world.ok(&world.project, &["graph", "overview"]);
-    assert!(overview["node_counts"]["term"].as_u64().unwrap() > 0);
-    assert!(overview["edge_counts"]["SUPPORTS"].as_u64().unwrap() > 0);
-    assert_eq!(overview["projection"]["status"], "disabled");
-
-    let listed = world.ok(
-        &world.project,
-        &["graph", "relation", "list", "--from", "page:alpha"],
-    );
-    assert_eq!(listed["relations"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        listed["relations"][0]["reason"],
-        "Alpha explicitly supports beta"
-    );
-
-    let retracted = world.ok(
-        &world.project,
-        &[
-            "graph",
-            "relation",
-            "retract",
-            "page:alpha",
-            "SUPPORTS",
-            "page:beta",
-            "--reason",
-            "Evidence was superseded",
-        ],
-    );
-    assert_eq!(retracted["retracted"], true);
-    let listed = world.ok(&world.project, &["graph", "relation", "list"]);
-    assert!(listed["relations"].as_array().unwrap().is_empty());
+    assert_eq!(overview["documents"], 2);
+    assert_eq!(overview["edges"], 2);
+    let verified = world.ok(&world.project, &["graph", "verify"]);
+    assert_eq!(verified["ok"], true, "{verified}");
 }
 
 #[test]
 fn semantic_relation_lifecycle_validates_all_types_provenance_sources_and_retraction() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
-    world.ok(&world.project, &["config", "set", "--engine", "rslg"]);
+    world.ok(&world.project, &["config", "set", "--graph", "grafeo"]);
     let source = world.write("relation-source.md", "Semantic relation evidence.");
     let added = world.ok(&world.project, &["source", "add", as_str(&source)]);
     let source_id = added["source"]["id"].as_i64().unwrap().to_string();
@@ -3310,7 +3299,7 @@ fn semantic_relation_lifecycle_validates_all_types_provenance_sources_and_retrac
 }
 
 #[test]
-fn document_removal_synchronously_removes_hierarchy_and_preserves_stale_span_diagnostics() {
+fn document_removal_preserves_stale_span_diagnostics_when_graph_is_disabled() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
     put_page(
@@ -3344,7 +3333,7 @@ fn document_removal_synchronously_removes_hierarchy_and_preserves_stale_span_dia
         &world.project,
         &["graph", "explore", "page:temporary-graph-page"],
     );
-    assert_eq!(missing["error"]["code"], "graph_node_not_found");
+    assert_eq!(missing["error"]["code"], "graph_disabled");
 }
 
 #[test]
@@ -3826,13 +3815,13 @@ fn read_commands_transparently_migrate_a_writable_v5_store() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 11,
+        version, 12,
         "context should migrate a writable legacy store"
     );
 }
 
 #[test]
-fn v10_commands_return_schema_migration_work_without_blocking_inline() {
+fn v10_commands_migrate_inline_without_building_a_graph() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
     put_page(
@@ -3859,52 +3848,31 @@ fn v10_commands_return_schema_migration_work_without_blocking_inline() {
         String::from_utf8_lossy(&output.stderr)
     );
     let response = stdout_json(&output);
-    assert_eq!(response["work"]["kind"], "schema-migrate");
-    assert!(
-        matches!(
-            response["work"]["state"].as_str(),
-            Some("queued" | "running")
-        ),
-        "unexpected Work response: {response}"
-    );
-    let work_id = response["work"]["id"].as_str().unwrap();
-    assert_eq!(work_id.len(), 64);
-    assert!(work_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(response["stores"][0]["scope"], "project", "{response}");
     assert!(
         elapsed < Duration::from_secs(2),
-        "foreground migration preflight waited {} ms on five seconds of background work",
+        "document-only migration took {} ms",
         elapsed.as_millis()
     );
-
-    let watched = world.ok(&world.project, &["work", "watch", work_id]);
-    assert_eq!(watched["work"]["state"], "succeeded", "{watched}");
-    assert_eq!(watched["work"]["percent"], 100.0);
-    let status = world.ok(&world.project, &["work", "status", work_id]);
-    assert_eq!(status["work"]["id"], work_id);
-    let works = world.ok(&world.project, &["work", "list"]);
-    assert!(
-        works["works"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|work| work["id"] == work_id)
-    );
-    let resume_error = world.err(&world.project, &["work", "resume", work_id]);
-    assert_eq!(resume_error["error"]["code"], "work_not_resumable");
-    world.ok(&world.project, &["context", "--limit", "5"]);
-    let verified = world.ok(&world.project, &["graph", "verify"]);
-    assert_eq!(verified["valid"], true, "{verified}");
     let migrated = Connection::open(database).unwrap();
     assert_eq!(
         migrated
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        11
+        12
     );
+    let old_graph_tables: i64 = migrated
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name GLOB 'graph_*'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_graph_tables, 0);
 }
 
 #[test]
-fn shadow_schema_migration_never_holds_the_live_wiki_writer_lock() {
+fn removed_graph_migration_leaves_the_live_writer_available() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
     put_page(
@@ -3919,39 +3887,14 @@ fn shadow_schema_migration_never_holds_the_live_wiki_writer_lock() {
     let output = Command::new(env!("CARGO_BIN_EXE_lwc"))
         .current_dir(&world.project)
         .env("HOME", &world.home)
-        .env("LWC_TEST_MIGRATION_DELAY_MS", "5000")
-        .env("LWC_TEST_MIGRATION_READY", "1")
         .args(["context", "--limit", "5"])
         .output()
         .unwrap();
     assert!(output.status.success());
-    let queued = stdout_json(&output);
-    let id = queued["work"]["id"].as_str().unwrap();
-    let state_path = world.project.join(".lwc/work").join(id).join("state.json");
-    let indexing_ready = state_path
-        .parent()
-        .unwrap()
-        .join("migration-indexing-ready");
-    (0..3_000)
-        .find(|_| {
-            let ready = indexing_ready.exists();
-            if !ready {
-                thread::sleep(Duration::from_millis(10));
-            }
-            ready
-        })
-        .unwrap_or_else(|| {
-            let state = fs::read_to_string(&state_path).unwrap_or_else(|error| error.to_string());
-            panic!("shadow migration did not enter its delayed indexing phase: {state}")
-        });
-
     let live = Connection::open(&database).unwrap();
     live.busy_timeout(Duration::from_millis(100)).unwrap();
     live.execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
-        .expect("shadow graph construction must not lock the live Wiki writer");
-    drop(live);
-    let watched = world.ok(&world.project, &["work", "watch", id]);
-    assert_eq!(watched["work"]["state"], "succeeded", "{watched}");
+        .expect("removed graph migration must not lock the live Wiki writer");
 }
 
 #[test]
@@ -4005,7 +3948,7 @@ fn read_commands_migrate_v6_store_to_structured_provenance() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     conn.prepare("SELECT page_slug, provenance FROM page_provenance LIMIT 0")
         .unwrap();
 }
@@ -4043,7 +3986,7 @@ fn read_commands_migrate_v7_without_guessing_source_path_history() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     assert_eq!(tracked, 0, "migration must not guess a legacy path head");
 
     let source_id = added["source"]["id"].as_i64().unwrap().to_string();
@@ -4090,7 +4033,7 @@ fn read_commands_atomically_migrate_a_v8_store_to_weighted_retrieval() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     conn.prepare("SELECT path_terms FROM search_fts LIMIT 0")
         .unwrap();
     conn.prepare("SELECT weight FROM retrieval_weights LIMIT 0")
@@ -4189,7 +4132,7 @@ fn read_commands_atomically_migrate_a_v9_store_to_changeset_metadata() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     for key in ["store_id", "store_revision"] {
         let value: String = conn
             .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {

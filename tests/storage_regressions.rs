@@ -123,7 +123,7 @@ fn new_store_uses_contentless_search_fts_and_keeps_identifiers_readable() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     for table in ["retrieval_weights", "retrieval_feedback", "changesets"] {
         let exists: i64 = conn
             .query_row(
@@ -170,6 +170,64 @@ fn new_store_uses_contentless_search_fts_and_keeps_identifiers_readable() {
     assert!(
         rows.contains(&("source".to_string(), source_id)),
         "source identifier should stay readable from search_fts: {rows:?}"
+    );
+}
+
+#[test]
+fn graph_disabled_store_has_no_custom_graph_schema_or_sidecar() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+    let page = world.write(
+        "wide.md",
+        "# 宽表\n\n| 字段 | 内容 |\n| --- | --- |\n| 名称 | 一二三四五六七八九十 |\n",
+    );
+    world.ok(&[
+        "page",
+        "put",
+        "wide",
+        "--title",
+        "宽表",
+        "--file",
+        as_str(&page),
+        "--provenance",
+        "agent-observed",
+    ]);
+
+    let conn = Connection::open(&database).unwrap();
+    for table in [
+        "graph_nodes",
+        "graph_edges",
+        "graph_occurrences",
+        "term_pair_contributions",
+        "term_pair_totals",
+        "graph_generations",
+        "graph_deltas",
+        "graph_projection_state",
+        "document_index_state",
+    ] {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists, 0,
+            "removed custom graph table still exists: {table}"
+        );
+    }
+
+    let sidecars = fs::read_dir(database.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("graph-"))
+        .collect::<Vec<_>>();
+    assert!(
+        sidecars.is_empty(),
+        "graph-disabled write created sidecars: {sidecars:?}"
     );
 }
 

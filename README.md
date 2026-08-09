@@ -5,6 +5,10 @@
 </p>
 
 <p align="center">
+  <a href="https://www.npmjs.com/package/@i-xor/lwc"><img alt="npm: @i-xor/lwc" src="https://img.shields.io/badge/npm-%40i--xor%2Flwc-CB3837?logo=npm"></a>
+  <img alt="Node.js >=22" src="https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs">
+  <img alt="Platform: macOS, Linux, Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-666666">
+  <a href="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
 </p>
 
@@ -206,9 +210,9 @@ before the read proceeds.
 
 ## Hierarchical Recall and Knowledge Graph
 
-Every current Source and Wiki page is deterministically indexed as passages,
-sentences, and normalized terms. SQLite remains authoritative; span FTS and the
-typed canonical graph are rebuilt indexes. Existing search stays document-only
+Every current Source and Wiki page is deterministically indexed as passages and
+sentences. SQLite remains authoritative; span FTS and an optional external
+document graph are rebuilt indexes. Existing search stays document-only
 unless a granularity is requested:
 
 ```bash
@@ -227,7 +231,6 @@ Use the bounded, typed graph API for exploration without requiring keywords:
 
 ```bash
 lwc graph explore                         # representative macro view
-lwc graph explore term:consistency --depth 2 --edge-type CO_OCCURS
 lwc graph node page:projection-policy
 lwc graph neighbors page:projection-policy --direction outgoing
 lwc graph path page:implementation page:policy --max-depth 6
@@ -252,45 +255,39 @@ lwc graph relation retract page:implementation DEPENDS_ON page:policy \
 Relation reasons are durable content: never put credentials, secrets, or raw
 chain-of-thought in them.
 
-The canonical SQLite graph is always available and is the only authority. The
-optional physical graph is disabled by default so a normal mutation never waits
-for a second graph engine. When explicitly enabled, `auto` selects the pinned
-embedded GraphQLite runtime on supported macOS/Linux targets and rslg elsewhere.
-Windows uses rslg and does not embed or load GraphQLite. Configuration is
-layered from built-in defaults through global and project files; project values
-can inherit:
+SQLite documents remain authoritative. Graph storage is disabled by default;
+enable exactly one external engine when traversal is needed. Configuration is
+layered from built-in defaults through global and project files:
 
 ```bash
 lwc config show
-lwc config set --physical enabled --engine auto
-lwc config set --engine rslg
-lwc config unset --physical --engine
+lwc config set --graph grafeo
+lwc config set --graph surrealdb
+lwc config set --graph disabled
+lwc config unset --graph
 ```
 
-The canonical schema stores exact term positions once per term/document in a
-compact posting blob. Passage/sentence `OCCURS_IN` edges and structural
-`CONTAINS`/`NEXT`/`PREVIOUS` edges are derived deterministically from those
-postings and span locators, so public graph behavior stays exact without
-triplicating row/index storage. Co-occurrence evidence is stored in compact
-per-document blobs plus incremental totals; normalized edge weights are
-persisted to six decimal places while exact totals remain available for
-rebuilds.
-
-GraphQLite is a disposable, checksummed sidecar projection. Canonical mutations
-commit first and, when GraphQLite is enabled, coalesce projection into a durable
-background `graph-project` Work. Canonical graph reads remain available while
-that projection is pending or failed; `graph status` and `graph verify` report
-physical parity independently. Use `work list`, `work status`, or `work watch`
-to inspect progress and use `work resume` for a failed or interrupted Work. One
-stable sidecar is updated incrementally rather than cloned per generation.
-Draft changesets always query their candidate canonical graph with rslg and
-never import deployment-local projection state.
+Grafeo and embedded SurrealDB use disposable sidecars under `.lwc/`. Each
+`graph-project` Work commits one current Source/Page and its owned links,
+citations, and explicit relations before starting the next document. Updates
+and deletions enqueue only touched documents; rebuild and resume use the same
+document units. Historical source revisions remain immutable and are never
+re-tokenized or projected. Use `work list`, `work status`, or `work watch` to
+observe progress and `work resume` after interruption. `graph status` reports
+the selected engine and projected document count; `graph verify` compares its
+current document keys with SQLite.
 
 ## Installation
 
 Most users should use the Agent setup prompt above. The manual commands below
 are for maintainers, debugging, or Agent environments that cannot install the
 companion Skill.
+
+Install with npm (Node.js 22+):
+
+```bash
+npm install --global @i-xor/lwc
+```
 
 Install from GitHub:
 
@@ -562,9 +559,9 @@ lwc --scope project changeset commit architecture-refresh
 
 Draft reads see staged writes, while live SQLite and Markdown stay unchanged.
 The draft database starts as a small sparse overlay; it does not copy or
-checkpoint the live Wiki. `changeset show` reports staged operations, lint,
-revisions, conflicts, and readiness. Commit validates and applies only touched
-entities, so unrelated live writes survive; a same-entity fingerprint conflict
+checkpoint the live Wiki. `changeset show` reports staged operations, revisions,
+and readiness without running lint. Commit validates and applies only
+touched entities, so unrelated live writes survive; a same-entity revision conflict
 fails without overwriting either side. Commit rejects empty drafts and lint
 issues; there is no force or automatic merge. Use
 `--allow-lint-issues --reason "reviewed pre-existing debt"` only for audited
@@ -724,8 +721,9 @@ current.
 For a multi-source ingest or broad page replacement, prefer a changeset over a
 manual checkpoint: successful commit writes a sparse inverse patch, publishes
 only touched canonical entities in one transaction, and incrementally
-materializes changed Markdown. `wal_checkpointed=false` is normal in v0.10.0:
-commit does not force a store-wide WAL truncate.
+materializes changed Markdown. Commit attempts a WAL truncate after publication;
+`wal_checkpointed=false` means an active reader prevented it and does not mean
+the canonical commit failed.
 
 For an external filesystem backup, stop active `lwc` commands and copy the
 complete `.lwc/` directory. Do not copy only `wiki.db` while a writer may still
