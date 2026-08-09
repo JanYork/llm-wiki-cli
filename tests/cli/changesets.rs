@@ -793,6 +793,7 @@ fn changeset_reports_a_rolled_back_materialization_failure_and_retry_repairs_it(
             .contains("rollback-projection-first")
     );
 }
+#[cfg(unix)]
 #[test]
 fn changeset_reports_committed_cleanup_failure_and_retry_only_finishes_cleanup() {
     use std::os::unix::fs::PermissionsExt;
