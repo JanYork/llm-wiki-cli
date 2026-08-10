@@ -1020,6 +1020,84 @@ fn trans_config_rejects_invalid_timeout_from_disk_for_show_and_update() {
 }
 
 #[test]
+fn trans_config_rejects_secret_args_before_write_and_allows_endpoints() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let config_path = world.project.join(".lwc/config.json");
+
+    let allowed = world.ok(
+        &world.project,
+        &[
+            "config",
+            "set",
+            "--trans",
+            "markitdown",
+            "--trans-arg",
+            "--use-cu",
+            "--trans-arg",
+            "--cu-endpoint",
+            "--trans-arg",
+            "https://example.invalid/cu",
+        ],
+    );
+    assert_eq!(allowed["trans"]["setting"], "markitdown");
+    let stored = fs::read_to_string(&config_path).unwrap();
+    assert!(stored.contains("https://example.invalid/cu"));
+
+    fs::remove_file(&config_path).unwrap();
+    let secret = "sk-proj-123456789012345678901234";
+    let error = world.err(
+        &world.project,
+        &[
+            "config",
+            "set",
+            "--trans",
+            "markitdown",
+            "--trans-arg",
+            "--api-key",
+            "--trans-arg",
+            secret,
+        ],
+    );
+    assert_eq!(error["error"]["code"], "possible_secret_detected");
+    assert!(!config_path.exists());
+}
+
+#[test]
+fn trans_config_rejects_secret_args_from_disk_for_show_and_update() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let config_path = world.project.join(".lwc/config.json");
+    let secret = "sk-proj-123456789012345678901234";
+
+    fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 3,
+            "graph": {
+                "setting": "inherit"
+            },
+            "trans": {
+                "setting": "markitdown",
+                "timeout_seconds": 120,
+                "anydoc_args": [],
+                "markitdown_args": ["--api-key", secret]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let before = fs::read_to_string(&config_path).unwrap();
+
+    let show = world.err(&world.project, &["config", "show"]);
+    assert_eq!(show["error"]["code"], "invalid_config");
+
+    let update = world.err(&world.project, &["config", "set", "--graph", "disabled"]);
+    assert_eq!(update["error"]["code"], "invalid_config");
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
+}
+
+#[test]
 fn external_graph_engines_build_current_documents_through_observable_work() {
     for engine in ["grafeo", "surrealdb"] {
         let world = TestWorld::new();

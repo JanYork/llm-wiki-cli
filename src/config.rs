@@ -175,7 +175,19 @@ fn validate_trans_settings(trans: &TransSettings) -> Result<()> {
                 "invalid_config",
                 format!("invalid trans timeout_seconds: {}", error.message),
             )
-        })
+        })?;
+    validate_trans_args_for_config(&trans.anydoc_args).map_err(|error| {
+        AppError::new(
+            "invalid_config",
+            format!("invalid anydoc_args: {}", error.message),
+        )
+    })?;
+    validate_trans_args_for_config(&trans.markitdown_args).map_err(|error| {
+        AppError::new(
+            "invalid_config",
+            format!("invalid markitdown_args: {}", error.message),
+        )
+    })
 }
 
 fn validate_config_file(config: ConfigFile) -> Result<ConfigFile> {
@@ -321,8 +333,14 @@ pub fn build_trans_settings(
                 ));
             }
         }
-        TransSetting::Anydoc => trans.anydoc_args = args,
-        TransSetting::Markitdown => trans.markitdown_args = args,
+        TransSetting::Anydoc => {
+            validate_trans_args_for_write(&args)?;
+            trans.anydoc_args = args;
+        }
+        TransSetting::Markitdown => {
+            validate_trans_args_for_write(&args)?;
+            trans.markitdown_args = args;
+        }
         TransSetting::Inherit => {}
     }
     Ok(trans)
@@ -390,6 +408,59 @@ fn unique_suffix() -> String {
         .unwrap_or_default()
         .as_nanos()
         .to_string()
+}
+
+fn validate_trans_args_for_write(args: &[String]) -> Result<()> {
+    if let Some(message) = detect_secret_arg_problem(args) {
+        return Err(AppError::new("possible_secret_detected", message));
+    }
+    Ok(())
+}
+
+fn validate_trans_args_for_config(args: &[String]) -> Result<()> {
+    if let Some(message) = detect_secret_arg_problem(args) {
+        return Err(AppError::new("possible_secret_detected", message));
+    }
+    Ok(())
+}
+
+fn detect_secret_arg_problem(args: &[String]) -> Option<String> {
+    for (index, arg) in args.iter().enumerate() {
+        if let Some((flag, _value)) = arg.split_once('=')
+            && is_explicit_credential_flag(flag)
+        {
+            return Some(format!(
+                "trans args contain explicit credential flag {flag} with an inline value"
+            ));
+        }
+        if is_explicit_credential_flag(arg) {
+            return Some(format!("trans args contain explicit credential flag {arg}"));
+        }
+        let reasons =
+            crate::secret_scan::detect_possible_secret_reasons(Path::new("trans-arg.txt"), arg);
+        if !reasons.is_empty() {
+            return Some(format!(
+                "trans arg at position {} looks sensitive: {}",
+                index + 1,
+                reasons.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+fn is_explicit_credential_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--api-key"
+            | "--apikey"
+            | "--token"
+            | "--access-token"
+            | "--secret"
+            | "--client-secret"
+            | "--password"
+            | "--subscription-key"
+    )
 }
 
 pub fn response(scope: &str, database: &Path) -> Result<Value> {

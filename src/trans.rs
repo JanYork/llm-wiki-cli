@@ -4,19 +4,84 @@ use crate::scope::{Scope, StorePath};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
 use std::{
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_TRANS_BYTES: u64 = 64 * 1024 * 1024;
-const STDERR_PREVIEW_BYTES: usize = 8192;
+const STDERR_PREVIEW_BYTES: u64 = 8192;
+const ESRCH: i32 = 3;
+
+struct OptionSpec {
+    names: &'static [&'static str],
+    takes_value: bool,
+}
+
+const ANYDOC_OPTIONS: &[OptionSpec] = &[OptionSpec {
+    names: &["--format"],
+    takes_value: true,
+}];
+
+const MARKITDOWN_OPTIONS: &[OptionSpec] = &[
+    OptionSpec {
+        names: &["-v", "--version"],
+        takes_value: false,
+    },
+    OptionSpec {
+        names: &["-x", "--extension"],
+        takes_value: true,
+    },
+    OptionSpec {
+        names: &["-m", "--mime-type"],
+        takes_value: true,
+    },
+    OptionSpec {
+        names: &["-c", "--charset"],
+        takes_value: true,
+    },
+    OptionSpec {
+        names: &["-d", "--use-docintel"],
+        takes_value: false,
+    },
+    OptionSpec {
+        names: &["--use-cu", "--use-content-understanding"],
+        takes_value: false,
+    },
+    OptionSpec {
+        names: &["-e", "--endpoint"],
+        takes_value: true,
+    },
+    OptionSpec {
+        names: &["--cu-endpoint"],
+        takes_value: true,
+    },
+    OptionSpec {
+        names: &["--cu-analyzer"],
+        takes_value: true,
+    },
+    OptionSpec {
+        names: &["--cu-file-types"],
+        takes_value: true,
+    },
+    OptionSpec {
+        names: &["-p", "--use-plugins"],
+        takes_value: false,
+    },
+    OptionSpec {
+        names: &["--list-plugins"],
+        takes_value: false,
+    },
+    OptionSpec {
+        names: &["--keep-data-uris"],
+        takes_value: false,
+    },
+];
 
 pub fn run(
     store_path: &StorePath,
@@ -30,13 +95,16 @@ pub fn run(
     let adapter_args = validate_adapter_args(engine, args_for_engine(&effective))?;
     let input_path = validate_input_path(store_path, input, allow_external_source)?;
     let output_path = validate_output_path(cwd, output, &input_path)?;
-    let temp_output = TempOutput::create(output_path.parent().expect("validated parent exists"))?;
+    let work_root = trans_work_root(&store_path.path)?;
+    let temp_output = TempArtifact::create(&work_root, "output", "tmp")?;
+    let temp_stderr = TempArtifact::create(&work_root, "stderr", "log")?;
 
     let result = run_engine(
         engine,
         &adapter_args,
         &input_path,
         temp_output.path(),
+        temp_stderr.path(),
         effective.timeout_seconds,
     );
     temp_output.finish(result)?;
@@ -166,18 +234,37 @@ fn validate_output_path(cwd: &Path, output: &Path, input: &Path) -> Result<PathB
 }
 
 fn validate_adapter_args(engine: &str, args: &[String]) -> Result<Vec<String>> {
+    let specs = option_specs(engine);
     let mut validated = Vec::with_capacity(args.len());
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
-        if arg == "--" || is_output_flag(arg) {
+        if arg == "--" {
             return Err(AppError::new(
                 "trans_unsafe_args",
-                format!("trans adapter arg is not allowed: {arg}"),
+                "trans adapter args must not inject a positional separator",
             ));
         }
-        if let Some(value) = arg.strip_prefix("--format=") {
-            if engine != "anydoc" || value.is_empty() {
+        if !arg.starts_with('-') {
+            return Err(AppError::new(
+                "trans_unsafe_args",
+                format!("trans adapter args must not add extra inputs: {arg}"),
+            ));
+        }
+        if let Some((name, value)) = split_inline_value(arg) {
+            if is_output_flag(name) {
+                return Err(AppError::new(
+                    "trans_unsafe_args",
+                    format!("trans adapter arg is not allowed: {arg}"),
+                ));
+            }
+            let spec = lookup_option(specs, name).ok_or_else(|| {
+                AppError::new(
+                    "trans_unsafe_args",
+                    format!("unsupported trans adapter arg for {engine}: {name}"),
+                )
+            })?;
+            if !spec.takes_value || value.is_empty() {
                 return Err(AppError::new(
                     "trans_unsafe_args",
                     format!("unsupported trans adapter arg for {engine}: {arg}"),
@@ -187,44 +274,64 @@ fn validate_adapter_args(engine: &str, args: &[String]) -> Result<Vec<String>> {
             index += 1;
             continue;
         }
-        match (engine, arg.as_str()) {
-            ("anydoc", "--format") => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    AppError::new("trans_unsafe_args", "anydoc --format requires a value")
-                })?;
-                if value.starts_with('-') {
-                    return Err(AppError::new(
-                        "trans_unsafe_args",
-                        "anydoc --format value must be literal text",
-                    ));
-                }
-                validated.push(arg.clone());
-                validated.push(value.clone());
-                index += 2;
-            }
-            ("markitdown", "--use-plugins" | "--list-plugins") => {
-                validated.push(arg.clone());
-                index += 1;
-            }
-            _ if arg.starts_with('-') => {
+
+        if is_output_flag(arg) {
+            return Err(AppError::new(
+                "trans_unsafe_args",
+                format!("trans adapter arg is not allowed: {arg}"),
+            ));
+        }
+
+        let spec = lookup_option(specs, arg).ok_or_else(|| {
+            AppError::new(
+                "trans_unsafe_args",
+                format!("unsupported trans adapter arg for {engine}: {arg}"),
+            )
+        })?;
+        validated.push(arg.clone());
+        if spec.takes_value {
+            let value = args.get(index + 1).ok_or_else(|| {
+                AppError::new(
+                    "trans_unsafe_args",
+                    format!("{arg} requires a value for {engine}"),
+                )
+            })?;
+            if value == "--" {
                 return Err(AppError::new(
                     "trans_unsafe_args",
-                    format!("unsupported trans adapter arg for {engine}: {arg}"),
+                    format!("{arg} must not inject a positional separator"),
                 ));
             }
-            _ => {
-                return Err(AppError::new(
-                    "trans_unsafe_args",
-                    format!("trans adapter args must not add extra inputs: {arg}"),
-                ));
-            }
+            validated.push(value.clone());
+            index += 2;
+        } else {
+            index += 1;
         }
     }
     Ok(validated)
 }
 
+fn option_specs(engine: &str) -> &'static [OptionSpec] {
+    match engine {
+        "anydoc" => ANYDOC_OPTIONS,
+        "markitdown" => MARKITDOWN_OPTIONS,
+        _ => &[],
+    }
+}
+
+fn lookup_option<'a>(options: &'a [OptionSpec], name: &str) -> Option<&'a OptionSpec> {
+    options.iter().find(|spec| spec.names.contains(&name))
+}
+
+fn split_inline_value(arg: &str) -> Option<(&str, &str)> {
+    if !arg.starts_with("--") {
+        return None;
+    }
+    arg.split_once('=')
+}
+
 fn is_output_flag(arg: &str) -> bool {
-    matches!(arg, "-o" | "--output") || arg.starts_with("--output=") || arg.starts_with("-o=")
+    matches!(arg, "-o" | "--output")
 }
 
 fn run_engine(
@@ -232,10 +339,15 @@ fn run_engine(
     adapter_args: &[String],
     input: &Path,
     temp_output: &Path,
+    temp_stderr: &Path,
     timeout_seconds: u16,
 ) -> Result<()> {
+    let stderr_file = open_existing_private_file(temp_stderr)?;
     let mut command = Command::new(engine);
-    command.stdout(Stdio::null()).stderr(Stdio::piped());
+    command.stdin(Stdio::null()).stdout(Stdio::null());
+    command.stderr(Stdio::from(stderr_file));
+    #[cfg(unix)]
+    command.process_group(0);
     command.args(adapter_args);
     command.arg(input);
     command.arg("-o");
@@ -248,27 +360,14 @@ fn run_engine(
         _ => AppError::new("trans_failed", format!("failed to start {engine}: {error}")),
     })?;
 
-    let stderr = spawn_stderr_reader(&mut child)?;
-    wait_with_timeout(engine, &mut child, timeout_seconds, stderr)
-}
-
-fn spawn_stderr_reader(child: &mut Child) -> Result<mpsc::Receiver<io::Result<BoundedBytes>>> {
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AppError::new("trans_failed", "stderr pipe was not available"))?;
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = sender.send(read_bounded(stderr));
-    });
-    Ok(receiver)
+    wait_with_timeout(engine, &mut child, timeout_seconds, temp_stderr)
 }
 
 fn wait_with_timeout(
     engine: &str,
     child: &mut Child,
     timeout_seconds: u16,
-    stderr: mpsc::Receiver<io::Result<BoundedBytes>>,
+    stderr_path: &Path,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(u64::from(timeout_seconds));
     let status = loop {
@@ -276,25 +375,19 @@ fn wait_with_timeout(
             break status;
         }
         if Instant::now() >= deadline {
-            child.kill()?;
+            terminate_process_tree(child)?;
             child.wait()?;
-            let bounded = stderr
-                .recv()
-                .unwrap_or_else(|_| Ok(BoundedBytes::default()))
-                .map_err(AppError::from)?;
+            let stderr = read_bounded_file(stderr_path, STDERR_PREVIEW_BYTES)?;
             return Err(AppError::new(
                 "trans_timeout",
                 format!("{engine} exceeded the configured timeout of {timeout_seconds} seconds"),
             )
-            .with_details(stderr_details(&bounded)));
+            .with_details(stderr_details(&stderr)));
         }
         thread::sleep(Duration::from_millis(25));
     };
 
-    let bounded = stderr
-        .recv()
-        .unwrap_or_else(|_| Ok(BoundedBytes::default()))
-        .map_err(AppError::from)?;
+    let stderr = read_bounded_file(stderr_path, STDERR_PREVIEW_BYTES)?;
     if status.success() {
         return Ok(());
     }
@@ -302,58 +395,92 @@ fn wait_with_timeout(
         "trans_failed",
         format!("{engine} exited with {}", render_status(status)),
     )
-    .with_details(stderr_details(&bounded)))
+    .with_details(stderr_details(&stderr)))
+}
+
+#[cfg(unix)]
+fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
+    if let Err(error) = kill_process_group(child.id())
+        && error.raw_os_error() != Some(ESRCH)
+    {
+        let _ = child.kill();
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
+    child.kill()
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) -> io::Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    const SIGKILL: i32 = 9;
+    let result = unsafe { kill(-(pid as i32), SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ESRCH) {
+        return Ok(());
+    }
+    Err(error)
 }
 
 fn validate_output(path: &Path) -> Result<Vec<u8>> {
-    let metadata = fs::metadata(path).map_err(|error| {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
         AppError::new(
             "trans_failed",
             format!("trans engine did not produce output: {error}"),
         )
     })?;
-    if !metadata.is_file() {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(AppError::new(
-            "trans_failed",
+            "trans_unsafe_output",
             format!(
                 "trans engine output is not a regular file: {}",
                 path.display()
             ),
         ));
     }
-    if metadata.len() == 0 {
-        return Err(AppError::new(
-            "trans_empty_output",
-            "trans engine produced an empty output file",
-        ));
-    }
-    if metadata.len() > MAX_TRANS_BYTES {
-        return Err(AppError::new(
-            "trans_output_too_large",
-            format!(
-                "trans output is {} bytes; maximum supported output is {MAX_TRANS_BYTES} bytes",
-                metadata.len()
-            ),
-        ));
-    }
-    let bytes = fs::read(path)?;
+
+    let bytes = read_limited_utf8_candidate(path, MAX_TRANS_BYTES)?;
     if bytes.is_empty() {
         return Err(AppError::new(
             "trans_empty_output",
             "trans engine produced an empty output file",
         ));
     }
-    if bytes.len() as u64 > MAX_TRANS_BYTES {
-        return Err(AppError::new(
-            "trans_output_too_large",
-            format!(
-                "trans output is {} bytes; maximum supported output is {MAX_TRANS_BYTES} bytes",
-                bytes.len()
-            ),
-        ));
-    }
     std::str::from_utf8(&bytes)
         .map_err(|_| AppError::new("trans_invalid_utf8", "trans output is not valid UTF-8"))?;
+    Ok(bytes)
+}
+
+fn read_limited_utf8_candidate(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    let file = fs::File::open(path).map_err(|error| {
+        AppError::new(
+            "trans_unsafe_output",
+            format!("cannot read trans output {}: {error}", path.display()),
+        )
+    })?;
+    let mut limited = file.take(max_bytes + 1);
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes).map_err(|error| {
+        AppError::new(
+            "trans_unsafe_output",
+            format!("cannot read trans output {}: {error}", path.display()),
+        )
+    })?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(AppError::new(
+            "trans_output_too_large",
+            format!("trans output exceeds the maximum supported output of {max_bytes} bytes"),
+        ));
+    }
     Ok(bytes)
 }
 
@@ -392,6 +519,117 @@ fn publish_output(destination: &Path, bytes: &[u8]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn trans_work_root(database: &Path) -> Result<PathBuf> {
+    let lwc = database.parent().ok_or_else(|| {
+        AppError::new(
+            "trans_unsafe_output",
+            "wiki database has no LWC directory for trans work files",
+        )
+    })?;
+    ensure_private_directory(lwc)?;
+    let work = lwc.join("work");
+    ensure_private_directory(&work)?;
+    let trans = work.join("trans");
+    ensure_private_directory(&trans)?;
+    Ok(trans)
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(AppError::new(
+                "trans_unsafe_output",
+                format!(
+                    "trans work path is not a real directory: {}",
+                    path.display()
+                ),
+            ))
+        }
+        Ok(_) => {
+            set_directory_mode(path)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                ensure_private_directory(parent)?;
+            }
+            fs::create_dir(path).map_err(|create_error| {
+                AppError::new(
+                    "trans_unsafe_output",
+                    format!(
+                        "failed to create trans work directory {}: {create_error}",
+                        path.display()
+                    ),
+                )
+            })?;
+            set_directory_mode(path)?;
+            Ok(())
+        }
+        Err(error) => Err(AppError::new(
+            "trans_unsafe_output",
+            format!(
+                "cannot inspect trans work directory {}: {error}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+fn set_directory_mode(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn create_private_file(path: &Path) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path).map_err(|error| {
+        AppError::new(
+            "trans_unsafe_output",
+            format!(
+                "failed to create trans work file {}: {error}",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn open_existing_private_file(path: &Path) -> Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|error| {
+            AppError::new(
+                "trans_unsafe_output",
+                format!("failed to open trans work file {}: {error}", path.display()),
+            )
+        })
+}
+
+fn read_bounded_file(path: &Path, limit: u64) -> Result<BoundedBytes> {
+    match fs::File::open(path) {
+        Ok(file) => {
+            let mut limited = file.take(limit + 1);
+            let mut bytes = Vec::new();
+            limited.read_to_end(&mut bytes).map_err(AppError::from)?;
+            let truncated = bytes.len() as u64 > limit;
+            if truncated {
+                bytes.truncate(limit as usize);
+            }
+            Ok(BoundedBytes { bytes, truncated })
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(BoundedBytes::default()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -435,19 +673,6 @@ fn stderr_details(stderr: &BoundedBytes) -> Value {
     })
 }
 
-fn read_bounded(mut reader: impl Read) -> io::Result<BoundedBytes> {
-    let mut bounded = BoundedBytes::default();
-    let mut buffer = [0u8; 4096];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        bounded.push(&buffer[..read]);
-    }
-    Ok(bounded)
-}
-
 #[derive(Default)]
 struct BoundedBytes {
     bytes: Vec<u8>,
@@ -455,51 +680,24 @@ struct BoundedBytes {
 }
 
 impl BoundedBytes {
-    fn push(&mut self, chunk: &[u8]) {
-        if chunk.is_empty() {
-            return;
-        }
-        if self.bytes.len() + chunk.len() <= STDERR_PREVIEW_BYTES {
-            self.bytes.extend_from_slice(chunk);
-            return;
-        }
-
-        self.truncated = true;
-        let keep = STDERR_PREVIEW_BYTES.saturating_sub(chunk.len());
-        if keep == 0 {
-            self.bytes.clear();
-            self.bytes
-                .extend_from_slice(&chunk[chunk.len() - STDERR_PREVIEW_BYTES..]);
-            return;
-        }
-        if self.bytes.len() > keep {
-            let drop = self.bytes.len() - keep;
-            self.bytes.drain(..drop);
-        }
-        self.bytes.extend_from_slice(chunk);
-    }
-
     fn preview(&self) -> String {
         String::from_utf8_lossy(&self.bytes).trim().to_string()
     }
 }
 
-struct TempOutput {
+struct TempArtifact {
     path: PathBuf,
 }
 
-impl TempOutput {
-    fn create(parent: &Path) -> Result<Self> {
-        let path = parent.join(format!(
-            ".lwc-trans-{}-{}.tmp",
+impl TempArtifact {
+    fn create(root: &Path, kind: &str, extension: &str) -> Result<Self> {
+        let path = root.join(format!(
+            "{kind}-{}-{}.{}",
             std::process::id(),
-            unique_suffix()
+            unique_suffix(),
+            extension
         ));
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        options.open(&path)?;
+        create_private_file(&path)?;
         Ok(Self { path })
     }
 
@@ -516,7 +714,7 @@ impl TempOutput {
     }
 }
 
-impl Drop for TempOutput {
+impl Drop for TempArtifact {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }

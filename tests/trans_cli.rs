@@ -8,7 +8,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 
@@ -128,6 +128,7 @@ fn args_log(script: &Path) -> Vec<String> {
         .map(ToOwned::to_owned)
         .collect()
 }
+
 fn success_script() -> &'static str {
     r#"#!/bin/sh
 set -eu
@@ -181,6 +182,11 @@ fn trans_uses_the_resolved_engine_literal_argv_and_returns_a_receipt() {
         let final_content = fs::read(&output).unwrap();
         let logged = args_log(&selected);
         let temp_output = PathBuf::from(logged.last().unwrap());
+        let expected_work_root = world
+            .project
+            .join(".lwc/work/trans")
+            .canonicalize()
+            .unwrap();
         assert_eq!(&logged[..args.len()], args);
         assert_eq!(
             logged[args.len()],
@@ -188,6 +194,10 @@ fn trans_uses_the_resolved_engine_literal_argv_and_returns_a_receipt() {
         );
         assert_eq!(logged[args.len() + 1], "-o");
         assert_ne!(temp_output, output);
+        assert_eq!(
+            temp_output.parent().unwrap().canonicalize().unwrap(),
+            expected_work_root
+        );
         assert!(!temp_output.exists(), "temporary output should be cleaned");
         assert!(!PathBuf::from(format!("{}.args", other.display())).exists());
 
@@ -207,6 +217,45 @@ fn trans_uses_the_resolved_engine_literal_argv_and_returns_a_receipt() {
             format!("# converted by {engine}\n")
         );
     }
+}
+
+#[test]
+fn trans_uses_the_scope_specific_private_work_root() {
+    let world = TransWorld::new();
+    world.init();
+    world.ok(&["--scope", "global", "init"]);
+    let selected = world.install_script("anydoc", success_script());
+    let input = world.write_project("docs/source.docx", "stub");
+    let output = world.project.join("out/global.md");
+
+    world.ok(&[
+        "--scope",
+        "global",
+        "config",
+        "set",
+        "--trans",
+        "anydoc",
+        "--trans-arg",
+        "--format",
+        "--trans-arg",
+        "docx",
+    ]);
+    world.ok(&[
+        "--scope",
+        "global",
+        "trans",
+        as_str(&input),
+        "--output",
+        as_str(&output),
+    ]);
+
+    let logged = args_log(&selected);
+    let temp_output = PathBuf::from(logged.last().unwrap());
+    assert!(
+        temp_output.starts_with(world.home.join(".lwc/work/trans")),
+        "{temp_output:?}"
+    );
+    assert!(!temp_output.exists(), "temporary output should be cleaned");
 }
 
 #[test]
@@ -303,12 +352,89 @@ fn trans_rejects_adapter_args_that_override_io_or_add_extra_inputs() {
             "--trans-arg",
             "rogue-input.docx",
         ],
+        vec![
+            "config",
+            "set",
+            "--trans",
+            "markitdown",
+            "--trans-arg",
+            "--use-plugins",
+            "--trans-arg",
+            "rogue-input.docx",
+        ],
+        vec![
+            "config",
+            "set",
+            "--trans",
+            "markitdown",
+            "--trans-arg",
+            "--output=evil.md",
+        ],
     ] {
         world.ok(&args);
         let error = world.err(&["trans", as_str(&input), "--output", as_str(&output)]);
         assert_eq!(error["error"]["code"], "trans_unsafe_args");
         assert!(!PathBuf::from(format!("{}.args", anydoc.display())).exists());
     }
+}
+
+#[test]
+fn trans_allows_documented_markitdown_flags_as_literal_passthrough() {
+    let world = TransWorld::new();
+    world.init();
+    let selected = world.install_script("markitdown", success_script());
+    let input = world.write_project("docs/source.pdf", "stub");
+    let output = world.project.join("out/markitdown.md");
+    let args = vec![
+        "--use-cu",
+        "--cu-endpoint",
+        "https://example.invalid/cu",
+        "--cu-analyzer",
+        "invoice",
+        "--cu-file-types",
+        "pdf,jpeg",
+        "-x",
+        "pdf",
+        "-m",
+        "application/pdf",
+        "-c",
+        "utf-8",
+        "-p",
+        "--use-plugins",
+        "--keep-data-uris",
+    ];
+    let mut config_args = vec!["config", "set", "--trans", "markitdown"];
+    for value in &args {
+        config_args.push("--trans-arg");
+        config_args.push(value);
+    }
+    world.ok(&config_args);
+
+    world.ok(&["trans", as_str(&input), "--output", as_str(&output)]);
+
+    let logged = args_log(&selected);
+    assert_eq!(&logged[..args.len()], args);
+}
+
+#[test]
+fn trans_allows_documented_markitdown_docintel_flags() {
+    let world = TransWorld::new();
+    world.init();
+    let selected = world.install_script("markitdown", success_script());
+    let input = world.write_project("docs/source.pdf", "stub");
+    let output = world.project.join("out/docintel.md");
+    let args = vec!["-d", "-e", "https://example.invalid/docintel"];
+    let mut config_args = vec!["config", "set", "--trans", "markitdown"];
+    for value in &args {
+        config_args.push("--trans-arg");
+        config_args.push(value);
+    }
+    world.ok(&config_args);
+
+    world.ok(&["trans", as_str(&input), "--output", as_str(&output)]);
+
+    let logged = args_log(&selected);
+    assert_eq!(&logged[..args.len()], args);
 }
 
 #[test]
@@ -336,6 +462,48 @@ set -eu
     let error = world.err(&["trans", as_str(&input), "--output", as_str(&output)]);
     assert_eq!(error["error"]["code"], "trans_timeout");
     assert!(!output.exists());
+}
+
+#[test]
+fn trans_kills_descendants_that_keep_stderr_open() {
+    let world = TransWorld::new();
+    world.init();
+    let marker = world.bin.join("markitdown.desc.survived");
+    world.install_script(
+        "markitdown",
+        &format!(
+            r#"#!/bin/sh
+set -eu
+(
+  /bin/sleep 2
+  echo survived > "{}"
+) &
+exec /bin/sleep 8
+"#,
+            marker.display()
+        ),
+    );
+    world.ok(&[
+        "config",
+        "set",
+        "--trans",
+        "markitdown",
+        "--trans-timeout",
+        "1",
+    ]);
+    let input = world.write_project("docs/source.pdf", "stub");
+    let output = world.project.join("out/descendant.md");
+
+    let started = Instant::now();
+    let error = world.err(&["trans", as_str(&input), "--output", as_str(&output)]);
+    assert_eq!(error["error"]["code"], "trans_timeout");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(!output.exists());
+    thread::sleep(Duration::from_millis(2500));
+    assert!(
+        !marker.exists(),
+        "descendant should not survive to write its marker"
+    );
 }
 
 #[test]
@@ -424,6 +592,36 @@ printf '\377' > "$out"
     world.ok(&["config", "set", "--trans", "markitdown"]);
     let invalid_utf8 = world.err(&["trans", as_str(&input), "--output", as_str(&output)]);
     assert_eq!(invalid_utf8["error"]["code"], "trans_invalid_utf8");
+    assert!(!output.exists());
+}
+
+#[test]
+fn trans_rejects_non_regular_engine_output_without_blocking() {
+    let world = TransWorld::new();
+    world.init();
+    world.install_script(
+        "markitdown",
+        r#"#!/bin/sh
+set -eu
+out=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    out="$arg"
+    break
+  fi
+  prev="$arg"
+done
+/bin/rm -f "$out"
+/usr/bin/mkfifo "$out"
+"#,
+    );
+    world.ok(&["config", "set", "--trans", "markitdown"]);
+    let input = world.write_project("docs/source.pdf", "stub");
+    let output = world.project.join("out/fifo.md");
+
+    let error = world.err(&["trans", as_str(&input), "--output", as_str(&output)]);
+    assert_eq!(error["error"]["code"], "trans_unsafe_output");
     assert!(!output.exists());
 }
 
