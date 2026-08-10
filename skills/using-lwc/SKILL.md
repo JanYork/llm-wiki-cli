@@ -1,6 +1,6 @@
 ---
 name: using-lwc
-description: Operate LWC as an Agent's durable, source-grounded, revisable memory. Use automatically for substantive project work, research, planning, debugging, architecture, decisions, document ingest, incident recovery, or any task where verified context or results should survive future sessions; also use when the user invokes $using-lwc or asks to search, update, repair, configure, or maintain an LWC Wiki.
+description: Use when substantive project work, structural code questions, research, planning, debugging, architecture, decisions, document ingest, incident recovery, or verified context and results should survive future sessions; also when the user invokes $using-lwc or asks to search, update, repair, configure, or maintain an LWC Wiki or CodeGraph index.
 ---
 
 # Using LWC
@@ -89,16 +89,20 @@ Use this loop without waiting for the user to micromanage memory:
 2. **Recall once.** Bootstrap once, read bounded context, run one task-specific
    search, and open only the best matching pages. Do not front-load the whole
    Wiki.
-3. **Work from evidence.** Treat recalled pages as compiled leads. Inspect their
+3. **Inspect live code structurally.** For a nontrivial code task, check `cg
+   status` once. If initialized, use the narrowest CodeGraph query before broad
+   source scans. If absent, follow the recommendation workflow below without
+   blocking the task.
+4. **Work from evidence.** Treat recalled pages as compiled leads. Inspect their
    cited immutable sources whenever freshness, exact wording, or high-stakes
    accuracy matters.
-4. **Capture at milestones.** Accumulate candidate updates while solving the
+5. **Capture at milestones.** Accumulate candidate updates while solving the
    task. Write only after a conclusion is verified or a coherent source ingest
    is ready; do not turn each tool result into a memory mutation.
-5. **Validate.** Lint the changed scope and run fixed retrieval checks for the
+6. **Validate.** Lint the changed scope and run fixed retrieval checks for the
    changed topics. If graph projection was requested, wait for its Work and run
    `graph verify`.
-6. **Finish the user's task.** Memory maintenance is supporting work. Do not
+7. **Finish the user's task.** Memory maintenance is supporting work. Do not
    delay the deliverable for optional cleanup or speculative Wiki expansion.
 
 ### Recall budget
@@ -147,6 +151,44 @@ Run only the selected command. Capture the returned `work.id`, wait with
 `graph verify`. A failed Work must remain stopped until inspected and explicitly
 resumed; never switch or disable engines while graph Work is running.
 
+### Code intelligence recommendation
+
+Treat Wiki memory, the optional Wiki graph, and CodeGraph as complementary:
+
+- Wiki recall preserves verified rationale, decisions, incidents, and sources.
+- The Wiki graph explains relationships between current documents.
+- CodeGraph answers current project structure: definitions, calls, dependencies,
+  file topology, and change impact.
+
+For every nontrivial code task, run `"$LWC" --scope project cg status` once. If
+the index already exists, use its read commands proactively; no extra consent is
+needed to query user-authorized project state. Prefer `query` then `node` for a
+definition, `callers`/`callees` for call direction, `impact` before changing a
+shared symbol, and `files` for topology. Use native text search for literal
+strings and comments rather than forcing a structural query. Here, nontrivial
+means tracing or changing behavior across symbols/files, investigating call or
+dependency flow, or estimating blast radius. Skip CodeGraph for a single-file
+literal edit, formatting-only work, or a docs/config-only change.
+
+If `initialized=false`, recommend CodeGraph once per project conversation and
+ask for consent before `cg init`. Explain that it provides tree-sitter-derived
+symbol and dependency answers, remains under the project's `.lwc`, disables
+telemetry, and indexes one complete file before the next. Continue the primary
+task while awaiting the answer. After consent:
+
+```bash
+"$LWC" --scope project cg init
+"$LWC" --scope project cg status
+```
+
+If the task depends on current dirty or uncommitted code, run `"$LWC" --scope
+project cg sync"` before the first structural query. Run it again after relevant
+working-tree code changes and before making a final structural claim. Use
+CodeGraph to locate the smallest source surface, then read the exact files that
+prove behavior. If live code and Wiki memory disagree, treat checked-out code as
+current implementation evidence and revise durable memory only after
+verification. Never ingest or edit the CodeGraph database directly.
+
 Choose the minimum operation:
 
 | Need | Action |
@@ -156,8 +198,8 @@ Choose the minimum operation:
 | Authoritative external document | Run the complete Source -> ingest -> cited page lifecycle. |
 | Two or more dependent mutations, or ingest state plus pages | Use one sparse changeset and validate the draft. |
 | Optional relationship traversal | If disabled, explain the benefits and ask consent; then enable one selected engine and watch Work. |
-| Structural code question | Check `cg status`; if absent, explain benefits and ask consent before `cg init`, then use the narrowest `cg` query. |
-| Visual inspection | Run foreground `view`; it is read-only and must stay loopback-only. |
+| Structural code question | Check `cg status`; query an existing index proactively, or explain benefits and ask consent before `cg init`; sync after relevant edits. |
+| Visual inspection | Run foreground `view`; it is read-only and loopback-only. It defaults to English; use the in-page `中文` / `EN` control when needed. |
 
 Read `references/operations-manual.md` completely before an unfamiliar command,
 graph configuration, recovery, checkpoint/restore, multi-source ingest, or

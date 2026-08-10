@@ -9,7 +9,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     io::{BufRead, BufReader, Read},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
 };
 
@@ -53,7 +53,7 @@ pub fn run(store: &StorePath, args: &[OsString]) -> Result<Value> {
     };
     if matches!(
         name,
-        "install" | "uninstall" | "upgrade" | "telemetry" | "daemon" | "serve"
+        "install" | "uninstall" | "upgrade" | "telemetry" | "daemon" | "daemons" | "serve"
     ) {
         return Err(AppError::new(
             "codegraph_command_not_project_scoped",
@@ -68,6 +68,7 @@ pub fn run(store: &StorePath, args: &[OsString]) -> Result<Value> {
             "run `lwc cg init` to download the pinned project-local CodeGraph runtime",
         ));
     }
+    validate_project_arguments(&paths, args)?;
 
     let mut forwarded = args.to_vec();
     if matches!(name, "index" | "sync" | "uninit" | "unlock") {
@@ -82,11 +83,100 @@ pub fn run(store: &StorePath, args: &[OsString]) -> Result<Value> {
             ));
         }
         forwarded.insert(1, paths.project.as_os_str().to_owned());
+        if matches!(name, "index" | "uninit")
+            && !forwarded.iter().any(|arg| arg == "--force" || arg == "-f")
+        {
+            forwarded.push(OsString::from("--force"));
+        }
     }
     execute(
         &paths,
         &forwarded,
         matches!(name, "index" | "sync" | "uninit" | "unlock"),
+    )
+}
+
+fn validate_project_arguments(paths: &Paths, args: &[OsString]) -> Result<()> {
+    let mut options = true;
+    for arg in args.iter().skip(1) {
+        if options && arg == "--" {
+            options = false;
+        } else if options
+            && (arg == "-p" || arg == "--path" || arg.to_string_lossy().starts_with("--path="))
+        {
+            return Err(external_path_error());
+        }
+    }
+
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("node") => {
+            let mut values = args.iter().skip(1);
+            while let Some(arg) = values.next() {
+                if arg == "-f" || arg == "--file" {
+                    let file = values.next().ok_or_else(external_path_error)?;
+                    ensure_project_path(paths, file)?;
+                } else if let Some(file) = arg.to_string_lossy().strip_prefix("--file=") {
+                    ensure_project_path(paths, OsStr::new(file))?;
+                }
+            }
+        }
+        Some("affected") => validate_affected_paths(paths, args)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_affected_paths(paths: &Paths, args: &[OsString]) -> Result<()> {
+    let mut values = args.iter().skip(1);
+    let mut positional = false;
+    while let Some(arg) = values.next() {
+        if arg == "--stdin" {
+            return Err(external_path_error());
+        }
+        if !positional && arg == "--" {
+            positional = true;
+            continue;
+        }
+        if !positional && matches!(arg.to_str(), Some("-d" | "--depth" | "-f" | "--filter")) {
+            values.next();
+            continue;
+        }
+        if !positional && arg.to_string_lossy().starts_with('-') {
+            continue;
+        }
+        ensure_project_path(paths, arg)?;
+    }
+    Ok(())
+}
+
+fn ensure_project_path(paths: &Paths, value: &OsStr) -> Result<()> {
+    let path = Path::new(value);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(&paths.project)
+            .map_err(|_| external_path_error())?
+    } else {
+        path
+    };
+    let mut depth = 0_usize;
+    for component in relative.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir if depth > 0 => depth -= 1,
+            Component::CurDir => {}
+            _ => return Err(external_path_error()),
+        }
+    }
+    let candidate = paths.project.join(relative);
+    if candidate.exists() && !fs::canonicalize(candidate)?.starts_with(&paths.project) {
+        return Err(external_path_error());
+    }
+    Ok(())
+}
+
+fn external_path_error() -> AppError {
+    AppError::new(
+        "codegraph_external_path_forbidden",
+        "LWC only permits CodeGraph paths inside the current project",
     )
 }
 

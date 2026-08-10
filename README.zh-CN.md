@@ -636,6 +636,10 @@ lwc view
 lwc view --port 4173 --no-open
 ```
 
+预览默认使用英文。通过页面内的 `中文` / `EN` 控件切换语言；浏览器会记住选择，
+但不会自动翻译 Wiki 正文。知识图和代码图统一使用受 Obsidian 启发的 3D 关系视图，
+采用小节点、常驻标签、细连线，并支持旋转与缩放。
+
 代码索引只支持项目级，默认不启用。首次显式执行 `lwc cg init` 时，LWC
 会从 GitHub Release 下载锁定版本的 CodeGraph 分支包，校验 SHA-256，
 运行时放在 `.lwc/runtime/codegraph`，索引放在 `.lwc/codegraph`。遥测始终
@@ -654,8 +658,8 @@ lwc cg files
 ```
 
 CodeGraph 的查询能力均可通过 `lwc cg` 使用。全局生命周期命令
-（`install`、`uninstall`、`upgrade`、`telemetry`、`daemon`、`serve`）会被
-拒绝，因为运行时由 LWC 管理且必须保持项目边界。首次、增量、全量、更新、
+（`install`、`uninstall`、`upgrade`、`telemetry`、`daemon`、`daemons`、
+`serve`）会被拒绝，因为运行时由 LWC 管理且必须保持项目边界。首次、增量、全量、更新、
 删除、引用解析和恢复写入都以所属文件为事务：一篇文件完全可用后才处理下一
 篇；当前图保持可读，历史文档版本永不刷新。
 

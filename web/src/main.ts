@@ -1,14 +1,14 @@
-import Graph from 'graphology'
-import forceAtlas2 from 'graphology-layout-forceatlas2'
+import ForceGraph3D, { type ForceGraph3DInstance } from '3d-force-graph'
 import { LitElement, html, nothing } from 'lit'
 import { customElement, state } from 'lit/decorators.js'
-import Sigma from 'sigma'
-import { boundedGraph, type GraphEdge, type GraphNode } from './graph'
+import SpriteText from 'three-spritetext'
+import { boundedGraph, graphDegrees, type GraphEdge, type GraphNode } from './graph'
+import { DEFAULT_LOCALE, graphCount, messages, pageCount, type Locale } from './i18n'
 import { renderMarkdown } from './markdown'
 import './styles.css'
 
 type Section = 'overview' | 'pages' | 'sources' | 'knowledge' | 'code'
-interface ApiStatus { database: string; revision: number; operation_id: string; read_only: boolean }
+interface ApiStatus { database: string; revision: string; operation_id: string; read_only: boolean }
 interface Page { slug: string; title?: string; updated_at?: string; body?: string }
 interface Source { id: number; origin: string; title?: string; bytes?: number }
 interface GraphPayload { nodes: GraphNode[]; edges: GraphEdge[]; available?: boolean; message?: string }
@@ -22,37 +22,114 @@ async function api<T>(path: string): Promise<T> {
 
 @customElement('lwc-graph')
 class LwcGraph extends LitElement {
-  @state() accessor message = 'Loading graph…'
-  private renderer?: Sigma
+  @state() accessor message: string = messages[DEFAULT_LOCALE].loadingGraph
+  private renderer3d?: ForceGraph3DInstance
   private container?: HTMLDivElement
   private path = '/api/graphs/knowledge'
+  private locale: Locale = DEFAULT_LOCALE
+  private request = 0
 
-  static properties = { path: { type: String } }
+  static properties = { path: { type: String }, locale: { type: String } }
   createRenderRoot() { return this }
-  render() { return html`<div class="graph" role="img" aria-label="Interactive graph visualization"></div><p class="muted" aria-live="polite">${this.message}</p>` }
-  firstUpdated() { this.container = this.querySelector('.graph') ?? undefined; void this.load() }
-  updated(changed: Map<string, unknown>) { if (changed.has('path')) void this.load() }
-  disconnectedCallback() { this.renderer?.kill(); super.disconnectedCallback() }
+  render() {
+    const copy = messages[this.locale]
+    return html`<div class="graph" role="img" aria-label=${copy.graphLabel}></div><p class="muted" aria-live="polite">${this.message}</p>`
+  }
+  firstUpdated() {
+    this.container = this.querySelector('.graph') ?? undefined
+    window.addEventListener('resize', this.resize)
+    void this.load()
+  }
+  updated(changed: Map<string, unknown>) { if (changed.has('path') || changed.has('locale')) void this.load() }
+  disconnectedCallback() {
+    window.removeEventListener('resize', this.resize)
+    this.clear()
+    super.disconnectedCallback()
+  }
+
+  private readonly resize = () => {
+    if (!this.container || !this.renderer3d) return
+    this.renderer3d.width(this.container.clientWidth).height(this.container.clientHeight)
+  }
+
+  private clear() {
+    this.renderer3d?._destructor()
+    this.renderer3d = undefined
+    this.container?.replaceChildren()
+  }
 
   private async load() {
     if (!this.container) return
-    this.renderer?.kill()
+    const request = ++this.request
+    this.clear()
+    this.message = messages[this.locale].loadingGraph
     try {
       const payload = await api<GraphPayload>(this.path)
+      if (request !== this.request) return
       if (payload.available === false) {
-        this.message = payload.message ?? 'Graph is not available.'
+        this.message = this.locale === 'en' ? (payload.message ?? messages.en.graphUnavailable) : messages['zh-CN'].graphUnavailable
         return
       }
       const visible = boundedGraph(payload.nodes ?? [], payload.edges ?? [])
-      const graph = new Graph()
-      const accent = getComputedStyle(document.documentElement).getPropertyValue('--color-accent').trim()
-      for (const [index, node] of visible.nodes.entries())
-        graph.addNode(node.id, { label: node.label, size: 4, color: accent, x: Math.cos(index), y: Math.sin(index) })
-      for (const edge of visible.edges)
-        if (!graph.hasEdge(edge.id)) graph.addEdgeWithKey(edge.id, edge.source, edge.target, { size: 1 })
-      if (graph.order > 1) forceAtlas2.assign(graph, { iterations: Math.min(100, graph.order * 2) })
-      this.renderer = new Sigma(graph, this.container, { renderEdgeLabels: false })
-      this.message = `${graph.order} nodes · ${graph.size} edges${visible.truncated ? ' · limited to 1,000 nodes / 5,000 edges' : ''}`
+      const styles = getComputedStyle(document.documentElement)
+      const accent = styles.getPropertyValue('--color-primary').trim()
+      const labelColor = styles.getPropertyValue('--color-graph-label').trim()
+      const nodeColor = styles.getPropertyValue('--color-graph-node').trim()
+      const edgeColor3d = styles.getPropertyValue('--color-graph-edge-3d').trim()
+      const graphSurface = styles.getPropertyValue('--color-graph-surface').trim()
+      const degrees = graphDegrees(visible.nodes, visible.edges)
+      const copy = messages[this.locale]
+      const nodes = visible.nodes.map((node) => {
+        const degree = degrees.get(node.id) ?? 0
+        return {
+          ...node,
+          color: degree >= 5 ? accent : nodeColor,
+          val: 0.65 + Math.log2(degree + 1) * 0.35,
+        }
+      })
+      const links = visible.edges.map(edge => ({ ...edge, color: edgeColor3d }))
+      const renderer = new ForceGraph3D(this.container, { controlType: 'orbit' })
+        .width(this.container.clientWidth)
+        .height(this.container.clientHeight)
+        .backgroundColor(graphSurface)
+        .showNavInfo(false)
+        .nodeLabel('label')
+        .nodeVal('val')
+        .nodeRelSize(1.15)
+        .nodeColor('color')
+        .nodeOpacity(0.82)
+        .nodeResolution(8)
+        .nodeThreeObject((node: object) => {
+          const label = new SpriteText(String((node as GraphNode).label), 1.7, labelColor)
+          label.material.depthWrite = false
+          label.center.y = -0.65
+          return label
+        })
+        .nodeThreeObjectExtend(true)
+        .linkColor('color')
+        .linkOpacity(0.12)
+        .linkWidth(0)
+        .warmupTicks(100)
+        .cooldownTicks(220)
+      const charge = renderer.d3Force('charge')
+      charge?.strength?.(-15)
+      charge?.distanceMax?.(140)
+      const frameGraph = () => {
+        const bounds = renderer.getGraphBbox()
+        const center = {
+          x: (bounds.x[0] + bounds.x[1]) / 2,
+          y: (bounds.y[0] + bounds.y[1]) / 2,
+          z: (bounds.z[0] + bounds.z[1]) / 2,
+        }
+        const span = Math.max(bounds.x[1] - bounds.x[0], bounds.y[1] - bounds.y[0], bounds.z[1] - bounds.z[0])
+        renderer.cameraPosition({ x: center.x, y: center.y, z: center.z + Math.max(100, span * 1.15) }, center, 350)
+      }
+      renderer.onEngineStop(frameGraph).graphData({ nodes, links })
+      this.renderer3d = renderer
+      window.setTimeout(() => {
+        if (this.renderer3d === renderer) frameGraph()
+      }, 800)
+      this.message = `${graphCount(this.locale, nodes.length, links.length)}${visible.truncated ? ` · ${copy.limited}` : ''} · ${copy.graph3dControls}`
     } catch (error) {
       this.message = error instanceof Error ? error.message : String(error)
     }
@@ -67,9 +144,14 @@ class LwcView extends LitElement {
   @state() accessor sources: Source[] = []
   @state() accessor selectedPage: Page | undefined = undefined
   @state() accessor error = ''
+  @state() accessor locale: Locale = localStorage.getItem('lwc-view-locale') === 'zh-CN' ? 'zh-CN' : DEFAULT_LOCALE
 
   createRenderRoot() { return this }
-  connectedCallback() { super.connectedCallback(); void this.load() }
+  connectedCallback() {
+    super.connectedCallback()
+    document.documentElement.lang = this.locale
+    void this.load()
+  }
 
   private async load() {
     try {
@@ -87,6 +169,11 @@ class LwcView extends LitElement {
   }
 
   private select(section: Section) { this.section = section }
+  private toggleLocale() {
+    this.locale = this.locale === 'en' ? 'zh-CN' : 'en'
+    document.documentElement.lang = this.locale
+    localStorage.setItem('lwc-view-locale', this.locale)
+  }
   private async showPage(slug: string) {
     this.section = 'pages'
     try {
@@ -98,19 +185,21 @@ class LwcView extends LitElement {
   }
 
   render() {
+    const copy = messages[this.locale]
     return html`<div class="shell">
       <nav class="rail" aria-label="LWC project sections">
-        <span class="wordmark">LWC</span>
-        ${this.nav('overview', 'Overview')}${this.nav('pages', 'Pages')}${this.nav('sources', 'Sources')}${this.nav('knowledge', 'Knowledge graph')}${this.nav('code', 'Code graph')}
+        <span class="wordmark">LW<b>C</b></span>
+        <div class="nav-links">${this.nav('overview', copy.overview)}${this.nav('pages', copy.pages)}${this.nav('sources', copy.sources)}${this.nav('knowledge', copy.knowledgeGraph)}${this.nav('code', copy.codeGraph)}</div>
+        <button class="language-button" aria-label=${copy.switchLanguageLabel} @click=${this.toggleLocale}>${copy.switchLanguage}</button>
       </nav>
       <main class="workspace">
         <header class="topline">
-          <div><h1>${this.heading()}</h1><p class="muted">Read-only project inspection. No migration, refresh, or write is triggered.</p></div>
-          <div class="status-row">${this.status ? html`<span class="status-chip">revision ${this.status.revision}</span><span class="status-chip">read only</span>` : nothing}</div>
+          <div><h1>${this.heading()}</h1><p class="muted">${copy.readOnlyDescription}</p></div>
+          <div class="status-row">${this.status ? html`<span class="status-chip" title=${this.status.revision}>${copy.revision} ${this.status.revision.slice(0, 12)}…</span><span class="status-chip">${copy.readOnly}</span>` : nothing}</div>
         </header>
         ${this.error ? html`<p class="notice error" role="alert">${this.error}</p>` : nothing}
         ${this.content()}
-        <footer class="foot-line">Project-local · loopback only · ${this.status?.database ?? 'loading database'}</footer>
+        <footer class="foot-line">${copy.projectLocal} · ${copy.loopbackOnly}</footer>
       </main>
     </div>`
   }
@@ -118,12 +207,16 @@ class LwcView extends LitElement {
   private nav(section: Section, label: string) {
     return html`<button class="nav-button" aria-current=${this.section === section ? 'page' : nothing} @click=${() => this.select(section)}>${label}</button>`
   }
-  private heading() { return ({ overview: 'Project condition', pages: 'Wiki pages', sources: 'Grounded sources', knowledge: 'Knowledge graph', code: 'Code graph' })[this.section] }
+  private heading() {
+    const copy = messages[this.locale]
+    return ({ overview: copy.projectCondition, pages: copy.wikiPages, sources: copy.groundedSources, knowledge: copy.knowledgeGraph, code: copy.codeGraph })[this.section]
+  }
   private content() {
-    if (this.section === 'overview') return html`<section class="split"><article class="panel"><header class="panel-head"><h2>Store</h2></header><table><tbody><tr><th>Database</th><td>${this.status?.database ?? 'Loading…'}</td></tr><tr><th>Operation</th><td>${this.status?.operation_id ?? '—'}</td></tr><tr><th>Pages</th><td>${this.pages.length}</td></tr><tr><th>Sources</th><td>${this.sources.length}</td></tr></tbody></table></article><article class="panel"><header class="panel-head"><h2>Boundaries</h2></header><div class="document"><p>Historical revisions remain frozen. This server exposes GET and HEAD only, binds to 127.0.0.1, and never starts graph construction.</p></div></article></section>`
-    if (this.section === 'pages') return html`<section class="split"><article class="panel"><header class="panel-head"><h2>${this.pages.length} pages</h2></header><ul class="list">${this.pages.map(page => html`<li><button class="list-button" @click=${() => this.showPage(page.slug)}><strong>${page.title ?? page.slug}</strong><span class="muted">${page.slug}</span></button></li>`)}</ul></article><article class="panel document">${this.selectedPage ? html`<div .innerHTML=${renderMarkdown(this.selectedPage.body ?? '')}></div>` : html`<p class="muted">Select a page to render its Markdown.</p>`}</article></section>`
-    if (this.section === 'sources') return html`<section class="panel table-wrap"><table><thead><tr><th>ID</th><th>Source</th><th>Bytes</th></tr></thead><tbody>${this.sources.map(source => html`<tr><td>${source.id}</td><td>${source.title ?? source.origin}</td><td>${source.bytes ?? '—'}</td></tr>`)}</tbody></table></section>`
+    const copy = messages[this.locale]
+    if (this.section === 'overview') return html`<section class="split overview-grid"><article class="panel"><header class="panel-head"><h2>${copy.store}</h2></header><dl class="metrics"><div class="metric metric-wide"><dt>${copy.database}</dt><dd class="path-value">${this.status?.database ?? copy.loadingDatabase}</dd></div><div class="metric"><dt>${copy.operation}</dt><dd>${this.status?.operation_id ?? '—'}</dd></div><div class="metric"><dt>${copy.pages}</dt><dd>${this.pages.length}</dd></div><div class="metric"><dt>${copy.sources}</dt><dd>${this.sources.length}</dd></div></dl></article><article class="panel panel-dark"><header class="panel-head"><h2>${copy.boundaries}</h2></header><div class="document"><p>${copy.frozenBoundary}</p></div></article></section>`
+    if (this.section === 'pages') return html`<section class="split pages-grid"><article class="panel"><header class="panel-head"><h2>${pageCount(this.locale, this.pages.length)}</h2></header><ul class="list">${this.pages.map(page => html`<li><button class="list-button" aria-current=${this.selectedPage?.slug === page.slug ? 'page' : nothing} @click=${() => this.showPage(page.slug)}><strong>${page.title ?? page.slug}</strong><span class="muted">${page.slug}</span></button></li>`)}</ul></article><article class="panel document">${this.selectedPage ? html`<div .innerHTML=${renderMarkdown(this.selectedPage.body ?? '')}></div>` : html`<p class="muted">${copy.selectPage}</p>`}</article></section>`
+    if (this.section === 'sources') return html`<section class="panel table-wrap"><table><thead><tr><th>${copy.id}</th><th>${copy.source}</th><th>${copy.bytes}</th></tr></thead><tbody>${this.sources.map(source => html`<tr><td>${source.id}</td><td>${source.title ?? source.origin}</td><td>${source.bytes ?? '—'}</td></tr>`)}</tbody></table></section>`
     const path = this.section === 'knowledge' ? '/api/graphs/knowledge' : '/api/graphs/code'
-    return html`<section class="panel"><header class="panel-head"><h2>${this.heading()}</h2></header><lwc-graph .path=${path}></lwc-graph></section>`
+    return html`<section class="panel graph-panel"><header class="panel-head"><h2>${copy.interactiveMap}</h2></header><lwc-graph .path=${path} .locale=${this.locale}></lwc-graph></section>`
   }
 }

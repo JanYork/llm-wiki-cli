@@ -5,6 +5,12 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 skill="$repo_root/skills/using-lwc/SKILL.md"
 policy="$repo_root/skills/using-lwc/references/memory-policy.md"
 manual="$repo_root/skills/using-lwc/references/operations-manual.md"
+metadata="$repo_root/skills/using-lwc/agents/openai.yaml"
+
+grep -Fq -- 'description: Use when' "$skill" || {
+  printf 'using-lwc description must state activation triggers\n' >&2
+  exit 1
+}
 
 for expected in \
   'source diff <OLD_SOURCE_ID>' \
@@ -27,6 +33,15 @@ for expected in \
   'Write-back triggers' \
   'Do not write' \
   'Graph activation recommendation' \
+  'Code intelligence recommendation' \
+  'use its read commands proactively' \
+  'ask for consent before `cg init`' \
+  'cg sync' \
+  'single-file' \
+  'literal edit' \
+  'current dirty or uncommitted code' \
+  'checked-out code' \
+  'current implementation evidence' \
   'config show' \
   'config set --graph grafeo' \
   'config set --graph surrealdb'; do
@@ -39,10 +54,25 @@ done
 for expected in \
   'Command families' \
   'Graph engine and document-granular Work' \
+  'Project code intelligence' \
+  'Route questions deliberately' \
+  'Use the three LWC planes together' \
+  'single-file literal' \
+  'current dirty or uncommitted code' \
+  'checked-out source is the current' \
   'Structured failure recovery' \
   'Safe recipes'; do
   grep -Fq -- "$expected" "$manual" || {
     printf 'missing LWC operations manual contract: %s\n' "$expected" >&2
+    exit 1
+  }
+done
+
+for expected in \
+  'project code intelligence' \
+  'inspect current code structurally'; do
+  grep -Fq -- "$expected" "$metadata" || {
+    printf 'missing CodeGraph skill metadata: %s\n' "$expected" >&2
     exit 1
   }
 done

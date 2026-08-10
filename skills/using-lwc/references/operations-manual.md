@@ -251,6 +251,14 @@ the task needs structural code answers (symbol definitions, callers, callees,
 flow, impact, or file topology). It is project-only, stores everything below
 the active project's `.lwc`, and keeps telemetry disabled.
 
+For every nontrivial code task, check it once. An initialized index is an
+available project capability, so use read-only structural queries proactively
+instead of waiting for the user to name CodeGraph. Do not use it for literal
+text, comments, generated output, or exact runtime values; use native text
+search or direct file reads for those. Nontrivial means cross-symbol/file
+behavior, call or dependency flow, or change-impact analysis. Skip CodeGraph for
+a single-file literal edit, formatting-only work, or docs/config-only changes.
+
 Start with the non-mutating check:
 
 ```bash
@@ -284,10 +292,37 @@ Choose the narrowest structural command:
 "$LWC" cg sync
 ```
 
-Use `sync` only after relevant working-tree files changed or status reports
-pending changes. Do not run `index` as a routine freshness check. Never invoke
-global CodeGraph lifecycle commands through another binary; LWC deliberately
-blocks install/uninstall/upgrade/telemetry/daemon/serve so project ownership,
+Route questions deliberately:
+
+| Question | Command sequence |
+| --- | --- |
+| Where is a symbol or file defined? | `cg query`, then `cg node` for exact source/signature. |
+| What calls this symbol? | `cg callers`. |
+| What does this symbol call? | `cg callees`. |
+| What may break if this changes? | `cg impact`, then inspect the returned source files. |
+| What code files are indexed? | `cg files`. |
+| Did edited code change the structure? | `cg sync`, then repeat the same structural query. |
+| What contains this exact string or comment? | Use native text search, not CodeGraph. |
+
+Use the three LWC planes together rather than treating one as a substitute for
+the others:
+
+1. Recall prior rationale and verified facts with Wiki `context`/`search`.
+2. Query CodeGraph for the checked-out implementation structure.
+3. Read the smallest exact source surface needed to prove behavior.
+4. When the verified result will matter later, update the appropriate Wiki page
+   and run its retrieval acceptance checks.
+
+When CodeGraph and Wiki memory disagree, checked-out source is the current
+implementation evidence; the Wiki may describe historical intent. Resolve the
+cause before updating either. Never cite the CodeGraph database as immutable
+source evidence and never ingest `.lwc/codegraph` back into the Wiki.
+
+If the task depends on current dirty or uncommitted code, run `sync` before the
+first structural query. Run it again after relevant working-tree files change.
+Do not run `index` as a routine freshness check. Never invoke global CodeGraph
+lifecycle commands through another binary; LWC deliberately blocks
+install/uninstall/upgrade/telemetry/daemon/daemons/serve so project ownership,
 runtime pinning, and telemetry policy cannot be bypassed.
 
 ## Read-only project viewer (`lwc view`)
@@ -305,6 +340,13 @@ does not migrate, sync, lint, refresh, or build either graph. Stop it with
 Ctrl-C. Treat its graph limits (1000 nodes, 5000 edges) as visualization bounds,
 not database totals. Never expose it on a public interface or infer write
 acceptance from a rendered page.
+
+Graphs use a single Obsidian-inspired 3D relationship view with small nodes,
+persistent labels, thin links, rotation, and zoom. It never changes graph data.
+
+The UI defaults to English. The `中文` / `EN` control switches viewer chrome and
+remembers the choice in browser-local storage; sources and Wiki pages are never
+translated implicitly.
 
 ## Maintenance and checkpoints
 

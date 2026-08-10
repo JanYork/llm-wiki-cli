@@ -375,6 +375,7 @@ counts and total describe the complete Wiki; limit and offset paginate only the 
 }
 
 #[derive(Subcommand)]
+#[command(disable_help_subcommand = true)]
 enum CgCommand {
     /// Download the pinned LWC CodeGraph runtime and build the project index.
     Init {

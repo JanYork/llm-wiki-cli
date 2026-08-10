@@ -704,6 +704,11 @@ lwc view
 lwc view --port 4173 --no-open
 ```
 
+The viewer starts in English. Use the `中文` / `EN` control to switch languages;
+the browser remembers the selection while Wiki content remains in its authored
+language. Graphs use a single Obsidian-inspired 3D relationship view with small
+nodes, persistent labels, thin links, rotation, and zoom.
+
 Code indexing is project-only and disabled until explicitly initialized. The
 pinned LWC CodeGraph fork is then downloaded from its GitHub Release, verified
 with SHA-256, and kept under `.lwc/runtime/codegraph`; its index lives under
@@ -723,8 +728,8 @@ lwc cg files
 ```
 
 All CodeGraph query capabilities are forwarded by `lwc cg`. Global lifecycle
-commands (`install`, `uninstall`, `upgrade`, `telemetry`, `daemon`, `serve`) are
-blocked because LWC owns the runtime and enforces the project boundary. Initial,
+commands (`install`, `uninstall`, `upgrade`, `telemetry`, `daemon`, `daemons`,
+`serve`) are blocked because LWC owns the runtime and enforces the project boundary. Initial,
 incremental, full, update, delete, reference-resolution, and recovery writes
 commit one owner file completely before the next; the current graph remains
 readable and historical document revisions are never refreshed.
