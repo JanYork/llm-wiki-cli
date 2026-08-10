@@ -1,7 +1,7 @@
 use crate::{
     error::{AppError, Result},
     scope::StorePath,
-    store::Store,
+    store::{Store, WordGraphOptions},
 };
 use axum::{
     Json, Router,
@@ -31,8 +31,27 @@ struct PageQuery {
     offset: usize,
 }
 
+#[derive(Deserialize)]
+struct WordGraphQuery {
+    query: String,
+    #[serde(default = "default_word_document_limit")]
+    limit: usize,
+    #[serde(default = "default_word_term_limit")]
+    term_limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
 fn default_limit() -> usize {
     100
+}
+
+fn default_word_document_limit() -> usize {
+    25
+}
+
+fn default_word_term_limit() -> usize {
+    30
 }
 
 type ApiResult = std::result::Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -52,6 +71,7 @@ pub fn run(store: StorePath, port: u16, no_open: bool) -> Result<Value> {
             .route("/api/sources", get(sources))
             .route("/api/graphs/knowledge", get(knowledge_graph))
             .route("/api/graphs/code", get(code_graph))
+            .route("/api/graphs/words", get(word_graph))
             .with_state(AppState {
                 store: Arc::new(store),
             });
@@ -194,6 +214,25 @@ async fn knowledge_graph(State(state): State<AppState>) -> ApiResult {
 
 async fn code_graph(State(state): State<AppState>) -> ApiResult {
     Ok(Json(crate::codegraph::graph(&state.store)))
+}
+
+async fn word_graph(
+    State(state): State<AppState>,
+    Query(query): Query<WordGraphQuery>,
+) -> ApiResult {
+    let store = open_read(&state)?;
+    to_json(
+        store
+            .word_graph(
+                &query.query,
+                &WordGraphOptions {
+                    document_limit: query.limit,
+                    term_limit: query.term_limit,
+                    offset: query.offset,
+                },
+            )
+            .map_err(api_error)?,
+    )
 }
 
 fn to_json(value: impl serde::Serialize) -> ApiResult {

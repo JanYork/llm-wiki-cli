@@ -73,6 +73,95 @@ fn view_serves_get_only_without_mutating_the_project() {
     assert_eq!(snapshot(&project.join(".lwc")), before);
 }
 
+#[test]
+fn view_serves_bounded_word_graph_queries_without_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    run_lwc(&project, &home, &["init"]);
+    for slug in ["alpha", "beta"] {
+        let file = project.join(format!("{slug}.md"));
+        fs::write(&file, format!("needle shared {slug}")).unwrap();
+        run_lwc(
+            &project,
+            &home,
+            &[
+                "page",
+                "put",
+                slug,
+                "--title",
+                slug,
+                "--file",
+                file.to_str().unwrap(),
+                "--provenance",
+                "user-provided",
+            ],
+        );
+    }
+    let before = snapshot(&project.join(".lwc"));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lwc"))
+        .current_dir(&project)
+        .env("HOME", &home)
+        .args(["view", "--port", "0", "--no-open"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let startup: Value = serde_json::from_str(&line).unwrap();
+    let address = startup["address"].as_str().unwrap();
+
+    let response = request(
+        address,
+        "GET",
+        "/api/graphs/words?query=needle&limit=999&term_limit=999&offset=0",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let graph: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(graph["documents"].as_array().unwrap().len(), 2);
+    assert!(
+        graph["terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|term| term["label"] == "shared")
+    );
+    assert_eq!(graph["limits"]["document_limit"], 25);
+    assert_eq!(graph["limits"]["term_limit"], 30);
+    assert!(
+        graph["truncation_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "request_limits")
+    );
+
+    assert!(request(address, "GET", "/api/graphs/words?query=").starts_with("HTTP/1.1 400"));
+    assert!(request(address, "POST", "/api/graphs/words?query=needle").starts_with("HTTP/1.1 405"));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(snapshot(&project.join(".lwc")), before);
+}
+
+fn run_lwc(project: &Path, home: &Path, args: &[&str]) {
+    let output = Command::new(env!("CARGO_BIN_EXE_lwc"))
+        .current_dir(project)
+        .env("HOME", home)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn request(address: &str, method: &str, path: &str) -> String {
     let mut stream = TcpStream::connect(address).unwrap();
     write!(
