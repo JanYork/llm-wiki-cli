@@ -27,24 +27,22 @@ const WORD_GRAPH_CANDIDATE_SQL: &str = "SELECT
      LIMIT ?2 OFFSET ?3";
 
 const WORD_GRAPH_SPAN_SQL: &str = "SELECT
-        CASE f.document_type
+        CASE n.document_type
             WHEN 'page' THEN SUBSTR(CAST(p.body AS BLOB), n.byte_start + 1, n.byte_end - n.byte_start)
             ELSE SUBSTR(CAST(s.content AS BLOB), n.byte_start + 1, n.byte_end - n.byte_start)
-        END,
-        bm25(span_fts, 0.0, 0.0, 0.0, 0.0, 4.0, 2.0, 1.0) AS fts_rank
-     FROM span_fts f
-     JOIN search_spans n ON n.span_id = f.span_id AND n.active = 1
+        END
+     FROM search_spans n
      LEFT JOIN pages p
-       ON f.document_type = 'page' AND p.slug = f.document_identifier
+       ON n.document_type = 'page' AND p.slug = n.document_identifier
      LEFT JOIN sources s
-       ON f.document_type = 'source'
-      AND s.id = CAST(f.document_identifier AS INTEGER)
-     WHERE span_fts MATCH ?1
-       AND f.span_type = 'passage'
-       AND f.document_type = ?2
-       AND f.document_identifier = ?3
-     ORDER BY fts_rank ASC, f.rowid ASC
-     LIMIT ?4";
+       ON n.document_type = 'source'
+      AND s.id = CAST(n.document_identifier AS INTEGER)
+     WHERE n.active = 1
+       AND n.span_type = 'passage'
+       AND n.document_type = ?1
+       AND n.document_identifier = ?2
+     ORDER BY n.ordinal ASC, n.span_id ASC
+     LIMIT ?3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WordGraphOptions {
@@ -201,7 +199,6 @@ impl Store {
             'documents: for (document_index, candidate) in candidates.iter().enumerate() {
                 let rows = spans.query_map(
                     params![
-                        &match_query,
                         &candidate.document_type,
                         &candidate.identifier,
                         WORD_GRAPH_MAX_SPANS_PER_DOCUMENT as i64
@@ -333,6 +330,16 @@ impl Store {
             .query_map(params![word_match_query(&terms), 2_i64, 0_i64], |row| {
                 row.get(3)
             })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    fn word_graph_span_query_plan(&self) -> Result<Vec<String>> {
+        let explain = format!("EXPLAIN QUERY PLAN {WORD_GRAPH_SPAN_SQL}");
+        let mut statement = self.conn.prepare(&explain)?;
+        statement
+            .query_map(params!["page", "example", 4_i64], |row| row.get(3))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -607,5 +614,12 @@ mod word_graph_tests {
             "{details:?}"
         );
         assert!(details.iter().any(|detail| detail.contains("search_fts")));
+        let span_details = store.word_graph_span_query_plan().unwrap();
+        assert!(
+            span_details
+                .iter()
+                .any(|detail| detail.contains("search_spans_document")),
+            "{span_details:?}"
+        );
     }
 }
