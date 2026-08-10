@@ -987,6 +987,39 @@ fn trans_config_rejects_timeout_bounds_and_unknown_fields_before_write() {
 }
 
 #[test]
+fn trans_config_rejects_invalid_timeout_from_disk_for_show_and_update() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let config_path = world.project.join(".lwc/config.json");
+
+    fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 3,
+            "graph": {
+                "setting": "inherit"
+            },
+            "trans": {
+                "setting": "markitdown",
+                "timeout_seconds": 0,
+                "anydoc_args": [],
+                "markitdown_args": ["--fast"]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let before = fs::read_to_string(&config_path).unwrap();
+
+    let show = world.err(&world.project, &["config", "show"]);
+    assert_eq!(show["error"]["code"], "invalid_config");
+
+    let update = world.err(&world.project, &["config", "set", "--graph", "disabled"]);
+    assert_eq!(update["error"]["code"], "invalid_config");
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
+}
+
+#[test]
 fn external_graph_engines_build_current_documents_through_observable_work() {
     for engine in ["grafeo", "surrealdb"] {
         let world = TestWorld::new();

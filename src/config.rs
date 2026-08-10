@@ -167,6 +167,22 @@ pub fn validate_trans_timeout(timeout_seconds: u16) -> Result<u16> {
     ))
 }
 
+fn validate_trans_settings(trans: &TransSettings) -> Result<()> {
+    validate_trans_timeout(trans.timeout_seconds)
+        .map(|_| ())
+        .map_err(|error| {
+            AppError::new(
+                "invalid_config",
+                format!("invalid trans timeout_seconds: {}", error.message),
+            )
+        })
+}
+
+fn validate_config_file(config: ConfigFile) -> Result<ConfigFile> {
+    validate_trans_settings(&config.trans)?;
+    Ok(config)
+}
+
 pub fn config_path_for_database(database: &Path) -> Result<PathBuf> {
     let parent = database.parent().ok_or_else(|| {
         AppError::new(
@@ -196,7 +212,7 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                 let legacy: ConfigFileV2 = serde_json::from_value(value).map_err(|error| {
                     AppError::new("invalid_config", format!("invalid config: {error}"))
                 })?;
-                return Ok(ConfigFile {
+                return validate_config_file(ConfigFile {
                     version: CONFIG_VERSION,
                     graph: legacy.graph,
                     trans: default_trans(),
@@ -208,9 +224,10 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                     format!("unsupported config version {version}"),
                 ));
             }
-            serde_json::from_value(value).map_err(|error| {
+            let config = serde_json::from_value(value).map_err(|error| {
                 AppError::new("invalid_config", format!("invalid config: {error}"))
-            })
+            })?;
+            validate_config_file(config)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ConfigFile::default()),
         Err(error) => Err(error.into()),
@@ -331,6 +348,7 @@ pub fn update(database: &Path, patch: ConfigPatch) -> Result<(PathBuf, ConfigFil
     if let Some(trans) = patch.trans {
         config.trans = trans;
     }
+    validate_config_file(config.clone())?;
     let bytes = serde_json::to_vec_pretty(&config)
         .map_err(|error| AppError::new("json_error", error.to_string()))?;
     let temporary = parent.join(format!(
