@@ -38,7 +38,6 @@ class LwcGraph extends LitElement {
   firstUpdated() {
     this.container = this.querySelector('.graph') ?? undefined
     window.addEventListener('resize', this.resize)
-    void this.load()
   }
   updated(changed: Map<string, unknown>) { if (changed.has('path') || changed.has('locale')) void this.load() }
   disconnectedCallback() {
@@ -73,6 +72,10 @@ class LwcGraph extends LitElement {
         return
       }
       const visible = boundedGraph(payload.nodes ?? [], payload.edges ?? [])
+      if (visible.nodes.length === 0) {
+        this.message = graphCount(this.locale, 0, 0)
+        return
+      }
       const styles = getComputedStyle(document.documentElement)
       const accent = styles.getPropertyValue('--color-primary').trim()
       const labelColor = styles.getPropertyValue('--color-graph-label').trim()
@@ -131,7 +134,8 @@ class LwcGraph extends LitElement {
       window.setTimeout(() => {
         if (this.renderer3d === renderer) frameGraph()
       }, 800)
-      this.message = `${graphCount(this.locale, nodes.length, links.length)}${visible.truncated || payload.truncated ? ` · ${copy.limited}` : ''} · ${copy.graph3dControls}`
+      const limitMessage = visible.truncated ? copy.limited : payload.truncated ? copy.sampleLimited : ''
+      this.message = `${graphCount(this.locale, nodes.length, links.length)}${limitMessage ? ` · ${limitMessage}` : ''} · ${copy.graph3dControls}`
     } catch (error) {
       this.message = error instanceof Error ? error.message : String(error)
     }

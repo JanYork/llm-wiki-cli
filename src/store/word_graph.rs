@@ -432,7 +432,7 @@ fn select_word_terms(
         }
         selected.push(term);
     }
-    if available > selected.len() || query_terms.len() > selected.len() {
+    if available > selected.len() {
         reasons.insert("terms".to_string());
     }
     selected
@@ -605,6 +605,10 @@ mod word_graph_tests {
             let error = store.word_graph(query, &options(10, 10, 0)).unwrap_err();
             assert_eq!(error.code, "invalid_query");
         }
+
+        let empty = store.word_graph("absent", &options(10, 10, 0)).unwrap();
+        assert!(empty.documents.is_empty());
+        assert!(!empty.truncated);
 
         let details = store.word_graph_candidate_query_plan("needle").unwrap();
         assert!(
