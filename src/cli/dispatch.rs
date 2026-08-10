@@ -588,7 +588,7 @@ fn run(cli: Cli) -> Result<Value> {
             if selected_changeset.is_some() {
                 return Err(AppError::new(
                     "changeset_command_not_supported",
-                    "graph configuration is deployment-local and cannot be changed in a changeset",
+                    "configuration is deployment-local and cannot be changed in a changeset",
                 ));
             }
             let store_path = resolve_live_store_path(cli.scope, &cwd)?;
@@ -596,14 +596,54 @@ fn run(cli: Cli) -> Result<Value> {
                 ConfigCommand::Show => {
                     config::response(scope_name(store_path.scope), &store_path.path)
                 }
-                ConfigCommand::Set { graph } => {
-                    let setting = config::parse_setting(&graph)?;
-                    config::update(&store_path.path, setting)?;
+                ConfigCommand::Set {
+                    graph,
+                    trans,
+                    trans_timeout,
+                    trans_args,
+                } => {
+                    if graph.is_none() && trans.is_none() {
+                        return Err(AppError::new(
+                            "invalid_input",
+                            "config set requires --graph or --trans",
+                        ));
+                    }
+                    if trans.is_none() && (trans_timeout.is_some() || !trans_args.is_empty()) {
+                        return Err(AppError::new(
+                            "invalid_input",
+                            "config set requires --trans when using --trans-timeout or --trans-arg",
+                        ));
+                    }
+
+                    let graph_setting = graph
+                        .as_deref()
+                        .map(config::parse_graph_setting)
+                        .transpose()?;
+                    let trans_setting = match trans {
+                        Some(trans) => Some(config::build_trans_settings(
+                            &store_path.path,
+                            config::parse_trans_setting(&trans)?,
+                            trans_timeout,
+                            trans_args,
+                        )?),
+                        None => None,
+                    };
+                    config::update(
+                        &store_path.path,
+                        config::ConfigPatch {
+                            graph: graph_setting,
+                            trans: trans_setting,
+                        },
+                    )?;
                     Store::open(scope_name(store_path.scope), &store_path.path)?;
                     let mut response =
                         config::response(scope_name(store_path.scope), &store_path.path)?;
-                    if setting != config::GraphSetting::Disabled
-                        && setting != config::GraphSetting::Inherit
+                    if matches!(
+                        graph_setting,
+                        Some(setting)
+                            if setting != config::GraphSetting::Disabled
+                                && setting != config::GraphSetting::Inherit
+                    )
                     {
                         response["work"] = work::start_graph_projection(
                             scope_name(store_path.scope),
@@ -613,14 +653,20 @@ fn run(cli: Cli) -> Result<Value> {
                     }
                     Ok(response)
                 }
-                ConfigCommand::Unset { graph } => {
-                    if !graph {
+                ConfigCommand::Unset { graph, trans } => {
+                    if !graph && !trans {
                         return Err(AppError::new(
                             "invalid_input",
-                            "config unset requires --graph",
+                            "config unset requires --graph or --trans",
                         ));
                     }
-                    config::update(&store_path.path, config::GraphSetting::Inherit)?;
+                    config::update(
+                        &store_path.path,
+                        config::ConfigPatch {
+                            graph: graph.then_some(config::GraphSetting::Inherit),
+                            trans: trans.then_some(config::inherit_trans_settings()),
+                        },
+                    )?;
                     Store::open(scope_name(store_path.scope), &store_path.path)?;
                     config::response(scope_name(store_path.scope), &store_path.path)
                 }

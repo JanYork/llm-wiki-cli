@@ -254,7 +254,7 @@ enum Command {
         #[command(subcommand)]
         command: IngestCommand,
     },
-    /// Inspect and update the layered graph engine setting.
+    /// Inspect and update the layered graph and trans settings.
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -698,18 +698,29 @@ This prevents completion after merely indexing raw text or writing a detached su
 
 #[derive(Subcommand)]
 enum ConfigCommand {
-    /// Show effective graph configuration and value origins.
+    /// Show effective graph and trans configuration plus value origins.
     Show,
-    /// Atomically set the graph engine setting.
+    /// Atomically set graph and trans configuration.
     Set {
         /// Select disabled, grafeo, surrealdb, or inherit.
         #[arg(long)]
-        graph: String,
+        graph: Option<String>,
+        /// Select disabled, anydoc, or markitdown.
+        #[arg(long)]
+        trans: Option<String>,
+        /// Override the trans timeout in seconds (1..=900).
+        #[arg(long = "trans-timeout")]
+        trans_timeout: Option<u16>,
+        /// Replace the selected trans engine's argument list; repeat for multiple values.
+        #[arg(long = "trans-arg", allow_hyphen_values = true)]
+        trans_args: Vec<String>,
     },
-    /// Restore the graph engine setting to its inherited default.
+    /// Restore graph and trans settings to their inherited defaults.
     Unset {
         #[arg(long)]
         graph: bool,
+        #[arg(long)]
+        trans: bool,
     },
 }
 

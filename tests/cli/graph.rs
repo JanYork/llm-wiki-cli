@@ -730,6 +730,263 @@ fn graph_is_disabled_by_default_and_removed_engines_are_rejected() {
 }
 
 #[test]
+fn trans_is_disabled_by_default_and_resolves_global_then_project_profiles() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+
+    let defaults = world.ok(&world.project, &["config", "show"]);
+    assert_eq!(defaults["trans"]["setting"], "disabled");
+    assert_eq!(defaults["trans"]["origin"], "built-in");
+    assert_eq!(defaults["trans"]["timeout_seconds"], 120);
+    assert_eq!(defaults["trans"]["anydoc_args"], serde_json::json!([]));
+    assert_eq!(defaults["trans"]["markitdown_args"], serde_json::json!([]));
+
+    world.ok(&world.project, &["--scope", "global", "init"]);
+    world.ok(
+        &world.project,
+        &[
+            "--scope",
+            "global",
+            "config",
+            "set",
+            "--trans",
+            "markitdown",
+            "--trans-timeout",
+            "45",
+            "--trans-arg",
+            "--fast",
+            "--trans-arg",
+            "pdf",
+        ],
+    );
+    let layered = world.ok(&world.project, &["config", "show"]);
+    assert_eq!(layered["trans"]["setting"], "markitdown");
+    assert_eq!(layered["trans"]["origin"], "global");
+    assert_eq!(layered["trans"]["timeout_seconds"], 45);
+    assert_eq!(layered["trans"]["anydoc_args"], serde_json::json!([]));
+    assert_eq!(
+        layered["trans"]["markitdown_args"],
+        serde_json::json!(["--fast", "pdf"])
+    );
+
+    let project = world.ok(
+        &world.project,
+        &[
+            "config",
+            "set",
+            "--trans",
+            "anydoc",
+            "--trans-timeout",
+            "30",
+            "--trans-arg",
+            "ocr",
+            "--trans-arg",
+            "html",
+        ],
+    );
+    assert_eq!(project["trans"]["setting"], "anydoc");
+    assert_eq!(project["trans"]["origin"], "project");
+    assert_eq!(project["trans"]["timeout_seconds"], 30);
+    assert_eq!(project["trans"]["anydoc_args"], serde_json::json!(["ocr", "html"]));
+    assert_eq!(project["trans"]["markitdown_args"], serde_json::json!([]));
+}
+
+#[test]
+fn trans_set_replaces_selected_engine_args_and_unset_restores_inherit() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+
+    world.ok(
+        &world.project,
+        &[
+            "config",
+            "set",
+            "--trans",
+            "anydoc",
+            "--trans-timeout",
+            "240",
+            "--trans-arg",
+            "first",
+            "--trans-arg",
+            "second",
+        ],
+    );
+    let replaced = world.ok(
+        &world.project,
+        &[
+            "config",
+            "set",
+            "--trans",
+            "anydoc",
+            "--trans-arg",
+            "only",
+        ],
+    );
+    assert_eq!(replaced["trans"]["setting"], "anydoc");
+    assert_eq!(replaced["trans"]["origin"], "project");
+    assert_eq!(replaced["trans"]["timeout_seconds"], 240);
+    assert_eq!(replaced["trans"]["anydoc_args"], serde_json::json!(["only"]));
+
+    let switched = world.ok(
+        &world.project,
+        &[
+            "config",
+            "set",
+            "--trans",
+            "markitdown",
+            "--trans-arg",
+            "md",
+        ],
+    );
+    assert_eq!(switched["trans"]["setting"], "markitdown");
+    assert_eq!(switched["trans"]["origin"], "project");
+    assert_eq!(switched["trans"]["anydoc_args"], serde_json::json!(["only"]));
+    assert_eq!(switched["trans"]["markitdown_args"], serde_json::json!(["md"]));
+
+    let stored: Value =
+        serde_json::from_str(&fs::read_to_string(world.project.join(".lwc/config.json")).unwrap())
+            .unwrap();
+    assert_eq!(stored["version"], 3);
+    assert_eq!(stored["trans"]["setting"], "markitdown");
+    assert_eq!(stored["trans"]["timeout_seconds"], 240);
+    assert_eq!(stored["trans"]["anydoc_args"], serde_json::json!(["only"]));
+    assert_eq!(stored["trans"]["markitdown_args"], serde_json::json!(["md"]));
+
+    let inherited = world.ok(&world.project, &["config", "unset", "--trans"]);
+    assert_eq!(inherited["trans"]["setting"], "disabled");
+    assert_eq!(inherited["trans"]["origin"], "built-in");
+    assert_eq!(inherited["trans"]["timeout_seconds"], 120);
+    assert_eq!(inherited["trans"]["anydoc_args"], serde_json::json!([]));
+    assert_eq!(inherited["trans"]["markitdown_args"], serde_json::json!([]));
+
+    let stored: Value =
+        serde_json::from_str(&fs::read_to_string(world.project.join(".lwc/config.json")).unwrap())
+            .unwrap();
+    assert_eq!(stored["version"], 3);
+    assert_eq!(stored["trans"]["setting"], "inherit");
+    assert_eq!(stored["trans"]["timeout_seconds"], 120);
+    assert_eq!(stored["trans"]["anydoc_args"], serde_json::json!([]));
+    assert_eq!(stored["trans"]["markitdown_args"], serde_json::json!([]));
+}
+
+#[test]
+fn v2_config_stays_compatible_and_migrates_to_v3_on_write() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+
+    let config_path = world.project.join(".lwc/config.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 2,
+            "graph": {
+                "setting": "surrealdb"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let shown = world.ok(&world.project, &["config", "show"]);
+    assert_eq!(shown["graph"]["setting"], "surrealdb");
+    assert_eq!(shown["graph"]["origin"], "project");
+    assert_eq!(shown["trans"]["setting"], "disabled");
+    assert_eq!(shown["trans"]["origin"], "built-in");
+    assert_eq!(shown["trans"]["timeout_seconds"], 120);
+
+    let updated = world.ok(
+        &world.project,
+        &[
+            "config",
+            "set",
+            "--trans",
+            "anydoc",
+            "--trans-timeout",
+            "15",
+            "--trans-arg",
+            "ocr",
+        ],
+    );
+    assert_eq!(updated["graph"]["setting"], "surrealdb");
+    assert_eq!(updated["trans"]["setting"], "anydoc");
+    assert_eq!(updated["trans"]["origin"], "project");
+
+    let stored: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(stored["version"], 3);
+    assert_eq!(stored["graph"]["setting"], "surrealdb");
+    assert_eq!(stored["trans"]["setting"], "anydoc");
+    assert_eq!(stored["trans"]["timeout_seconds"], 15);
+    assert_eq!(stored["trans"]["anydoc_args"], serde_json::json!(["ocr"]));
+    assert_eq!(stored["trans"]["markitdown_args"], serde_json::json!([]));
+}
+
+#[test]
+fn trans_config_rejects_timeout_bounds_and_unknown_fields_before_write() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let config_path = world.project.join(".lwc/config.json");
+
+    let too_low = world.err(
+        &world.project,
+        &[
+            "config",
+            "set",
+            "--trans",
+            "anydoc",
+            "--trans-timeout",
+            "0",
+        ],
+    );
+    assert_eq!(too_low["error"]["code"], "invalid_input");
+    assert!(!config_path.exists());
+
+    let too_high = world.err(
+        &world.project,
+        &[
+            "config",
+            "set",
+            "--trans",
+            "markitdown",
+            "--trans-timeout",
+            "901",
+        ],
+    );
+    assert_eq!(too_high["error"]["code"], "invalid_input");
+    assert!(!config_path.exists());
+
+    fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 3,
+            "graph": {
+                "setting": "inherit"
+            },
+            "trans": {
+                "setting": "anydoc",
+                "timeout_seconds": 120,
+                "anydoc_args": [],
+                "markitdown_args": [],
+                "unexpected": true
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let before = fs::read_to_string(&config_path).unwrap();
+    let invalid = world.err(
+        &world.project,
+        &[
+            "config",
+            "set",
+            "--trans",
+            "disabled",
+        ],
+    );
+    assert_eq!(invalid["error"]["code"], "invalid_config");
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
+}
+
+#[test]
 fn external_graph_engines_build_current_documents_through_observable_work() {
     for engine in ["grafeo", "surrealdb"] {
         let world = TestWorld::new();
