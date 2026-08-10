@@ -35,7 +35,28 @@ fn run(cli: Cli) -> Result<Value> {
                 "scope": scope_name(store_path.scope),
                 "database": store_path.path,
                 "created": created,
-                "git_exclude": git_exclude
+                "git_exclude": git_exclude,
+                "recommendations": {
+                    "md_trans": {
+                        "default": "disabled",
+                        "config_show": "lwc config show",
+                        "convert": "lwc trans INPUT --output OUTPUT.md",
+                        "ingest_after_review": "lwc source add OUTPUT.md",
+                        "automatic_actions": [],
+                        "engines": {
+                            "anydoc": {
+                                "install": "npm install --global @firecrawl/anydoc",
+                                "configure": "lwc config set --trans anydoc",
+                                "repository": "https://github.com/firecrawl/anydoc"
+                            },
+                            "markitdown": {
+                                "install": "python3 -m pip install 'markitdown[all]'",
+                                "configure": "lwc config set --trans markitdown",
+                                "repository": "https://github.com/microsoft/markitdown"
+                            }
+                        }
+                    }
+                }
             }))
         }
         Command::Work { command } => {

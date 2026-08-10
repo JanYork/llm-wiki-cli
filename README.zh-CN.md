@@ -252,6 +252,30 @@ lwc config set --graph disabled
 lwc config unset --graph
 ```
 
+Markdown 转换是独立的可选操作。`lwc init` 会返回同样的机器可读配置指引，但不会
+安装或启用转换器。安装并显式选择一个适配器，先转换为新的本地 Markdown 文件并
+检查内容，确认后再导入：
+
+```bash
+# 二选一；未配置时两者都不会启用。
+npm install --global @firecrawl/anydoc
+lwc config set --trans anydoc
+
+# 或：
+python3 -m pip install 'markitdown[all]'
+lwc config set --trans markitdown
+
+lwc trans INPUT --output OUTPUT.md
+lwc source add OUTPUT.md
+```
+
+配置支持 `--trans-timeout 1..900`，并可为当前适配器重复传入
+`--trans-arg=<value>`。LWC 只会直接执行已选择的固定适配器，不会自动回退到另一个
+适配器；仅接受本地文件，输入输出均限制为 64 MiB，且绝不覆盖已有输出。凭证应由
+适配器从环境变量读取，不得写入 LWC 配置。格式和可选参数以
+[Anydoc](https://github.com/firecrawl/anydoc) 与
+[MarkItDown](https://github.com/microsoft/markitdown) 官方文档为准。
+
 Grafeo 与嵌入式 SurrealDB 使用 `.lwc/` 下可重建的 sidecar。每个
 `graph-project` Work 会先完整提交一篇当前 Source/Page 及其自有链接、引用和显式关系，
 确认可用后才开始下一篇。更新和删除只排入实际触及的文档；重建和恢复也使用相同的

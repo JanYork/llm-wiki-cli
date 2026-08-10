@@ -459,6 +459,26 @@ fn project_flow_preserves_sources_and_rolls_back_failed_page_updates() {
 
     let initialized = world.ok(&world.project, &["init"]);
     assert_eq!(initialized["scope"], "project");
+    assert_eq!(
+        initialized["recommendations"]["md_trans"]["default"],
+        "disabled"
+    );
+    assert_eq!(
+        initialized["recommendations"]["md_trans"]["config_show"],
+        "lwc config show"
+    );
+    assert_eq!(
+        initialized["recommendations"]["md_trans"]["engines"]["anydoc"]["configure"],
+        "lwc config set --trans anydoc"
+    );
+    assert_eq!(
+        initialized["recommendations"]["md_trans"]["engines"]["markitdown"]["configure"],
+        "lwc config set --trans markitdown"
+    );
+    assert!(
+        !world.project.join(".lwc/config.json").exists(),
+        "init guidance must not enable or configure an adapter"
+    );
     assert!(world.project.join(".lwc/wiki.db").is_file());
 
     let schema = world.write(

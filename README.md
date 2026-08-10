@@ -283,6 +283,33 @@ lwc config set --graph disabled
 lwc config unset --graph
 ```
 
+Markdown conversion is a separate opt-in operation. `lwc init` reports the
+same machine-readable setup guidance, but never installs or enables a
+converter. Install one adapter, select it explicitly, convert to a new local
+Markdown file, review it, and only then ingest it:
+
+```bash
+# Choose one adapter; both are disabled unless configured.
+npm install --global @firecrawl/anydoc
+lwc config set --trans anydoc
+
+# Or:
+python3 -m pip install 'markitdown[all]'
+lwc config set --trans markitdown
+
+lwc trans INPUT --output OUTPUT.md
+lwc source add OUTPUT.md
+```
+
+Configuration accepts `--trans-timeout 1..900` and repeated
+`--trans-arg=<value>` options for the selected adapter. LWC invokes the fixed
+adapter executable directly, never falls back to the other adapter, accepts
+local files only, caps input and output at 64 MiB, and never overwrites an
+existing output. Keep credentials in the adapter's environment rather than in
+LWC configuration. See the official [Anydoc](https://github.com/firecrawl/anydoc)
+and [MarkItDown](https://github.com/microsoft/markitdown) documentation for
+supported formats and optional flags.
+
 Grafeo and embedded SurrealDB use disposable sidecars under `.lwc/`. Each
 `graph-project` Work commits one current Source/Page and its owned links,
 citations, and explicit relations before starting the next document. Updates

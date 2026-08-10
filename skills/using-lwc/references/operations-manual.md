@@ -244,6 +244,37 @@ Disable without deleting sidecars:
 Never copy, edit, compact, or delete live graph sidecars. A failed graph does
 not invalidate canonical pages/sources; ordinary reads remain available.
 
+## Optional Markdown conversion
+
+Markdown adapters are deployment-local and disabled by default. `init` returns
+setup guidance but performs no install, network request, adapter invocation, or
+configuration write. Inspect the effective setting, install one official CLI,
+and select exactly one engine:
+
+```bash
+"$LWC" --scope project config show
+npm install --global @firecrawl/anydoc
+"$LWC" --scope project config set --trans anydoc
+
+# Alternative engine:
+python3 -m pip install 'markitdown[all]'
+"$LWC" --scope project config set --trans markitdown
+```
+
+Optional adapter settings use `--trans-timeout 1..900` and repeated
+`--trans-arg=<value>`. Store no credentials in configuration; use the adapter's
+environment. LWC does not accept URL inputs or fall back between engines.
+
+```bash
+"$LWC" --scope project trans INPUT --output OUTPUT.md
+# Inspect OUTPUT.md first, then ingest explicitly if it is authoritative.
+"$LWC" --scope project source add OUTPUT.md
+```
+
+Both input and output are capped at 64 MiB. Output uses create-new semantics;
+conversion never overwrites a file or mutates the Wiki. Stable failures must be
+handled before retrying or switching the configured engine.
+
 ## Project code intelligence (`lwc cg`)
 
 CodeGraph is separate from the optional Wiki graph engines. Use it only when

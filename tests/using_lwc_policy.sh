@@ -43,6 +43,10 @@ for expected in \
   'checked-out code' \
   'current implementation evidence' \
   'config show' \
+  'Markdown conversion recommendation' \
+  'config set --trans anydoc' \
+  'config set --trans markitdown' \
+  'trans INPUT --output OUTPUT.md' \
   'config set --graph grafeo' \
   'config set --graph surrealdb'; do
   grep -Fq -- "$expected" "$skill" || {
@@ -54,6 +58,10 @@ done
 for expected in \
   'Command families' \
   'Graph engine and document-granular Work' \
+  'Optional Markdown conversion' \
+  'config set --trans anydoc' \
+  'config set --trans markitdown' \
+  'trans INPUT --output OUTPUT.md' \
   'Project code intelligence' \
   'Route questions deliberately' \
   'Use the three LWC planes together' \

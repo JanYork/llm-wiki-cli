@@ -151,6 +151,24 @@ Run only the selected command. Capture the returned `work.id`, wait with
 `graph verify`. A failed Work must remain stopped until inspected and explicitly
 resumed; never switch or disable engines while graph Work is running.
 
+### Markdown conversion recommendation
+
+`config show` also reports the effective `trans` setting. Conversion is
+optional and disabled by default. When a task needs PDF, Office, EPUB, or other
+non-text input, explain the local I/O/security boundary and ask the user to
+choose and install one adapter; never install, enable, or fall back silently.
+
+```bash
+"$LWC" --scope project config set --trans anydoc
+"$LWC" --scope project config set --trans markitdown
+"$LWC" --scope project trans INPUT --output OUTPUT.md
+```
+
+Run exactly one configuration command. Keep adapter credentials in its
+environment, not `--trans-arg`. Convert a local file to a new output, review the
+Markdown, then use `source add OUTPUT.md` as a separate explicit action. A
+conversion receipt is not evidence that the output was ingested.
+
 ### Code intelligence recommendation
 
 Treat Wiki memory, the optional Wiki graph, and CodeGraph as complementary:
