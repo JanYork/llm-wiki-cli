@@ -123,13 +123,21 @@ fn view_serves_bounded_word_graph_queries_without_mutation() {
     );
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let graph: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    assert_eq!(graph["documents"].as_array().unwrap().len(), 2);
-    assert!(
-        graph["terms"]
+    assert_eq!(
+        graph["nodes"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|term| term["label"] == "shared")
+            .filter(|node| node["type"] == "document")
+            .count(),
+        2
+    );
+    assert!(
+        graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["type"] == "term" && node["label"] == "shared")
     );
     assert_eq!(graph["limits"]["document_limit"], 25);
     assert_eq!(graph["limits"]["term_limit"], 30);

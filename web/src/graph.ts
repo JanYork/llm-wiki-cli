@@ -17,6 +17,17 @@ export interface VisibleGraph {
   truncated: boolean
 }
 
+export function wordGraphPath(query: string, offset: number): string {
+  if (!query.trim()) return ''
+  const parameters = new URLSearchParams({
+    query: query.trim(),
+    limit: '25',
+    term_limit: '30',
+    offset: String(Math.max(0, offset)),
+  })
+  return `/api/graphs/words?${parameters}`
+}
+
 export function boundedGraph(
   nodes: GraphNode[],
   edges: GraphEdge[],

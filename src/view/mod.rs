@@ -221,18 +221,64 @@ async fn word_graph(
     Query(query): Query<WordGraphQuery>,
 ) -> ApiResult {
     let store = open_read(&state)?;
-    to_json(
-        store
-            .word_graph(
-                &query.query,
-                &WordGraphOptions {
-                    document_limit: query.limit,
-                    term_limit: query.term_limit,
-                    offset: query.offset,
-                },
-            )
-            .map_err(api_error)?,
-    )
+    let graph = store
+        .word_graph(
+            &query.query,
+            &WordGraphOptions {
+                document_limit: query.limit,
+                term_limit: query.term_limit,
+                offset: query.offset,
+            },
+        )
+        .map_err(api_error)?;
+    let nodes = graph
+        .documents
+        .iter()
+        .map(|node| {
+            json!({
+                "id": node.id,
+                "label": node.label,
+                "type": "document",
+                "document_type": node.document_type,
+                "identifier": node.identifier,
+                "kind": node.kind,
+            })
+        })
+        .chain(graph.terms.iter().map(|node| {
+            json!({
+                "id": node.id,
+                "label": node.label,
+                "type": "term",
+                "sample_document_frequency": node.sample_document_frequency,
+                "sample_occurrences": node.sample_occurrences,
+            })
+        }))
+        .collect::<Vec<_>>();
+    let edges = graph
+        .edges
+        .iter()
+        .map(|edge| {
+            json!({
+                "id": edge.id,
+                "source": edge.term,
+                "target": edge.document,
+                "type": "SAMPLE_CONTAINS",
+                "sample_occurrences": edge.sample_occurrences,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "available": true,
+        "query": graph.query,
+        "query_terms": graph.query_terms,
+        "nodes": nodes,
+        "edges": edges,
+        "has_more": graph.has_more,
+        "truncated": graph.truncated,
+        "truncation_reasons": graph.truncation_reasons,
+        "limits": graph.limits,
+        "diagnostics": graph.diagnostics,
+    })))
 }
 
 fn to_json(value: impl serde::Serialize) -> ApiResult {
