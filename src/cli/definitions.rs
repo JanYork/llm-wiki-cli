@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use crate::{changeset, codegraph, config, source_diff, store, view, work};
+use crate::{changeset, codegraph, config, source_diff, store, trans, view, work};
 use crate::error::{AppError, Result};
 use crate::import::collect_documents;
 use crate::scope::{
@@ -258,6 +258,21 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Convert one authorized local file with the configured trans engine.
+    #[command(
+        long_about = "Run the resolved anydoc or markitdown engine against one authorized local file and write the UTF-8 Markdown result to an explicit new output path.\n\nThis command does not add sources, pages, citations, or operation-log entries.",
+        after_help = "Examples:\n  lwc trans docs/report.docx --output out/report.md\n  lwc trans ../shared/file.pdf --output out/file.md --allow-external-source"
+    )]
+    Trans {
+        /// Existing local file to convert.
+        file: PathBuf,
+        /// Explicit destination path; must not already exist.
+        #[arg(long)]
+        output: PathBuf,
+        /// Permit a project input that resolves outside the active project root.
+        #[arg(long)]
+        allow_external_source: bool,
     },
     /// Explore, explain, verify, and maintain the selected document graph.
     #[command(

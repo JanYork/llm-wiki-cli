@@ -8,6 +8,7 @@ fn run(cli: Cli) -> Result<Value> {
             | Command::WorkRun { .. }
             | Command::Cg { .. }
             | Command::View { .. }
+            | Command::Trans { .. }
     ) {
         let paths = if cli.scope == Scope::All {
             resolve_live_read_store_paths(cli.scope, &cwd, true)?
@@ -671,6 +672,16 @@ fn run(cli: Cli) -> Result<Value> {
                     config::response(scope_name(store_path.scope), &store_path.path)
                 }
             }
+        }
+        Command::Trans {
+            file,
+            output,
+            allow_external_source,
+        } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "trans")?;
+            ensure_scope_supported(cli.scope, false, "trans")?;
+            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
+            trans::run(&store_path, &cwd, &file, &output, allow_external_source)
         }
         Command::Graph { command } => {
             ensure_scope_supported(cli.scope, false, "graph")?;
