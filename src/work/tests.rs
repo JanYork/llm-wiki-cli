@@ -40,6 +40,12 @@ mod tests {
         assert_eq!(attempts, 3);
     }
 
+    #[test]
+    fn removing_an_already_released_active_file_is_idempotent() {
+        let temp = tempdir().unwrap();
+        remove_file_if_present(&temp.path().join("active")).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn work_commands_reject_a_symlinked_work_root() {

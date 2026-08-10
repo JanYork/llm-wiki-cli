@@ -107,12 +107,20 @@ fn disable_standard_handle_inheritance() -> Result<()> {
 fn release_active(root: &Path, id: &str) -> Result<()> {
     let path = root.join("active");
     match fs::read_to_string(&path) {
-        Ok(value) if value.trim() == id => fs::remove_file(path)?,
+        Ok(value) if value.trim() == id => remove_file_if_present(&path)?,
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+fn remove_file_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn work_root(database: &Path) -> Result<PathBuf> {
