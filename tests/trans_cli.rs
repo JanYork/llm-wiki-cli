@@ -465,6 +465,66 @@ set -eu
 }
 
 #[test]
+fn trans_errors_never_echo_raw_stderr_secrets() {
+    let world = TransWorld::new();
+    world.init();
+    let input = world.write_project("docs/source.pdf", "stub");
+    let output = world.project.join("out/secret.md");
+    let secret = "Authorization: Bearer super-secret-token";
+
+    world.install_script(
+        "markitdown",
+        &format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' '{}' >&2
+exit 7
+"#,
+            secret
+        ),
+    );
+    world.ok(&["config", "set", "--trans", "markitdown"]);
+    let failed = world.err(&["trans", as_str(&input), "--output", as_str(&output)]);
+    let failed_json = serde_json::to_string(&failed).unwrap();
+    assert_eq!(failed["error"]["code"], "trans_failed");
+    assert!(!failed_json.contains(secret), "{failed_json}");
+    assert_eq!(failed["error"]["details"]["stderr_present"], true);
+    assert_eq!(failed["error"]["details"]["stderr_truncated"], false);
+    assert!(failed["error"]["details"].get("stderr_preview").is_none());
+
+    world.install_script(
+        "markitdown",
+        &format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' '{}' >&2
+/bin/sleep 5
+"#,
+            secret
+        ),
+    );
+    world.ok(&[
+        "config",
+        "set",
+        "--trans",
+        "markitdown",
+        "--trans-timeout",
+        "1",
+    ]);
+    let timed_out = world.err(&["trans", as_str(&input), "--output", as_str(&output)]);
+    let timeout_json = serde_json::to_string(&timed_out).unwrap();
+    assert_eq!(timed_out["error"]["code"], "trans_timeout");
+    assert!(!timeout_json.contains(secret), "{timeout_json}");
+    assert_eq!(timed_out["error"]["details"]["stderr_present"], true);
+    assert_eq!(timed_out["error"]["details"]["stderr_truncated"], false);
+    assert!(
+        timed_out["error"]["details"]
+            .get("stderr_preview")
+            .is_none()
+    );
+}
+
+#[test]
 fn trans_kills_descendants_that_keep_stderr_open() {
     let world = TransWorld::new();
     world.init();

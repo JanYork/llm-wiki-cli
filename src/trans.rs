@@ -408,9 +408,50 @@ fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
-    child.kill()
+    let pid = child.id().to_string();
+    let taskkill_path = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| root.join("System32").join("taskkill.exe"))
+        .unwrap_or_else(|| PathBuf::from("taskkill.exe"));
+    let mut taskkill = Command::new(taskkill_path);
+    let taskkill = taskkill
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .args(["/PID", pid.as_str(), "/T", "/F"])
+        .status();
+    if matches!(taskkill, Ok(status) if status.success()) {
+        return Ok(());
+    }
+
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(error) => {
+            if child.try_wait()?.is_some() {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(error) => {
+            if child.try_wait()?.is_some() {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -668,7 +709,7 @@ fn render_status(status: ExitStatus) -> String {
 
 fn stderr_details(stderr: &BoundedBytes) -> Value {
     json!({
-        "stderr_preview": stderr.preview(),
+        "stderr_present": !stderr.bytes.is_empty(),
         "stderr_truncated": stderr.truncated,
     })
 }
@@ -677,12 +718,6 @@ fn stderr_details(stderr: &BoundedBytes) -> Value {
 struct BoundedBytes {
     bytes: Vec<u8>,
     truncated: bool,
-}
-
-impl BoundedBytes {
-    fn preview(&self) -> String {
-        String::from_utf8_lossy(&self.bytes).trim().to_string()
-    }
 }
 
 struct TempArtifact {
