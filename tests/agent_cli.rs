@@ -13,6 +13,28 @@ struct World {
     log: PathBuf,
 }
 
+fn assert_onboarding_guidance(text: &str) {
+    for expected in [
+        "`using-lwc` Skill when it is available",
+        "full LWC capability guidance is missing",
+        "lwc agent status",
+        "LWC_READINESS",
+        "plain-text choice",
+        "Detection is not consent",
+        "1. Enable both graphs",
+        "lwc --scope project config set --graph grafeo",
+        "lwc --scope project graph verify",
+        "lwc --scope project cg init",
+        "lwc --scope project cg status",
+        "continue the primary task",
+    ] {
+        assert!(
+            text.contains(expected),
+            "missing Agent guidance: {expected}"
+        );
+    }
+}
+
 impl World {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -179,16 +201,12 @@ fn detected_yes_install_is_idempotent_and_uninstall_restores_exact_user_bytes() 
     assert!(!settings_text.contains("codegraph prompt-hook"));
     assert!(settings_text.contains("agent hook --agent claude"));
     assert!(world.home.join(".codex/hooks/lwc.json").is_file());
-    assert!(
-        fs::read_to_string(&codex_agents)
-            .unwrap()
-            .contains("LWC_AGENT_START")
-    );
-    assert!(
-        fs::read_to_string(&claude_md)
-            .unwrap()
-            .contains("LWC_AGENT_START")
-    );
+    let codex_guidance = fs::read_to_string(&codex_agents).unwrap();
+    let claude_guidance = fs::read_to_string(&claude_md).unwrap();
+    assert!(codex_guidance.contains("LWC_AGENT_START"));
+    assert!(claude_guidance.contains("LWC_AGENT_START"));
+    assert_onboarding_guidance(&codex_guidance);
+    assert_onboarding_guidance(&claude_guidance);
 
     let installed_bytes = [
         fs::read(&codex_config).unwrap(),
@@ -281,6 +299,7 @@ fn print_config_is_pure_and_pi_is_an_explicit_no_mcp_lifecycle_target() {
     assert!(text.contains("mcp_servers.codegraph"));
     assert!(text.contains("LWC_AGENT_START"));
     assert!(text.contains("agent hook --agent codex"));
+    assert_onboarding_guidance(&text);
     assert_eq!(directory_snapshot(&world.home), before);
     assert!(!world.log.exists(), "print-config must not call CodeGraph");
 
