@@ -84,6 +84,18 @@ impl Store {
     }
 
     pub fn open_read_only(scope: impl Into<String>, database: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_with_timeout(scope, database, BUSY_TIMEOUT)
+    }
+
+    pub fn open_for_hook(scope: impl Into<String>, database: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_with_timeout(scope, database, Duration::from_millis(250))
+    }
+
+    fn open_read_only_with_timeout(
+        scope: impl Into<String>,
+        database: impl AsRef<Path>,
+        timeout: Duration,
+    ) -> Result<Self> {
         let scope = scope.into();
         let database = database.as_ref().to_path_buf();
         if !database.is_file() {
@@ -94,7 +106,7 @@ impl Store {
         }
 
         let conn = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        configure_read_only_connection(&conn)?;
+        configure_read_only_connection(&conn, timeout)?;
         prepare_store_read_only(&conn)?;
 
         Ok(Self {

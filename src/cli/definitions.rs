@@ -255,6 +255,12 @@ enum Command {
         #[command(subcommand)]
         command: LoadCommand,
     },
+    /// Internal lifecycle integration used by installed Agent hooks.
+    #[command(hide = true)]
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     /// Drive the persistent Agent ingest state machine.
     #[command(
         long_about = "Compile immutable sources into persistent Wiki knowledge through a crash-safe state machine:\n  pending -> analyzing -> generating -> completed\n\nFailed or interrupted work can be returned to pending with retry.",
@@ -526,6 +532,34 @@ enum LoadCommand {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    /// Compile bounded read-only context from a native Agent hook event.
+    Hook {
+        #[arg(long, value_enum)]
+        agent: AgentArg,
+        #[arg(long)]
+        event: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AgentArg {
+    Codex,
+    Claude,
+    Pi,
+}
+
+impl From<AgentArg> for crate::agent::AgentKind {
+    fn from(value: AgentArg) -> Self {
+        match value {
+            AgentArg::Codex => Self::Codex,
+            AgentArg::Claude => Self::Claude,
+            AgentArg::Pi => Self::Pi,
+        }
+    }
 }
 
 #[derive(Subcommand)]

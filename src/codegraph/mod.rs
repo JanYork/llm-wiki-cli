@@ -311,23 +311,90 @@ impl Paths {
             .path
             .parent()
             .expect("Wiki database has an .lwc parent");
+        Self::from_project(
+            lwc.parent()
+                .expect("project .lwc has a parent")
+                .to_path_buf(),
+        )
+    }
+
+    fn from_project(project: PathBuf) -> Result<Self> {
         let target = target_name()?;
         let extension = if cfg!(windows) { "zip" } else { "tar.gz" };
         Ok(Self {
-            project: lwc
-                .parent()
-                .expect("project .lwc has a parent")
-                .to_path_buf(),
+            legacy_runtime: project.join(".lwc/runtime/codegraph"),
+            index: project.join(".lwc/codegraph"),
+            project,
             runtime: global_lwc_root()?
                 .join("runtime/codegraph")
                 .join(VERSION)
                 .join(target),
-            legacy_runtime: lwc.join("runtime/codegraph"),
-            index: lwc.join("codegraph"),
             target,
             asset: format!("codegraph-{target}.{extension}"),
         })
     }
+}
+
+pub fn prompt_hook(project: &Path, prompt: &str) -> Result<String> {
+    const MAX_OUTPUT_BYTES: u64 = 20 * 1024;
+    const TIMEOUT: Duration = Duration::from_secs(2);
+
+    let project = fs::canonicalize(project)?;
+    let paths = Paths::from_project(project.clone())?;
+    let mut command = configured_command(&paths, &[OsString::from("prompt-hook")])?;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().expect("piped CodeGraph stdout");
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_OUTPUT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    if let Some(mut stdin) = child.stdin.take() {
+        serde_json::to_writer(&mut stdin, &json!({"prompt": prompt, "cwd": project})).map_err(
+            |error| {
+                AppError::new(
+                    "codegraph_prompt_hook_failed",
+                    format!("failed to write CodeGraph prompt input: {error}"),
+                )
+            },
+        )?;
+    }
+    let deadline = Instant::now() + TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::new(
+                "codegraph_prompt_hook_timeout",
+                "CodeGraph prompt hook exceeded 2 seconds",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let bytes = reader
+        .join()
+        .map_err(|_| AppError::new("codegraph_prompt_hook_failed", "output reader failed"))??;
+    if !status.success() || bytes.len() > MAX_OUTPUT_BYTES as usize {
+        return Err(AppError::new(
+            "codegraph_prompt_hook_failed",
+            "CodeGraph prompt hook failed or exceeded its output budget",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        AppError::new(
+            "codegraph_prompt_hook_failed",
+            "CodeGraph prompt hook returned invalid UTF-8",
+        )
+    })
 }
 
 fn execute(paths: &Paths, args: &[OsString], stream: bool) -> Result<Value> {

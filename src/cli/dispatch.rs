@@ -9,6 +9,7 @@ fn run(cli: Cli) -> Result<Value> {
             | Command::Cg { .. }
             | Command::View { .. }
             | Command::Trans { .. }
+            | Command::Agent { .. }
     ) {
         let paths = if cli.scope == Scope::All {
             resolve_live_read_store_paths(cli.scope, &cwd, true)?
@@ -609,6 +610,9 @@ fn run(cli: Cli) -> Result<Value> {
                     .into_iter()
                     .map(|path| Store::open_for_read(scope_name(path.scope), &path.path))
                     .collect::<Result<Vec<_>>>()?;
+                for store in &stores {
+                    store.begin_read_snapshot()?;
+                }
                 let mut identities = Vec::new();
                 let mut found = false;
                 for (index, store) in stores.iter().enumerate() {
@@ -657,6 +661,12 @@ fn run(cli: Cli) -> Result<Value> {
                 }))
             }
         },
+        Command::Agent {
+            command: AgentCommand::Hook { agent, event },
+        } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "agent hook")?;
+            Ok(crate::agent::hook(agent.into(), &event, cli.scope, &cwd))
+        }
         Command::Ingest { command } => {
             ensure_scope_supported(cli.scope, false, "ingest")?;
             let store_path =

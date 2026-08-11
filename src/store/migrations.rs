@@ -6,8 +6,8 @@ fn configure_connection(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn configure_read_only_connection(conn: &Connection) -> Result<()> {
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+fn configure_read_only_connection(conn: &Connection, timeout: Duration) -> Result<()> {
+    conn.busy_timeout(timeout)?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     Ok(())
 }

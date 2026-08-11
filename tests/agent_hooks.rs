@@ -1,0 +1,361 @@
+use serde_json::Value;
+use std::{
+    fs,
+    io::Write,
+    path::PathBuf,
+    process::{Command, Output, Stdio},
+    time::{Duration, Instant},
+};
+
+struct World {
+    _temp: tempfile::TempDir,
+    project: PathBuf,
+    home: PathBuf,
+}
+
+impl World {
+    fn new(init: bool) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let home = temp.path().join("home");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let world = Self {
+            _temp: temp,
+            project,
+            home,
+        };
+        if init {
+            world.ok(&["init"]);
+        }
+        world
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lwc"));
+        command.current_dir(&self.project).env("HOME", &self.home);
+        command
+    }
+
+    fn output(&self, args: &[&str], input: &str) -> Output {
+        let mut child = self
+            .command()
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
+        child.wait_with_output().unwrap()
+    }
+
+    fn ok(&self, args: &[&str]) -> Value {
+        let output = self.command().args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    fn page(&self, slug: &str, body: &str) {
+        let path = self.project.join(format!("{slug}.md"));
+        fs::write(&path, body).unwrap();
+        self.ok(&[
+            "page",
+            "put",
+            slug,
+            "--title",
+            slug,
+            "--file",
+            path.to_str().unwrap(),
+            "--provenance",
+            "user-provided",
+        ]);
+    }
+
+    fn enable_tag(&self, tag: &str, page: &str, tag_priority: &str, max_chars: &str) {
+        self.ok(&[
+            "tag",
+            "set",
+            tag,
+            page,
+            "--priority",
+            tag_priority,
+            "--reason",
+            "core fixture",
+        ]);
+        self.ok(&[
+            "tag",
+            "autoload",
+            tag,
+            "--enable",
+            "--priority",
+            tag_priority,
+            "--limit",
+            "10",
+            "--max-chars",
+            max_chars,
+            "--reason",
+            "session fixture",
+        ]);
+    }
+}
+
+fn context(output: &Output) -> String {
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    value["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[cfg(unix)]
+fn prompt_hook_output(world: &World, binary: &PathBuf, input: &Value) -> Output {
+    let mut command = world.command();
+    command.env("LWC_CODEGRAPH_BINARY", binary);
+    let mut child = command
+        .args([
+            "agent",
+            "hook",
+            "--agent",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn boundary_hook_loads_whole_budgeted_pages_without_reading_transcript() {
+    let world = World::new(true);
+    world.page("oversized", &"x".repeat(30));
+    world.page("shared", "keep me");
+    world.enable_tag("Rules", "oversized", "20", "10");
+    world.ok(&[
+        "tag",
+        "set",
+        "Rules",
+        "shared",
+        "--priority",
+        "10",
+        "--reason",
+        "core fixture",
+    ]);
+    world.enable_tag("Operations", "shared", "10", "100");
+    let transcript = world.project.join("transcript.jsonl");
+    fs::write(&transcript, "TRANSCRIPT_SECRET").unwrap();
+    let input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+        "cwd": world.project,
+        "transcript_path": transcript,
+    });
+    let output = world.output(
+        &[
+            "--scope",
+            "all",
+            "agent",
+            "hook",
+            "--agent",
+            "claude",
+            "--event",
+            "SessionStart",
+        ],
+        &input.to_string(),
+    );
+    let context = context(&output);
+    assert!(context.contains("keep me"));
+    assert!(!context.contains(&"x".repeat(30)));
+    assert!(!context.contains("TRANSCRIPT_SECRET"));
+    assert_eq!(context.matches("keep me").count(), 1);
+    assert!(context.contains("Rules"));
+    assert!(context.contains("Operations"));
+    assert!(context.contains("omitted"));
+    assert!(context.contains("reference data"));
+}
+
+#[test]
+fn hook_input_is_capped_and_failures_are_empty_successes() {
+    let world = World::new(false);
+    let oversized = "x".repeat(65 * 1024);
+    for args in [
+        vec![
+            "agent",
+            "hook",
+            "--agent",
+            "claude",
+            "--event",
+            "SessionStart",
+        ],
+        vec!["agent", "hook", "--agent", "pi", "--event", "session_start"],
+    ] {
+        let output = world.output(&args, &oversized);
+        assert!(output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            serde_json::json!({})
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_prompt_hook_uses_codegraph_without_opening_or_creating_a_wiki() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let world = World::new(false);
+    let fake = world.project.join("fake-codegraph");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nread payload\nprintf '<codegraph_context>fake graph</codegraph_context>'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let input = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "cwd": "/untrusted/path",
+        "prompt": "what calls parse_token?",
+        "transcript_path": "/must/not/be/read",
+    });
+    let output = prompt_hook_output(&world, &fake, &input);
+    let context = context(&output);
+    assert!(context.contains("fake graph"));
+    assert!(!world.project.join(".lwc/wiki.db").exists());
+
+    fs::write(&fake, "#!/bin/sh\nhead -c 21000 /dev/zero | tr '\\0' x\n").unwrap();
+    let oversized = prompt_hook_output(&world, &fake, &input);
+    assert!(oversized.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&oversized.stdout).unwrap(),
+        serde_json::json!({})
+    );
+
+    fs::write(&fake, "#!/bin/sh\nsleep 3\nprintf late\n").unwrap();
+    let started = Instant::now();
+    let timed_out = prompt_hook_output(&world, &fake, &input);
+    assert!(started.elapsed() < Duration::from_millis(2800));
+    assert!(timed_out.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&timed_out.stdout).unwrap(),
+        serde_json::json!({})
+    );
+}
+
+#[test]
+fn codex_and_pi_envelopes_keep_the_same_context_semantics() {
+    let world = World::new(true);
+    world.page("rule", "same body");
+    world.enable_tag("Rules", "rule", "1", "100");
+    let input = serde_json::json!({"source": "compact", "cwd": world.project}).to_string();
+
+    let codex = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ],
+        &input,
+    );
+    assert!(context(&codex).contains("same body"));
+
+    let pi = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "pi",
+            "--event",
+            "session_before_compact",
+        ],
+        &input,
+    );
+    assert!(pi.status.success());
+    let value: Value = serde_json::from_slice(&pi.stdout).unwrap();
+    assert!(
+        value["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("same body")
+    );
+}
+
+#[test]
+fn hook_context_never_cuts_a_page_to_fit_the_hard_cap() {
+    let world = World::new(true);
+    let body = "界".repeat(100_000);
+    world.page("too-large", &body);
+    world.enable_tag("Rules", "too-large", "1", "100000");
+    let input = serde_json::json!({"source": "startup", "cwd": world.project}).to_string();
+    let output = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "claude",
+            "--event",
+            "SessionStart",
+        ],
+        &input,
+    );
+    let context = context(&output);
+    assert!(context.chars().count() <= 100_000);
+    assert!(!context.contains(&body));
+    assert!(context.contains("omitted_by_global_budget"));
+    assert!(context.contains("\"included\":0"));
+}
+
+#[test]
+fn locked_wiki_fails_open_without_blocking_the_agent() {
+    let world = World::new(true);
+    world.page("rule", "locked body");
+    world.enable_tag("Rules", "rule", "1", "100");
+    let database = world.project.join(".lwc/wiki.db");
+    let lock = rusqlite::Connection::open(database).unwrap();
+    lock.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+        .unwrap();
+
+    let input = serde_json::json!({"source": "startup", "cwd": world.project}).to_string();
+    let started = Instant::now();
+    let output = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "claude",
+            "--event",
+            "SessionStart",
+        ],
+        &input,
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        serde_json::json!({})
+    );
+    lock.execute_batch("ROLLBACK").unwrap();
+}

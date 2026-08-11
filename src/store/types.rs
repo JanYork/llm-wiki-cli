@@ -457,6 +457,16 @@ pub struct TaggedPage {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TagAutoloadPolicy {
+    pub scope: String,
+    pub name: String,
+    pub priority: i32,
+    pub limit: usize,
+    pub max_chars: usize,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PageLinksResponse {
     pub scope: String,
     pub database: String,

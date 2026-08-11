@@ -116,6 +116,43 @@ fn restore_tag_snapshot(tx: &Transaction<'_>, snapshot: &SparseTagSnapshot) -> R
 }
 
 impl Store {
+    pub fn begin_read_snapshot(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+        Ok(())
+    }
+
+    pub fn begin_hook_snapshot(&self) -> Result<()> {
+        self.conn.busy_timeout(std::time::Duration::from_millis(250))?;
+        self.begin_read_snapshot()
+    }
+
+    pub fn tag_autoload_policies(&self) -> Result<(Vec<TagAutoloadPolicy>, bool)> {
+        // ponytail: 100 policies cap hook work; raise only with measured demand and budget evidence.
+        const LIMIT: i64 = 101;
+        let mut statement = self.conn.prepare(
+            "SELECT name, autoload_priority, autoload_limit, autoload_max_chars, reason
+             FROM tags
+             WHERE autoload = 1
+             ORDER BY autoload_priority DESC, name ASC
+             LIMIT ?1",
+        )?;
+        let mut policies = statement
+            .query_map([LIMIT], |row| {
+                Ok(TagAutoloadPolicy {
+                    scope: self.scope.clone(),
+                    name: row.get(0)?,
+                    priority: row.get(1)?,
+                    limit: row.get::<_, i64>(2)? as usize,
+                    max_chars: row.get::<_, i64>(3)? as usize,
+                    reason: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = policies.len() == LIMIT as usize;
+        policies.truncate((LIMIT - 1) as usize);
+        Ok((policies, has_more))
+    }
+
     pub fn tag_fingerprint(&self, tag: &str) -> Result<String> {
         Ok(tag_snapshot_fingerprint(&load_tag_snapshot(
             &self.conn, "main", tag,

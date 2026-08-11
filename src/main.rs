@@ -1,3 +1,4 @@
+mod agent;
 mod artifacts;
 mod changeset;
 mod cli;
