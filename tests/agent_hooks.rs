@@ -7,6 +7,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+const CODEGRAPH_VERSION: &str = "v1.5.0-lwc.1";
+
+fn codegraph_target() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-arm64",
+        ("macos", "x86_64") => "darwin-x64",
+        ("linux", "aarch64") => "linux-arm64",
+        ("linux", "x86_64") => "linux-x64",
+        ("windows", "aarch64") => "win32-arm64",
+        ("windows", "x86_64") => "win32-x64",
+        pair => panic!("unsupported test platform {pair:?}"),
+    }
+}
+
 struct World {
     _temp: tempfile::TempDir,
     project: PathBuf,
@@ -102,6 +116,37 @@ impl World {
             "--reason",
             "session fixture",
         ]);
+    }
+
+    fn install_codegraph_runtime_fixture(&self) {
+        let target = codegraph_target();
+        let runtime = self
+            .home
+            .join(".lwc/runtime/codegraph")
+            .join(CODEGRAPH_VERSION)
+            .join(target);
+        let binary = runtime.join(if cfg!(windows) {
+            "bin/codegraph.cmd"
+        } else {
+            "bin/codegraph"
+        });
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"fixture").unwrap();
+        fs::write(
+            runtime.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": CODEGRAPH_VERSION,
+                "target": target,
+                "asset": format!(
+                    "codegraph-{target}.{}",
+                    if cfg!(windows) { "zip" } else { "tar.gz" }
+                ),
+                "archive_sha256": "0".repeat(64),
+                "binary": binary.strip_prefix(&runtime).unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
 }
 
@@ -245,6 +290,7 @@ fn boundary_hook_reports_portable_graph_authorization_without_mutation() {
     assert_eq!(readiness["wiki"]["initialized"], true);
     assert_eq!(readiness["document_graph"]["enabled"], false);
     assert_eq!(readiness["code_graph"]["initialized"], false);
+    assert_eq!(readiness["code_graph"]["ready"], false);
     assert_eq!(readiness["authorization"]["mode"], "plain-text");
     assert_eq!(readiness["authorization"]["recommended_choice"], "1");
     assert_eq!(
@@ -311,6 +357,7 @@ fn boundary_hook_omits_authorization_when_both_graphs_are_configured() {
         b"fixture",
     )
     .unwrap();
+    world.install_codegraph_runtime_fixture();
 
     let input = serde_json::json!({"source": "startup", "cwd": world.project}).to_string();
     let output = world.output(
@@ -321,6 +368,7 @@ fn boundary_hook_omits_authorization_when_both_graphs_are_configured() {
     let readiness = readiness(value["additionalContext"].as_str().unwrap());
     assert_eq!(readiness["document_graph"]["enabled"], true);
     assert_eq!(readiness["code_graph"]["initialized"], true);
+    assert_eq!(readiness["code_graph"]["ready"], true);
     assert!(readiness.get("authorization").is_none());
 }
 

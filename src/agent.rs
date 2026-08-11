@@ -102,9 +102,11 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
     let graph = config::resolve_graph("project", &store.path)?;
     let document_graph_enabled = graph.setting != GraphSetting::Disabled;
     let code_graph = codegraph::status(&store)?;
+    let code_graph_runtime_installed = code_graph["installed"].as_bool().unwrap_or(false);
     let code_graph_initialized = code_graph["initialized"].as_bool().unwrap_or(false);
+    let code_graph_ready = code_graph_runtime_installed && code_graph_initialized;
     let document_graph_needs_consent = !document_graph_enabled;
-    let code_graph_needs_consent = !code_graph_initialized;
+    let code_graph_needs_consent = !code_graph_ready;
 
     let mut value = json!({
         "wiki": {
@@ -121,9 +123,10 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
             "verify": "lwc --scope project graph verify",
         },
         "code_graph": {
-            "runtime_installed": code_graph["installed"],
+            "runtime_installed": code_graph_runtime_installed,
             "runtime_health": code_graph["runtime_health"],
             "initialized": code_graph_initialized,
+            "ready": code_graph_ready,
             "requires_consent": code_graph_needs_consent,
             "initialize": "lwc --scope project cg init",
             "status": "lwc --scope project cg status",
