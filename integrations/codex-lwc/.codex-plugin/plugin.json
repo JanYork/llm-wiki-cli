@@ -1,0 +1,25 @@
+{
+  "name": "codex-lwc",
+  "version": "0.1.0",
+  "description": "Durable LWC Wiki context and project-scoped CodeGraph for Codex.",
+  "author": {
+    "name": "JanYork",
+    "url": "https://github.com/JanYork"
+  },
+  "homepage": "https://github.com/JanYork/llm-wiki-cli",
+  "repository": "https://github.com/JanYork/llm-wiki-cli",
+  "license": "Apache-2.0",
+  "keywords": ["memory", "wiki", "codegraph", "codex"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "LWC for Codex",
+    "shortDescription": "Durable Wiki memory and project code structure",
+    "longDescription": "Loads explicitly selected LWC Wiki context at session boundaries and exposes the pinned project CodeGraph over MCP.",
+    "developerName": "JanYork",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read"],
+    "websiteURL": "https://github.com/JanYork/llm-wiki-cli",
+    "defaultPrompt": ["Recall relevant LWC context, then inspect this project structurally"]
+  },
+  "mcpServers": "./.mcp.json"
+}

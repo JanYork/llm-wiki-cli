@@ -64,7 +64,13 @@ jobs:
       - name: Test npm package
         run: node --test tests/npm_package.mjs
 
-      # Companion Agent Skill checks are local-only; do not add them to repository CI.
+      - name: Validate native Agent integrations
+        run: |
+          node --test ../../tests/integrations.mjs
+          npm pack --dry-run --ignore-scripts
+        working-directory: integrations/pi-lwc
+
+      # Companion Agent Skill policy checks are local-only.
 
       - name: Build release binary
         run: cargo build --locked --release

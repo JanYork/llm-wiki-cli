@@ -703,12 +703,18 @@ fn install_hook(target: &str, path: Option<&Path>, codegraph_prompt_hook: bool) 
 const lwc = {executable};
 // Native bridge: lwc agent hook --agent pi
 function context(event) {{
-  try {{ return JSON.parse(execFileSync(lwc, ["agent", "hook", "--agent", "pi", "--event", event], {{ input: "{{}}", encoding: "utf8", timeout: 1000 }})).additionalContext || ""; }} catch {{ return ""; }}
+  try {{ return JSON.parse(execFileSync(lwc, ["agent", "hook", "--agent", "pi", "--event", event], {{ input: "{{}}", encoding: "utf8", timeout: 2000 }})).additionalContext || ""; }} catch {{ return ""; }}
 }}
 export default function (pi) {{
-  pi.on("session_start", async () => ({{ additionalContext: context("session_start") }}));
-  pi.on("session_before_compact", async () => ({{ additionalContext: context("session_before_compact") }}));
-  pi.on("before_agent_start", async () => ({{ additionalContext: context("before_agent_start") }}));
+  let pending = "";
+  pi.on("session_start", async () => {{ pending = context("session_start"); }});
+  pi.on("session_before_compact", async () => {{ pending = context("session_before_compact"); }});
+  pi.on("before_agent_start", async (event) => {{
+    if (!pending) return;
+    const current = pending;
+    pending = "";
+    return {{ systemPrompt: `${{event.systemPrompt}}\n\n${{current}}` }};
+  }});
 }}
 "#
             );

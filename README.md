@@ -402,6 +402,39 @@ runtime-neutral: any Agent that can execute it and load or adapt the Skill's
 instructions can use LWC. Skill commands, global instructions, and Hooks remain
 runtime-specific, so the setup prompt detects and configures the current host.
 
+### Native Agent setup
+
+LWC can detect supported Agents and install CodeGraph MCP, marker-bounded LWC
+guidance, and native lifecycle hooks without relying on a particular host:
+
+```bash
+lwc agent install --yes
+lwc agent status --target all --location global
+lwc agent install --print-config codex
+lwc agent refresh --target codex,claude
+lwc agent uninstall --target codex,claude --yes
+```
+
+`--yes` selects detected Agents, global scope, and Claude Code's fused prompt
+hook. Repeated install and refresh are byte-idempotent; uninstall restores only
+owned state and leaves project indexes intact. Optional Codex, Claude Code, and
+Pi packages live under `integrations/`; installing a package does not grant or
+bypass native trust. Do not combine the direct installer and native package for
+the same Agent.
+
+Strong tags provide bounded full-page loading for core rules and runbooks:
+
+```bash
+lwc tag create "operations" --reason "core operations manuals"
+lwc tag set "operations" incident-response --priority 100 --reason "primary runbook"
+lwc load tag "operations" --limit 3
+lwc tag autoload "operations" --enable --priority 100 --limit 3 \
+  --max-chars 50000 --reason "required at session boundaries"
+```
+
+This is an explicit strong-load mechanism, not token-derived search: limits and
+character budgets are applied before complete pages enter Agent context.
+
 ## Quick Start
 
 This section documents the CLI protocol that the Agent executes. Humans do not
@@ -737,10 +770,10 @@ language. Graphs use a single Obsidian-inspired 3D relationship view with small
 nodes, persistent labels, thin links, rotation, and zoom.
 
 Code indexing is project-only and disabled until explicitly initialized. The
-pinned LWC CodeGraph fork is then downloaded from its GitHub Release, verified
-with SHA-256, and kept under `.lwc/runtime/codegraph`; its index lives under
-`.lwc/codegraph`. Telemetry is always off and no `.codegraph` or user-global
-CodeGraph state is used.
+pinned LWC CodeGraph fork is downloaded once from its GitHub Release, verified
+with SHA-256, and cached under `~/.lwc/runtime/codegraph/<PIN>/<TARGET>/`; each
+project keeps only its index under `.lwc/codegraph`. Telemetry is always off and
+no `.codegraph` state is used.
 
 ```bash
 lwc cg status
@@ -755,8 +788,9 @@ lwc cg files
 ```
 
 All CodeGraph query capabilities are forwarded by `lwc cg`. Global lifecycle
-commands (`install`, `uninstall`, `upgrade`, `telemetry`, `daemon`, `daemons`,
-`serve`) are blocked because LWC owns the runtime and enforces the project boundary. Initial,
+commands (`install`, `uninstall`, `upgrade`, `telemetry`, `daemon`, `daemons`)
+are blocked; only the exact Agent bridge `lwc cg serve --mcp` is allowed because
+LWC owns the runtime and enforces the project boundary. Initial,
 incremental, full, update, delete, reference-resolution, and recovery writes
 commit one owner file completely before the next; the current graph remains
 readable and historical document revisions are never refreshed.

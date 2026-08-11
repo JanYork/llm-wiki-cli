@@ -359,6 +359,37 @@ CLI 本身不绑定具体运行时：任何能够执行 CLI，并加载或适配
 使用 LWC；Skill 命令、全局指令和 Hook 的注册方式由各运行时决定，因此上面的配置
 提示词会先识别并适配当前宿主。
 
+### 原生 Agent 配置
+
+LWC 可以检测已安装的 Agent，并配置 CodeGraph MCP、有边界标记的 LWC 指导和
+原生生命周期 Hook：
+
+```bash
+lwc agent install --yes
+lwc agent status --target all --location global
+lwc agent install --print-config codex
+lwc agent refresh --target codex,claude
+lwc agent uninstall --target codex,claude --yes
+```
+
+`--yes` 默认选择检测到的 Agent、全局配置，并启用 Claude Code 融合后的 prompt
+Hook。重复安装和刷新逐字节幂等；卸载只恢复 LWC/CodeGraph 拥有的状态，不删除项目
+索引。`integrations/` 提供可选的 Codex、Claude Code 和 Pi 原生包；安装包不等于
+授权或信任，也不要为同一个 Agent 同时安装原生包和直接配置。
+
+强标签用于不经过搜索、按上限完整载入少量核心规则或手册：
+
+```bash
+lwc tag create "运维手册" --reason "核心运维手册"
+lwc tag set "运维手册" incident-response --priority 100 --reason "主响应手册"
+lwc load tag "运维手册" --limit 3
+lwc tag autoload "运维手册" --enable --priority 100 --limit 3 \
+  --max-chars 50000 --reason "会话边界必须载入"
+```
+
+它不是根据分词自动推断的搜索标签；系统会先按索引、篇数和字符预算选页，再把完整
+页面放入 Agent 上下文，绝不会一次载入全部分词关系。
+
 ## 快速开始
 
 本节记录的是 Agent 实际执行的 CLI 协议；正常使用时，人类不需要手工运行这些命令。
@@ -665,9 +696,9 @@ lwc view --port 4173 --no-open
 采用小节点、常驻标签、细连线，并支持旋转与缩放。
 
 代码索引只支持项目级，默认不启用。首次显式执行 `lwc cg init` 时，LWC
-会从 GitHub Release 下载锁定版本的 CodeGraph 分支包，校验 SHA-256，
-运行时放在 `.lwc/runtime/codegraph`，索引放在 `.lwc/codegraph`。遥测始终
-关闭，不创建 `.codegraph`，也不使用用户级 CodeGraph 状态。
+会从 GitHub Release 下载锁定版本的 CodeGraph 分支包并校验 SHA-256。运行时只
+下载一次，缓存到 `~/.lwc/runtime/codegraph/<PIN>/<TARGET>/`；每个项目只保留自己
+的 `.lwc/codegraph` 索引。遥测始终关闭，也不创建 `.codegraph` 状态。
 
 ```bash
 lwc cg status
@@ -682,8 +713,9 @@ lwc cg files
 ```
 
 CodeGraph 的查询能力均可通过 `lwc cg` 使用。全局生命周期命令
-（`install`、`uninstall`、`upgrade`、`telemetry`、`daemon`、`daemons`、
-`serve`）会被拒绝，因为运行时由 LWC 管理且必须保持项目边界。首次、增量、全量、更新、
+（`install`、`uninstall`、`upgrade`、`telemetry`、`daemon`、`daemons`）会被
+拒绝；只允许精确的 Agent 桥接命令 `lwc cg serve --mcp`，因为运行时由 LWC 管理且
+必须保持项目边界。首次、增量、全量、更新、
 删除、引用解析和恢复写入都以所属文件为事务：一篇文件完全可用后才处理下一
 篇；当前图保持可读，历史文档版本永不刷新。
 
