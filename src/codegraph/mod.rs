@@ -397,6 +397,45 @@ pub fn prompt_hook(project: &Path, prompt: &str) -> Result<String> {
     })
 }
 
+pub(crate) fn installer(project: &Path, args: &[OsString]) -> Result<()> {
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    let paths = Paths::from_project(fs::canonicalize(project)?)?;
+    install(&paths)?;
+    let executable = binary(&paths).ok_or_else(|| {
+        AppError::new("codegraph_runtime_missing", "CodeGraph runtime is missing")
+    })?;
+    let mut child = Command::new(executable)
+        .args(args)
+        .current_dir(&paths.project)
+        .env("CODEGRAPH_TELEMETRY", "0")
+        .env("DO_NOT_TRACK", "1")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(AppError::new(
+                "codegraph_installer_failed",
+                format!("CodeGraph installer exited with {status}"),
+            ));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::new(
+                "codegraph_installer_timeout",
+                "CodeGraph installer exceeded 30 seconds",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn execute(paths: &Paths, args: &[OsString], stream: bool) -> Result<Value> {
     let mut command = configured_command(paths, args)?;
     let (status, stdout, stderr) = if stream {

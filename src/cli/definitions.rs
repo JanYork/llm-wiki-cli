@@ -536,6 +536,42 @@ enum LoadCommand {
 
 #[derive(Subcommand)]
 enum AgentCommand {
+    /// Install LWC and CodeGraph integration into detected or selected Agents.
+    Install {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, value_enum)]
+        location: Option<AgentLocationArg>,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        print_config: Option<String>,
+        #[arg(long)]
+        no_codegraph_prompt_hook: bool,
+    },
+    /// Inspect installed Agent integrations.
+    Status {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, value_enum)]
+        location: Option<AgentLocationArg>,
+    },
+    /// Refresh selected Agent integrations without duplicating owned entries.
+    Refresh {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, value_enum)]
+        location: Option<AgentLocationArg>,
+    },
+    /// Remove only LWC-owned Agent integration state.
+    Uninstall {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, value_enum)]
+        location: Option<AgentLocationArg>,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Compile bounded read-only context from a native Agent hook event.
     Hook {
         #[arg(long, value_enum)]
@@ -543,6 +579,21 @@ enum AgentCommand {
         #[arg(long)]
         event: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AgentLocationArg {
+    Global,
+    Local,
+}
+
+impl From<AgentLocationArg> for crate::agent::AgentLocation {
+    fn from(value: AgentLocationArg) -> Self {
+        match value {
+            AgentLocationArg::Global => Self::Global,
+            AgentLocationArg::Local => Self::Local,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

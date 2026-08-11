@@ -661,11 +661,47 @@ fn run(cli: Cli) -> Result<Value> {
                 }))
             }
         },
-        Command::Agent {
-            command: AgentCommand::Hook { agent, event },
-        } => {
-            changeset::reject_selector(selected_changeset.as_deref(), "agent hook")?;
-            Ok(crate::agent::hook(agent.into(), &event, cli.scope, &cwd))
+        Command::Agent { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "agent")?;
+            match command {
+                AgentCommand::Install {
+                    target,
+                    location,
+                    yes,
+                    print_config,
+                    no_codegraph_prompt_hook,
+                } => crate::agent::install(
+                    &cwd,
+                    target.as_deref(),
+                    location.map(Into::into),
+                    yes,
+                    print_config.as_deref(),
+                    !no_codegraph_prompt_hook,
+                ),
+                AgentCommand::Status { target, location } => crate::agent::status(
+                    &cwd,
+                    target.as_deref(),
+                    location.map(Into::into),
+                ),
+                AgentCommand::Refresh { target, location } => crate::agent::refresh(
+                    &cwd,
+                    target.as_deref(),
+                    location.map(Into::into),
+                ),
+                AgentCommand::Uninstall {
+                    target,
+                    location,
+                    yes,
+                } => crate::agent::uninstall(
+                    &cwd,
+                    target.as_deref(),
+                    location.map(Into::into),
+                    yes,
+                ),
+                AgentCommand::Hook { agent, event } => {
+                    Ok(crate::agent::hook(agent.into(), &event, cli.scope, &cwd))
+                }
+            }
         }
         Command::Ingest { command } => {
             ensure_scope_supported(cli.scope, false, "ingest")?;

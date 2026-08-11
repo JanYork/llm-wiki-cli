@@ -12,6 +12,9 @@ use std::{
     path::Path,
 };
 
+mod install;
+pub(crate) use install::{AgentLocation, install, refresh, status, uninstall};
+
 const MAX_INPUT_BYTES: u64 = 64 * 1024;
 const MAX_CONTEXT_CHARS: usize = 100_000;
 
