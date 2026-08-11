@@ -143,47 +143,6 @@ Skill 与别名路径、全局 Wiki 路径、修改过的 Hook/配置文件、�
   <img src="docs/images/lwc-architecture-zh.png" alt="LWC 架构图" width="100%">
 </p>
 
-```text
-+-----------------------------------------------------------------------+
-|                              AGENT PLANE                              |
-+-----------------------------------------------------------------------+
-| User Task -> LLM Agent -> using-lwc Skill                             |
-|                         trigger | bootstrap | recall | write-back     |
-+-----------------------------------------------------------------------+
-                                   |
-                          JSON / stdin / files
-                                   v
-+-----------------------------------------------------------------------+
-|                               CLI LAYER                               |
-+-----------------------------------------------------------------------+
-| clap command router                                                   |
-| init | schema | purpose | source | page | ingest | search | context   |
-| graph | cg | view | lint | changeset | maintenance | checkpoint | log |
-+-----------------------------------------------------------------------+
-                                   |
-                                   v
-+----------------------------------+------------------------------------+
-| SCOPE RESOLVER                   | IMPORT / VALIDATION                |
-| project | global | all (merge)   | UTF-8 | size | ext | symlink       |
-+----------------------------------+------------------------------------+
-                                   |
-                                   v
-+-----------------------------------------------------------------------+
-|                             SQLITE STORE                              |
-+-----------------------------------------------------------------------+
-| Canonical | WAL | foreign keys | transactions | migrations            |
-| meta | sources | pages | page_sources | links | ingest_jobs           |
-| operations | changesets | search_fts                                  |
-+-----------------------------------------------------------------------+
-                                   |
-                                   v
-+-----------------------+-----------------------+-----------------------+
-| SEARCH PIPELINE       | GRAPH ENGINE          | MARKDOWN PROJECTION   |
-| CJK n-grams + Latin   | links + citations     | raw/ + wiki/          |
-| contentless FTS5/BM25 | structural evidence   | index/log/overview    |
-+-----------------------+-----------------------+-----------------------+
-```
-
 持久化知识模型分为三个逻辑层：
 
 | 层 | 内容 | 约束 |
@@ -204,6 +163,10 @@ Markdown。命令成功时向 stdout 返回 JSON，失败时向 stderr 返回结
 每个当前 Source 和 Wiki 页面都会被确定性拆分并索引为段、句和规范化词。SQLite
 仍是权威数据源；Span FTS 与类型化规范图都是可重建索引。现有搜索默认仍只返回
 文档，只有显式指定粒度才检索段句：
+
+<p align="center">
+  <img src="docs/images/lwc-memory-graph-zh.png" alt="LWC 记忆图" width="100%">
+</p>
 
 ```bash
 lwc search "投影一致性" --granularity sentence --type page
@@ -717,6 +680,10 @@ lwc view --port 4173 --no-open
 预览默认使用英文。通过页面内的 `中文` / `EN` 控件切换语言；浏览器会记住选择，
 但不会自动翻译 Wiki 正文。知识图和代码图统一使用受 Obsidian 启发的 3D 关系视图，
 采用小节点、常驻标签、细连线，并支持旋转与缩放。
+
+<p align="center">
+  <img src="docs/images/lwc-codegraph-zh.png" alt="LWC 代码图" width="100%">
+</p>
 
 代码索引只支持项目级，默认不启用。首次显式执行 `lwc cg init` 时，LWC
 会从 GitHub Release 下载锁定版本的 CodeGraph 分支包并校验 SHA-256。运行时只

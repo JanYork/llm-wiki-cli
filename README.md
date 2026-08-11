@@ -169,47 +169,6 @@ This project adapts those ideas into an agent-first Rust CLI backed by SQLite.
   <img src="docs/images/lwc-architecture-en.png" alt="LWC architecture" width="100%">
 </p>
 
-```text
-+-----------------------------------------------------------------------+
-|                              AGENT PLANE                              |
-+-----------------------------------------------------------------------+
-| User Task -> LLM Agent -> using-lwc Skill                             |
-|                         trigger | bootstrap | recall | write-back     |
-+-----------------------------------------------------------------------+
-                                   |
-                          JSON / stdin / files
-                                   v
-+-----------------------------------------------------------------------+
-|                               CLI LAYER                               |
-+-----------------------------------------------------------------------+
-| clap command router                                                   |
-| init | schema | purpose | source | page | ingest | search | context   |
-| graph | cg | view | lint | changeset | maintenance | checkpoint | log |
-+-----------------------------------------------------------------------+
-                                   |
-                                   v
-+----------------------------------+------------------------------------+
-| SCOPE RESOLVER                   | IMPORT / VALIDATION                |
-| project | global | all (merge)   | UTF-8 | size | ext | symlink       |
-+----------------------------------+------------------------------------+
-                                   |
-                                   v
-+-----------------------------------------------------------------------+
-|                             SQLITE STORE                              |
-+-----------------------------------------------------------------------+
-| Canonical | WAL | foreign keys | transactions | migrations            |
-| meta | sources | pages | page_sources | links | ingest_jobs           |
-| operations | changesets | search_fts                                  |
-+-----------------------------------------------------------------------+
-                                   |
-                                   v
-+-----------------------+-----------------------+-----------------------+
-| SEARCH PIPELINE       | GRAPH ENGINE          | MARKDOWN PROJECTION   |
-| CJK n-grams + Latin   | links + citations     | raw/ + wiki/          |
-| contentless FTS5/BM25 | structural evidence   | index/log/overview    |
-+-----------------------+-----------------------+-----------------------+
-```
-
 The persistent knowledge model has three logical layers:
 
 | Layer | Contents | Contract |
@@ -233,6 +192,10 @@ Every current Source and Wiki page is deterministically indexed as passages and
 sentences. SQLite remains authoritative; span FTS and an optional external
 document graph are rebuilt indexes. Existing search stays document-only
 unless a granularity is requested:
+
+<p align="center">
+  <img src="docs/images/lwc-memory-graph-en.png" alt="LWC memory graph" width="100%">
+</p>
 
 ```bash
 lwc search "projection consistency" --granularity sentence --type page
@@ -799,6 +762,10 @@ The viewer starts in English. Use the `中文` / `EN` control to switch language
 the browser remembers the selection while Wiki content remains in its authored
 language. Graphs use a single Obsidian-inspired 3D relationship view with small
 nodes, persistent labels, thin links, rotation, and zoom.
+
+<p align="center">
+  <img src="docs/images/lwc-codegraph-en.png" alt="LWC CodeGraph code intelligence" width="100%">
+</p>
 
 Code indexing is project-only and disabled until explicitly initialized. The
 pinned LWC CodeGraph fork is downloaded once from its GitHub Release, verified
