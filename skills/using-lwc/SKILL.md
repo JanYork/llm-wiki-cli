@@ -26,20 +26,23 @@ widen that authority.
 
 ## Start once per working root
 
-1. Run `scripts/bootstrap.sh` from this Skill directory with
-   `LWC_PROJECT_ROOT` set to the canonical authorized root. Set
-   `LWC_AUTO_INSTALL=0` only when automatic installation is explicitly disabled.
-2. Verify the returned `project_root`, `project_wiki`, and `project_boundary`
-   remain inside that root and `scope_conflict=false`. Use the absolute
-   `lwc_path` from the result.
+1. From the current project directory, run `scripts/bootstrap.sh` from this
+   Skill directory. Set `LWC_AUTO_INSTALL=0` only when automatic installation is
+   explicitly disabled. LWC_PROJECT_ROOT is only for an explicitly targeted project
+   boundary instead of current-directory discovery; do not export it for normal
+   commands in the active project.
+2. Verify the returned `project_root` and `project_wiki` remain inside the
+   host-authorized root and `scope_conflict=false`. Require `command -v lwc` to
+   succeed after bootstrap. Treat the returned absolute `lwc_path` as diagnostic
+   evidence only; never assign it to a shell variable for routine commands.
 3. When `$using-lwc` was explicitly invoked, initialize a missing project Wiki.
    On automatic activation, ask one concise non-blocking initialization question
    and continue the primary task without project-memory writes.
 4. Recall bounded context once:
 
    ```bash
-   "$LWC" --scope all context --limit 25
-   "$LWC" --scope all search "task terms" --limit 20
+   lwc --scope all context --limit 25
+   lwc --scope all search "task terms" --limit 20
    ```
 
 Do not repeat bootstrap or broad recall in the same working root. Rerun it after

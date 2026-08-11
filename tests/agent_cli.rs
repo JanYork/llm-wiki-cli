@@ -59,6 +59,7 @@ impl World {
         command
             .current_dir(&self.project)
             .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("PATH", "/usr/bin:/bin")
             .env("LWC_CODEGRAPH_BINARY", &self.backend)
             .env("LWC_FAKE_LOG", &self.log);

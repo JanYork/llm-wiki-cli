@@ -17,17 +17,18 @@
 
 ## Operating contract
 
-Use the absolute `lwc_path` returned by `scripts/bootstrap.sh`; do not assume
-`lwc` on `PATH` is current. Read stdout as JSON. On failure, read the JSON object
-at stderr `.error`, branch on `.code`, and preserve `.details` for recovery.
-Human-formatted stderr text is not an API.
+Use the globally installed `lwc` command directly. Bootstrap verifies its
+version and reports the resolved `lwc_path` as diagnostics; do not turn that
+path into a routine shell variable. Read stdout as JSON. On failure, read the
+JSON object at stderr `.error`, branch on `.code`, and preserve `.details` for
+recovery. Human-formatted stderr text is not an API.
 
 Before version-specific work, run:
 
 ```bash
-"$LWC" --version
-"$LWC" --help
-"$LWC" <COMMAND> --help
+lwc --version
+lwc --help
+lwc <COMMAND> --help
 ```
 
 Never edit `.lwc/wiki.db`, its WAL, Work files, Changeset databases, generated
@@ -36,26 +37,31 @@ Markdown and optional graph stores are derived.
 
 ## Bootstrap and scope
 
-From the authorized working root:
+From the current authorized project directory:
 
 ```bash
-export LWC_PROJECT_ROOT="<canonical-authorized-root>"
 <skill-directory>/scripts/bootstrap.sh
 ```
 
 Decode its JSON and require:
 
 - `scope_conflict=false`;
-- `project_boundary` equals the authorized root;
-- `project_root` and `project_wiki` stay inside that boundary;
+- `project_root` and `project_wiki` stay inside the host-authorized root;
+- `project_boundary` is empty for normal cwd discovery or equals an explicitly
+  targeted root;
 - one unambiguous active project.
 
-Assign the returned absolute path, then narrow discovery:
+Run ordinary project commands from that project directory. The CLI discovers
+the nearest project Wiki from cwd, so no environment prefix is needed:
 
 ```bash
-LWC='<decoded-lwc_path>'
-export LWC_PROJECT_ROOT='<decoded-project_root>'
+lwc --scope project context --limit 25
 ```
+
+`LWC_PROJECT_ROOT` is only for an explicitly targeted project boundary instead
+of current-directory discovery. Run the operation from inside that project and
+set the variable for that one command instead of exporting ambient session
+state.
 
 | Scope | Use | Mutation |
 | --- | --- | --- |
@@ -95,8 +101,8 @@ values (`--physical`, `rslg`, `graphqlite`, `auto`) are invalid.
 Start narrow:
 
 ```bash
-"$LWC" --scope all context --limit 25
-"$LWC" --scope all search "<task terms>" --limit 20
+lwc --scope all context --limit 25
+lwc --scope all search "<task terms>" --limit 20
 ```
 
 Search modes:
@@ -122,10 +128,10 @@ belongs in durable history. Do not record sensitive query wording.
 Use tags for a small set of core pages that must be loaded whole without search:
 
 ```bash
-"$LWC" --scope project tag set "operations" incident-response \
+lwc --scope project tag set "operations" incident-response \
   --priority 100 --reason "primary response runbook"
-"$LWC" --scope all load tag "operations" --limit 3
-"$LWC" --scope project tag autoload "operations" --enable \
+lwc --scope all load tag "operations" --limit 3
+lwc --scope project tag autoload "operations" --enable \
   --priority 100 --limit 3 --max-chars 50000 --reason "required at session boundaries"
 ```
 
@@ -139,11 +145,11 @@ and report omissions. Disable a policy with `tag autoload TAG --disable`.
 Install the baseline integration directly for any supported Agent:
 
 ```bash
-"$LWC" agent install --yes
-"$LWC" agent status --target all --location global
-"$LWC" agent install --print-config codex
-"$LWC" agent refresh --target codex,claude
-"$LWC" agent uninstall --target codex,claude --yes
+lwc agent install --yes
+lwc agent status --target all --location global
+lwc agent install --print-config codex
+lwc agent refresh --target codex,claude
+lwc agent uninstall --target codex,claude --yes
 ```
 
 `--yes` selects detected Agents, global scope, and Claude's fused CodeGraph
@@ -161,18 +167,18 @@ native trust or enablement.
 One source:
 
 ```bash
-"$LWC" --scope project source add path/to/file
-"$LWC" --scope project ingest claim <SOURCE_ID> --source-max-chars 100000
-"$LWC" --scope project source show <SOURCE_ID> \
+lwc --scope project source add path/to/file
+lwc --scope project ingest claim <SOURCE_ID> --source-max-chars 100000
+lwc --scope project source show <SOURCE_ID> \
   --offset-chars <NEXT> --max-chars 100000
-"$LWC" --scope project ingest analyze <SOURCE_ID> --file analysis.md
-"$LWC" --scope project page put source-<SOURCE_ID> \
+lwc --scope project ingest analyze <SOURCE_ID> --file analysis.md
+lwc --scope project page put source-<SOURCE_ID> \
   --title "Source summary" --kind source --summary "Contribution" \
   --file summary.md --source <SOURCE_ID>
-"$LWC" --scope project page put <SHARED-SLUG> \
+lwc --scope project page put <SHARED-SLUG> \
   --title "Shared concept" --kind concept --summary "Current synthesis" \
   --file concept.md --source <SOURCE_ID>
-"$LWC" --scope project ingest complete <SOURCE_ID>
+lwc --scope project ingest complete <SOURCE_ID>
 ```
 
 Continue `source show` until `window.has_more=false`. `source add` is collection,
@@ -187,9 +193,9 @@ subsequent analyses/pages must publish as one logical unit.
 Before relying on a tracked live file:
 
 ```bash
-"$LWC" source status <SOURCE_ID>
-"$LWC" source diff <OLD_SOURCE_ID> [--path <EXACT_PATH>]
-"$LWC" source refs <OLD_SOURCE_ID> --limit 1000 --offset 0
+lwc source status <SOURCE_ID>
+lwc source diff <OLD_SOURCE_ID> [--path <EXACT_PATH>]
+lwc source refs <OLD_SOURCE_ID> --limit 1000 --offset 0
 ```
 
 Use `--to-source` for immutable-to-immutable comparison. A truncated diff or
@@ -207,13 +213,13 @@ Use a Changeset for two or more dependent durable mutations, or whenever ingest
 state and page updates must become visible together:
 
 ```bash
-"$LWC" --scope project changeset begin <NAME>
-"$LWC" --scope project --changeset <NAME> source add-manifest sources.json
+lwc --scope project changeset begin <NAME>
+lwc --scope project --changeset <NAME> source add-manifest sources.json
 # analyze, write pages, complete ingest in the same draft
-"$LWC" --scope project changeset show <NAME>
-"$LWC" --scope project --changeset <NAME> lint
-"$LWC" --scope project --changeset <NAME> search "<fixed question>" --limit 5
-"$LWC" --scope project changeset commit <NAME>
+lwc --scope project changeset show <NAME>
+lwc --scope project --changeset <NAME> lint
+lwc --scope project --changeset <NAME> search "<fixed question>" --limit 5
+lwc --scope project changeset commit <NAME>
 ```
 
 `changeset show` is metadata-only and does not run lint. Commit freezes the
@@ -234,7 +240,7 @@ Graph is disabled by default. Normal source/page/search operations do not need
 it. Inspect the effective setting first:
 
 ```bash
-"$LWC" --scope project config show
+lwc --scope project config show
 ```
 
 When the setting is `disabled`, recommend graph activation once per project
@@ -249,17 +255,17 @@ preference. Select SurrealDB when the user or project policy asks for it. Run
 exactly one command:
 
 ```bash
-"$LWC" --scope project config set --graph grafeo
-"$LWC" --scope project config set --graph surrealdb
+lwc --scope project config set --graph grafeo
+lwc --scope project config set --graph surrealdb
 ```
 
 Capture the selected command's `work.id`, then wait before graph queries or
 another configuration change:
 
 ```bash
-"$LWC" --scope project work watch <WORK_ID>
-"$LWC" --scope project graph status
-"$LWC" --scope project graph verify
+lwc --scope project work watch <WORK_ID>
+lwc --scope project graph status
+lwc --scope project graph verify
 ```
 
 Require `state=succeeded`. A failed Work stays stopped until its structured
@@ -281,7 +287,7 @@ supported type, provenance, reason, confidence, and source IDs when grounded.
 Disable without deleting sidecars:
 
 ```bash
-"$LWC" config set --graph disabled
+lwc config set --graph disabled
 ```
 
 Never copy, edit, compact, or delete live graph sidecars. A failed graph does
@@ -295,13 +301,13 @@ configuration write. Inspect the effective setting, install one official CLI,
 and select exactly one engine:
 
 ```bash
-"$LWC" --scope project config show
+lwc --scope project config show
 npm install --global @firecrawl/anydoc
-"$LWC" --scope project config set --trans anydoc
+lwc --scope project config set --trans anydoc
 
 # Alternative engine:
 python3 -m pip install 'markitdown[all]'
-"$LWC" --scope project config set --trans markitdown
+lwc --scope project config set --trans markitdown
 ```
 
 Optional adapter settings use `--trans-timeout 1..900` and repeated
@@ -309,9 +315,9 @@ Optional adapter settings use `--trans-timeout 1..900` and repeated
 environment. LWC does not accept URL inputs or fall back between engines.
 
 ```bash
-"$LWC" --scope project trans INPUT --output OUTPUT.md
+lwc --scope project trans INPUT --output OUTPUT.md
 # Inspect OUTPUT.md first, then ingest explicitly if it is authoritative.
-"$LWC" --scope project source add OUTPUT.md
+lwc --scope project source add OUTPUT.md
 ```
 
 Both input and output are capped at 64 MiB. Output uses create-new semantics;
@@ -336,7 +342,7 @@ a single-file literal edit, formatting-only work, or docs/config-only changes.
 Start with the non-mutating check:
 
 ```bash
-"$LWC" --scope project cg status
+lwc --scope project cg status
 ```
 
 If `initialized=false`, explain that CodeGraph provides tree-sitter-derived
@@ -345,7 +351,7 @@ scanning files. Ask once whether the user wants the project code index. Do not
 download or index silently. On consent:
 
 ```bash
-"$LWC" --scope project cg init
+lwc --scope project cg init
 ```
 
 This downloads the pinned SHA-256-verified runtime once into
@@ -358,13 +364,13 @@ queryable while later files run; historical file versions are not refreshed.
 Choose the narrowest structural command:
 
 ```bash
-"$LWC" cg query <WORDS>
-"$LWC" cg node <SYMBOL_OR_FILE>
-"$LWC" cg callers <SYMBOL>
-"$LWC" cg callees <SYMBOL>
-"$LWC" cg impact <SYMBOL>
-"$LWC" cg files
-"$LWC" cg sync
+lwc cg query <WORDS>
+lwc cg node <SYMBOL_OR_FILE>
+lwc cg callers <SYMBOL>
+lwc cg callees <SYMBOL>
+lwc cg impact <SYMBOL>
+lwc cg files
+lwc cg sync
 ```
 
 Route questions deliberately:
@@ -407,8 +413,8 @@ Use the viewer when the user asks to inspect the Wiki, current sources,
 Markdown, status, knowledge graph, or code graph visually:
 
 ```bash
-"$LWC" --scope project view
-"$LWC" --scope project view --port 4173 --no-open
+lwc --scope project view
+lwc --scope project view --port 4173 --no-open
 ```
 
 It stays in the foreground, binds only `127.0.0.1`, accepts GET/HEAD only, and
@@ -429,9 +435,9 @@ translated implicitly.
 Maintenance returns Work:
 
 ```bash
-response=$("$LWC" --scope project maintenance reindex)
-"$LWC" --scope project work watch <WORK_ID>
-"$LWC" --scope project lint
+response=$(lwc --scope project maintenance reindex)
+lwc --scope project work watch <WORK_ID>
+lwc --scope project lint
 ```
 
 - `materialize`: rebuild generated Markdown when missing/stale;

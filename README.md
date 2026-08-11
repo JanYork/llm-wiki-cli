@@ -108,8 +108,10 @@ Requirements:
 5. From the current host-authorized workspace root, run the canonical Skill's
    bootstrap exactly as its instructions require. Let it install the official
    SHA-256-verified LWC release when needed and initialize ~/.lwc global memory.
-   Validate the returned JSON, the absolute lwc path, `lwc --version`, and the
-   global Wiki. Do not initialize any project Wiki unless the user explicitly
+   Validate the returned JSON, confirm `lwc` is globally callable on `PATH`,
+   run `lwc --version`, and inspect the global Wiki. Treat the returned absolute
+   path as diagnostics only; do not assign it to a routine shell variable. Do
+   not initialize any project Wiki unless the user explicitly
    requests it for that project; never use global memory as a fallback for
    project-specific writes.
 6. Apply the smallest complementary integration through your own native
@@ -394,9 +396,10 @@ conversion, Agent onboarding, and recovery/maintenance. Each document states
 when to use and skip the capability, its minimum workflow, consent boundary, and
 completion evidence.
 
-The Skill uses `LWC_PROJECT_ROOT` first as the canonical authorized workspace
-boundary, then narrows it to the selected active project; discovery and
-initialization cannot traverse above it.
+The Skill normally discovers the active project from the current directory and
+invokes the globally installed `lwc` command directly. `LWC_PROJECT_ROOT` is an
+explicit boundary for a deliberately targeted project, not a prefix to export
+for routine commands in the project you are already working in.
 
 Set `LWC_AUTO_INSTALL=0` to disable automatic CLI installation. Automatic
 installation executes the reviewed installer bundled in the Skill, trusts this

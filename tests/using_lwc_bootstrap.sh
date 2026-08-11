@@ -157,4 +157,20 @@ if (
   fail "bootstrap accepted an lwc without the global changeset selector"
 fi
 
-printf 'using-lwc bootstrap tests: 7 passed\n'
+path_home="$test_root/path-home"
+mkdir -p "$path_home/.local/bin"
+cp "$mock_bin/lwc" "$path_home/.local/bin/lwc"
+if (
+  cd "$project"
+  HOME="$path_home" \
+    PATH="/usr/bin:/bin" \
+    TMPDIR="$runtime_tmp" \
+    LWC_AUTO_INSTALL=0 \
+    sh "$bootstrap"
+) >"$test_root/path.out" 2>"$test_root/path.err"; then
+  fail "bootstrap accepted an lwc binary that was not globally callable on PATH"
+fi
+grep -Fq 'lwc is not on PATH' "$test_root/path.err" ||
+  fail "bootstrap did not explain how to make lwc globally callable"
+
+printf 'using-lwc bootstrap tests: 8 passed\n'

@@ -151,16 +151,24 @@ global_initialized_now=false
 
 lwc_path="$(command -v lwc 2>/dev/null || true)"
 if [ -z "$lwc_path" ] || ! usable_lwc "$lwc_path"; then
-  lwc_path="$(managed_lwc_path || true)"
+  managed_path="$(managed_lwc_path || true)"
+  if [ -n "$managed_path" ]; then
+    die "lwc is not on PATH; add $(dirname "$managed_path") to PATH and start a new Agent session"
+  fi
+  lwc_path=""
 fi
 if [ -z "$lwc_path" ]; then
   [ "${LWC_AUTO_INSTALL:-1}" != 0 ] ||
     die "compatible lwc not found and LWC_AUTO_INSTALL=0"
   LWC_INSTALL_DIR="$home_dir/.local/bin" sh "$installer" >&2 ||
     die "lwc installation failed"
-  lwc_path="$(managed_lwc_path || true)"
-  [ -n "$lwc_path" ] ||
+  lwc_path="$(command -v lwc 2>/dev/null || true)"
+  if [ -z "$lwc_path" ] || ! usable_lwc "$lwc_path"; then
+    managed_path="$(managed_lwc_path || true)"
+    [ -z "$managed_path" ] ||
+      die "lwc is not on PATH; add $(dirname "$managed_path") to PATH and start a new Agent session"
     die "installed lwc failed its compatibility check"
+  fi
   installed=true
 fi
 

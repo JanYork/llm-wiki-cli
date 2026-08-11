@@ -8,6 +8,22 @@ manual="$repo_root/skills/using-lwc/references/operations-manual.md"
 metadata="$repo_root/skills/using-lwc/agents/openai.yaml"
 skill_documents=("$skill" "$repo_root"/skills/using-lwc/references/*.md)
 
+if rg -n '\"\$LWC\"|LWC=.decoded-lwc_path.|export LWC_PROJECT_ROOT=.decoded-project_root.' \
+  "${skill_documents[@]}"; then
+  printf 'using-lwc guidance must invoke global lwc directly from the current project\n' >&2
+  exit 1
+fi
+
+for expected in \
+  'lwc --scope all context --limit 25' \
+  'lwc --scope all search "task terms" --limit 20' \
+  'LWC_PROJECT_ROOT is only for an explicitly targeted project'; do
+  grep -Fq -- "$expected" "${skill_documents[@]}" || {
+    printf 'missing direct lwc invocation contract: %s\n' "$expected" >&2
+    exit 1
+  }
+done
+
 capabilities=(
   core-memory
   trigger-playbook

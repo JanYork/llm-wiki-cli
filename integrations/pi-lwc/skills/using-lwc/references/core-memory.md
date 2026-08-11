@@ -12,7 +12,9 @@ known. Do not reload it as a session tax.
 
 ## Minimum workflow
 
-1. Bootstrap once and keep the returned absolute `lwc_path` as `LWC`.
+1. Bootstrap once, then invoke the globally installed `lwc` command directly.
+   The returned absolute `lwc_path` is diagnostic evidence, not a routine shell
+   variable.
 2. Recall bounded context with `context --limit 25` and one task-specific
    `search --limit 20`.
 3. Open 1-5 matching pages with `page show`. Inspect immutable evidence with

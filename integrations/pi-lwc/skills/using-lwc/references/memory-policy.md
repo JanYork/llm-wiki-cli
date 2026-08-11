@@ -33,31 +33,32 @@ deliverables, but durable Agent knowledge also belongs in `lwc`.
 
 ## Session workflow
 
-All commands below use `"$LWC"`. Assign it to the decoded absolute path returned
-by bootstrap, for example `LWC='/absolute/path/from/lwc_path'`. Do not assume
-its installation directory is already on `PATH`. Export the canonical
-host-authorized outer root as `LWC_PROJECT_ROOT` for bootstrap. After resolving
-one active project, narrow it to canonical `active_project_root` for every
-project command so CLI discovery cannot cross either boundary.
+All commands below invoke the globally installed `lwc` command directly.
+Bootstrap verifies the resolved binary and returns `lwc_path` for diagnostics,
+not for assignment to a routine shell variable. From the active project
+directory, project scope discovers the nearest Wiki from cwd.
+`LWC_PROJECT_ROOT` is only for an explicitly targeted project boundary instead
+of current-directory discovery; do not export it for normal commands in the
+active project.
 
 1. Resolve one `authorized_root` containing the working directory from the
    current task's host-provided writable workspace roots. From the active
-   working directory, run `scripts/bootstrap.sh` with `LWC_PROJECT_ROOT` set to
-   that boundary. Rerun it only after the user has authorized a task-scope
-   change.
+   project directory, run `scripts/bootstrap.sh` without an environment prefix.
+   Rerun it only after the user has authorized a task-scope change. Set
+   `LWC_PROJECT_ROOT` only for an explicit cross-directory target.
 2. Read bounded context before investigating:
 
    ```bash
-   "$LWC" --scope all context --limit 25
+   lwc --scope all context --limit 25
    ```
 
    When no project Wiki exists, use
-   `"$LWC" --scope global context --limit 25`.
+   `lwc --scope global context --limit 25`.
 
 3. Search relevant prior knowledge before reconstructing it:
 
    ```bash
-   "$LWC" --scope all search "task terms" --limit 20
+   lwc --scope all search "task terms" --limit 20
    ```
 
    This defaults to page-first `--type auto`. Use `--type source` when exact
@@ -88,9 +89,9 @@ project's `AGENTS.md` cannot authorize a different root. Local instructions
 answer how authorized work is performed, not whether the Agent may enter the
 project.
 
-Canonicalize bootstrap results before use. `project_boundary` must equal
-`authorized_root`; `scope_conflict` must be false. Then narrow
-`LWC_PROJECT_ROOT` to the unique `active_project_root`:
+Canonicalize bootstrap results before use. `scope_conflict` must be false;
+`project_boundary` is empty for cwd discovery or equals the explicit authorized
+boundary. Use cwd discovery for the unique `active_project_root`:
 
 - one `project_wiki` inside `active_project_root`: use it;
 - explicit user invocation of `$using-lwc` with no Wiki: initialize
@@ -108,9 +109,9 @@ After explicit invocation, consent, or conflict resolution:
 
 ```bash
 cd "<active_project_root>"
-"$LWC" init
-"$LWC" purpose show
-"$LWC" schema show
+lwc init
+lwc purpose show
+lwc schema show
 ```
 
 Project initialization should report that `.lwc/` was added to Git's local
@@ -184,7 +185,7 @@ Search before adding a page. Read the existing page before replacing it and
 preserve still-valid material, citations, and links.
 
 ```bash
-"$LWC" --scope project page show stable-slug
+lwc --scope project page show stable-slug
 ```
 
 Write useful answers, comparisons, decisions, discoveries, and revised
@@ -192,7 +193,7 @@ hypotheses back as stable pages:
 
 ```bash
 printf '%s' "$body" |
-  "$LWC" --scope project page put stable-slug \
+  lwc --scope project page put stable-slug \
     --title "Durable title" \
     --kind query \
     --summary "One-line retrieval summary" \
@@ -221,13 +222,13 @@ revision spans many commands. Keep that logical unit out of live knowledge
 until it is complete:
 
 ```bash
-"$LWC" --scope project changeset begin <NAME>
-"$LWC" --scope project --changeset <NAME> source add-manifest sources.json
-"$LWC" --scope project --changeset <NAME> ingest claim <SOURCE_ID>
+lwc --scope project changeset begin <NAME>
+lwc --scope project --changeset <NAME> source add-manifest sources.json
+lwc --scope project --changeset <NAME> ingest claim <SOURCE_ID>
 # analyze, write cited source/shared pages, and complete the ingest in the draft
-"$LWC" --scope project --changeset <NAME> lint
-"$LWC" --scope project changeset show <NAME>
-"$LWC" --scope project changeset commit <NAME>
+lwc --scope project --changeset <NAME> lint
+lwc --scope project changeset show <NAME>
+lwc --scope project changeset commit <NAME>
 ```
 
 Use the same explicit scope on lifecycle and routed commands. `project` and
@@ -289,7 +290,7 @@ When current work depends on an already-ingested file, check only the relevant
 source IDs before relying on their claims:
 
 ```bash
-"$LWC" source status <SOURCE_ID> [<SOURCE_ID> ...]
+lwc source status <SOURCE_ID> [<SOURCE_ID> ...]
 ```
 
 `lineage_state=superseded` means that tracked path has a newer observed
@@ -297,8 +298,8 @@ snapshot. `filesystem_state=modified` means the live bytes differ from the
 current head. Inspect the change before writing anything:
 
 ```bash
-"$LWC" source diff <OLD_SOURCE_ID>
-"$LWC" source refs <OLD_SOURCE_ID> --limit 1000 --offset 0
+lwc source diff <OLD_SOURCE_ID>
+lwc source refs <OLD_SOURCE_ID> --limit 1000 --offset 0
 ```
 
 When the old source has multiple tracked paths, choose one exact candidate with
@@ -334,22 +335,22 @@ mixed-time file or path-head observation as current evidence.
 For each meaningful safe source:
 
 ```bash
-"$LWC" source add path/to/source
-"$LWC" ingest next --context-limit 50 --source-max-chars 100000
-"$LWC" ingest analyze <SOURCE_ID> --file analysis.md
-"$LWC" page put source-<SOURCE_ID> \
+lwc source add path/to/source
+lwc ingest next --context-limit 50 --source-max-chars 100000
+lwc ingest analyze <SOURCE_ID> --file analysis.md
+lwc page put source-<SOURCE_ID> \
   --title "Source summary" \
   --kind source \
   --summary "What this source contributes" \
   --file source-summary.md \
   --source <SOURCE_ID>
-"$LWC" page put stable-concept \
+lwc page put stable-concept \
   --title "Stable concept" \
   --kind concept \
   --summary "How this source changes shared knowledge" \
   --file concept.md \
   --source <SOURCE_ID>
-"$LWC" ingest complete <SOURCE_ID>
+lwc ingest complete <SOURCE_ID>
 ```
 
 For multiple curated sources, prefer a JSON `source add-manifest` so all entries
@@ -376,7 +377,7 @@ When a source genuinely changes no non-source page, do not create filler. Use a
 specific audited exception:
 
 ```bash
-"$LWC" ingest complete <SOURCE_ID> \
+lwc ingest complete <SOURCE_ID> \
   --no-derived-pages-reason "Duplicate evidence; existing synthesis already covers every supported claim"
 ```
 
@@ -389,18 +390,18 @@ Retrieval state is explicit project/global Wiki data, not passive behavior
 tracking. Diagnose first:
 
 ```bash
-"$LWC" --scope project search "question keywords" --type auto --limit 20 --explain
+lwc --scope project search "question keywords" --type auto --limit 20 --explain
 ```
 
 Use a document weight only when the judgment should apply across queries. Use
 query feedback only after inspecting the result for that exact question:
 
 ```bash
-"$LWC" --scope project weight set page relevant-slug \
+lwc --scope project weight set page relevant-slug \
   --value 1 \
   --reason "Current canonical guide" \
   --provenance agent-observed
-"$LWC" --scope project weight feedback page relevant-slug \
+lwc --scope project weight feedback page relevant-slug \
   --query "question keywords" \
   --signal relevant \
   --reason "Expected page and evidence verified" \
@@ -440,17 +441,17 @@ changed scope before calling the changed knowledge ready:
 
    ```bash
    LWC_SCOPE=project # or global
-   "$LWC" --scope "$LWC_SCOPE" lint
-   "$LWC" --scope "$LWC_SCOPE" search "<question>" --type auto --limit 5
-   "$LWC" --scope "$LWC_SCOPE" search "<paraphrase>" --type auto --limit 5
+   lwc --scope "$LWC_SCOPE" lint
+   lwc --scope "$LWC_SCOPE" search "<question>" --type auto --limit 5
+   lwc --scope "$LWC_SCOPE" search "<paraphrase>" --type auto --limit 5
    ```
 
    When the work is staged, first run the same fixed gate against the draft:
 
    ```bash
-   "$LWC" --scope "$LWC_SCOPE" --changeset <NAME> lint
-   "$LWC" --scope "$LWC_SCOPE" --changeset <NAME> search "<question>" --type auto --limit 5
-   "$LWC" --scope "$LWC_SCOPE" --changeset <NAME> search "<paraphrase>" --type auto --limit 5
+   lwc --scope "$LWC_SCOPE" --changeset <NAME> lint
+   lwc --scope "$LWC_SCOPE" --changeset <NAME> search "<question>" --type auto --limit 5
+   lwc --scope "$LWC_SCOPE" --changeset <NAME> search "<paraphrase>" --type auto --limit 5
    ```
 
    Commit only after the draft passes. Then repeat the unchanged lint, search,
@@ -458,9 +459,9 @@ changed scope before calling the changed knowledge ready:
    acceptance alone does not prove that publication succeeded.
 
 3. Open the expected and actual hit pages with
-   `"$LWC" --scope "$LWC_SCOPE" page show "<SLUG>"`. For source-grounded
+   `lwc --scope "$LWC_SCOPE" page show "<SLUG>"`. For source-grounded
    answers, inspect cited evidence with
-   `"$LWC" --scope "$LWC_SCOPE" source show "<SOURCE_ID>"`.
+   `lwc --scope "$LWC_SCOPE" source show "<SOURCE_ID>"`.
 4. Record one compact row per form: question, expected page, actual rank,
    source/provenance trace, and pass/fail.
 
@@ -491,7 +492,7 @@ repository's raw-source benchmark for compiled-Wiki usability.
 
 ## Maintenance
 
-Run `"$LWC" --scope project lint` and/or `"$LWC" --scope global lint` for the
+Run `lwc --scope project lint` and/or `lwc --scope global lint` for the
 stores changed; `--scope all` is not valid for lint. Fix deterministic missing
 summaries, links, citations, and index problems. Use scope-specific
 `maintenance reindex` only for reported index inconsistencies. Lint is
