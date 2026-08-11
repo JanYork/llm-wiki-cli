@@ -26,7 +26,7 @@ links, indexes, and history so knowledge compounds instead of being rediscovered
 from raw chunks on every query.
 
 <p align="center">
-  <img src="docs/images/lwc-overview-zh.png" alt="LWC product overview" width="820">
+  <img src="docs/images/lwc-overview-en.png" alt="LWC product overview" width="820">
 </p>
 
 ## LWC Is Agent Memory, Not RAG
@@ -53,7 +53,7 @@ does not require embeddings or a vector database, and it does not discard each
 synthesis after answering. It can complement RAG, but it is not query-time RAG.
 
 <p align="center">
-  <img src="docs/images/lwc-source-grounding-zh.png" alt="LWC source grounding and traceability" width="820">
+  <img src="docs/images/lwc-source-grounding-en.png" alt="LWC source grounding and traceability" width="820">
 </p>
 
 ### The Agent operates LWC
@@ -166,7 +166,7 @@ This project adapts those ideas into an agent-first Rust CLI backed by SQLite.
 ## Core Design
 
 <p align="center">
-  <img src="docs/images/lwc-architecture-zh.png" alt="LWC architecture" width="100%">
+  <img src="docs/images/lwc-architecture-en.png" alt="LWC architecture" width="100%">
 </p>
 
 ```text

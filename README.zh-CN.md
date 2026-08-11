@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/lwc-agent-memory.png" alt="LWC Agent Memory" width="100%">
+  <img src="docs/images/lwc-agent-memory-zh.png" alt="LWC Agent 记忆" width="100%">
 </p>
 
 `lwc` 是一个面向 Agent 的 CLI，它把经过筛选的文档转化为可长期维护的
