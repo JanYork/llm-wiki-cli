@@ -74,3 +74,22 @@ jobs:
 
       - name: Build release binary
         run: cargo build --locked --release
+
+  windows-codegraph:
+    name: Windows CodeGraph path regression
+    runs-on: windows-2025
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-codegraph
+
+      - name: Test Windows CodeGraph path forwarding
+        run: cargo test --locked --test codegraph_cli_windows
