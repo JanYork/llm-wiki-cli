@@ -344,7 +344,7 @@ fn run_engine(
     timeout_seconds: u16,
 ) -> Result<()> {
     let stderr_file = open_existing_private_file(temp_stderr)?;
-    let mut command = Command::new(engine);
+    let mut command = engine_command(engine);
     command.stdin(Stdio::null()).stdout(Stdio::null());
     command.stderr(Stdio::from(stderr_file));
     #[cfg(unix)]
@@ -362,6 +362,24 @@ fn run_engine(
     })?;
 
     wait_with_timeout(engine, &mut child, timeout_seconds, temp_stderr)
+}
+
+#[cfg(windows)]
+fn engine_command(engine: &str) -> Command {
+    let executable = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .flat_map(|directory| {
+                ["exe", "cmd", "bat"]
+                    .map(move |extension| directory.join(format!("{engine}.{extension}")))
+            })
+            .find(|candidate| candidate.is_file())
+    });
+    Command::new(executable.unwrap_or_else(|| PathBuf::from(engine)))
+}
+
+#[cfg(not(windows))]
+fn engine_command(engine: &str) -> Command {
+    Command::new(engine)
 }
 
 fn wait_with_timeout(
