@@ -256,6 +256,11 @@ fn fresh_init_recommends_both_graphs_without_enabling_them() {
 
     assert_eq!(recommendation["wiki"]["initialized"], true);
     assert_eq!(recommendation["document_graph"]["enabled"], false);
+    assert_eq!(recommendation["document_graph"]["ready"], false);
+    assert_eq!(
+        recommendation["document_graph"]["projection"]["status"],
+        "disabled"
+    );
     assert_eq!(recommendation["code_graph"]["initialized"], false);
     assert_eq!(recommendation["authorization"]["mode"], "plain-text");
     assert_eq!(recommendation["authorization"]["recommended_choice"], "1");
@@ -289,6 +294,7 @@ fn boundary_hook_reports_portable_graph_authorization_without_mutation() {
 
     assert_eq!(readiness["wiki"]["initialized"], true);
     assert_eq!(readiness["document_graph"]["enabled"], false);
+    assert_eq!(readiness["document_graph"]["ready"], false);
     assert_eq!(readiness["code_graph"]["initialized"], false);
     assert_eq!(readiness["code_graph"]["ready"], false);
     assert_eq!(readiness["authorization"]["mode"], "plain-text");
@@ -367,6 +373,11 @@ fn boundary_hook_omits_authorization_when_both_graphs_are_configured() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     let readiness = readiness(value["additionalContext"].as_str().unwrap());
     assert_eq!(readiness["document_graph"]["enabled"], true);
+    assert_eq!(readiness["document_graph"]["ready"], false);
+    assert_eq!(
+        readiness["document_graph"]["projection"]["status"],
+        "pending"
+    );
     assert_eq!(readiness["code_graph"]["initialized"], true);
     assert_eq!(readiness["code_graph"]["ready"], true);
     assert!(readiness.get("authorization").is_none());

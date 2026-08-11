@@ -1,7 +1,7 @@
 # Using LWC Capability Guidance and First-Use Readiness
 
-Status: approved  
-Date: 2026-08-11  
+Status: approved
+Date: 2026-08-11
 Plan: `.agent/.plans/global-codegraph-agent-tags/`
 
 ## Goal
@@ -40,6 +40,7 @@ silently changing project state.
 | `trigger-playbook.md` | task classification and session/milestone/compaction triggers | deciding whether LWC should activate |
 | `active-memory.md` | bounded recall, verified write-back, freshness, prohibited memory | recalling or preserving durable knowledge |
 | `document-graph.md` | physical Wiki graph, engine consent, Work, status and verification | document relationships or graph readiness matters |
+| `word-graph.md` | query-driven bounded term-to-document bridges and performance limits | shared vocabulary may connect relevant pages or sources |
 | `code-graph.md` | CodeGraph routing, global runtime versus project index, init/sync | structural code questions or changes span symbols/files |
 | `strong-context.md` | tags, full-page load and lifecycle auto-load budgets | core rules/runbooks need deterministic loading |
 | `document-conversion.md` | MarkItDown/anydoc configuration and safe conversion boundary | non-Markdown documents must become reviewable Markdown |
@@ -57,7 +58,7 @@ install/init/session boundary
   -> bounded local readiness snapshot
   -> Wiki present?
   -> physical document graph enabled?
-  -> CodeGraph project index initialized?
+  -> CodeGraph runtime healthy and project index initialized?
   -> no gaps: continue silently with normal LWC routing
   -> gaps: Agent explains benefits and asks once in plain text
        1 both graphs (recommended)
@@ -83,10 +84,10 @@ The Hook context and `lwc init` recommendation expose machine-readable facts and
 human-usable commands:
 
 - `wiki.initialized` and the project-local initialization command;
-- `document_graph.setting`, `ready`, consent requirement, enable and verify
-  commands;
-- `code_graph.runtime_installed`, `initialized`, consent requirement, init and
-  status commands;
+- `document_graph.setting`, `enabled`, current projection status, `ready`,
+  consent requirement, enable and verify commands;
+- `code_graph.runtime_installed`, `initialized`, `ready`, consent requirement,
+  init and status commands;
 - `authorization.mode=plain-text`, the numbered choices, and
   `recommended_choice=1` when both graphs are missing.
 
@@ -98,7 +99,8 @@ fail-open for Agent startup.
 
 The existing `LWC_AGENT_START`/`LWC_AGENT_END` block tells an Agent to:
 
-- use the installed `using-lwc` Skill for substantive work;
+- use the `using-lwc` Skill when available, otherwise report that the full Skill
+  guidance is missing and retain the bounded marker as fallback;
 - inspect readiness at session start and after compaction;
 - ask through the portable text choices when graph consent is required;
 - execute and verify the selected initialization immediately after consent;
@@ -118,7 +120,8 @@ owned marker and Hook entries.
   without enabling either one.
 - Boundary Hook output reports graph gaps and the same numbered text protocol;
   prompt Hooks still perform no Wiki reads.
-- Ready projects do not receive graph authorization choices.
+- Projects with durable consent for both graphs do not receive authorization
+  choices; pending or failed projection readiness remains visible for recovery.
 - Existing input/output bounds, fail-open behavior, marker idempotence, exact
   uninstall, Windows CodeGraph path handling, and full repository tests remain
   green.

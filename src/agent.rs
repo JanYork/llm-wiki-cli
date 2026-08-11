@@ -101,6 +101,15 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
     let wiki_initialized = store.path.is_file();
     let graph = config::resolve_graph("project", &store.path)?;
     let document_graph_enabled = graph.setting != GraphSetting::Disabled;
+    let document_graph_projection = if !document_graph_enabled {
+        json!({"status": "disabled", "documents": 0})
+    } else if !wiki_initialized {
+        json!({"status": "missing-wiki", "documents": 0})
+    } else {
+        crate::external_graph::status("project", &store.path)
+            .unwrap_or_else(|error| json!({"status": "error", "error_code": error.code}))
+    };
+    let document_graph_ready = document_graph_projection["status"] == "ready";
     let code_graph = codegraph::status(&store)?;
     let code_graph_runtime_installed = code_graph["installed"].as_bool().unwrap_or(false);
     let code_graph_initialized = code_graph["initialized"].as_bool().unwrap_or(false);
@@ -117,6 +126,8 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
             "setting": graph.setting,
             "origin": graph.origin,
             "enabled": document_graph_enabled,
+            "ready": document_graph_ready,
+            "projection": document_graph_projection,
             "requires_consent": document_graph_needs_consent,
             "enable": "lwc --scope project config set --graph grafeo",
             "status": "lwc --scope project graph status",
@@ -175,10 +186,15 @@ fn graph_authorization(
         ],
         (false, false) => unreachable!(),
     };
+    let reply = if document_graph && code_graph {
+        "Reply with 1-4."
+    } else {
+        "Reply with 1 or 4."
+    };
     Some(json!({
         "mode": "plain-text",
         "recommended_choice": "1",
-        "prompt": format!("{prefix}Reply with 1-4."),
+        "prompt": format!("{prefix}{reply}"),
         "choices": choices,
     }))
 }
@@ -424,5 +440,21 @@ mod tests {
             normalize_event("UserPromptSubmit").unwrap(),
             HookEvent::Prompt
         ));
+    }
+
+    #[test]
+    fn single_graph_authorization_names_only_valid_choices() {
+        for authorization in [
+            graph_authorization(true, false, false).unwrap(),
+            graph_authorization(false, true, false).unwrap(),
+        ] {
+            assert_eq!(authorization["choices"].as_array().unwrap().len(), 2);
+            assert!(
+                authorization["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Reply with 1 or 4")
+            );
+        }
     }
 }

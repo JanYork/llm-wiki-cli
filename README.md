@@ -128,9 +128,10 @@ Requirements:
      workspace boundary; and never store secrets, raw chain-of-thought,
      transient logs, or unsupported guesses.
    - When you support lifecycle Hooks, create or merge one native user-level
-     session-start Hook. It should only add a brief reminder to evaluate and use
-     the LWC Skill at suitable times. The Hook must not read, initialize, or
-     mutate a project Wiki itself. Do not add a per-prompt Hook, replace
+     session-start Hook that invokes the bounded, read-only `lwc agent hook`.
+     It may report local readiness and load only explicitly enabled strong-tag
+     pages. It must not initialize or mutate a Wiki, enable a graph, download a
+     runtime, or build an index. Do not add per-prompt Wiki loading, replace
      unrelated Hooks, or bypass Hook trust review. If you do not support Hooks,
      rely on the global instructions and report that limitation instead of
      inventing a mechanism.
@@ -386,6 +387,13 @@ When triggered, the Skill:
 - separates project facts from reusable global knowledge;
 - integrates sources and writes durable answers back into the Wiki.
 
+`SKILL.md` is a short router rather than a monolithic manual. It links one
+focused teaching document for basic memory, trigger timing, active memory,
+physical document graph, bounded Word Graph, CodeGraph, strong tags, document
+conversion, Agent onboarding, and recovery/maintenance. Each document states
+when to use and skip the capability, its minimum workflow, consent boundary, and
+completion evidence.
+
 The Skill uses `LWC_PROJECT_ROOT` first as the canonical authorized workspace
 boundary, then narrows it to the selected active project; discovery and
 initialization cannot traverse above it.
@@ -421,6 +429,27 @@ owned state and leaves project indexes intact. Optional Codex, Claude Code, and
 Pi packages live under `integrations/`; installing a package does not grant or
 bypass native trust. Do not combine the direct installer and native package for
 the same Agent.
+
+Fresh project `lwc init` output and session/compaction Hooks expose bounded
+`LWC_READINESS` facts for the Wiki, physical document graph, CodeGraph runtime
+and project index, plus Agent integration commands. Physical graph readiness
+distinguishes configured consent from a pending or failed projection. Detection
+is read-only and never enables or initializes a graph. When both graphs need
+authorization, the portable baseline is plain text, so Agents without checkbox
+support behave the same way:
+
+```text
+1. Enable physical document graph and CodeGraph (recommended)
+2. Enable physical document graph only
+3. Enable CodeGraph only
+4. Later
+```
+
+After explicit choice `1`, the Agent initializes a missing project Wiki, enables
+Grafeo, waits for and verifies its projection Work, initializes CodeGraph, and
+checks both results independently. `Later` changes nothing and does not block
+the primary task. Native plugins may render the same choice IDs with their own
+UI, but checkbox support is never required.
 
 Strong tags provide bounded full-page loading for core rules and runbooks:
 

@@ -66,5 +66,7 @@ memory. Native plugin trust remains a separate host/user decision.
 - `lwc agent status` reports the intended target and global/local location.
 - Reinstall/refresh is byte-idempotent; uninstall removes only owned MCP,
   markers, and Hooks.
-- Readiness disappears once both graph capabilities verify ready.
+- Graph authorization choices disappear once both capabilities have durable
+  consent; bounded readiness facts still expose pending or failed initialization
+  for routing and repair.
 - The same numbered meaning works through plain text and optional native UI.

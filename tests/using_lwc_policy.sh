@@ -13,6 +13,7 @@ capabilities=(
   trigger-playbook
   active-memory
   document-graph
+  word-graph
   code-graph
   strong-context
   document-conversion

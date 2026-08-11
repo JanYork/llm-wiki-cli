@@ -57,6 +57,7 @@ completion evidence.
 | Decide whether and when LWC should activate | `references/trigger-playbook.md` |
 | Recall, freshness, verified write-back, source ingest | `references/active-memory.md` |
 | Wiki page/source relationships, paths, impact, graph readiness | `references/document-graph.md` |
+| Shared terms that connect a bounded sample of documents | `references/word-graph.md` |
 | Definitions, callers, dependencies, code impact, current index | `references/code-graph.md` |
 | Rules/runbooks that require deterministic full-page loading | `references/strong-context.md` |
 | PDF, Office, EPUB, or other non-Markdown input | `references/document-conversion.md` |
