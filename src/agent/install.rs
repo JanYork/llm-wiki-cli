@@ -917,28 +917,73 @@ fn detected_targets(home: &Path, cwd: &Path) -> Vec<&'static str> {
     TARGET_NAMES
         .iter()
         .copied()
-        .filter(|target| match *target {
-            "claude" => {
-                home.join(".claude").exists()
-                    || home.join(".claude.json").exists()
-                    || cwd.join(".claude").exists()
-            }
-            "codex" => home.join(".codex").exists(),
-            "cursor" => home.join(".cursor").exists() || cwd.join(".cursor").exists(),
-            "opencode" => {
-                home.join(".config/opencode").exists() || cwd.join("opencode.jsonc").exists()
-            }
-            "hermes" => home.join(".hermes").exists(),
-            "gemini" => home.join(".gemini").exists(),
-            "antigravity" => {
-                home.join(".gemini/antigravity").exists()
-                    || home.join(".gemini/config/mcp_config.json").is_file()
-            }
-            "kiro" => home.join(".kiro").exists() || cwd.join(".kiro").exists(),
-            "pi" => home.join(".pi").exists() || cwd.join(".pi").exists(),
-            _ => false,
+        .filter(|target| {
+            command_exists(target)
+                || match *target {
+                    "claude" => {
+                        home.join(".claude").exists()
+                            || home.join(".claude.json").exists()
+                            || cwd.join(".claude").exists()
+                    }
+                    "codex" => home.join(".codex").exists(),
+                    "cursor" => home.join(".cursor").exists() || cwd.join(".cursor").exists(),
+                    "opencode" => {
+                        home.join(".config/opencode").exists()
+                            || cwd.join("opencode.jsonc").exists()
+                    }
+                    "hermes" => home.join(".hermes").exists(),
+                    "gemini" => home.join(".gemini").exists(),
+                    "antigravity" => {
+                        home.join(".gemini/antigravity").exists()
+                            || home.join(".gemini/config/mcp_config.json").is_file()
+                    }
+                    "kiro" => home.join(".kiro").exists() || cwd.join(".kiro").exists(),
+                    "pi" => home.join(".pi").exists() || cwd.join(".pi").exists(),
+                    _ => false,
+                }
         })
         .collect()
+}
+
+fn command_exists(name: &str) -> bool {
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&path).any(|directory| {
+        if directory.as_os_str().is_empty() {
+            return false;
+        }
+        if executable_file(&directory.join(name)) {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            let extensions =
+                env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
+            return extensions.to_string_lossy().split(';').any(|extension| {
+                !extension.is_empty()
+                    && executable_file(&directory.join(format!("{name}{extension}")))
+            });
+        }
+        #[cfg(not(windows))]
+        false
+    })
+}
+
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return metadata.permissions().mode() & 0o111 != 0;
+    }
+    #[cfg(not(unix))]
+    true
 }
 
 fn choose_targets(

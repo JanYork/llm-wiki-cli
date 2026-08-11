@@ -59,6 +59,7 @@ impl World {
         command
             .current_dir(&self.project)
             .env("HOME", &self.home)
+            .env("PATH", "/usr/bin:/bin")
             .env("LWC_CODEGRAPH_BINARY", &self.backend)
             .env("LWC_FAKE_LOG", &self.log);
         command
@@ -250,6 +251,40 @@ fn detected_yes_install_is_idempotent_and_uninstall_restores_exact_user_bytes() 
         assert_eq!(fs::read(path).unwrap(), original);
     }
     assert!(!world.home.join(".codex/hooks/lwc.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn yes_detects_agent_executables_before_their_first_config() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let world = World::new();
+    let bin = world.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for agent in ["claude", "codex", "pi"] {
+        let executable = bin.join(agent);
+        fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path =
+        std::env::join_paths([bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap();
+    let output = world
+        .command()
+        .env("PATH", path)
+        .args(["agent", "install", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let installed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        installed["detected"],
+        serde_json::json!(["claude", "codex", "pi"])
+    );
+    assert_eq!(installed["targets"].as_array().unwrap().len(), 3);
 }
 
 #[cfg(unix)]
