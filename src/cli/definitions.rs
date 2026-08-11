@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use crate::{changeset, codegraph, config, source_diff, store, view, work};
+use crate::{changeset, codegraph, config, source_diff, store, trans, view, work};
 use crate::error::{AppError, Result};
 use crate::import::collect_documents;
 use crate::scope::{
@@ -245,6 +245,22 @@ enum Command {
         #[command(subcommand)]
         command: PageCommand,
     },
+    /// Assign explicit strong-load tags to core Wiki pages.
+    Tag {
+        #[command(subcommand)]
+        command: TagCommand,
+    },
+    /// Load deterministic Wiki context without search.
+    Load {
+        #[command(subcommand)]
+        command: LoadCommand,
+    },
+    /// Internal lifecycle integration used by installed Agent hooks.
+    #[command(hide = true)]
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     /// Drive the persistent Agent ingest state machine.
     #[command(
         long_about = "Compile immutable sources into persistent Wiki knowledge through a crash-safe state machine:\n  pending -> analyzing -> generating -> completed\n\nFailed or interrupted work can be returned to pending with retry.",
@@ -254,10 +270,25 @@ enum Command {
         #[command(subcommand)]
         command: IngestCommand,
     },
-    /// Inspect and update the layered graph engine setting.
+    /// Inspect and update the layered graph and trans settings.
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Convert one authorized local file with the configured trans engine.
+    #[command(
+        long_about = "Run the resolved anydoc or markitdown engine against one authorized local file and write the UTF-8 Markdown result to an explicit new output path.\n\nThis command does not add sources, pages, citations, or operation-log entries.",
+        after_help = "Examples:\n  lwc trans docs/report.docx --output out/report.md\n  lwc trans ../shared/file.pdf --output out/file.md --allow-external-source"
+    )]
+    Trans {
+        /// Existing local file to convert.
+        file: PathBuf,
+        /// Explicit destination path; must not already exist.
+        #[arg(long)]
+        output: PathBuf,
+        /// Permit a project input that resolves outside the active project root.
+        #[arg(long)]
+        allow_external_source: bool,
     },
     /// Explore, explain, verify, and maintain the selected document graph.
     #[command(
@@ -462,6 +493,124 @@ FILE may be '-' to read UTF-8 Markdown from stdin. The update is stored transact
     /// Print the current durable purpose as JSON.
     #[command(after_help = "Example:\n  lwc purpose show")]
     Show,
+}
+
+#[derive(Subcommand)]
+enum TagCommand {
+    Set {
+        tag: String,
+        page: String,
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
+        #[arg(long)]
+        reason: String,
+    },
+    Remove { tag: String, page: String },
+    Delete { tag: String },
+    Autoload {
+        tag: String,
+        #[arg(long, required_unless_present = "disable", conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, default_value_t = 50_000)]
+        max_chars: usize,
+        #[arg(long)]
+        reason: String,
+    },
+    List,
+}
+
+#[derive(Subcommand)]
+enum LoadCommand {
+    Tag {
+        tag: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    /// Install LWC and CodeGraph integration into detected or selected Agents.
+    Install {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, value_enum)]
+        location: Option<AgentLocationArg>,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        print_config: Option<String>,
+        #[arg(long)]
+        no_codegraph_prompt_hook: bool,
+    },
+    /// Inspect installed Agent integrations.
+    Status {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, value_enum)]
+        location: Option<AgentLocationArg>,
+    },
+    /// Refresh selected Agent integrations without duplicating owned entries.
+    Refresh {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, value_enum)]
+        location: Option<AgentLocationArg>,
+    },
+    /// Remove only LWC-owned Agent integration state.
+    Uninstall {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, value_enum)]
+        location: Option<AgentLocationArg>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Compile bounded read-only context from a native Agent hook event.
+    Hook {
+        #[arg(long, value_enum)]
+        agent: AgentArg,
+        #[arg(long)]
+        event: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AgentLocationArg {
+    Global,
+    Local,
+}
+
+impl From<AgentLocationArg> for crate::agent::AgentLocation {
+    fn from(value: AgentLocationArg) -> Self {
+        match value {
+            AgentLocationArg::Global => Self::Global,
+            AgentLocationArg::Local => Self::Local,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AgentArg {
+    Codex,
+    Claude,
+    Pi,
+}
+
+impl From<AgentArg> for crate::agent::AgentKind {
+    fn from(value: AgentArg) -> Self {
+        match value {
+            AgentArg::Codex => Self::Codex,
+            AgentArg::Claude => Self::Claude,
+            AgentArg::Pi => Self::Pi,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -698,18 +847,29 @@ This prevents completion after merely indexing raw text or writing a detached su
 
 #[derive(Subcommand)]
 enum ConfigCommand {
-    /// Show effective graph configuration and value origins.
+    /// Show effective graph and trans configuration plus value origins.
     Show,
-    /// Atomically set the graph engine setting.
+    /// Atomically set graph and trans configuration.
     Set {
         /// Select disabled, grafeo, surrealdb, or inherit.
         #[arg(long)]
-        graph: String,
+        graph: Option<String>,
+        /// Select disabled, anydoc, or markitdown.
+        #[arg(long)]
+        trans: Option<String>,
+        /// Override the trans timeout in seconds (1..=900).
+        #[arg(long = "trans-timeout")]
+        trans_timeout: Option<u16>,
+        /// Replace the selected trans engine's argument list; repeat for multiple values.
+        #[arg(long = "trans-arg", allow_hyphen_values = true)]
+        trans_args: Vec<String>,
     },
-    /// Restore the graph engine setting to its inherited default.
+    /// Restore graph and trans settings to their inherited defaults.
     Unset {
         #[arg(long)]
         graph: bool,
+        #[arg(long)]
+        trans: bool,
     },
 }
 

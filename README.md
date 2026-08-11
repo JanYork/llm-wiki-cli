@@ -128,9 +128,10 @@ Requirements:
      workspace boundary; and never store secrets, raw chain-of-thought,
      transient logs, or unsupported guesses.
    - When you support lifecycle Hooks, create or merge one native user-level
-     session-start Hook. It should only add a brief reminder to evaluate and use
-     the LWC Skill at suitable times. The Hook must not read, initialize, or
-     mutate a project Wiki itself. Do not add a per-prompt Hook, replace
+     session-start Hook that invokes the bounded, read-only `lwc agent hook`.
+     It may report local readiness and load only explicitly enabled strong-tag
+     pages. It must not initialize or mutate a Wiki, enable a graph, download a
+     runtime, or build an index. Do not add per-prompt Wiki loading, replace
      unrelated Hooks, or bypass Hook trust review. If you do not support Hooks,
      rely on the global instructions and report that limitation instead of
      inventing a mechanism.
@@ -283,6 +284,33 @@ lwc config set --graph disabled
 lwc config unset --graph
 ```
 
+Markdown conversion is a separate opt-in operation. `lwc init` reports the
+same machine-readable setup guidance, but never installs or enables a
+converter. Install one adapter, select it explicitly, convert to a new local
+Markdown file, review it, and only then ingest it:
+
+```bash
+# Choose one adapter; both are disabled unless configured.
+npm install --global @firecrawl/anydoc
+lwc config set --trans anydoc
+
+# Or:
+python3 -m pip install 'markitdown[all]'
+lwc config set --trans markitdown
+
+lwc trans INPUT --output OUTPUT.md
+lwc source add OUTPUT.md
+```
+
+Configuration accepts `--trans-timeout 1..900` and repeated
+`--trans-arg=<value>` options for the selected adapter. LWC invokes the fixed
+adapter executable directly, never falls back to the other adapter, accepts
+local files only, caps input and output at 64 MiB, and never overwrites an
+existing output. Keep credentials in the adapter's environment rather than in
+LWC configuration. See the official [Anydoc](https://github.com/firecrawl/anydoc)
+and [MarkItDown](https://github.com/microsoft/markitdown) documentation for
+supported formats and optional flags.
+
 Grafeo and embedded SurrealDB use disposable sidecars under `.lwc/`. Each
 `graph-project` Work commits one current Source/Page and its owned links,
 citations, and explicit relations before starting the next document. Updates
@@ -359,6 +387,13 @@ When triggered, the Skill:
 - separates project facts from reusable global knowledge;
 - integrates sources and writes durable answers back into the Wiki.
 
+`SKILL.md` is a short router rather than a monolithic manual. It links one
+focused teaching document for basic memory, trigger timing, active memory,
+physical document graph, bounded Word Graph, CodeGraph, strong tags, document
+conversion, Agent onboarding, and recovery/maintenance. Each document states
+when to use and skip the capability, its minimum workflow, consent boundary, and
+completion evidence.
+
 The Skill uses `LWC_PROJECT_ROOT` first as the canonical authorized workspace
 boundary, then narrows it to the selected active project; discovery and
 initialization cannot traverse above it.
@@ -374,6 +409,59 @@ resource layout, while
 runtime-neutral: any Agent that can execute it and load or adapt the Skill's
 instructions can use LWC. Skill commands, global instructions, and Hooks remain
 runtime-specific, so the setup prompt detects and configures the current host.
+
+### Native Agent setup
+
+LWC can detect supported Agents and install CodeGraph MCP, marker-bounded LWC
+guidance, and native lifecycle hooks without relying on a particular host:
+
+```bash
+lwc agent install --yes
+lwc agent status --target all --location global
+lwc agent install --print-config codex
+lwc agent refresh --target codex,claude
+lwc agent uninstall --target codex,claude --yes
+```
+
+`--yes` selects detected Agents, global scope, and Claude Code's fused prompt
+hook. Repeated install and refresh are byte-idempotent; uninstall restores only
+owned state and leaves project indexes intact. Optional Codex, Claude Code, and
+Pi packages live under `integrations/`; installing a package does not grant or
+bypass native trust. Do not combine the direct installer and native package for
+the same Agent.
+
+Fresh project `lwc init` output and session/compaction Hooks expose bounded
+`LWC_READINESS` facts for the Wiki, physical document graph, CodeGraph runtime
+and project index, plus Agent integration commands. Physical graph readiness
+distinguishes configured consent from a pending or failed projection. Detection
+is read-only and never enables or initializes a graph. When both graphs need
+authorization, the portable baseline is plain text, so Agents without checkbox
+support behave the same way:
+
+```text
+1. Enable physical document graph and CodeGraph (recommended)
+2. Enable physical document graph only
+3. Enable CodeGraph only
+4. Later
+```
+
+After explicit choice `1`, the Agent initializes a missing project Wiki, enables
+Grafeo, waits for and verifies its projection Work, initializes CodeGraph, and
+checks both results independently. `Later` changes nothing and does not block
+the primary task. Native plugins may render the same choice IDs with their own
+UI, but checkbox support is never required.
+
+Strong tags provide bounded full-page loading for core rules and runbooks:
+
+```bash
+lwc tag set "operations" incident-response --priority 100 --reason "primary runbook"
+lwc load tag "operations" --limit 3
+lwc tag autoload "operations" --enable --priority 100 --limit 3 \
+  --max-chars 50000 --reason "required at session boundaries"
+```
+
+This is an explicit strong-load mechanism, not token-derived search: limits and
+character budgets are applied before complete pages enter Agent context.
 
 ## Quick Start
 
@@ -710,10 +798,10 @@ language. Graphs use a single Obsidian-inspired 3D relationship view with small
 nodes, persistent labels, thin links, rotation, and zoom.
 
 Code indexing is project-only and disabled until explicitly initialized. The
-pinned LWC CodeGraph fork is then downloaded from its GitHub Release, verified
-with SHA-256, and kept under `.lwc/runtime/codegraph`; its index lives under
-`.lwc/codegraph`. Telemetry is always off and no `.codegraph` or user-global
-CodeGraph state is used.
+pinned LWC CodeGraph fork is downloaded once from its GitHub Release, verified
+with SHA-256, and cached under `~/.lwc/runtime/codegraph/<PIN>/<TARGET>/`; each
+project keeps only its index under `.lwc/codegraph`. Telemetry is always off and
+no `.codegraph` state is used.
 
 ```bash
 lwc cg status
@@ -728,8 +816,9 @@ lwc cg files
 ```
 
 All CodeGraph query capabilities are forwarded by `lwc cg`. Global lifecycle
-commands (`install`, `uninstall`, `upgrade`, `telemetry`, `daemon`, `daemons`,
-`serve`) are blocked because LWC owns the runtime and enforces the project boundary. Initial,
+commands (`install`, `uninstall`, `upgrade`, `telemetry`, `daemon`, `daemons`)
+are blocked; only the exact Agent bridge `lwc cg serve --mcp` is allowed because
+LWC owns the runtime and enforces the project boundary. Initial,
 incremental, full, update, delete, reference-resolution, and recovery writes
 commit one owner file completely before the next; the current graph remains
 readable and historical document revisions are never refreshed.

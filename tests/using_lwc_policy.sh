@@ -6,6 +6,49 @@ skill="$repo_root/skills/using-lwc/SKILL.md"
 policy="$repo_root/skills/using-lwc/references/memory-policy.md"
 manual="$repo_root/skills/using-lwc/references/operations-manual.md"
 metadata="$repo_root/skills/using-lwc/agents/openai.yaml"
+skill_documents=("$skill" "$repo_root"/skills/using-lwc/references/*.md)
+
+capabilities=(
+  core-memory
+  trigger-playbook
+  active-memory
+  document-graph
+  word-graph
+  code-graph
+  strong-context
+  document-conversion
+  agent-onboarding
+  recovery-maintenance
+)
+
+for capability in "${capabilities[@]}"; do
+  document="$repo_root/skills/using-lwc/references/$capability.md"
+  [[ -f "$document" ]] || {
+    printf 'missing using-lwc capability document: %s\n' "$capability" >&2
+    exit 1
+  }
+  grep -Fq -- "references/$capability.md" "$skill" || {
+    printf 'using-lwc router does not link capability: %s\n' "$capability" >&2
+    exit 1
+  }
+  for heading in \
+    '## Use when' \
+    '## Skip when' \
+    '## Minimum workflow' \
+    '## Consent boundaries' \
+    '## Completion evidence'; do
+    grep -Fq -- "$heading" "$document" || {
+      printf 'capability %s is missing teaching section: %s\n' "$capability" "$heading" >&2
+      exit 1
+    }
+  done
+done
+
+skill_lines="$(wc -l < "$skill" | tr -d ' ')"
+((skill_lines <= 250)) || {
+  printf 'using-lwc router is too large: %s lines (maximum 250)\n' "$skill_lines" >&2
+  exit 1
+}
 
 grep -Fq -- 'description: Use when' "$skill" || {
   printf 'using-lwc description must state activation triggers\n' >&2
@@ -21,7 +64,7 @@ for expected in \
   '--max-chars 100000' \
   '--to-source <NEW_SOURCE_ID>' \
   'review candidates'; do
-  grep -Fq -- "$expected" "$skill" "$policy" || {
+  grep -Fq -- "$expected" "${skill_documents[@]}" || {
     printf 'missing using-lwc policy contract: %s\n' "$expected" >&2
     exit 1
   }
@@ -43,9 +86,13 @@ for expected in \
   'checked-out code' \
   'current implementation evidence' \
   'config show' \
+  'Markdown conversion recommendation' \
+  'config set --trans anydoc' \
+  'config set --trans markitdown' \
+  'trans INPUT --output OUTPUT.md' \
   'config set --graph grafeo' \
   'config set --graph surrealdb'; do
-  grep -Fq -- "$expected" "$skill" || {
+  grep -Fq -- "$expected" "${skill_documents[@]}" || {
     printf 'missing automatic LWC guidance: %s\n' "$expected" >&2
     exit 1
   }
@@ -54,6 +101,10 @@ done
 for expected in \
   'Command families' \
   'Graph engine and document-granular Work' \
+  'Optional Markdown conversion' \
+  'config set --trans anydoc' \
+  'config set --trans markitdown' \
+  'trans INPUT --output OUTPUT.md' \
   'Project code intelligence' \
   'Route questions deliberately' \
   'Use the three LWC planes together' \

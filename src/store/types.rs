@@ -31,7 +31,8 @@ const PAGE_PROVENANCE_VERSION: i32 = 7;
 const SOURCE_PATH_REVISIONS_VERSION: i32 = 8;
 const RETRIEVAL_WEIGHTING_VERSION: i32 = 9;
 const CHANGESETS_VERSION: i32 = 10;
-const USER_VERSION: i32 = 12;
+const EXTERNAL_GRAPH_VERSION: i32 = 12;
+const USER_VERSION: i32 = 13;
 const CHANGESET_FREEZE_KEY: &str = "changeset_frozen";
 const SEARCH_INDEX_VERSION: i32 = 4;
 const INGEST_WORKFLOW_VERSION: i32 = 5;
@@ -437,6 +438,35 @@ pub struct PageShowResponse {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TagPageIdentity {
+    pub scope: String,
+    pub tag: String,
+    pub page_slug: String,
+    pub priority: i32,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TaggedPage {
+    pub scope: String,
+    pub tag: String,
+    pub priority: i32,
+    pub reason: String,
+    pub ordinal: usize,
+    pub page: PageRecord,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TagAutoloadPolicy {
+    pub scope: String,
+    pub name: String,
+    pub priority: i32,
+    pub limit: usize,
+    pub max_chars: usize,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PageLinksResponse {
     pub scope: String,
     pub database: String,
@@ -825,6 +855,40 @@ struct SparseSourceInverse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct TagPolicySnapshot {
+    name: String,
+    autoload: bool,
+    autoload_priority: i32,
+    autoload_limit: i64,
+    autoload_max_chars: i64,
+    reason: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PageTagSnapshot {
+    tag_name: String,
+    page_slug: String,
+    priority: i32,
+    reason: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SparseTagSnapshot {
+    policy: Option<TagPolicySnapshot>,
+    memberships: Vec<PageTagSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SparseTagInverse {
+    name: String,
+    before: SparseTagSnapshot,
+    after_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SparseInversePayload {
     version: u32,
     changeset_id: String,
@@ -834,6 +898,8 @@ struct SparseInversePayload {
     meta: Vec<SparseMetaInverse>,
     #[serde(default)]
     sources: Vec<SparseSourceInverse>,
+    #[serde(default)]
+    tags: Vec<SparseTagInverse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

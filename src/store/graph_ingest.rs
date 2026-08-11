@@ -875,7 +875,7 @@ impl Store {
         }
 
         let source = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        configure_read_only_connection(&source)?;
+        configure_read_only_connection(&source, BUSY_TIMEOUT)?;
         prepare_store_read_only(&source)?;
 
         let safety_checkpoint = fresh_checkpoint_name(&self.database, "pre-restore")?;

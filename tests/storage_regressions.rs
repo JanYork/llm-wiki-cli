@@ -70,6 +70,155 @@ fn wal_path(database: &Path) -> PathBuf {
 }
 
 #[test]
+fn new_store_has_v13_tag_schema_constraints_and_cascades() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+    let page = world.write("tagged.md", "tagged body");
+    world.ok(&[
+        "page",
+        "put",
+        "tagged",
+        "--title",
+        "Tagged",
+        "--file",
+        as_str(&page),
+        "--provenance",
+        "user-provided",
+    ]);
+
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    let version: i32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 13);
+    let indexes = {
+        let mut statement = conn
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'index' AND name LIKE 'page_tags_%' ORDER BY name",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(indexes, ["page_tags_lookup", "page_tags_page"]);
+
+    conn.execute(
+        "INSERT INTO tags(name, reason, updated_at) VALUES ('rules', 'core rules', 'now')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO page_tags(tag_name, page_slug, priority, reason, created_at, updated_at)
+         VALUES ('rules', 'tagged', 10, 'essential', 'now', 'now')",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "UPDATE tags SET autoload_limit = 0 WHERE name = 'rules'",
+            [],
+        )
+        .is_err()
+    );
+    conn.execute("DELETE FROM pages WHERE slug = 'tagged'", [])
+        .unwrap();
+    let memberships: i64 = conn
+        .query_row("SELECT COUNT(*) FROM page_tags", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(memberships, 0);
+    let tags: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(tags, 1);
+}
+
+fn downgrade_tag_schema_to_v12(database: &Path) {
+    let conn = Connection::open(database).unwrap();
+    conn.execute_batch(
+        "DROP TABLE page_tags;
+         DROP TABLE tags;
+         UPDATE meta SET value = '12' WHERE key = 'format_version';
+         PRAGMA user_version = 12;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn v12_store_migrates_to_v13_with_existing_pages_untagged() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+    downgrade_tag_schema_to_v12(&database);
+
+    world.ok(&["init"]);
+
+    let conn = Connection::open(&database).unwrap();
+    let version: i32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    let format: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'format_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!((version, format.as_str()), (13, "13"));
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM page_tags", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn failed_v13_migration_leaves_v12_unchanged_and_can_retry() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+    downgrade_tag_schema_to_v12(&database);
+    let conn = Connection::open(&database).unwrap();
+    conn.execute("CREATE TABLE tags(broken TEXT)", []).unwrap();
+    drop(conn);
+
+    let failed = world.command(&["init"]);
+    assert!(!failed.status.success());
+    let error: Value = serde_json::from_slice(&failed.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "store_migration_failed");
+    let conn = Connection::open(&database).unwrap();
+    let version: i32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 12);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('tags') WHERE name = 'broken'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+    assert!(conn.prepare("SELECT * FROM page_tags").is_err());
+    conn.execute("DROP TABLE tags", []).unwrap();
+    drop(conn);
+
+    world.ok(&["init"]);
+    let conn = Connection::open(&database).unwrap();
+    let version: i32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 13);
+}
+
+#[test]
 fn new_store_uses_contentless_search_fts_and_keeps_identifiers_readable() {
     let world = TestWorld::new();
     let initialized = world.ok(&["init"]);
@@ -123,8 +272,14 @@ fn new_store_uses_contentless_search_fts_and_keeps_identifiers_readable() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 12);
-    for table in ["retrieval_weights", "retrieval_feedback", "changesets"] {
+    assert_eq!(version, 13);
+    for table in [
+        "retrieval_weights",
+        "retrieval_feedback",
+        "changesets",
+        "tags",
+        "page_tags",
+    ] {
         let exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",

@@ -1,40 +1,58 @@
 use crate::{
     error::{AppError, Result},
-    scope::StorePath,
+    scope::{StorePath, global_lwc_root},
 };
 use rusqlite::{Connection, OpenFlags};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::{OsStr, OsString},
-    fs,
-    io::{BufRead, BufReader, Read},
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 const VERSION: &str = "v1.5.0-lwc.1";
 const RELEASE_ROOT: &str = "https://github.com/JanYork/codegraph/releases/download";
+const RUNTIME_MANIFEST: &str = "runtime.json";
+const INSTALL_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn status(store: &StorePath) -> Value {
-    let paths = Paths::new(store);
-    json!({
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeManifest {
+    version: String,
+    target: String,
+    asset: String,
+    archive_sha256: String,
+    binary: PathBuf,
+}
+
+pub fn status(store: &StorePath) -> Result<Value> {
+    let paths = Paths::new(store)?;
+    let runtime = runtime_state(&paths);
+    Ok(json!({
         "scope": "project",
         "version": VERSION,
-        "installed": binary(&paths).is_some(),
+        "installed": runtime.binary.is_some(),
+        "runtime_health": runtime.health,
         "initialized": paths.index.join("codegraph.db").is_file(),
         "runtime": paths.runtime,
+        "legacy_project_runtime": paths.legacy_runtime.exists(),
+        "legacy_runtime": paths.legacy_runtime,
         "index": paths.index,
         "telemetry": false,
-    })
+    }))
 }
 
 pub fn init(store: &StorePath, verbose: bool) -> Result<Value> {
-    let paths = Paths::new(store);
+    let paths = Paths::new(store)?;
     install(&paths)?;
     let mut args = vec![
         OsString::from("init"),
-        paths.project.as_os_str().to_owned(),
+        OsString::from("."),
         OsString::from("--force"),
     ];
     if verbose {
@@ -44,16 +62,25 @@ pub fn init(store: &StorePath, verbose: bool) -> Result<Value> {
 }
 
 pub fn run(store: &StorePath, args: &[OsString]) -> Result<Value> {
-    let paths = Paths::new(store);
+    let paths = Paths::new(store)?;
     let Some(name) = args.first().and_then(|value| value.to_str()) else {
         return Err(AppError::new(
             "invalid_codegraph_command",
             "missing CodeGraph command",
         ));
     };
+    if name == "serve" {
+        if args.len() == 2 && args[1] == "--mcp" {
+            return serve_mcp(&paths, args);
+        }
+        return Err(AppError::new(
+            "codegraph_command_not_project_scoped",
+            "LWC only permits the exact project-scoped `lwc cg serve --mcp` command",
+        ));
+    }
     if matches!(
         name,
-        "install" | "uninstall" | "upgrade" | "telemetry" | "daemon" | "daemons" | "serve"
+        "install" | "uninstall" | "upgrade" | "telemetry" | "daemon" | "daemons"
     ) {
         return Err(AppError::new(
             "codegraph_command_not_project_scoped",
@@ -65,7 +92,7 @@ pub fn run(store: &StorePath, args: &[OsString]) -> Result<Value> {
     if binary(&paths).is_none() {
         return Err(AppError::new(
             "codegraph_runtime_missing",
-            "run `lwc cg init` to download the pinned project-local CodeGraph runtime",
+            "run `lwc cg init` to install the pinned global CodeGraph runtime",
         ));
     }
     validate_project_arguments(&paths, args)?;
@@ -82,7 +109,7 @@ pub fn run(store: &StorePath, args: &[OsString]) -> Result<Value> {
                 "LWC chooses the current project path; do not pass another project path",
             ));
         }
-        forwarded.insert(1, paths.project.as_os_str().to_owned());
+        forwarded.insert(1, OsString::from("."));
         if matches!(name, "index" | "uninit")
             && !forwarded.iter().any(|arg| arg == "--force" || arg == "-f")
         {
@@ -94,6 +121,17 @@ pub fn run(store: &StorePath, args: &[OsString]) -> Result<Value> {
         &forwarded,
         matches!(name, "index" | "sync" | "uninit" | "unlock"),
     )
+}
+
+fn serve_mcp(paths: &Paths, args: &[OsString]) -> Result<Value> {
+    let status = configured_command(paths, args)?.status()?;
+    if !status.success() {
+        return Err(AppError::new(
+            "codegraph_command_failed",
+            format!("CodeGraph MCP server exited with {status}"),
+        ));
+    }
+    Ok(Value::Null)
 }
 
 fn validate_project_arguments(paths: &Paths, args: &[OsString]) -> Result<()> {
@@ -181,7 +219,17 @@ fn external_path_error() -> AppError {
 }
 
 pub fn graph(store: &StorePath) -> Value {
-    let paths = Paths::new(store);
+    let paths = match Paths::new(store) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return json!({
+                "available": false,
+                "nodes": [],
+                "edges": [],
+                "message": error.message,
+            });
+        }
+    };
     let database = paths.index.join("codegraph.db");
     if !database.is_file() {
         return json!({
@@ -251,41 +299,145 @@ fn read_graph(database: &Path) -> Result<Value> {
 struct Paths {
     project: PathBuf,
     runtime: PathBuf,
+    legacy_runtime: PathBuf,
     index: PathBuf,
+    target: &'static str,
+    asset: String,
 }
 
 impl Paths {
-    fn new(store: &StorePath) -> Self {
+    fn new(store: &StorePath) -> Result<Self> {
         let lwc = store
             .path
             .parent()
             .expect("Wiki database has an .lwc parent");
-        Self {
-            project: lwc
-                .parent()
+        Self::from_project(
+            lwc.parent()
                 .expect("project .lwc has a parent")
                 .to_path_buf(),
-            runtime: lwc.join("runtime/codegraph"),
-            index: lwc.join("codegraph"),
+        )
+    }
+
+    fn from_project(project: PathBuf) -> Result<Self> {
+        let target = target_name()?;
+        let extension = if cfg!(windows) { "zip" } else { "tar.gz" };
+        Ok(Self {
+            legacy_runtime: project.join(".lwc/runtime/codegraph"),
+            index: project.join(".lwc/codegraph"),
+            project,
+            runtime: global_lwc_root()?
+                .join("runtime/codegraph")
+                .join(VERSION)
+                .join(target),
+            target,
+            asset: format!("codegraph-{target}.{extension}"),
+        })
+    }
+}
+
+pub fn prompt_hook(project: &Path, prompt: &str) -> Result<String> {
+    const MAX_OUTPUT_BYTES: u64 = 20 * 1024;
+    const TIMEOUT: Duration = Duration::from_secs(2);
+
+    let project = fs::canonicalize(project)?;
+    let paths = Paths::from_project(project.clone())?;
+    let mut command = configured_command(&paths, &[OsString::from("prompt-hook")])?;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().expect("piped CodeGraph stdout");
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_OUTPUT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    if let Some(mut stdin) = child.stdin.take() {
+        serde_json::to_writer(&mut stdin, &json!({"prompt": prompt, "cwd": project})).map_err(
+            |error| {
+                AppError::new(
+                    "codegraph_prompt_hook_failed",
+                    format!("failed to write CodeGraph prompt input: {error}"),
+                )
+            },
+        )?;
+    }
+    let deadline = Instant::now() + TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::new(
+                "codegraph_prompt_hook_timeout",
+                "CodeGraph prompt hook exceeded 2 seconds",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let bytes = reader
+        .join()
+        .map_err(|_| AppError::new("codegraph_prompt_hook_failed", "output reader failed"))??;
+    if !status.success() || bytes.len() > MAX_OUTPUT_BYTES as usize {
+        return Err(AppError::new(
+            "codegraph_prompt_hook_failed",
+            "CodeGraph prompt hook failed or exceeded its output budget",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        AppError::new(
+            "codegraph_prompt_hook_failed",
+            "CodeGraph prompt hook returned invalid UTF-8",
+        )
+    })
+}
+
+pub(crate) fn installer(project: &Path, args: &[OsString]) -> Result<()> {
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    let paths = Paths::from_project(fs::canonicalize(project)?)?;
+    install(&paths)?;
+    let executable = binary(&paths).ok_or_else(|| {
+        AppError::new("codegraph_runtime_missing", "CodeGraph runtime is missing")
+    })?;
+    let mut child = Command::new(executable)
+        .args(args)
+        .current_dir(&paths.project)
+        .env("CODEGRAPH_TELEMETRY", "0")
+        .env("DO_NOT_TRACK", "1")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(AppError::new(
+                "codegraph_installer_failed",
+                format!("CodeGraph installer exited with {status}"),
+            ));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::new(
+                "codegraph_installer_timeout",
+                "CodeGraph installer exceeded 30 seconds",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
 fn execute(paths: &Paths, args: &[OsString], stream: bool) -> Result<Value> {
-    let executable = binary(paths)
-        .ok_or_else(|| AppError::new("codegraph_runtime_missing", "run `lwc cg init` first"))?;
-    let home = paths.runtime.join("home");
-    fs::create_dir_all(&home)?;
-    let mut command = Command::new(&executable);
-    command
-        .args(args)
-        .current_dir(&paths.project)
-        .env("CODEGRAPH_DIR", ".lwc/codegraph")
-        .env("CODEGRAPH_TELEMETRY", "0")
-        .env("DO_NOT_TRACK", "1")
-        .env("NO_COLOR", "1")
-        .env("HOME", &home)
-        .env("USERPROFILE", &home);
+    let mut command = configured_command(paths, args)?;
     let (status, stdout, stderr) = if stream {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn()?;
@@ -321,6 +473,24 @@ fn execute(paths: &Paths, args: &[OsString], stream: bool) -> Result<Value> {
     }))
 }
 
+fn configured_command(paths: &Paths, args: &[OsString]) -> Result<Command> {
+    let executable = binary(paths)
+        .ok_or_else(|| AppError::new("codegraph_runtime_missing", "run `lwc cg init` first"))?;
+    let home = paths.runtime.join("home");
+    fs::create_dir_all(&home)?;
+    let mut command = Command::new(&executable);
+    command
+        .args(args)
+        .current_dir(&paths.project)
+        .env("CODEGRAPH_DIR", ".lwc/codegraph")
+        .env("CODEGRAPH_TELEMETRY", "0")
+        .env("DO_NOT_TRACK", "1")
+        .env("NO_COLOR", "1")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home);
+    Ok(command)
+}
+
 fn stream_lines(pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut captured = String::new();
@@ -342,9 +512,13 @@ fn install(paths: &Paths) -> Result<()> {
     if binary(paths).is_some() {
         return Ok(());
     }
-    let target = target_name()?;
-    let extension = if cfg!(windows) { "zip" } else { "tar.gz" };
-    let asset = format!("codegraph-{target}.{extension}");
+    let Some(_lock) = acquire_install_lock(paths)? else {
+        return Ok(());
+    };
+    if binary(paths).is_some() {
+        return Ok(());
+    }
+    quarantine_invalid_runtime(paths)?;
     let parent = paths.runtime.parent().expect("runtime has a parent");
     fs::create_dir_all(parent)?;
     let staging = parent.join(format!("codegraph.download-{}", std::process::id()));
@@ -353,16 +527,46 @@ fn install(paths: &Paths) -> Result<()> {
     }
     fs::create_dir(&staging)?;
     let result = (|| {
-        let archive = staging.join(&asset);
+        let archive = staging.join(&paths.asset);
         let sums = staging.join("SHA256SUMS");
-        download(&format!("{RELEASE_ROOT}/{VERSION}/{asset}"), &archive)?;
+        download(
+            &format!("{RELEASE_ROOT}/{VERSION}/{}", paths.asset),
+            &archive,
+        )?;
         download(&format!("{RELEASE_ROOT}/{VERSION}/SHA256SUMS"), &sums)?;
-        verify(&archive, &sums, &asset)?;
+        let archive_sha256 = verify(&archive, &sums, &paths.asset)?;
         unpack(&archive, &staging)?;
         fs::remove_file(&archive)?;
         fs::remove_file(&sums)?;
-        if paths.runtime.exists() {
-            fs::remove_dir_all(&paths.runtime)?;
+        let executable = find_binary(&staging, 0).ok_or_else(|| {
+            AppError::new(
+                "codegraph_runtime_invalid",
+                "downloaded CodeGraph runtime has no executable",
+            )
+        })?;
+        let relative = executable
+            .strip_prefix(&staging)
+            .expect("staging executable is inside staging")
+            .to_path_buf();
+        let manifest = RuntimeManifest {
+            version: VERSION.to_owned(),
+            target: paths.target.to_owned(),
+            asset: paths.asset.clone(),
+            archive_sha256,
+            binary: relative,
+        };
+        let manifest = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+            AppError::new(
+                "codegraph_runtime_invalid",
+                format!("failed to encode CodeGraph runtime manifest: {error}"),
+            )
+        })?;
+        fs::write(staging.join(RUNTIME_MANIFEST), manifest)?;
+        if fs::symlink_metadata(&paths.runtime).is_ok() {
+            return Err(AppError::new(
+                "codegraph_runtime_publish_conflict",
+                "CodeGraph runtime path appeared while installation was in progress",
+            ));
         }
         fs::rename(&staging, &paths.runtime)?;
         Ok(())
@@ -371,6 +575,76 @@ fn install(paths: &Paths) -> Result<()> {
         let _ = fs::remove_dir_all(staging);
     }
     result
+}
+
+fn quarantine_invalid_runtime(paths: &Paths) -> Result<Option<PathBuf>> {
+    if fs::symlink_metadata(&paths.runtime).is_err() || runtime_state(paths).binary.is_some() {
+        return Ok(None);
+    }
+    let parent = paths.runtime.parent().expect("runtime has a parent");
+    for attempt in 0..1000_u16 {
+        let suffix = if attempt == 0 {
+            format!("{}.invalid-{}", paths.target, std::process::id())
+        } else {
+            format!("{}.invalid-{}-{attempt}", paths.target, std::process::id())
+        };
+        let destination = parent.join(suffix);
+        if fs::symlink_metadata(&destination).is_ok() {
+            continue;
+        }
+        fs::rename(&paths.runtime, &destination)?;
+        return Ok(Some(destination));
+    }
+    Err(AppError::new(
+        "codegraph_runtime_quarantine_failed",
+        "could not reserve a quarantine path for the invalid CodeGraph runtime",
+    ))
+}
+
+struct InstallLock {
+    path: PathBuf,
+}
+
+impl Drop for InstallLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_install_lock(paths: &Paths) -> Result<Option<InstallLock>> {
+    let parent = paths.runtime.parent().expect("runtime has a parent");
+    fs::create_dir_all(parent)?;
+    let path = parent.join(format!(".{}.install.lock", paths.target));
+    let started = Instant::now();
+    loop {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                writeln!(file, "pid={}", std::process::id())?;
+                file.sync_all()?;
+                return Ok(Some(InstallLock { path }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if binary(paths).is_some() {
+                    return Ok(None);
+                }
+                if started.elapsed() >= INSTALL_LOCK_TIMEOUT {
+                    return Err(AppError::new(
+                        "codegraph_install_busy",
+                        "another CodeGraph runtime installation is still in progress",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn download(url: &str, destination: &Path) -> Result<()> {
@@ -395,7 +669,7 @@ fn download(url: &str, destination: &Path) -> Result<()> {
     }
 }
 
-fn verify(archive: &Path, sums: &Path, asset: &str) -> Result<()> {
+fn verify(archive: &Path, sums: &Path, asset: &str) -> Result<String> {
     let expected = fs::read_to_string(sums)?
         .lines()
         .find_map(|line| {
@@ -424,7 +698,7 @@ fn verify(archive: &Path, sums: &Path, asset: &str) -> Result<()> {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     if actual == expected {
-        Ok(())
+        Ok(expected)
     } else {
         Err(AppError::new(
             "codegraph_checksum_mismatch",
@@ -463,7 +737,88 @@ fn binary(paths: &Paths) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("LWC_CODEGRAPH_BINARY") {
         return Some(PathBuf::from(path));
     }
-    find_binary(&paths.runtime, 0)
+    runtime_state(paths).binary
+}
+
+struct RuntimeState {
+    health: &'static str,
+    binary: Option<PathBuf>,
+}
+
+fn runtime_state(paths: &Paths) -> RuntimeState {
+    let Ok(runtime_metadata) = fs::symlink_metadata(&paths.runtime) else {
+        return RuntimeState {
+            health: "missing",
+            binary: None,
+        };
+    };
+    if !runtime_metadata.is_dir() || runtime_metadata.file_type().is_symlink() {
+        return RuntimeState {
+            health: "invalid",
+            binary: None,
+        };
+    }
+    let manifest_path = paths.runtime.join(RUNTIME_MANIFEST);
+    let Ok(metadata) = fs::symlink_metadata(&manifest_path) else {
+        return RuntimeState {
+            health: "invalid",
+            binary: None,
+        };
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return RuntimeState {
+            health: "invalid",
+            binary: None,
+        };
+    }
+    let Ok(bytes) = fs::read(&manifest_path) else {
+        return RuntimeState {
+            health: "invalid",
+            binary: None,
+        };
+    };
+    let Ok(manifest) = serde_json::from_slice::<RuntimeManifest>(&bytes) else {
+        return RuntimeState {
+            health: "invalid",
+            binary: None,
+        };
+    };
+    if manifest.version != VERSION
+        || manifest.target != paths.target
+        || manifest.asset != paths.asset
+        || manifest.archive_sha256.len() != 64
+        || !manifest
+            .archive_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || manifest.binary.is_absolute()
+        || manifest
+            .binary
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return RuntimeState {
+            health: "invalid",
+            binary: None,
+        };
+    }
+    let executable = paths.runtime.join(&manifest.binary);
+    let Ok(metadata) = fs::symlink_metadata(&executable) else {
+        return RuntimeState {
+            health: "invalid",
+            binary: None,
+        };
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return RuntimeState {
+            health: "invalid",
+            binary: None,
+        };
+    }
+    RuntimeState {
+        health: "ready",
+        binary: Some(executable),
+    }
 }
 
 fn find_binary(directory: &Path, depth: usize) -> Option<PathBuf> {

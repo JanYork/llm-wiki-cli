@@ -11,4 +11,6 @@ include!("changeset_restore.rs");
 include!("search_state.rs");
 include!("indexing.rs");
 include!("graph_search.rs");
+include!("word_graph.rs");
+include!("tags.rs");
 include!("tests.rs");

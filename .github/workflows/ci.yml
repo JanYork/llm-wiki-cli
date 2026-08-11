@@ -64,7 +64,32 @@ jobs:
       - name: Test npm package
         run: node --test tests/npm_package.mjs
 
-      # Companion Agent Skill checks are local-only; do not add them to repository CI.
+      - name: Validate native Agent integrations
+        run: |
+          node --test ../../tests/integrations.mjs
+          npm pack --dry-run --ignore-scripts
+        working-directory: integrations/pi-lwc
+
+      # Companion Agent Skill policy checks are local-only.
 
       - name: Build release binary
         run: cargo build --locked --release
+
+  windows-codegraph:
+    name: Windows CodeGraph path regression
+    runs-on: windows-2025
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-codegraph
+
+      - name: Test Windows CodeGraph path forwarding
+        run: cargo test --locked --test codegraph_cli_windows

@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lwc agent hook --agent claude --event SessionStart",
+            "timeout": 2,
+            "statusMessage": "Loading bounded LWC context..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lwc agent hook --agent claude --event UserPromptSubmit",
+            "timeout": 2,
+            "statusMessage": "Checking project structure context..."
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -8,6 +8,8 @@ fn run(cli: Cli) -> Result<Value> {
             | Command::WorkRun { .. }
             | Command::Cg { .. }
             | Command::View { .. }
+            | Command::Trans { .. }
+            | Command::Agent { .. }
     ) {
         let paths = if cli.scope == Scope::All {
             resolve_live_read_store_paths(cli.scope, &cwd, true)?
@@ -30,12 +32,38 @@ fn run(cli: Cli) -> Result<Value> {
             let (mut store, created) =
                 Store::initialize(scope_name(store_path.scope), &store_path.path)?;
             store.materialize()?;
-            Ok(json!({
+            let mut response = json!({
                 "scope": scope_name(store_path.scope),
                 "database": store_path.path,
                 "created": created,
-                "git_exclude": git_exclude
-            }))
+                "git_exclude": git_exclude,
+                "recommendations": {
+                    "md_trans": {
+                        "default": "disabled",
+                        "config_show": "lwc config show",
+                        "convert": "lwc trans INPUT --output OUTPUT.md",
+                        "ingest_after_review": "lwc source add OUTPUT.md",
+                        "automatic_actions": [],
+                        "engines": {
+                            "anydoc": {
+                                "install": "npm install --global @firecrawl/anydoc",
+                                "configure": "lwc config set --trans anydoc",
+                                "repository": "https://github.com/firecrawl/anydoc"
+                            },
+                            "markitdown": {
+                                "install": "python3 -m pip install 'markitdown[all]'",
+                                "configure": "lwc config set --trans markitdown",
+                                "repository": "https://github.com/microsoft/markitdown"
+                            }
+                        }
+                    }
+                }
+            });
+            if store_path.scope == Scope::Project {
+                response["recommendations"]["lwc_readiness"] =
+                    crate::agent::readiness(&cwd)?;
+            }
+            Ok(response)
         }
         Command::Work { command } => {
             changeset::reject_selector(selected_changeset.as_deref(), "work")?;
@@ -59,7 +87,7 @@ fn run(cli: Cli) -> Result<Value> {
             let store_path = resolve_live_store_path(cli.scope, &cwd)?;
             match command {
                 CgCommand::Init { verbose } => codegraph::init(&store_path, verbose),
-                CgCommand::Status => Ok(codegraph::status(&store_path)),
+                CgCommand::Status => codegraph::status(&store_path),
                 CgCommand::Run(args) => codegraph::run(&store_path, &args),
             }
         }
@@ -497,6 +525,189 @@ fn run(cli: Cli) -> Result<Value> {
                 }
             }
         }
+        Command::Tag {
+            command: TagCommand::List,
+        } if cli.scope == Scope::All => {
+            let paths = resolve_effective_read_store_paths(
+                cli.scope,
+                &cwd,
+                selected_changeset.as_deref(),
+            )?;
+            let stores = paths
+                .into_iter()
+                .map(|path| {
+                    Store::open_for_read(scope_name(path.scope), &path.path)?.tag_list()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(json!({"scope": "all", "stores": stores}))
+        }
+        Command::Tag { command } => {
+            ensure_scope_supported(cli.scope, false, "tag")?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
+            match command {
+                TagCommand::Set {
+                    tag,
+                    page,
+                    priority,
+                    reason,
+                } => {
+                    if let Some(name) = selected_changeset.as_deref() {
+                        let live = resolve_live_store_path(cli.scope, &cwd)?;
+                        changeset::prepare_tag_touch(&live, name, &tag, Some(&page), false)?;
+                    }
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    store.tag_set(&tag, &page, priority, &reason)
+                }
+                TagCommand::Remove { tag, page } => {
+                    if let Some(name) = selected_changeset.as_deref() {
+                        let live = resolve_live_store_path(cli.scope, &cwd)?;
+                        changeset::prepare_tag_touch(&live, name, &tag, Some(&page), false)?;
+                    }
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    store.tag_remove(&tag, &page)
+                }
+                TagCommand::Delete { tag } => {
+                    if let Some(name) = selected_changeset.as_deref() {
+                        let live = resolve_live_store_path(cli.scope, &cwd)?;
+                        changeset::prepare_tag_touch(&live, name, &tag, None, false)?;
+                    }
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    store.tag_delete(&tag)
+                }
+                TagCommand::Autoload {
+                    tag,
+                    enable,
+                    disable: _,
+                    priority,
+                    limit,
+                    max_chars,
+                    reason,
+                } => {
+                    if let Some(name) = selected_changeset.as_deref() {
+                        let live = resolve_live_store_path(cli.scope, &cwd)?;
+                        changeset::prepare_tag_touch(&live, name, &tag, None, enable)?;
+                    }
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    store.tag_autoload(&tag, enable, priority, limit, max_chars, &reason)
+                }
+                TagCommand::List => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    store.tag_list()
+                }
+            }
+        }
+        Command::Load { command } => match command {
+            LoadCommand::Tag { tag, limit } => {
+                if !(1..=100).contains(&limit) {
+                    return Err(AppError::new(
+                        "invalid_limit",
+                        "tag load limit must be between 1 and 100",
+                    ));
+                }
+                let paths = resolve_effective_read_store_paths(
+                    cli.scope,
+                    &cwd,
+                    selected_changeset.as_deref(),
+                )?;
+                let stores = paths
+                    .into_iter()
+                    .map(|path| Store::open_for_read(scope_name(path.scope), &path.path))
+                    .collect::<Result<Vec<_>>>()?;
+                for store in &stores {
+                    store.begin_read_snapshot()?;
+                }
+                let mut identities = Vec::new();
+                let mut found = false;
+                for (index, store) in stores.iter().enumerate() {
+                    match store.tag_page_identities(&tag, limit + 1) {
+                        Ok(rows) => {
+                            found = true;
+                            identities.extend(rows.into_iter().map(|row| (index, row)));
+                        }
+                        Err(error) if error.code == "tag_not_found" && cli.scope == Scope::All => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                if !found {
+                    return Err(AppError::new(
+                        "tag_not_found",
+                        format!("tag {} does not exist", tag.trim()),
+                    ));
+                }
+                identities.sort_by(|(_, left), (_, right)| {
+                    right
+                        .priority
+                        .cmp(&left.priority)
+                        .then_with(|| scope_priority(&left.scope).cmp(&scope_priority(&right.scope)))
+                        .then_with(|| left.page_slug.cmp(&right.page_slug))
+                });
+                let has_more = identities.len() > limit;
+                identities.truncate(limit);
+                let mut pages = Vec::with_capacity(identities.len());
+                for (ordinal, (store, identity)) in identities.into_iter().enumerate() {
+                    pages.push(stores[store].tagged_page(identity, ordinal + 1)?);
+                }
+                let body_bytes = pages.iter().map(|page| page.page.body.len()).sum::<usize>();
+                let body_chars = pages
+                    .iter()
+                    .map(|page| page.page.body.chars().count())
+                    .sum::<usize>();
+                Ok(json!({
+                    "scope": scope_name(cli.scope),
+                    "tag": tag.trim(),
+                    "pages": pages,
+                    "limit": limit,
+                    "returned": pages.len(),
+                    "has_more": has_more,
+                    "body_bytes": body_bytes,
+                    "body_chars": body_chars,
+                }))
+            }
+        },
+        Command::Agent { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "agent")?;
+            match command {
+                AgentCommand::Install {
+                    target,
+                    location,
+                    yes,
+                    print_config,
+                    no_codegraph_prompt_hook,
+                } => crate::agent::install(
+                    &cwd,
+                    target.as_deref(),
+                    location.map(Into::into),
+                    yes,
+                    print_config.as_deref(),
+                    !no_codegraph_prompt_hook,
+                ),
+                AgentCommand::Status { target, location } => crate::agent::status(
+                    &cwd,
+                    target.as_deref(),
+                    location.map(Into::into),
+                ),
+                AgentCommand::Refresh { target, location } => crate::agent::refresh(
+                    &cwd,
+                    target.as_deref(),
+                    location.map(Into::into),
+                ),
+                AgentCommand::Uninstall {
+                    target,
+                    location,
+                    yes,
+                } => crate::agent::uninstall(
+                    &cwd,
+                    target.as_deref(),
+                    location.map(Into::into),
+                    yes,
+                ),
+                AgentCommand::Hook { agent, event } => {
+                    Ok(crate::agent::hook(agent.into(), &event, cli.scope, &cwd))
+                }
+            }
+        }
         Command::Ingest { command } => {
             ensure_scope_supported(cli.scope, false, "ingest")?;
             let store_path =
@@ -588,7 +799,7 @@ fn run(cli: Cli) -> Result<Value> {
             if selected_changeset.is_some() {
                 return Err(AppError::new(
                     "changeset_command_not_supported",
-                    "graph configuration is deployment-local and cannot be changed in a changeset",
+                    "configuration is deployment-local and cannot be changed in a changeset",
                 ));
             }
             let store_path = resolve_live_store_path(cli.scope, &cwd)?;
@@ -596,14 +807,54 @@ fn run(cli: Cli) -> Result<Value> {
                 ConfigCommand::Show => {
                     config::response(scope_name(store_path.scope), &store_path.path)
                 }
-                ConfigCommand::Set { graph } => {
-                    let setting = config::parse_setting(&graph)?;
-                    config::update(&store_path.path, setting)?;
+                ConfigCommand::Set {
+                    graph,
+                    trans,
+                    trans_timeout,
+                    trans_args,
+                } => {
+                    if graph.is_none() && trans.is_none() {
+                        return Err(AppError::new(
+                            "invalid_input",
+                            "config set requires --graph or --trans",
+                        ));
+                    }
+                    if trans.is_none() && (trans_timeout.is_some() || !trans_args.is_empty()) {
+                        return Err(AppError::new(
+                            "invalid_input",
+                            "config set requires --trans when using --trans-timeout or --trans-arg",
+                        ));
+                    }
+
+                    let graph_setting = graph
+                        .as_deref()
+                        .map(config::parse_graph_setting)
+                        .transpose()?;
+                    let trans_setting = match trans {
+                        Some(trans) => Some(config::build_trans_settings(
+                            &store_path.path,
+                            config::parse_trans_setting(&trans)?,
+                            trans_timeout,
+                            trans_args,
+                        )?),
+                        None => None,
+                    };
+                    config::update(
+                        &store_path.path,
+                        config::ConfigPatch {
+                            graph: graph_setting,
+                            trans: trans_setting,
+                        },
+                    )?;
                     Store::open(scope_name(store_path.scope), &store_path.path)?;
                     let mut response =
                         config::response(scope_name(store_path.scope), &store_path.path)?;
-                    if setting != config::GraphSetting::Disabled
-                        && setting != config::GraphSetting::Inherit
+                    if matches!(
+                        graph_setting,
+                        Some(setting)
+                            if setting != config::GraphSetting::Disabled
+                                && setting != config::GraphSetting::Inherit
+                    )
                     {
                         response["work"] = work::start_graph_projection(
                             scope_name(store_path.scope),
@@ -613,18 +864,34 @@ fn run(cli: Cli) -> Result<Value> {
                     }
                     Ok(response)
                 }
-                ConfigCommand::Unset { graph } => {
-                    if !graph {
+                ConfigCommand::Unset { graph, trans } => {
+                    if !graph && !trans {
                         return Err(AppError::new(
                             "invalid_input",
-                            "config unset requires --graph",
+                            "config unset requires --graph or --trans",
                         ));
                     }
-                    config::update(&store_path.path, config::GraphSetting::Inherit)?;
+                    config::update(
+                        &store_path.path,
+                        config::ConfigPatch {
+                            graph: graph.then_some(config::GraphSetting::Inherit),
+                            trans: trans.then_some(config::inherit_trans_settings()),
+                        },
+                    )?;
                     Store::open(scope_name(store_path.scope), &store_path.path)?;
                     config::response(scope_name(store_path.scope), &store_path.path)
                 }
             }
+        }
+        Command::Trans {
+            file,
+            output,
+            allow_external_source,
+        } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "trans")?;
+            ensure_scope_supported(cli.scope, false, "trans")?;
+            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
+            trans::run(&store_path, &cwd, &file, &output, allow_external_source)
         }
         Command::Graph { command } => {
             ensure_scope_supported(cli.scope, false, "graph")?;

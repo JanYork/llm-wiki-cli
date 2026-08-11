@@ -1,5 +1,6 @@
 pub fn main() {
     match run(Cli::parse()) {
+        Ok(Value::Null) => {}
         Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap()),
         Err(error) => {
             let mut payload = json!({"code": error.code, "message": error.message});

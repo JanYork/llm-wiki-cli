@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { boundedGraph, graphDegrees } from './graph'
+import { boundedGraph, graphDegrees, wordGraphPath } from './graph'
 
 describe('boundedGraph', () => {
   it('caps nodes and removes edges whose endpoints are not visible', () => {
@@ -33,5 +33,16 @@ describe('boundedGraph', () => {
 
     expect(degrees.get('hub')).toBe(3)
     expect(degrees.get('a')).toBe(1)
+  })
+})
+
+describe('wordGraphPath', () => {
+  it('does not create a request before a query is submitted', () => {
+    expect(wordGraphPath('', 0)).toBe('')
+    expect(wordGraphPath('  ', 0)).toBe('')
+  })
+
+  it('encodes the query and bounded pagination inputs', () => {
+    expect(wordGraphPath('库存 shared', 25)).toBe('/api/graphs/words?query=%E5%BA%93%E5%AD%98+shared&limit=25&term_limit=30&offset=25')
   })
 })

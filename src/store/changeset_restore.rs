@@ -31,6 +31,10 @@ fn validate_sparse_operation_actions<'a>(actions: impl IntoIterator<Item = &'a s
                 | "page_remove"
                 | "schema_set"
                 | "purpose_set"
+                | "tag_set"
+                | "tag_remove"
+                | "tag_delete"
+                | "tag_autoload"
                 | "search"
         ) {
             return Err(AppError::new(
@@ -374,6 +378,16 @@ fn rollback_sparse_changeset(
             })));
         }
     }
+    for tag in &inverse.payload.tags {
+        let observed = load_tag_snapshot(&tx, "main", &tag.name)?;
+        if tag_snapshot_fingerprint(&observed) != tag.after_fingerprint {
+            return Err(AppError::new(
+                "changeset_rollback_conflict",
+                format!("tag {} changed after this changeset committed", tag.name),
+            )
+            .with_details(json!({"entity_type": "tag", "identifier": tag.name})));
+        }
+    }
     for page in &inverse.payload.pages {
         tx.execute(
             "DELETE FROM links WHERE from_slug = ?1",
@@ -382,6 +396,16 @@ fn rollback_sparse_changeset(
     }
     for page in &inverse.payload.pages {
         restore_sparse_page(&tx, page)?;
+    }
+    for tag in &inverse.payload.tags {
+        tx.execute("DELETE FROM tags WHERE name = ?1", [&tag.name])?;
+        restore_tag_snapshot(&tx, &tag.before)?;
+        record_operation(
+            &tx,
+            "tag_restore",
+            &tag.name,
+            &json!({"rollback": true}),
+        )?;
     }
     for entry in &inverse.payload.meta {
         tx.execute(

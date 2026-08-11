@@ -34,6 +34,12 @@ pub fn tokenize_for_index_with_positions(text: &str) -> Vec<TokenOccurrence> {
     occurrences
 }
 
+pub fn tokenize_for_graph_with_positions(text: &str) -> Vec<TokenOccurrence> {
+    let mut occurrences = Vec::new();
+    tokenize_occurrences_into(text, false, |occurrence| occurrences.push(occurrence));
+    occurrences
+}
+
 pub fn joined_index_terms(text: &str) -> String {
     let mut joined = String::with_capacity(text.len());
     tokenize_occurrences_into(text, true, |occurrence| {

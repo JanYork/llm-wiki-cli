@@ -457,6 +457,36 @@ fn merge_sparse_candidate(tx: &Transaction<'_>, begin_operation_id: i64) -> Resu
             ));
         }
     }
+    let tag_targets = operations
+        .iter()
+        .filter(|(action, _, _)| {
+            matches!(
+                action.as_str(),
+                "tag_set" | "tag_remove" | "tag_delete" | "tag_autoload"
+            )
+        })
+        .map(|(_, _, detail)| {
+            serde_json::from_str::<Value>(detail)
+                .ok()
+                .and_then(|value| value.get("tag").and_then(Value::as_str).map(str::to_string))
+                .ok_or_else(|| AppError::new("changeset_corrupt", "tag operation lacks tag"))
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    for tag in &tag_targets {
+        let expected: String = tx.query_row(
+            "SELECT value FROM candidate.meta WHERE key = ?1",
+            [format!("changeset_base_tag:{tag}")],
+            |row| row.get(0),
+        )?;
+        let observed = tag_snapshot_fingerprint(&load_tag_snapshot(tx, "main", tag)?);
+        if observed != expected {
+            return Err(AppError::new(
+                "changeset_conflict",
+                format!("tag {tag} changed after it was first touched"),
+            )
+            .with_details(json!({"entity_type": "tag", "identifier": tag})));
+        }
+    }
 
     merge_sparse_sources(tx, &operations)?;
     for (action, target, detail) in &operations {
@@ -468,6 +498,7 @@ fn merge_sparse_candidate(tx: &Transaction<'_>, begin_operation_id: i64) -> Resu
     for slug in page_targets {
         merge_sparse_page(tx, &slug)?;
     }
+    merge_sparse_tags(tx, &operations)?;
     if operations
         .iter()
         .any(|(action, _, _)| action == "schema_set")
@@ -487,6 +518,91 @@ fn merge_sparse_candidate(tx: &Transaction<'_>, begin_operation_id: i64) -> Resu
              WHERE key = 'purpose'",
             [],
         )?;
+    }
+    Ok(())
+}
+
+fn merge_sparse_tags(tx: &Transaction<'_>, operations: &[(String, String, String)]) -> Result<()> {
+    for (action, _, detail) in operations {
+        if !matches!(
+            action.as_str(),
+            "tag_set" | "tag_remove" | "tag_delete" | "tag_autoload"
+        ) {
+            continue;
+        }
+        let detail: Value = serde_json::from_str(detail)
+            .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?;
+        let tag = detail
+            .get("tag")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::new("changeset_corrupt", "tag operation lacks tag"))?;
+        match action.as_str() {
+            "tag_set" => {
+                tx.execute(
+                    "INSERT OR IGNORE INTO tags(
+                        name, autoload, autoload_priority, autoload_limit,
+                        autoload_max_chars, reason, updated_at
+                     ) SELECT
+                        name, autoload, autoload_priority, autoload_limit,
+                        autoload_max_chars, reason, updated_at
+                       FROM candidate.tags WHERE name = ?1",
+                    [tag],
+                )?;
+                let page = detail
+                    .get("page")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AppError::new("changeset_corrupt", "tag_set operation lacks page")
+                    })?;
+                tx.execute(
+                    "INSERT INTO page_tags(
+                        tag_name, page_slug, priority, reason, created_at, updated_at
+                     ) SELECT
+                        tag_name, page_slug, priority, reason, created_at, updated_at
+                       FROM candidate.page_tags
+                       WHERE tag_name = ?1 AND page_slug = ?2
+                     ON CONFLICT(tag_name, page_slug) DO UPDATE SET
+                        priority = excluded.priority, reason = excluded.reason,
+                        created_at = excluded.created_at, updated_at = excluded.updated_at",
+                    params![tag, page],
+                )?;
+            }
+            "tag_remove" => {
+                let page = detail
+                    .get("page")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AppError::new("changeset_corrupt", "tag_remove operation lacks page")
+                    })?;
+                tx.execute(
+                    "DELETE FROM page_tags WHERE tag_name = ?1 AND page_slug = ?2",
+                    params![tag, page],
+                )?;
+            }
+            "tag_delete" => {
+                tx.execute("DELETE FROM tags WHERE name = ?1", [tag])?;
+            }
+            "tag_autoload" => {
+                let changed = tx.execute(
+                    "UPDATE tags SET
+                        autoload = (SELECT autoload FROM candidate.tags WHERE name = ?1),
+                        autoload_priority = (SELECT autoload_priority FROM candidate.tags WHERE name = ?1),
+                        autoload_limit = (SELECT autoload_limit FROM candidate.tags WHERE name = ?1),
+                        autoload_max_chars = (SELECT autoload_max_chars FROM candidate.tags WHERE name = ?1),
+                        reason = (SELECT reason FROM candidate.tags WHERE name = ?1),
+                        updated_at = (SELECT updated_at FROM candidate.tags WHERE name = ?1)
+                     WHERE name = ?1",
+                    [tag],
+                )?;
+                if changed != 1 {
+                    return Err(AppError::new(
+                        "changeset_corrupt",
+                        format!("staged tag {tag} is missing"),
+                    ));
+                }
+            }
+            _ => unreachable!(),
+        }
     }
     Ok(())
 }

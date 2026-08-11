@@ -50,6 +50,61 @@ mod tests {
     }
 
     #[test]
+    fn tag_mutations_are_validated_idempotent_and_independent_of_page_put() {
+        let mut store = test_store();
+        let page = PagePutInput {
+            slug: "core-rule".to_string(),
+            title: "Core rule".to_string(),
+            kind: None,
+            summary: None,
+            body: "first".to_string(),
+            source_ids: Vec::new(),
+            provenance: vec!["user-provided".to_string()],
+        };
+        store.page_put(page.clone()).unwrap();
+
+        let created = store
+            .tag_set("  Rules  ", "core-rule", 20, "required context")
+            .unwrap();
+        assert_eq!(created["action"], "created");
+        assert_eq!(created["tag"], "Rules");
+        let unchanged = store
+            .tag_set("Rules", "core-rule", 20, "required context")
+            .unwrap();
+        assert_eq!(unchanged["action"], "unchanged");
+
+        let mut replacement = page;
+        replacement.body = "replacement".to_string();
+        store.page_put(replacement).unwrap();
+        assert_eq!(store.tag_membership_count("Rules", "core-rule").unwrap(), 1);
+
+        let enabled = store
+            .tag_autoload("Rules", true, 100, 3, 4096, "session rules")
+            .unwrap();
+        assert_eq!(enabled["action"], "updated");
+        assert_eq!(enabled["policy"]["autoload"], true);
+        assert_eq!(
+            store
+                .tag_autoload("Rules", true, 100, 0, 4096, "session rules")
+                .unwrap_err()
+                .code,
+            "invalid_tag_policy"
+        );
+        assert_eq!(
+            store
+                .tag_set("\u{0000}", "core-rule", 0, "bad")
+                .unwrap_err()
+                .code,
+            "invalid_tag"
+        );
+
+        assert_eq!(store.tag_remove("Rules", "core-rule").unwrap()["action"], "removed");
+        assert_eq!(store.tag_remove("Rules", "core-rule").unwrap()["action"], "unchanged");
+        assert_eq!(store.tag_delete("Rules").unwrap()["action"], "deleted");
+        assert_eq!(store.tag_delete("Rules").unwrap()["action"], "unchanged");
+    }
+
+    #[test]
     fn streamed_source_add_rolls_back_on_a_late_input_error() {
         let mut store = test_store();
         let tables = ["sources", "source_path_revisions", "operations"];
@@ -490,7 +545,9 @@ mod tests {
 
         let conn = Connection::open(&database).unwrap();
         conn.execute_batch(
-            "DROP TABLE search_fts;
+            "DROP TABLE page_tags;
+             DROP TABLE tags;
+             DROP TABLE search_fts;
              DROP TABLE retrieval_feedback;
              DROP TABLE retrieval_weights;
              DROP TABLE source_path_revisions;

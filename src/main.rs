@@ -1,3 +1,4 @@
+mod agent;
 mod artifacts;
 mod changeset;
 mod cli;
@@ -8,10 +9,12 @@ mod external_graph;
 pub mod graph;
 mod import;
 mod scope;
+mod secret_scan;
 pub mod segment;
 mod source_diff;
 mod store;
 pub mod tokenize;
+mod trans;
 mod view;
 mod work;
 

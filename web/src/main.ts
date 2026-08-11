@@ -2,16 +2,16 @@ import ForceGraph3D, { type ForceGraph3DInstance } from '3d-force-graph'
 import { LitElement, html, nothing } from 'lit'
 import { customElement, state } from 'lit/decorators.js'
 import SpriteText from 'three-spritetext'
-import { boundedGraph, graphDegrees, type GraphEdge, type GraphNode } from './graph'
+import { boundedGraph, graphDegrees, wordGraphPath, type GraphEdge, type GraphNode } from './graph'
 import { DEFAULT_LOCALE, graphCount, messages, pageCount, type Locale } from './i18n'
 import { renderMarkdown } from './markdown'
 import './styles.css'
 
-type Section = 'overview' | 'pages' | 'sources' | 'knowledge' | 'code'
+type Section = 'overview' | 'pages' | 'sources' | 'knowledge' | 'code' | 'words'
 interface ApiStatus { database: string; revision: string; operation_id: string; read_only: boolean }
 interface Page { slug: string; title?: string; updated_at?: string; body?: string }
 interface Source { id: number; origin: string; title?: string; bytes?: number }
-interface GraphPayload { nodes: GraphNode[]; edges: GraphEdge[]; available?: boolean; message?: string }
+interface GraphPayload { nodes: GraphNode[]; edges: GraphEdge[]; available?: boolean; message?: string; has_more?: boolean; truncated?: boolean }
 
 async function api<T>(path: string): Promise<T> {
   const response = await fetch(path, { headers: { Accept: 'application/json' } })
@@ -25,7 +25,7 @@ class LwcGraph extends LitElement {
   @state() accessor message: string = messages[DEFAULT_LOCALE].loadingGraph
   private renderer3d?: ForceGraph3DInstance
   private container?: HTMLDivElement
-  private path = '/api/graphs/knowledge'
+  private path = ''
   private locale: Locale = DEFAULT_LOCALE
   private request = 0
 
@@ -38,7 +38,6 @@ class LwcGraph extends LitElement {
   firstUpdated() {
     this.container = this.querySelector('.graph') ?? undefined
     window.addEventListener('resize', this.resize)
-    void this.load()
   }
   updated(changed: Map<string, unknown>) { if (changed.has('path') || changed.has('locale')) void this.load() }
   disconnectedCallback() {
@@ -60,17 +59,23 @@ class LwcGraph extends LitElement {
 
   private async load() {
     if (!this.container) return
+    if (!this.path) return
     const request = ++this.request
     this.clear()
     this.message = messages[this.locale].loadingGraph
     try {
       const payload = await api<GraphPayload>(this.path)
       if (request !== this.request) return
+      this.dispatchEvent(new CustomEvent('graph-loaded', { detail: payload }))
       if (payload.available === false) {
         this.message = this.locale === 'en' ? (payload.message ?? messages.en.graphUnavailable) : messages['zh-CN'].graphUnavailable
         return
       }
       const visible = boundedGraph(payload.nodes ?? [], payload.edges ?? [])
+      if (visible.nodes.length === 0) {
+        this.message = graphCount(this.locale, 0, 0)
+        return
+      }
       const styles = getComputedStyle(document.documentElement)
       const accent = styles.getPropertyValue('--color-primary').trim()
       const labelColor = styles.getPropertyValue('--color-graph-label').trim()
@@ -129,7 +134,8 @@ class LwcGraph extends LitElement {
       window.setTimeout(() => {
         if (this.renderer3d === renderer) frameGraph()
       }, 800)
-      this.message = `${graphCount(this.locale, nodes.length, links.length)}${visible.truncated ? ` · ${copy.limited}` : ''} · ${copy.graph3dControls}`
+      const limitMessage = visible.truncated ? copy.limited : payload.truncated ? copy.sampleLimited : ''
+      this.message = `${graphCount(this.locale, nodes.length, links.length)}${limitMessage ? ` · ${limitMessage}` : ''} · ${copy.graph3dControls}`
     } catch (error) {
       this.message = error instanceof Error ? error.message : String(error)
     }
@@ -144,6 +150,10 @@ class LwcView extends LitElement {
   @state() accessor sources: Source[] = []
   @state() accessor selectedPage: Page | undefined = undefined
   @state() accessor error = ''
+  @state() accessor wordQuery = ''
+  @state() accessor wordPath = ''
+  @state() accessor wordOffset = 0
+  @state() accessor wordHasMore = false
   @state() accessor locale: Locale = localStorage.getItem('lwc-view-locale') === 'zh-CN' ? 'zh-CN' : DEFAULT_LOCALE
 
   createRenderRoot() { return this }
@@ -183,13 +193,24 @@ class LwcView extends LitElement {
       this.error = error instanceof Error ? error.message : String(error)
     }
   }
+  private searchWords(event: SubmitEvent) {
+    event.preventDefault()
+    this.wordOffset = 0
+    this.wordHasMore = false
+    this.wordPath = wordGraphPath(this.wordQuery, 0)
+  }
+  private pageWords(offset: number) {
+    this.wordOffset = Math.max(0, offset)
+    this.wordHasMore = false
+    this.wordPath = wordGraphPath(this.wordQuery, this.wordOffset)
+  }
 
   render() {
     const copy = messages[this.locale]
     return html`<div class="shell">
       <nav class="rail" aria-label="LWC project sections">
         <span class="wordmark">LW<b>C</b></span>
-        <div class="nav-links">${this.nav('overview', copy.overview)}${this.nav('pages', copy.pages)}${this.nav('sources', copy.sources)}${this.nav('knowledge', copy.knowledgeGraph)}${this.nav('code', copy.codeGraph)}</div>
+        <div class="nav-links">${this.nav('overview', copy.overview)}${this.nav('pages', copy.pages)}${this.nav('sources', copy.sources)}${this.nav('knowledge', copy.knowledgeGraph)}${this.nav('code', copy.codeGraph)}${this.nav('words', copy.wordGraph)}</div>
         <button class="language-button" aria-label=${copy.switchLanguageLabel} @click=${this.toggleLocale}>${copy.switchLanguage}</button>
       </nav>
       <main class="workspace">
@@ -209,13 +230,14 @@ class LwcView extends LitElement {
   }
   private heading() {
     const copy = messages[this.locale]
-    return ({ overview: copy.projectCondition, pages: copy.wikiPages, sources: copy.groundedSources, knowledge: copy.knowledgeGraph, code: copy.codeGraph })[this.section]
+    return ({ overview: copy.projectCondition, pages: copy.wikiPages, sources: copy.groundedSources, knowledge: copy.knowledgeGraph, code: copy.codeGraph, words: copy.wordGraph })[this.section]
   }
   private content() {
     const copy = messages[this.locale]
     if (this.section === 'overview') return html`<section class="split overview-grid"><article class="panel"><header class="panel-head"><h2>${copy.store}</h2></header><dl class="metrics"><div class="metric metric-wide"><dt>${copy.database}</dt><dd class="path-value">${this.status?.database ?? copy.loadingDatabase}</dd></div><div class="metric"><dt>${copy.operation}</dt><dd>${this.status?.operation_id ?? '—'}</dd></div><div class="metric"><dt>${copy.pages}</dt><dd>${this.pages.length}</dd></div><div class="metric"><dt>${copy.sources}</dt><dd>${this.sources.length}</dd></div></dl></article><article class="panel panel-dark"><header class="panel-head"><h2>${copy.boundaries}</h2></header><div class="document"><p>${copy.frozenBoundary}</p></div></article></section>`
     if (this.section === 'pages') return html`<section class="split pages-grid"><article class="panel"><header class="panel-head"><h2>${pageCount(this.locale, this.pages.length)}</h2></header><ul class="list">${this.pages.map(page => html`<li><button class="list-button" aria-current=${this.selectedPage?.slug === page.slug ? 'page' : nothing} @click=${() => this.showPage(page.slug)}><strong>${page.title ?? page.slug}</strong><span class="muted">${page.slug}</span></button></li>`)}</ul></article><article class="panel document">${this.selectedPage ? html`<div .innerHTML=${renderMarkdown(this.selectedPage.body ?? '')}></div>` : html`<p class="muted">${copy.selectPage}</p>`}</article></section>`
     if (this.section === 'sources') return html`<section class="panel table-wrap"><table><thead><tr><th>${copy.id}</th><th>${copy.source}</th><th>${copy.bytes}</th></tr></thead><tbody>${this.sources.map(source => html`<tr><td>${source.id}</td><td>${source.title ?? source.origin}</td><td>${source.bytes ?? '—'}</td></tr>`)}</tbody></table></section>`
+    if (this.section === 'words') return html`<section class="panel graph-panel"><header class="panel-head"><h2>${copy.wordGraph}</h2><form class="word-search" @submit=${this.searchWords}><label for="word-query">${copy.wordQuery}</label><input id="word-query" .value=${this.wordQuery} @input=${(event: InputEvent) => { this.wordQuery = (event.target as HTMLInputElement).value }} placeholder=${copy.wordQueryPlaceholder} required><button type="submit">${copy.search}</button></form></header>${this.wordPath ? html`<lwc-graph .path=${this.wordPath} .locale=${this.locale} @graph-loaded=${(event: CustomEvent<GraphPayload>) => { this.wordHasMore = event.detail.has_more === true }}></lwc-graph><div class="word-pagination"><button ?disabled=${this.wordOffset === 0} @click=${() => this.pageWords(this.wordOffset - 25)}>${copy.previous}</button><span>${copy.samplePage} ${Math.floor(this.wordOffset / 25) + 1}</span><button ?disabled=${!this.wordHasMore} @click=${() => this.pageWords(this.wordOffset + 25)}>${copy.next}</button></div>` : html`<p class="word-prompt muted">${copy.wordPrompt}</p>`}</section>`
     const path = this.section === 'knowledge' ? '/api/graphs/knowledge' : '/api/graphs/code'
     return html`<section class="panel graph-panel"><header class="panel-head"><h2>${copy.interactiveMap}</h2></header><lwc-graph .path=${path} .locale=${this.locale}></lwc-graph></section>`
   }

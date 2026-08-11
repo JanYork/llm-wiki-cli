@@ -459,6 +459,26 @@ fn project_flow_preserves_sources_and_rolls_back_failed_page_updates() {
 
     let initialized = world.ok(&world.project, &["init"]);
     assert_eq!(initialized["scope"], "project");
+    assert_eq!(
+        initialized["recommendations"]["md_trans"]["default"],
+        "disabled"
+    );
+    assert_eq!(
+        initialized["recommendations"]["md_trans"]["config_show"],
+        "lwc config show"
+    );
+    assert_eq!(
+        initialized["recommendations"]["md_trans"]["engines"]["anydoc"]["configure"],
+        "lwc config set --trans anydoc"
+    );
+    assert_eq!(
+        initialized["recommendations"]["md_trans"]["engines"]["markitdown"]["configure"],
+        "lwc config set --trans markitdown"
+    );
+    assert!(
+        !world.project.join(".lwc/config.json").exists(),
+        "init guidance must not enable or configure an adapter"
+    );
     assert!(world.project.join(".lwc/wiki.db").is_file());
 
     let schema = world.write(
@@ -797,7 +817,9 @@ fn read_commands_transparently_migrate_a_writable_v5_store() {
     let database = world.project.join(".lwc/wiki.db");
     let conn = Connection::open(&database).unwrap();
     conn.execute_batch(
-        "DROP TABLE search_fts;
+        "DROP TABLE page_tags;
+         DROP TABLE tags;
+         DROP TABLE search_fts;
          DROP TABLE IF EXISTS search_fts_data;
          DROP TABLE IF EXISTS search_fts_idx;
          DROP TABLE IF EXISTS search_fts_content;
@@ -831,7 +853,7 @@ fn read_commands_transparently_migrate_a_writable_v5_store() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 12,
+        version, 13,
         "context should migrate a writable legacy store"
     );
 }
@@ -875,7 +897,7 @@ fn v10_commands_migrate_inline_without_building_a_graph() {
         migrated
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        12
+        13
     );
     let old_graph_tables: i64 = migrated
         .query_row(
