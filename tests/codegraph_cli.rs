@@ -428,6 +428,23 @@ fn cg_forwards_only_project_local_state_with_telemetry_disabled() {
             .unwrap()
             .success()
     );
+
+    let initialized = Command::new(env!("CARGO_BIN_EXE_lwc"))
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("LWC_CODEGRAPH_BINARY", &fake)
+        .args(["cg", "init"])
+        .output()
+        .unwrap();
+    assert!(initialized.status.success());
+    let json: Value = serde_json::from_slice(&initialized.stdout).unwrap();
+    assert!(
+        json["stdout"]
+            .as_str()
+            .unwrap()
+            .ends_with("|init . --force")
+    );
+
     let output = Command::new(env!("CARGO_BIN_EXE_lwc"))
         .current_dir(&project)
         .env("HOME", &home)
@@ -473,16 +490,13 @@ fn cg_forwards_only_project_local_state_with_telemetry_disabled() {
         .unwrap();
     assert!(streamed.status.success());
     let json: Value = serde_json::from_slice(&streamed.stdout).unwrap();
-    let expected = format!(
-        "|index {} --force",
-        project.canonicalize().unwrap().display()
-    );
+    let expected = "|index . --force";
     let line = json["stdout"].as_str().unwrap();
     assert!(
         line.ends_with(&expected),
         "expected {expected:?}, got {line:?}"
     );
-    assert!(String::from_utf8_lossy(&streamed.stderr).contains(&expected));
+    assert!(String::from_utf8_lossy(&streamed.stderr).contains(expected));
 
     let uninit = Command::new(env!("CARGO_BIN_EXE_lwc"))
         .current_dir(&project)
@@ -493,10 +507,7 @@ fn cg_forwards_only_project_local_state_with_telemetry_disabled() {
         .unwrap();
     assert!(uninit.status.success());
     let json: Value = serde_json::from_slice(&uninit.stdout).unwrap();
-    let expected = format!(
-        "|uninit {} --force",
-        project.canonicalize().unwrap().display()
-    );
+    let expected = "|uninit . --force";
     assert!(json["stdout"].as_str().unwrap().ends_with(&expected));
 }
 

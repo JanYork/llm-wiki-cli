@@ -52,7 +52,7 @@ pub fn init(store: &StorePath, verbose: bool) -> Result<Value> {
     install(&paths)?;
     let mut args = vec![
         OsString::from("init"),
-        paths.project.as_os_str().to_owned(),
+        OsString::from("."),
         OsString::from("--force"),
     ];
     if verbose {
@@ -109,7 +109,7 @@ pub fn run(store: &StorePath, args: &[OsString]) -> Result<Value> {
                 "LWC chooses the current project path; do not pass another project path",
             ));
         }
-        forwarded.insert(1, paths.project.as_os_str().to_owned());
+        forwarded.insert(1, OsString::from("."));
         if matches!(name, "index" | "uninit")
             && !forwarded.iter().any(|arg| arg == "--force" || arg == "-f")
         {
