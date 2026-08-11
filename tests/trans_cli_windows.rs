@@ -45,10 +45,12 @@ impl TransWorld {
     }
 
     fn command(&self, args: &[&str]) -> Output {
+        let system32 = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+        let path = std::env::join_paths([&self.bin, &system32]).unwrap();
         Command::new(env!("CARGO_BIN_EXE_lwc"))
             .current_dir(&self.project)
             .env("HOME", &self.home)
-            .env("PATH", &self.bin)
+            .env("PATH", path)
             .args(args)
             .output()
             .unwrap()
