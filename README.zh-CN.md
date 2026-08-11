@@ -380,7 +380,6 @@ Hook。重复安装和刷新逐字节幂等；卸载只恢复 LWC/CodeGraph 拥�
 强标签用于不经过搜索、按上限完整载入少量核心规则或手册：
 
 ```bash
-lwc tag create "运维手册" --reason "核心运维手册"
 lwc tag set "运维手册" incident-response --priority 100 --reason "主响应手册"
 lwc load tag "运维手册" --limit 3
 lwc tag autoload "运维手册" --enable --priority 100 --limit 3 \

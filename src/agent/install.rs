@@ -52,7 +52,7 @@ struct Manifest {
     files: Vec<FileSnapshot>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct FileSnapshot {
     path: PathBuf,
     original: Option<String>,
@@ -203,25 +203,51 @@ fn install_target(
 ) -> Result<Value> {
     ensure_location(target, location)?;
     let manifest_path = manifest_path(home, cwd, target, location);
-    if let Some(manifest) = read_manifest(&manifest_path)?
-        && post_matches(&manifest)
-    {
+    let old_manifest = read_manifest(&manifest_path)?;
+    if old_manifest.as_ref().is_some_and(post_matches) {
         return Ok(receipt(target, "unchanged"));
     }
 
     let paths = target_paths(target, location, home, cwd)?;
-    let old_manifest = read_manifest(&manifest_path)?;
-    let snapshots = match old_manifest {
-        Some(manifest) => manifest.files,
-        None => snapshot(&all_paths(&paths))?,
-    };
-    if let Some(original) = snapshots
+    let current = snapshot(&all_paths(&paths))?;
+    if let Some(original) = current
         .iter()
         .find(|file| file.path == paths.instruction)
         .and_then(|file| file.original.as_deref())
     {
         replace_marker(original, &guidance())?;
     }
+    let snapshots = if old_manifest.is_some() {
+        let cleanup = (|| {
+            if target != "pi" {
+                codegraph::installer(cwd, &backend_args("uninstall", target, location, true))?;
+            }
+            remove_owned(target, location, home, cwd)
+        })();
+        if let Err(error) = cleanup {
+            let _ = restore(&Manifest {
+                version: 1,
+                target: target.to_owned(),
+                location,
+                files: current,
+            });
+            return Err(error);
+        }
+        match snapshot(&all_paths(&paths)) {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                let _ = restore(&Manifest {
+                    version: 1,
+                    target: target.to_owned(),
+                    location,
+                    files: current,
+                });
+                return Err(error);
+            }
+        }
+    } else {
+        current.clone()
+    };
     let result = (|| {
         if target != "pi" {
             codegraph::installer(cwd, &backend_args("install", target, location, false))?;
@@ -229,6 +255,19 @@ fn install_target(
         }
         install_marker(&paths.instruction)?;
         install_hook(target, paths.hook.as_deref(), codegraph_prompt_hook)?;
+        let mut files = snapshots;
+        for file in &mut files {
+            file.post_hash = hash_file(&file.path)?;
+        }
+        write_json(
+            &manifest_path,
+            &Manifest {
+                version: 1,
+                target: target.to_owned(),
+                location,
+                files,
+            },
+        )?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -239,23 +278,11 @@ fn install_target(
             version: 1,
             target: target.to_owned(),
             location,
-            files: snapshots,
+            files: current,
         };
         let _ = restore(&rollback);
         return Err(error);
     }
-
-    let mut files = snapshots;
-    for file in &mut files {
-        file.post_hash = hash_file(&file.path)?;
-    }
-    let manifest = Manifest {
-        version: 1,
-        target: target.to_owned(),
-        location,
-        files,
-    };
-    write_json(&manifest_path, &manifest)?;
     Ok(receipt(target, "installed"))
 }
 
@@ -623,7 +650,16 @@ fn replace_marker(text: &str, block: &str) -> Result<String> {
             Ok(format!("{text}{separator}{block}\n"))
         }
         ([(start, _)], [(end, _)]) if start < end => {
-            let end = end + MARKER_END.len();
+            let mut end = end + MARKER_END.len();
+            if block.is_empty() {
+                end += if text[end..].starts_with("\r\n") {
+                    2
+                } else if text[end..].starts_with('\n') {
+                    1
+                } else {
+                    0
+                };
+            }
             Ok(format!("{}{}{}", &text[..*start], block, &text[end..]))
         }
         _ => Err(AppError::new(
@@ -1030,7 +1066,10 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
         .ok_or_else(|| AppError::new("agent_config_invalid", "Agent config path has no parent"))?;
     reject_symlink(parent)?;
     fs::create_dir_all(parent)?;
+    #[cfg(unix)]
     let existing_mode = mode.or_else(|| mode_of(path));
+    #[cfg(not(unix))]
+    let _ = mode;
     let temporary = parent.join(format!(
         ".lwc-agent-{}-{}.tmp",
         std::process::id(),
@@ -1070,19 +1109,12 @@ fn reject_symlink(path: &Path) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn mode_of(path: &Path) -> Option<u32> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path)
-            .ok()
-            .map(|metadata| metadata.permissions().mode())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        None
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions().mode())
 }
 
 fn hex_hash(bytes: &[u8]) -> String {

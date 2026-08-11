@@ -236,6 +236,42 @@ fn detected_yes_install_is_idempotent_and_uninstall_restores_exact_user_bytes() 
 
 #[cfg(unix)]
 #[test]
+fn refresh_rebases_uninstall_snapshot_without_losing_user_edits() {
+    let world = World::new();
+    let guidance = world.home.join(".pi/agent/extensions/lwc-guidance.md");
+
+    world.ok(&[
+        "agent",
+        "install",
+        "--target",
+        "pi",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    let installed = fs::read_to_string(&guidance).unwrap();
+    fs::write(&guidance, format!("user instructions\n{installed}")).unwrap();
+
+    world.ok(&["agent", "refresh", "--target", "pi", "--location", "global"]);
+    world.ok(&[
+        "agent",
+        "uninstall",
+        "--target",
+        "pi",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+
+    assert_eq!(
+        fs::read_to_string(&guidance).unwrap(),
+        "user instructions\n"
+    );
+    assert!(!world.home.join(".pi/agent/extensions/lwc.js").exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn print_config_is_pure_and_pi_is_an_explicit_no_mcp_lifecycle_target() {
     let world = World::new();
     let before = directory_snapshot(&world.home);

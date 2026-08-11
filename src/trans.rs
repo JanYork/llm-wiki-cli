@@ -16,6 +16,7 @@ use std::{
 
 const MAX_TRANS_BYTES: u64 = 64 * 1024 * 1024;
 const STDERR_PREVIEW_BYTES: u64 = 8192;
+#[cfg(unix)]
 const ESRCH: i32 = 3;
 
 struct OptionSpec {
@@ -618,11 +619,11 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     }
 }
 
-fn set_directory_mode(path: &Path) -> Result<()> {
+fn set_directory_mode(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(_path, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }

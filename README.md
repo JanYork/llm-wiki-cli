@@ -425,7 +425,6 @@ the same Agent.
 Strong tags provide bounded full-page loading for core rules and runbooks:
 
 ```bash
-lwc tag create "operations" --reason "core operations manuals"
 lwc tag set "operations" incident-response --priority 100 --reason "primary runbook"
 lwc load tag "operations" --limit 3
 lwc tag autoload "operations" --enable --priority 100 --limit 3 \

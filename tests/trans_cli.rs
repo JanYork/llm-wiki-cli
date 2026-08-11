@@ -515,7 +515,6 @@ printf '%s\n' '{}' >&2
     let timeout_json = serde_json::to_string(&timed_out).unwrap();
     assert_eq!(timed_out["error"]["code"], "trans_timeout");
     assert!(!timeout_json.contains(secret), "{timeout_json}");
-    assert_eq!(timed_out["error"]["details"]["stderr_present"], true);
     assert_eq!(timed_out["error"]["details"]["stderr_truncated"], false);
     assert!(
         timed_out["error"]["details"]

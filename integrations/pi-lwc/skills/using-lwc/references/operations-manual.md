@@ -122,7 +122,6 @@ belongs in durable history. Do not record sensitive query wording.
 Use tags for a small set of core pages that must be loaded whole without search:
 
 ```bash
-"$LWC" --scope project tag create "operations" --reason "core operations manuals"
 "$LWC" --scope project tag set "operations" incident-response \
   --priority 100 --reason "primary response runbook"
 "$LWC" --scope all load tag "operations" --limit 3
