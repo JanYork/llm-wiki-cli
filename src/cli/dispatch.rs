@@ -32,7 +32,7 @@ fn run(cli: Cli) -> Result<Value> {
             let (mut store, created) =
                 Store::initialize(scope_name(store_path.scope), &store_path.path)?;
             store.materialize()?;
-            Ok(json!({
+            let mut response = json!({
                 "scope": scope_name(store_path.scope),
                 "database": store_path.path,
                 "created": created,
@@ -58,7 +58,12 @@ fn run(cli: Cli) -> Result<Value> {
                         }
                     }
                 }
-            }))
+            });
+            if store_path.scope == Scope::Project {
+                response["recommendations"]["lwc_readiness"] =
+                    crate::agent::readiness(&cwd)?;
+            }
+            Ok(response)
         }
         Command::Work { command } => {
             changeset::reject_selector(selected_changeset.as_deref(), "work")?;

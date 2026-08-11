@@ -119,6 +119,14 @@ fn context(output: &Output) -> String {
         .to_string()
 }
 
+fn readiness(context: &str) -> Value {
+    let line = context
+        .lines()
+        .find_map(|line| line.strip_prefix("LWC_READINESS "))
+        .expect("boundary context must contain readiness");
+    serde_json::from_str(line).unwrap()
+}
+
 #[cfg(unix)]
 fn prompt_hook_output(world: &World, binary: &PathBuf, input: &Value) -> Output {
     let mut command = world.command();
@@ -193,6 +201,127 @@ fn boundary_hook_loads_whole_budgeted_pages_without_reading_transcript() {
     assert!(context.contains("Operations"));
     assert!(context.contains("omitted"));
     assert!(context.contains("reference data"));
+}
+
+#[test]
+fn fresh_init_recommends_both_graphs_without_enabling_them() {
+    let world = World::new(false);
+    let initialized = world.ok(&["init"]);
+    let recommendation = &initialized["recommendations"]["lwc_readiness"];
+
+    assert_eq!(recommendation["wiki"]["initialized"], true);
+    assert_eq!(recommendation["document_graph"]["enabled"], false);
+    assert_eq!(recommendation["code_graph"]["initialized"], false);
+    assert_eq!(recommendation["authorization"]["mode"], "plain-text");
+    assert_eq!(recommendation["authorization"]["recommended_choice"], "1");
+    assert_eq!(recommendation["authorization"]["choices"][0]["id"], "1");
+    assert_eq!(
+        recommendation["authorization"]["choices"][0]["capabilities"],
+        serde_json::json!(["document-graph", "code-graph"])
+    );
+
+    assert!(!world.project.join(".lwc/config.json").exists());
+    assert!(!world.project.join(".lwc/codegraph").exists());
+    assert!(!world.home.join(".lwc/runtime/codegraph").exists());
+}
+
+#[test]
+fn boundary_hook_reports_portable_graph_authorization_without_mutation() {
+    let world = World::new(true);
+    let input = serde_json::json!({"source": "startup", "cwd": world.project}).to_string();
+    let output = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ],
+        &input,
+    );
+    let readiness = readiness(&context(&output));
+
+    assert_eq!(readiness["wiki"]["initialized"], true);
+    assert_eq!(readiness["document_graph"]["enabled"], false);
+    assert_eq!(readiness["code_graph"]["initialized"], false);
+    assert_eq!(readiness["authorization"]["mode"], "plain-text");
+    assert_eq!(readiness["authorization"]["recommended_choice"], "1");
+    assert_eq!(
+        readiness["authorization"]["choices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert!(
+        readiness["authorization"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("Reply with 1-4")
+    );
+
+    assert!(!world.project.join(".lwc/config.json").exists());
+    assert!(!world.project.join(".lwc/codegraph").exists());
+    assert!(!world.home.join(".lwc/runtime/codegraph").exists());
+}
+
+#[test]
+fn boundary_hook_can_report_a_missing_wiki_without_creating_it() {
+    let world = World::new(false);
+    let input = serde_json::json!({"source": "startup", "cwd": world.project}).to_string();
+    let output = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "claude",
+            "--event",
+            "SessionStart",
+        ],
+        &input,
+    );
+    let readiness = readiness(&context(&output));
+    assert_eq!(readiness["wiki"]["initialized"], false);
+    assert_eq!(readiness["authorization"]["recommended_choice"], "1");
+    assert!(!world.project.join(".lwc").exists());
+}
+
+#[test]
+fn boundary_hook_omits_authorization_when_both_graphs_are_configured() {
+    let world = World::new(true);
+    fs::write(
+        world.project.join(".lwc/config.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 3,
+            "graph": {"setting": "grafeo"},
+            "trans": {
+                "setting": "inherit",
+                "timeout_seconds": 120,
+                "anydoc_args": [],
+                "markitdown_args": []
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(world.project.join(".lwc/codegraph")).unwrap();
+    fs::write(
+        world.project.join(".lwc/codegraph/codegraph.db"),
+        b"fixture",
+    )
+    .unwrap();
+
+    let input = serde_json::json!({"source": "startup", "cwd": world.project}).to_string();
+    let output = world.output(
+        &["agent", "hook", "--agent", "pi", "--event", "session_start"],
+        &input,
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let readiness = readiness(value["additionalContext"].as_str().unwrap());
+    assert_eq!(readiness["document_graph"]["enabled"], true);
+    assert_eq!(readiness["code_graph"]["initialized"], true);
+    assert!(readiness.get("authorization").is_none());
 }
 
 #[test]
