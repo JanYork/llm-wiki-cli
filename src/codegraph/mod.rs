@@ -321,12 +321,14 @@ impl Paths {
     fn from_project(project: PathBuf) -> Result<Self> {
         let target = target_name()?;
         let extension = if cfg!(windows) { "zip" } else { "tar.gz" };
+        let project_lwc = project.join(".lwc");
         Ok(Self {
-            legacy_runtime: project.join(".lwc/runtime/codegraph"),
-            index: project.join(".lwc/codegraph"),
+            legacy_runtime: project_lwc.join("runtime").join("codegraph"),
+            index: project_lwc.join("codegraph"),
             project,
             runtime: global_lwc_root()?
-                .join("runtime/codegraph")
+                .join("runtime")
+                .join("codegraph")
                 .join(VERSION)
                 .join(target),
             target,

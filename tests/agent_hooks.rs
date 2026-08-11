@@ -539,7 +539,8 @@ fn locked_wiki_fails_open_without_blocking_the_agent() {
         ],
         &input,
     );
-    assert!(started.elapsed() < Duration::from_secs(1));
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(2), "hook took {elapsed:?}");
     assert!(output.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap(),

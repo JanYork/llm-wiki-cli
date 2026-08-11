@@ -1,6 +1,6 @@
 {
   "name": "@i-xor/lwc",
-  "version": "0.13.2",
+  "version": "0.13.3",
   "description": "Persistent, source-grounded wikis for LLM agents",
   "license": "Apache-2.0",
   "repository": {
