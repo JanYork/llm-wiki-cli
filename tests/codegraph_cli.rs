@@ -17,7 +17,9 @@ fn codegraph_target() -> &'static str {
 }
 
 fn codegraph_runtime(home: &Path) -> PathBuf {
-    home.join(".lwc/runtime/codegraph")
+    home.join(".lwc")
+        .join("runtime")
+        .join("codegraph")
         .join(CODEGRAPH_VERSION)
         .join(codegraph_target())
 }
@@ -136,8 +138,10 @@ fn cg_status_reports_but_does_not_remove_a_legacy_project_runtime() {
     let status = cg_status(&project, &home);
     assert_eq!(status["legacy_project_runtime"], true);
     assert_eq!(
-        status["legacy_runtime"],
-        legacy.canonicalize().unwrap().to_string_lossy().as_ref()
+        Path::new(status["legacy_runtime"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        legacy.canonicalize().unwrap()
     );
     assert!(legacy.join("bin/codegraph").is_file());
 }
