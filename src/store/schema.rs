@@ -53,6 +53,35 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
             FOREIGN KEY(page_slug) REFERENCES pages(slug) ON DELETE CASCADE
         );
 
+        CREATE TABLE tags(
+            name TEXT PRIMARY KEY,
+            autoload INTEGER NOT NULL DEFAULT 0 CHECK(autoload IN (0, 1)),
+            autoload_priority INTEGER NOT NULL DEFAULT 0,
+            autoload_limit INTEGER NOT NULL DEFAULT 10
+                CHECK(autoload_limit BETWEEN 1 AND 100),
+            autoload_max_chars INTEGER NOT NULL DEFAULT 50000
+                CHECK(autoload_max_chars BETWEEN 1 AND 100000),
+            reason TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE page_tags(
+            tag_name TEXT NOT NULL,
+            page_slug TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(tag_name, page_slug),
+            FOREIGN KEY(tag_name) REFERENCES tags(name) ON DELETE CASCADE,
+            FOREIGN KEY(page_slug) REFERENCES pages(slug) ON DELETE CASCADE
+        );
+
+        CREATE INDEX page_tags_lookup
+        ON page_tags(tag_name, priority DESC, page_slug ASC);
+
+        CREATE INDEX page_tags_page ON page_tags(page_slug, tag_name);
+
         CREATE TABLE links(
             from_slug TEXT NOT NULL,
             to_slug TEXT NOT NULL,
@@ -379,6 +408,8 @@ fn validate_store(conn: &Connection) -> Result<()> {
         "SELECT slug, title, kind, summary, body, structural_navigation, created_at, updated_at FROM pages LIMIT 0",
         "SELECT page_slug, source_id FROM page_sources LIMIT 0",
         "SELECT page_slug, provenance FROM page_provenance LIMIT 0",
+        "SELECT name, autoload, autoload_priority, autoload_limit, autoload_max_chars, reason, updated_at FROM tags LIMIT 0",
+        "SELECT tag_name, page_slug, priority, reason, created_at, updated_at FROM page_tags LIMIT 0",
         "SELECT from_slug, to_slug FROM links LIMIT 0",
         "SELECT action, target, detail_json, created_at FROM operations LIMIT 0",
         "SELECT source_id, status, attempts, analysis, last_error, no_derived_pages_reason, updated_at FROM ingest_jobs LIMIT 0",

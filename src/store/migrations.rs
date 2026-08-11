@@ -120,6 +120,10 @@ fn prepare_store(
         migrate_external_graph_schema(conn)?;
         version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     }
+    if version == EXTERNAL_GRAPH_VERSION {
+        migrate_tags(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
     if version != USER_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
@@ -429,7 +433,7 @@ fn migrate_changesets(conn: &mut Connection) -> Result<()> {
 fn migrate_external_graph_schema(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current == USER_VERSION {
+    if (EXTERNAL_GRAPH_VERSION..=USER_VERSION).contains(&current) {
         tx.commit()?;
         return Ok(());
     }
@@ -515,13 +519,71 @@ fn migrate_external_graph_schema(conn: &mut Connection) -> Result<()> {
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![EXTERNAL_GRAPH_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", EXTERNAL_GRAPH_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to remove legacy graph schema: {error}"),
+        )
+    })
+}
+
+fn migrate_tags(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if current == USER_VERSION {
+        tx.commit()?;
+        return Ok(());
+    }
+    if current != EXTERNAL_GRAPH_VERSION {
+        return Err(AppError::new(
+            "unsupported_store_version",
+            format!("cannot migrate wiki database version {current} to {USER_VERSION}"),
+        ));
+    }
+    tx.execute_batch(
+        "CREATE TABLE tags(
+            name TEXT PRIMARY KEY,
+            autoload INTEGER NOT NULL DEFAULT 0 CHECK(autoload IN (0, 1)),
+            autoload_priority INTEGER NOT NULL DEFAULT 0,
+            autoload_limit INTEGER NOT NULL DEFAULT 10
+                CHECK(autoload_limit BETWEEN 1 AND 100),
+            autoload_max_chars INTEGER NOT NULL DEFAULT 50000
+                CHECK(autoload_max_chars BETWEEN 1 AND 100000),
+            reason TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE page_tags(
+            tag_name TEXT NOT NULL REFERENCES tags(name) ON DELETE CASCADE,
+            page_slug TEXT NOT NULL REFERENCES pages(slug) ON DELETE CASCADE,
+            priority INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(tag_name, page_slug)
+        );
+        CREATE INDEX page_tags_lookup
+        ON page_tags(tag_name, priority DESC, page_slug ASC);
+        CREATE INDEX page_tags_page ON page_tags(page_slug, tag_name);",
+    )
+    .map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to prepare v{USER_VERSION} tag schema: {error}"),
+        )
+    })?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![USER_VERSION.to_string()],
     )?;
     tx.pragma_update(None, "user_version", USER_VERSION)?;
     tx.commit().map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to remove legacy graph schema: {error}"),
+            format!("failed to commit v{USER_VERSION} tag migration: {error}"),
         )
     })
 }

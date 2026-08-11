@@ -105,6 +105,8 @@ fn downgrade_to_v10(database: &Path) {
          DROP TABLE IF EXISTS graph_nodes;
          DROP TABLE IF EXISTS document_index_state;
          DROP TABLE IF EXISTS semantic_relations;
+         DROP TABLE IF EXISTS page_tags;
+         DROP TABLE IF EXISTS tags;
          UPDATE meta SET value = '10' WHERE key = 'format_version';
          PRAGMA user_version = 10;
          PRAGMA foreign_keys = ON;",

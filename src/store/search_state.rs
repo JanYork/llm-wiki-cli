@@ -37,7 +37,7 @@ fn attached_store_identity(conn: &Connection) -> Result<StoreIdentity> {
 }
 
 fn validate_changeset_table_inventory(conn: &Connection, schema: &str) -> Result<()> {
-    const TABLES: [&str; 26] = [
+    const TABLES: [&str; 28] = [
         "changesets",
         "ingest_jobs",
         "links",
@@ -45,6 +45,7 @@ fn validate_changeset_table_inventory(conn: &Connection, schema: &str) -> Result
         "operations",
         "page_provenance",
         "page_sources",
+        "page_tags",
         "pages",
         "retrieval_feedback",
         "retrieval_weights",
@@ -64,6 +65,7 @@ fn validate_changeset_table_inventory(conn: &Connection, schema: &str) -> Result
         "span_fts_data",
         "span_fts_docsize",
         "span_fts_idx",
+        "tags",
     ];
     let sql = format!(
         "SELECT name FROM {schema}.sqlite_schema
@@ -261,6 +263,8 @@ fn replace_main_from_attached(tx: &Transaction<'_>, source_schema: &str) -> Resu
     tx.execute_batch(
         "DELETE FROM semantic_relations;
          DELETE FROM search_spans;
+         DELETE FROM page_tags;
+         DELETE FROM tags;
          DELETE FROM page_sources;
          DELETE FROM page_provenance;
          DELETE FROM links;
@@ -296,6 +300,18 @@ fn replace_main_from_attached(tx: &Transaction<'_>, source_schema: &str) -> Resu
          SELECT page_slug, source_id FROM candidate.page_sources;
          INSERT INTO page_provenance(page_slug, provenance)
          SELECT page_slug, provenance FROM candidate.page_provenance;
+         INSERT INTO tags(
+             name, autoload, autoload_priority, autoload_limit,
+             autoload_max_chars, reason, updated_at
+         ) SELECT
+             name, autoload, autoload_priority, autoload_limit,
+             autoload_max_chars, reason, updated_at
+           FROM candidate.tags;
+         INSERT INTO page_tags(
+             tag_name, page_slug, priority, reason, created_at, updated_at
+         ) SELECT
+             tag_name, page_slug, priority, reason, created_at, updated_at
+           FROM candidate.page_tags;
          INSERT INTO links(from_slug, to_slug)
          SELECT from_slug, to_slug FROM candidate.links;
          INSERT INTO operations(id, action, target, detail_json, created_at)

@@ -266,6 +266,20 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn changeset_touched_tags(&self) -> Result<Vec<(String, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT json_extract(o.detail_json, '$.tag'), m.value
+             FROM operations o
+             JOIN changesets c ON o.id > c.begin_operation_id AND c.status = 'draft'
+             JOIN meta m ON m.key = 'changeset_base_tag:' || json_extract(o.detail_json, '$.tag')
+             WHERE o.action IN ('tag_set', 'tag_remove', 'tag_delete', 'tag_autoload')
+             ORDER BY 1",
+        )?;
+        Ok(statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn changeset_touched_meta(&self) -> Result<Vec<(String, String)>> {
         let mut statement = self.conn.prepare(
             "SELECT touched.key, m.value
@@ -383,6 +397,62 @@ impl Store {
                 tx.execute(
                     "INSERT INTO meta(key, value) VALUES (?1, ?2)",
                     params![base_key, base],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        let _ = self.conn.execute("DETACH DATABASE live_base", []);
+        result
+    }
+
+    pub fn changeset_prepare_tag_touch(
+        &mut self,
+        live_path: &Path,
+        tag: &str,
+        page: Option<&str>,
+    ) -> Result<()> {
+        let tag = normalize_tag_name(tag)?;
+        self.conn.execute(
+            "ATTACH DATABASE ?1 AS live_base",
+            params![live_path.to_string_lossy().as_ref()],
+        )?;
+        let result = (|| -> Result<()> {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let base_key = format!("changeset_base_tag:{tag}");
+            let prepared: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key = ?1)",
+                [&base_key],
+                |row| row.get(0),
+            )?;
+            if !prepared {
+                let base = load_tag_snapshot(&tx, "live_base", &tag)?;
+                tx.execute(
+                    "INSERT INTO meta(key, value) VALUES (?1, ?2)",
+                    params![&base_key, tag_snapshot_fingerprint(&base)],
+                )?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO tags(
+                        name, autoload, autoload_priority, autoload_limit,
+                        autoload_max_chars, reason, updated_at
+                     ) SELECT
+                        name, autoload, autoload_priority, autoload_limit,
+                        autoload_max_chars, reason, updated_at
+                       FROM live_base.tags WHERE name = ?1",
+                    [&tag],
+                )?;
+            }
+            if let Some(page) = page {
+                tx.execute(
+                    "INSERT OR IGNORE INTO page_tags(
+                        tag_name, page_slug, priority, reason, created_at, updated_at
+                     ) SELECT
+                        tag_name, page_slug, priority, reason, created_at, updated_at
+                       FROM live_base.page_tags
+                       WHERE tag_name = ?1 AND page_slug = ?2",
+                    params![&tag, page],
                 )?;
             }
             tx.commit()?;
@@ -649,6 +719,22 @@ impl Store {
                 after_fingerprint: sparse_source_fingerprint(&after),
             });
         }
+        let mut tags = Vec::new();
+        for (name, expected) in draft.changeset_touched_tags()? {
+            let before = load_tag_snapshot(&self.conn, "main", &name)?;
+            if tag_snapshot_fingerprint(&before) != expected {
+                return Err(AppError::new(
+                    "changeset_conflict",
+                    format!("tag {name} changed while preparing its inverse patch"),
+                ));
+            }
+            let after = projected_sparse_tag_snapshot(&before, &draft, &name)?;
+            tags.push(SparseTagInverse {
+                name,
+                before,
+                after_fingerprint: tag_snapshot_fingerprint(&after),
+            });
+        }
         let payload = SparseInversePayload {
             version: 1,
             changeset_id: changeset_id.to_string(),
@@ -656,6 +742,7 @@ impl Store {
             pages,
             meta,
             sources,
+            tags,
         };
         let encoded = serde_json::to_vec(&payload)
             .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?;
@@ -859,6 +946,18 @@ impl Store {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let tags = inverse
+            .payload
+            .tags
+            .iter()
+            .map(|entry| {
+                Ok(SparseTagInverse {
+                    name: entry.name.clone(),
+                    before: load_tag_snapshot(&self.conn, "main", &entry.name)?,
+                    after_fingerprint: tag_snapshot_fingerprint(&entry.before),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let payload = SparseInversePayload {
             version: 1,
             changeset_id: history.id.clone(),
@@ -866,6 +965,7 @@ impl Store {
             pages,
             meta,
             sources,
+            tags,
         };
         let encoded = serde_json::to_vec(&payload)
             .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?;

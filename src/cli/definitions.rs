@@ -245,6 +245,16 @@ enum Command {
         #[command(subcommand)]
         command: PageCommand,
     },
+    /// Assign explicit strong-load tags to core Wiki pages.
+    Tag {
+        #[command(subcommand)]
+        command: TagCommand,
+    },
+    /// Load deterministic Wiki context without search.
+    Load {
+        #[command(subcommand)]
+        command: LoadCommand,
+    },
     /// Drive the persistent Agent ingest state machine.
     #[command(
         long_about = "Compile immutable sources into persistent Wiki knowledge through a crash-safe state machine:\n  pending -> analyzing -> generating -> completed\n\nFailed or interrupted work can be returned to pending with retry.",
@@ -477,6 +487,45 @@ FILE may be '-' to read UTF-8 Markdown from stdin. The update is stored transact
     /// Print the current durable purpose as JSON.
     #[command(after_help = "Example:\n  lwc purpose show")]
     Show,
+}
+
+#[derive(Subcommand)]
+enum TagCommand {
+    Set {
+        tag: String,
+        page: String,
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
+        #[arg(long)]
+        reason: String,
+    },
+    Remove { tag: String, page: String },
+    Delete { tag: String },
+    Autoload {
+        tag: String,
+        #[arg(long, required_unless_present = "disable", conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, default_value_t = 50_000)]
+        max_chars: usize,
+        #[arg(long)]
+        reason: String,
+    },
+    List,
+}
+
+#[derive(Subcommand)]
+enum LoadCommand {
+    Tag {
+        tag: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]

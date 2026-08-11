@@ -519,6 +519,144 @@ fn run(cli: Cli) -> Result<Value> {
                 }
             }
         }
+        Command::Tag {
+            command: TagCommand::List,
+        } if cli.scope == Scope::All => {
+            let paths = resolve_effective_read_store_paths(
+                cli.scope,
+                &cwd,
+                selected_changeset.as_deref(),
+            )?;
+            let stores = paths
+                .into_iter()
+                .map(|path| {
+                    Store::open_for_read(scope_name(path.scope), &path.path)?.tag_list()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(json!({"scope": "all", "stores": stores}))
+        }
+        Command::Tag { command } => {
+            ensure_scope_supported(cli.scope, false, "tag")?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
+            match command {
+                TagCommand::Set {
+                    tag,
+                    page,
+                    priority,
+                    reason,
+                } => {
+                    if let Some(name) = selected_changeset.as_deref() {
+                        let live = resolve_live_store_path(cli.scope, &cwd)?;
+                        changeset::prepare_tag_touch(&live, name, &tag, Some(&page), false)?;
+                    }
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    store.tag_set(&tag, &page, priority, &reason)
+                }
+                TagCommand::Remove { tag, page } => {
+                    if let Some(name) = selected_changeset.as_deref() {
+                        let live = resolve_live_store_path(cli.scope, &cwd)?;
+                        changeset::prepare_tag_touch(&live, name, &tag, Some(&page), false)?;
+                    }
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    store.tag_remove(&tag, &page)
+                }
+                TagCommand::Delete { tag } => {
+                    if let Some(name) = selected_changeset.as_deref() {
+                        let live = resolve_live_store_path(cli.scope, &cwd)?;
+                        changeset::prepare_tag_touch(&live, name, &tag, None, false)?;
+                    }
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    store.tag_delete(&tag)
+                }
+                TagCommand::Autoload {
+                    tag,
+                    enable,
+                    disable: _,
+                    priority,
+                    limit,
+                    max_chars,
+                    reason,
+                } => {
+                    if let Some(name) = selected_changeset.as_deref() {
+                        let live = resolve_live_store_path(cli.scope, &cwd)?;
+                        changeset::prepare_tag_touch(&live, name, &tag, None, enable)?;
+                    }
+                    let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
+                    store.tag_autoload(&tag, enable, priority, limit, max_chars, &reason)
+                }
+                TagCommand::List => {
+                    let store =
+                        Store::open_for_read(scope_name(store_path.scope), &store_path.path)?;
+                    store.tag_list()
+                }
+            }
+        }
+        Command::Load { command } => match command {
+            LoadCommand::Tag { tag, limit } => {
+                if !(1..=100).contains(&limit) {
+                    return Err(AppError::new(
+                        "invalid_limit",
+                        "tag load limit must be between 1 and 100",
+                    ));
+                }
+                let paths = resolve_effective_read_store_paths(
+                    cli.scope,
+                    &cwd,
+                    selected_changeset.as_deref(),
+                )?;
+                let stores = paths
+                    .into_iter()
+                    .map(|path| Store::open_for_read(scope_name(path.scope), &path.path))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut identities = Vec::new();
+                let mut found = false;
+                for (index, store) in stores.iter().enumerate() {
+                    match store.tag_page_identities(&tag, limit + 1) {
+                        Ok(rows) => {
+                            found = true;
+                            identities.extend(rows.into_iter().map(|row| (index, row)));
+                        }
+                        Err(error) if error.code == "tag_not_found" && cli.scope == Scope::All => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                if !found {
+                    return Err(AppError::new(
+                        "tag_not_found",
+                        format!("tag {} does not exist", tag.trim()),
+                    ));
+                }
+                identities.sort_by(|(_, left), (_, right)| {
+                    right
+                        .priority
+                        .cmp(&left.priority)
+                        .then_with(|| scope_priority(&left.scope).cmp(&scope_priority(&right.scope)))
+                        .then_with(|| left.page_slug.cmp(&right.page_slug))
+                });
+                let has_more = identities.len() > limit;
+                identities.truncate(limit);
+                let mut pages = Vec::with_capacity(identities.len());
+                for (ordinal, (store, identity)) in identities.into_iter().enumerate() {
+                    pages.push(stores[store].tagged_page(identity, ordinal + 1)?);
+                }
+                let body_bytes = pages.iter().map(|page| page.page.body.len()).sum::<usize>();
+                let body_chars = pages
+                    .iter()
+                    .map(|page| page.page.body.chars().count())
+                    .sum::<usize>();
+                Ok(json!({
+                    "scope": scope_name(cli.scope),
+                    "tag": tag.trim(),
+                    "pages": pages,
+                    "limit": limit,
+                    "returned": pages.len(),
+                    "has_more": has_more,
+                    "body_bytes": body_bytes,
+                    "body_chars": body_chars,
+                }))
+            }
+        },
         Command::Ingest { command } => {
             ensure_scope_supported(cli.scope, false, "ingest")?;
             let store_path =

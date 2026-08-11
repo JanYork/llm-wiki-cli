@@ -156,6 +156,32 @@ pub fn prepare_page_touch(
     Ok(())
 }
 
+pub fn prepare_tag_touch(
+    live: &StorePath,
+    name: &str,
+    tag: &str,
+    page: Option<&str>,
+    require_member: bool,
+) -> Result<()> {
+    let path = draft_path(live, name, false)?;
+    validate_draft_binding(live, name, &path, 0)?;
+    let member = if let Some(page) = page {
+        Some(page.to_string())
+    } else if require_member {
+        Store::open_for_read(scope_name(live.scope), &live.path)?.tag_first_page(tag)?
+    } else {
+        None
+    };
+    if let Some(page) = member.as_deref() {
+        prepare_page_touch(live, name, page, &[])?;
+    }
+    let mut draft = Store::open(scope_name(live.scope), &path)?;
+    if draft.changeset_storage_kind()?.as_deref() == Some("sparse-v1") {
+        draft.changeset_prepare_tag_touch(&live.path, tag, member.as_deref())?;
+    }
+    Ok(())
+}
+
 pub fn show(live: &StorePath, name: &str, limit: usize) -> Result<ChangesetShowResponse> {
     validate_name(name)?;
     let path = draft_path(live, name, false)?;
@@ -279,6 +305,15 @@ pub fn commit(
                     format!("{key} changed after the changeset began"),
                 )
                 .with_details(json!({"entity_type": "meta", "identifier": key})));
+            }
+        }
+        for (tag, expected) in draft.changeset_touched_tags()? {
+            if live_reader.tag_fingerprint(&tag)? != expected {
+                return Err(AppError::new(
+                    "changeset_conflict",
+                    format!("tag {tag} changed after it was first touched"),
+                )
+                .with_details(json!({"entity_type": "tag", "identifier": tag})));
             }
         }
     }

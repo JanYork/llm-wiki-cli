@@ -273,6 +273,79 @@ fn sparse_source_fingerprint(source: &SparseSourceSnapshot) -> String {
     hash_content(&serde_json::to_string(source).unwrap_or_default())
 }
 
+fn projected_sparse_tag_snapshot(
+    before: &SparseTagSnapshot,
+    draft: &Store,
+    tag: &str,
+) -> Result<SparseTagSnapshot> {
+    let candidate = load_tag_snapshot(&draft.conn, "main", tag)?;
+    let begin: i64 = draft.conn.query_row(
+        "SELECT begin_operation_id FROM changesets WHERE status = 'draft' LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut after = before.clone();
+    let mut statement = draft.conn.prepare(
+        "SELECT action, detail_json FROM operations
+         WHERE id > ?1 AND action IN ('tag_set', 'tag_remove', 'tag_delete', 'tag_autoload')
+         ORDER BY id",
+    )?;
+    let operations = statement
+        .query_map([begin], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (action, detail) in operations {
+        let detail: Value = serde_json::from_str(&detail)
+            .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?;
+        if detail.get("tag").and_then(Value::as_str) != Some(tag) {
+            continue;
+        }
+        match action.as_str() {
+            "tag_set" => {
+                if after.policy.is_none() {
+                    after.policy = candidate.policy.clone();
+                }
+                let page = detail
+                    .get("page")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AppError::new("changeset_corrupt", "tag_set operation lacks page")
+                    })?;
+                after.memberships.retain(|entry| entry.page_slug != page);
+                if let Some(member) = candidate
+                    .memberships
+                    .iter()
+                    .find(|entry| entry.page_slug == page)
+                {
+                    after.memberships.push(member.clone());
+                    after
+                        .memberships
+                        .sort_by(|left, right| left.page_slug.cmp(&right.page_slug));
+                }
+            }
+            "tag_remove" => {
+                let page = detail
+                    .get("page")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AppError::new("changeset_corrupt", "tag_remove operation lacks page")
+                    })?;
+                after.memberships.retain(|entry| entry.page_slug != page);
+            }
+            "tag_delete" => {
+                after = SparseTagSnapshot {
+                    policy: None,
+                    memberships: Vec::new(),
+                };
+            }
+            "tag_autoload" => after.policy = candidate.policy.clone(),
+            _ => unreachable!(),
+        }
+    }
+    Ok(after)
+}
+
 fn fresh_checkpoint_name(database: &Path, prefix: &str) -> Result<String> {
     validate_checkpoint_name(prefix)?;
     let millis = SystemTime::now()
