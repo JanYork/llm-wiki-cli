@@ -81,7 +81,7 @@ fn run(cli: Cli) -> Result<Value> {
             let store_path = resolve_live_store_path(cli.scope, &cwd)?;
             match command {
                 CgCommand::Init { verbose } => codegraph::init(&store_path, verbose),
-                CgCommand::Status => Ok(codegraph::status(&store_path)),
+                CgCommand::Status => codegraph::status(&store_path),
                 CgCommand::Run(args) => codegraph::run(&store_path, &args),
             }
         }

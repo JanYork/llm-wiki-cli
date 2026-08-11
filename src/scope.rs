@@ -336,7 +336,7 @@ fn invalid_store_path(path: &Path, project_root: Option<&Path>, reason: &str) ->
     }
 }
 
-fn global_store_path() -> Result<PathBuf> {
+pub(crate) fn global_lwc_root() -> Result<PathBuf> {
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
@@ -353,7 +353,11 @@ fn global_store_path() -> Result<PathBuf> {
             (!home.as_os_str().is_empty()).then_some(home)
         })
         .ok_or_else(|| AppError::new("home_not_set", "user home directory is not available"))?;
-    Ok(project_store_path(&home))
+    Ok(home.join(STORE_DIR))
+}
+
+fn global_store_path() -> Result<PathBuf> {
+    Ok(global_lwc_root()?.join(STORE_FILE))
 }
 
 fn store_not_found(message: &str) -> AppError {
