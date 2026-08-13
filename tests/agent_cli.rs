@@ -2400,6 +2400,7 @@ fn antigravity_installs_an_official_plugin_and_preserves_legacy_config() {
     );
     #[cfg(not(target_os = "macos"))]
     assert_eq!(unified_config["mcpServers"]["lwc"]["command"], "lwc");
+    #[cfg(target_os = "macos")]
     let hooks: Value =
         serde_json::from_slice(&fs::read(plugin.join("hooks.json")).unwrap()).unwrap();
     #[cfg(target_os = "macos")]
