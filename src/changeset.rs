@@ -172,9 +172,6 @@ pub fn prepare_tag_touch(
     } else {
         None
     };
-    if let Some(page) = member.as_deref() {
-        prepare_page_touch(live, name, page, &[])?;
-    }
     let mut draft = Store::open(scope_name(live.scope), &path)?;
     if draft.changeset_storage_kind()?.as_deref() == Some("sparse-v1") {
         draft.changeset_prepare_tag_touch(&live.path, tag, member.as_deref())?;
@@ -238,6 +235,21 @@ pub fn discard(live: &StorePath, name: &str) -> Result<ChangesetDiscardResponse>
         name: state.name,
         status: "discarded",
     })
+}
+
+pub fn lint(
+    live: &StorePath,
+    name: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<crate::store::LintResponse> {
+    let path = draft_path(live, name, false)?;
+    validate_draft_binding(live, name, &path, 0)?;
+    let draft = Store::open_for_read(scope_name(live.scope), &path)?;
+    if draft.changeset_storage_kind()?.as_deref() != Some("sparse-v1") {
+        return draft.lint(limit, offset);
+    }
+    Store::open(scope_name(live.scope), &live.path)?.changeset_sparse_lint(&path, limit, offset)
 }
 
 pub fn commit(
@@ -318,7 +330,13 @@ pub fn commit(
         }
     }
     draft.validate_changeset_integrity()?;
-    let lint_issues = draft.lint(1, 0)?.total;
+    let lint_issues = if sparse {
+        Store::open(scope_name(live.scope), &live.path)?
+            .changeset_sparse_lint(&path, 1, 0)?
+            .total
+    } else {
+        draft.lint(1, 0)?.total
+    };
     if lint_issues > 0 && !allow_lint_issues {
         return Err(AppError::new(
             "changeset_lint_failed",

@@ -292,7 +292,7 @@ fn publish_attached_changeset(
         .optional()?
         .unwrap_or(false);
     if sparse {
-        merge_sparse_candidate(&tx, begin_operation_id)?;
+        merge_sparse_candidate(&tx, begin_operation_id, true)?;
     } else {
         let changed_search = changed_search_documents(&tx, "candidate")?;
         replace_main_from_attached(&tx, "candidate")?;
@@ -364,7 +364,11 @@ fn publish_attached_changeset(
     })
 }
 
-fn merge_sparse_candidate(tx: &Transaction<'_>, begin_operation_id: i64) -> Result<()> {
+fn merge_sparse_candidate(
+    tx: &Transaction<'_>,
+    begin_operation_id: i64,
+    validate_operations: bool,
+) -> Result<()> {
     let operations = {
         let mut statement = tx.prepare(
             "SELECT action, target, detail_json
@@ -380,7 +384,9 @@ fn merge_sparse_candidate(tx: &Transaction<'_>, begin_operation_id: i64) -> Resu
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    validate_sparse_operation_actions(operations.iter().map(|(action, _, _)| action.as_str()))?;
+    if validate_operations {
+        validate_sparse_operation_actions(operations.iter().map(|(action, _, _)| action.as_str()))?;
+    }
     let page_targets = operations
         .iter()
         .filter(|(action, _, _)| matches!(action.as_str(), "page_put" | "page_remove"))

@@ -458,6 +458,15 @@ impl Store {
             }
             if let Some(page) = page {
                 tx.execute(
+                    "INSERT OR IGNORE INTO pages(
+                        slug, title, kind, summary, body, structural_navigation,
+                        created_at, updated_at
+                     ) SELECT slug, title, kind, summary, '', structural_navigation,
+                              created_at, updated_at
+                       FROM live_base.pages WHERE slug = ?1",
+                    [page],
+                )?;
+                tx.execute(
                     "INSERT OR IGNORE INTO page_tags(
                         tag_name, page_slug, priority, reason, created_at, updated_at
                      ) SELECT
@@ -850,6 +859,38 @@ impl Store {
             params![draft_path.to_string_lossy().as_ref()],
         )?;
         let result = publish_attached_changeset(&mut self.conn, input);
+        let _ = self.conn.execute("DETACH DATABASE candidate", []);
+        result
+    }
+
+    pub fn changeset_sparse_lint(
+        &mut self,
+        draft_path: &Path,
+        limit: usize,
+        offset: usize,
+    ) -> Result<LintResponse> {
+        self.conn.execute(
+            "ATTACH DATABASE ?1 AS candidate",
+            params![draft_path.to_string_lossy().as_ref()],
+        )?;
+        let begin_operation_id: i64 = self.conn.query_row(
+            "SELECT begin_operation_id FROM candidate.changesets WHERE status = 'draft'",
+            [],
+            |row| row.get(0),
+        )?;
+        let result = (|| -> Result<LintResponse> {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            merge_sparse_candidate(&tx, begin_operation_id, false)?;
+            Self::lint_connection(
+                &tx,
+                self.scope.clone(),
+                draft_path.to_string_lossy().into_owned(),
+                limit,
+                offset,
+            )
+        })();
         let _ = self.conn.execute("DETACH DATABASE candidate", []);
         result
     }

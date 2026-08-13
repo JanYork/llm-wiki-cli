@@ -1322,6 +1322,16 @@ fn run(cli: Cli) -> Result<Value> {
             ensure_scope_supported(cli.scope, false, "lint")?;
             validate_limit(limit)?;
             validate_offset(offset)?;
+            if let Some(name) = selected_changeset.as_deref() {
+                if record {
+                    return Err(AppError::new(
+                        "changeset_record_unsupported",
+                        "changeset overlay lint cannot be recorded in the sparse draft",
+                    ));
+                }
+                let live = resolve_live_store_path(cli.scope, &cwd)?;
+                return to_json(changeset::lint(&live, name, limit, offset)?);
+            }
             let store_path =
                 resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
             if record {

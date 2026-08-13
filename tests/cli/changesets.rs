@@ -710,6 +710,114 @@ fn changeset_commit_rejects_empty_and_lint_failures_before_checkpointing() {
 }
 
 #[test]
+fn sparse_tag_only_changeset_lints_against_live_wiki_and_commits_cleanly() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let schema = world.write("schema.md", "# Test Wiki");
+    world.ok(&world.project, &["schema", "set", as_str(&schema)]);
+    for (slug, title, body) in [
+        (
+            "linked-target",
+            "Linked target",
+            "target body links back to [[tagged-page]]",
+        ),
+        (
+            "tagged-page",
+            "Tagged page",
+            "core rules link to [[linked-target]]",
+        ),
+    ] {
+        let file = world.write(&format!("{slug}.md"), body);
+        world.ok(
+            &world.project,
+            &[
+                "page",
+                "put",
+                slug,
+                "--title",
+                title,
+                "--summary",
+                title,
+                "--file",
+                as_str(&file),
+                "--provenance",
+                "agent-observed",
+            ],
+        );
+    }
+    assert_eq!(world.ok(&world.project, &["lint"])["total"], 0);
+    let live_database = world.project.join(".lwc/wiki.db");
+    let live_revision: String = Connection::open(&live_database)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'store_revision'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    world.ok(&world.project, &["changeset", "begin", "tag-only"]);
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "tag-only",
+            "tag",
+            "set",
+            "Rules",
+            "tagged-page",
+            "--reason",
+            "required context",
+        ],
+    );
+    let draft = Connection::open(world.project.join(".lwc/changesets/tag-only.db")).unwrap();
+    let staged_body: String = draft
+        .query_row(
+            "SELECT body FROM pages WHERE slug = 'tagged-page'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(staged_body.is_empty(), "tag-only staging copied the page body");
+    let staged_dependencies: i64 = draft
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM links) +
+                (SELECT COUNT(*) FROM page_sources) +
+                (SELECT COUNT(*) FROM page_provenance) +
+                (SELECT COUNT(*) FROM search_fts)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(staged_dependencies, 0);
+
+    let lint = world.ok(
+        &world.project,
+        &["--changeset", "tag-only", "lint"],
+    );
+    assert_eq!(lint["total"], 0, "{lint}");
+    assert_eq!(
+        Connection::open(&live_database)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'store_revision'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        live_revision,
+        "overlay lint mutated the live Wiki",
+    );
+    let committed = world.ok(
+        &world.project,
+        &["changeset", "commit", "tag-only"],
+    );
+    assert_eq!(committed["lint_issues"], 0);
+    assert_eq!(world.ok(&world.project, &["load", "tag", "Rules"])["returned"], 1);
+}
+
+#[test]
 fn changeset_reports_a_committed_materialization_failure_and_repairs_it() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);

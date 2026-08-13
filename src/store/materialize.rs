@@ -226,9 +226,23 @@ impl Store {
     }
 
     pub fn lint(&self, limit: usize, offset: usize) -> Result<LintResponse> {
-        let scope = self.scope.clone();
-        let database = self.database_string();
-        let mut statement = self.conn.prepare(&format!(
+        Self::lint_connection(
+            &self.conn,
+            self.scope.clone(),
+            self.database_string(),
+            limit,
+            offset,
+        )
+    }
+
+    fn lint_connection(
+        conn: &Connection,
+        scope: String,
+        database: String,
+        limit: usize,
+        offset: usize,
+    ) -> Result<LintResponse> {
+        let mut statement = conn.prepare(&format!(
             "{LINT_ISSUES_SQL}
              SELECT code, page, target, message
              FROM issues ORDER BY code, page, target"
