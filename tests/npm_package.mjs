@@ -5,13 +5,33 @@ import test from 'node:test'
 
 import { archiveFor, checksumFor, targetFor } from '../npm/install.mjs'
 
-const cargoVersion = /^version = "([^"]+)"/m.exec(readFileSync('Cargo.toml', 'utf8'))[1]
+const cargoToml = readFileSync('Cargo.toml', 'utf8')
+const cargoVersion = /^version = "([^"]+)"/m.exec(cargoToml)[1]
+const cargoDescription = /^description = "([^"]+)"/m.exec(cargoToml)[1]
+const cargoKeywords = JSON.parse(`[${/^keywords = \[(.+)\]$/m.exec(cargoToml)[1]}]`)
 const packageJson = JSON.parse(readFileSync('npm/package.json', 'utf8'))
 
 test('npm and Cargo versions match', () => {
   assert.equal(packageJson.name, '@i-xor/lwc')
   assert.equal(packageJson.version, cargoVersion)
   assert.equal(packageJson.bin.lwc, 'bin/lwc.mjs')
+})
+
+test('npm, Cargo, and README discovery metadata stay aligned', () => {
+  const description =
+    'Agent-driven proactive memory CLI for AI agents — autonomously recall, maintain, and evolve persistent, source-grounded knowledge across sessions.'
+  const compatibility =
+    /Works with Claude Code, Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes,\s+Antigravity, and pi\./
+
+  assert.equal(cargoDescription, description)
+  assert.equal(packageJson.description, description)
+  assert.deepEqual(packageJson.keywords.slice(0, cargoKeywords.length), cargoKeywords)
+
+  for (const readme of ['README.md', 'npm/README.md']) {
+    const contents = readFileSync(readme, 'utf8')
+    assert.match(contents, /agent-driven proactive memory CLI for AI agents/i)
+    assert.match(contents, compatibility)
+  }
 })
 
 test('both READMEs advertise the npm package and runtime contract', () => {

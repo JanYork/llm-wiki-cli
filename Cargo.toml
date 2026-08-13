@@ -1,13 +1,13 @@
 [package]
 name = "lwc"
-version = "0.13.5"
+version = "0.14.0"
 edition = "2024"
-description = "Agent-first CLI for building persistent, source-grounded wikis from local documents"
+description = "Agent-driven proactive memory CLI for AI agents — autonomously recall, maintain, and evolve persistent, source-grounded knowledge across sessions."
 license = "Apache-2.0"
 repository = "https://github.com/JanYork/llm-wiki-cli"
 homepage = "https://github.com/JanYork/llm-wiki-cli"
 readme = "README.md"
-keywords = ["llm", "wiki", "agents", "sqlite", "knowledge-base"]
+keywords = ["agent-memory-system", "ai-agents", "proactive-memory", "knowledge-bases", "context-engineering"]
 categories = ["command-line-utilities", "database"]
 exclude = [".agent/**", ".local-benchmarks/**", ".pi-subagents/**"]
 

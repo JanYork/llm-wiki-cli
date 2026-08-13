@@ -1,7 +1,7 @@
-<h1 align="center">lwc</h1>
+<h1 align="center">LWC — Proactive Memory for AI Agents</h1>
 
 <p align="center">
-  <strong>Persistent, source-grounded wikis for LLM agents.</strong>
+  <strong>Agent-driven · Persistent · Source-grounded</strong>
 </p>
 
 <p align="center">
@@ -17,13 +17,20 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/lwc-agent-memory.png" alt="LWC Agent Memory" width="100%">
+  <img src="docs/images/lwc-social-preview.png" alt="LWC — Proactive Memory for AI Agents" width="100%">
 </p>
 
-`lwc` is an agent-first CLI that turns curated documents into a durable Wiki.
-The agent reasons and synthesizes; `lwc` preserves sources, pages, citations,
-links, indexes, and history so knowledge compounds instead of being rediscovered
-from raw chunks on every query.
+`lwc` is an agent-driven proactive memory CLI for AI agents. It lets Agents
+autonomously recall, maintain, and evolve persistent, source-grounded knowledge
+across sessions.
+
+**Works with Claude Code, Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes,
+Antigravity, and pi.**
+
+LWC turns curated documents into a durable Wiki. Agents reason and synthesize;
+`lwc` preserves sources, pages, citations, links, indexes, and history so
+knowledge compounds instead of being rediscovered from raw chunks on every
+query.
 
 <p align="center">
   <img src="docs/images/lwc-overview-en.png" alt="LWC product overview" width="820">

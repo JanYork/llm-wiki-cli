@@ -1,7 +1,7 @@
-<h1 align="center">lwc</h1>
+<h1 align="center">LWC — 面向 AI Agent 的主动记忆</h1>
 
 <p align="center">
-  <strong>面向 LLM Agent 的持久化、来源可追溯 Wiki。</strong>
+  <strong>Agent 驱动 · 持久化 · 来源可追溯</strong>
 </p>
 
 <p align="center">
@@ -20,9 +20,15 @@
   <img src="docs/images/lwc-agent-memory-zh.png" alt="LWC Agent 记忆" width="100%">
 </p>
 
-`lwc` 是一个面向 Agent 的 CLI，它把经过筛选的文档转化为可长期维护的
-Wiki。Agent 负责理解与综合，`lwc` 负责保存来源、页面、引用、链接、索引和历史，
-让知识持续积累，而不是每次查询都重新拼接原始片段。
+`lwc` 是一个由 Agent 驱动的主动记忆 CLI，让 AI Agent 能够跨会话自主召回、维护和
+演进持久化、来源可追溯的知识。
+
+**兼容 Claude Code、Codex、Cursor、OpenCode、Gemini CLI、Kiro、Hermes、
+Antigravity 和 pi。**
+
+LWC 把经过筛选的文档转化为可长期维护的 Wiki。Agent 负责理解与综合，`lwc` 负责
+保存来源、页面、引用、链接、索引和历史，让知识持续积累，而不是每次查询都重新拼接
+原始片段。
 
 <p align="center">
   <img src="docs/images/lwc-overview-zh.png" alt="LWC 产品概览" width="820">
