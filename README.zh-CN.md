@@ -9,6 +9,7 @@
   <img alt="Node.js 22 or newer" src="https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs">
   <img alt="平台：macOS、Linux、Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-666666">
   <a href="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://skills.sh/JanYork/llm-wiki-cli"><img alt="skills.sh" src="https://skills.sh/b/JanYork/llm-wiki-cli"></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
 </p>
 
@@ -269,8 +270,14 @@ cargo install --locked --path .
 ## 配套 Agent Skill
 
 仓库内置 [`skills/using-lwc`](skills/using-lwc) Agent Skill，让 `lwc` 在有长期
-价值的会话中主动承担外部记忆层。应将它安装到当前 Agent 运行时的用户级 Skill
-目录。以 Codex 为例，可在本地检出目录中执行：
+价值的会话中主动承担外部记忆层。可从
+[skills.sh](https://skills.sh/JanYork/llm-wiki-cli) 安装：
+
+```bash
+npx skills add JanYork/llm-wiki-cli --skill using-lwc -g
+```
+
+也可以从本地检出复制到当前 Agent 运行时的用户级 Skill 目录。以 Codex 为例：
 
 ```bash
 mkdir -p "$HOME/.agents/skills"
