@@ -1267,3 +1267,44 @@ fn graph_work_resumes_only_uncommitted_documents_after_a_document_failure() {
         3
     );
 }
+
+#[test]
+fn graph_work_cancel_then_resume_reaches_a_verified_terminal_state() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    for index in 0..24 {
+        let slug = format!("cancel-resume-{index:02}");
+        put_page(
+            &world,
+            &slug,
+            &slug,
+            "small document for deterministic cancellation coverage",
+        );
+    }
+
+    let configured = world.ok(&world.project, &["config", "set", "--graph", "grafeo"]);
+    let work_id = configured["work"]["id"].as_str().unwrap();
+    let cancellation = world.ok(&world.project, &["work", "cancel", work_id]);
+    assert!(cancellation["work"]["cancel_requested"].as_bool().unwrap());
+
+    let cancelled = world.ok(&world.project, &["work", "watch", work_id]);
+    assert_eq!(cancelled["work"]["state"], "cancelled", "{cancelled}");
+    assert_eq!(
+        cancelled["work"]["error"]["code"], "work_cancelled",
+        "{cancelled}"
+    );
+    if let Some(total) = cancelled["work"]["total"].as_u64() {
+        assert!(
+            cancelled["work"]["completed"].as_u64().unwrap() < total,
+            "{cancelled}"
+        );
+    }
+
+    let resumed = world.ok(&world.project, &["work", "resume", work_id]);
+    assert_eq!(resumed["work"]["state"], "queued", "{resumed}");
+    assert!(!resumed["work"]["cancel_requested"].as_bool().unwrap());
+
+    let completed = world.ok(&world.project, &["work", "watch", work_id]);
+    assert_eq!(completed["work"]["state"], "succeeded", "{completed}");
+    assert_eq!(world.ok(&world.project, &["graph", "verify"])["ok"], true);
+}

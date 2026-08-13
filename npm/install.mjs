@@ -36,11 +36,30 @@ export function checksumFor(contents, archive) {
   throw new Error(`checksum not found for ${archive}`)
 }
 
-async function download(url, destination, fetchImpl) {
-  const response = await fetchImpl(url)
-  if (!response.ok)
-    throw new Error(`download failed (${response.status}): ${url}`)
-  await writeFile(destination, new Uint8Array(await response.arrayBuffer()))
+export async function download(url, destination, fetchImpl, {
+  retries = 2,
+  retryDelayMs = 250,
+  timeoutMs = 30_000,
+} = {}) {
+  let cause
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const response = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) })
+      if (!response.ok)
+        throw new Error(`download failed (${response.status}): ${url}`)
+      await writeFile(destination, new Uint8Array(await response.arrayBuffer()))
+      return
+    }
+    catch (error) {
+      cause = error
+      if (attempt < retries)
+        await new Promise(resolve => setTimeout(resolve, retryDelayMs * (2 ** attempt)))
+    }
+  }
+  throw new Error(
+    `download failed after ${retries + 1} attempts: ${url}: ${cause?.message ?? cause}`,
+    { cause },
+  )
 }
 
 export async function install({

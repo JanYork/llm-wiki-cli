@@ -8,7 +8,8 @@ use crate::{
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use rusqlite::{
     Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
-    backup::Backup, ffi, params,
+    backup::{Backup, StepResult},
+    ffi, params,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -222,6 +223,16 @@ pub struct Store {
     scope: String,
     database: PathBuf,
     conn: Connection,
+}
+
+struct TemporaryDatabase(PathBuf);
+
+impl Drop for TemporaryDatabase {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+        let _ = fs::remove_file(self.0.with_extension("db-shm"));
+        let _ = fs::remove_file(self.0.with_extension("db-wal"));
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

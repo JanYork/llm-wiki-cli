@@ -472,6 +472,217 @@ fn checkpoint_restore_recovers_the_database_and_keeps_a_safety_copy() {
 }
 
 #[test]
+fn checkpoint_restore_reprojects_the_document_graph() {
+    let world = TestWorld::new();
+    world.init();
+    let configured = world.ok(&["config", "set", "--graph", "grafeo"]);
+    if let Some(work_id) = configured["work"]["id"].as_str() {
+        world.ok(&["work", "watch", work_id]);
+    }
+    world.ok(&["checkpoint", "create", "graph-baseline"]);
+
+    let page = world.write("post-checkpoint.md", "post-checkpoint graph page");
+    let inserted = world.ok(&[
+        "page",
+        "put",
+        "post-checkpoint",
+        "--title",
+        "Post Checkpoint",
+        "--file",
+        as_str(&page),
+    ]);
+    world.ok(&[
+        "work",
+        "watch",
+        inserted["graph"]["work"]["id"].as_str().unwrap(),
+    ]);
+    assert_eq!(world.ok(&["graph", "verify"])["ok"], true);
+
+    let restored = world.ok(&["checkpoint", "restore", "graph-baseline"]);
+    world.ok(&[
+        "work",
+        "watch",
+        restored["graph_work"]["id"].as_str().unwrap(),
+    ]);
+    assert_eq!(
+        world.err(&["page", "show", "post-checkpoint"])["error"]["code"],
+        "page_not_found"
+    );
+    assert_eq!(
+        world.err(&["graph", "node", "page:post-checkpoint"])["error"]["code"],
+        "graph_node_not_found"
+    );
+    assert_eq!(world.ok(&["graph", "verify"])["ok"], true);
+}
+
+#[test]
+fn checkpoint_restore_reports_canonical_partial_state_when_materialization_fails() {
+    let world = TestWorld::new();
+    world.init();
+    world.ok(&["checkpoint", "create", "materialize-baseline"]);
+
+    let page = world.write("post-checkpoint.md", "post-checkpoint canonical mutation");
+    world.ok(&[
+        "page",
+        "put",
+        "post-checkpoint",
+        "--title",
+        "Post Checkpoint",
+        "--file",
+        as_str(&page),
+    ]);
+
+    let wiki = world.project.join(".lwc/wiki");
+    let saved = world.project.join(".lwc/wiki-before-restore-failure");
+    fs::rename(&wiki, &saved).unwrap();
+    fs::write(&wiki, "blocks Markdown materialization").unwrap();
+    let error = world.err(&["checkpoint", "restore", "materialize-baseline"]);
+
+    assert_eq!(
+        world.err(&["page", "show", "post-checkpoint"])["error"]["code"],
+        "page_not_found",
+        "checkpoint restore did not commit canonically before materialization failed"
+    );
+    assert_eq!(error["error"]["details"]["checkpoint_restored"], true);
+    assert_eq!(
+        error["error"]["details"]["checkpoint"],
+        "materialize-baseline"
+    );
+    assert!(
+        error["error"]["details"]["safety_checkpoint"]
+            .as_str()
+            .is_some()
+    );
+    assert_eq!(
+        error["error"]["details"]["recovery_command"],
+        "lwc --scope project maintenance materialize"
+    );
+}
+
+#[test]
+fn checkpoint_restore_recovers_after_graph_queue_failure() {
+    let world = TestWorld::new();
+    world.init();
+    let configured = world.ok(&["config", "set", "--graph", "grafeo"]);
+    if let Some(work_id) = configured["work"]["id"].as_str() {
+        world.ok(&["work", "watch", work_id]);
+    }
+    world.ok(&["checkpoint", "create", "queue-baseline"]);
+
+    let page = world.write("queued-after-baseline.md", "queued after baseline");
+    let inserted = world.ok(&[
+        "page",
+        "put",
+        "queued-after-baseline",
+        "--title",
+        "Queued After Baseline",
+        "--file",
+        as_str(&page),
+    ]);
+    world.ok(&[
+        "work",
+        "watch",
+        inserted["graph"]["work"]["id"].as_str().unwrap(),
+    ]);
+
+    let work = world.project.join(".lwc/work");
+    let saved = world.project.join(".lwc/work-before-restore-failure");
+    fs::rename(&work, &saved).unwrap();
+    fs::write(&work, "blocks graph Work creation").unwrap();
+    let error = world.err(&["checkpoint", "restore", "queue-baseline"]);
+    assert_eq!(error["error"]["code"], "graph_projection_failed");
+    assert_eq!(error["error"]["details"]["checkpoint_restored"], true);
+    assert_eq!(
+        error["error"]["details"]["recovery_command"],
+        "lwc --scope project config set --graph grafeo"
+    );
+
+    fs::remove_file(&work).unwrap();
+    fs::rename(saved, &work).unwrap();
+    let recovered = world.ok(&["config", "set", "--graph", "grafeo"]);
+    world.ok(&["work", "watch", recovered["work"]["id"].as_str().unwrap()]);
+    assert_eq!(
+        world.err(&["page", "show", "queued-after-baseline"])["error"]["code"],
+        "page_not_found"
+    );
+    assert_eq!(world.ok(&["graph", "verify"])["ok"], true);
+}
+
+#[test]
+fn checkpoint_restore_rejects_a_checkpoint_that_cannot_record_the_restore() {
+    let world = TestWorld::new();
+    world.init();
+    world.ok(&["checkpoint", "create", "blocked-record"]);
+
+    let page = world.write("preserved-live.md", "preserved live state");
+    world.ok(&[
+        "page",
+        "put",
+        "preserved-live",
+        "--title",
+        "Preserved Live",
+        "--file",
+        as_str(&page),
+    ]);
+    let checkpoint = world.project.join(".lwc/checkpoints/blocked-record.db");
+    Connection::open(checkpoint)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER block_checkpoint_restore_operation
+             BEFORE INSERT ON operations
+             WHEN NEW.action = 'checkpoint_restore'
+             BEGIN SELECT RAISE(ABORT, 'blocked restore record'); END;",
+        )
+        .unwrap();
+
+    let error = world.err(&["checkpoint", "restore", "blocked-record"]);
+    assert_eq!(error["error"]["code"], "checkpoint_invalid");
+    assert_eq!(error["error"]["details"]["checkpoint_restored"], false);
+    assert_eq!(
+        world.ok(&["page", "show", "preserved-live"])["page"]["body"],
+        "preserved live state"
+    );
+}
+
+#[test]
+fn checkpoint_restore_accepts_a_nondefault_checkpoint_page_size() {
+    let world = TestWorld::new();
+    world.init();
+    let database = world.database();
+    let database_connection = Connection::open(database).unwrap();
+    database_connection
+        .execute_batch("PRAGMA journal_mode=DELETE; PRAGMA page_size=8192; VACUUM;")
+        .unwrap();
+    assert_eq!(
+        database_connection
+            .pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        8192
+    );
+    database_connection
+        .execute_batch("PRAGMA journal_mode=WAL;")
+        .unwrap();
+    drop(database_connection);
+    world.ok(&["checkpoint", "create", "large-pages"]);
+
+    let page = world.write("after-large-pages.md", "after large pages checkpoint");
+    world.ok(&[
+        "page",
+        "put",
+        "after-large-pages",
+        "--title",
+        "After Large Pages",
+        "--file",
+        as_str(&page),
+    ]);
+    world.ok(&["checkpoint", "restore", "large-pages"]);
+    assert_eq!(
+        world.err(&["page", "show", "after-large-pages"])["error"]["code"],
+        "page_not_found"
+    );
+}
+
+#[test]
 fn changeset_copy_constraint_failure_rolls_back_every_live_table() {
     let world = TestWorld::new();
     world.init();

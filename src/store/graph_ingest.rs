@@ -896,21 +896,134 @@ impl Store {
         let source = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         configure_read_only_connection(&source, BUSY_TIMEOUT)?;
         prepare_store_read_only(&source)?;
-
         let safety_checkpoint = fresh_checkpoint_name(&self.database, "pre-restore")?;
         let safety_path = checkpoint_path(&self.database, &safety_checkpoint)?;
-        create_checkpoint(&self.conn, &safety_path)?;
-
-        {
-            let backup = Backup::new(&source, &mut self.conn)?;
-            backup.run_to_completion(100, Duration::from_millis(10), None)?;
-        }
-        validate_store(&self.conn)?;
-        self.record_top_level_operation(
-            "checkpoint_restore",
-            name,
-            json!({ "safety_checkpoint": safety_checkpoint }),
+        let runtime = crate::scope::require_database_runtime_root(&self.database)?;
+        let candidate_path = runtime.join(format!(
+            ".restore-candidate-{}-{}.db",
+            std::process::id(),
+            SOURCE_STAGE_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate_path)?;
+        let candidate_guard = TemporaryDatabase(candidate_path.clone());
+        let mut candidate = Connection::open_with_flags(
+            &candidate_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
+        configure_read_only_connection(&candidate, BUSY_TIMEOUT)?;
+        let prepared = (|| -> Result<()> {
+            {
+                let backup = Backup::new(&source, &mut candidate)?;
+                backup.run_to_completion(100, Duration::from_millis(10), None)?;
+            }
+            validate_store(&candidate)?;
+            validate_database_integrity(&candidate)?;
+            let tx = candidate.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            record_operation(
+                &tx,
+                "checkpoint_restore",
+                name,
+                &json!({ "safety_checkpoint": safety_checkpoint }),
+            )?;
+            tx.commit()?;
+            validate_store(&candidate)?;
+            validate_database_integrity(&candidate)
+        })();
+        if let Err(error) = prepared {
+            drop(candidate);
+            return Err(AppError::new(
+                "checkpoint_invalid",
+                format!("checkpoint {name} cannot be restored safely: {error}"),
+            )
+            .with_details(json!({
+                "checkpoint_restored": false,
+                "checkpoint": name,
+                "cause": error.code,
+            })));
+        }
+        create_checkpoint(&self.conn, &safety_path)?;
+        let safety = Connection::open_with_flags(&safety_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        configure_read_only_connection(&safety, BUSY_TIMEOUT)?;
+        let safety_revision = store_identity(&safety)?.revision;
+        {
+            let backup = Backup::new(&candidate, &mut self.conn)?;
+            let lock_started = Instant::now();
+            loop {
+                match backup.step(1)? {
+                    StepResult::More => break,
+                    StepResult::Busy | StepResult::Locked => {
+                        if lock_started.elapsed() >= BUSY_TIMEOUT {
+                            return Err(AppError::new(
+                                "database_busy",
+                                "the live Wiki stayed busy while checkpoint restore was acquiring its write lock",
+                            )
+                            .with_details(json!({
+                                "checkpoint_restored": false,
+                                "retryable": true,
+                                "retry_after_ms": 100,
+                            })));
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    StepResult::Done => {
+                        return Err(AppError::new(
+                            "checkpoint_invalid",
+                            "checkpoint is too small to preserve a pre-restore safety snapshot",
+                        ));
+                    }
+                    _ => continue,
+                }
+            }
+            let live = Connection::open_with_flags(
+                &self.database,
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            configure_read_only_connection(&live, BUSY_TIMEOUT)?;
+            if store_identity(&live)?.revision != safety_revision {
+                drop(backup);
+                drop(safety);
+                drop(candidate);
+                let _ = fs::remove_file(&safety_path);
+                return Err(AppError::new(
+                    "database_busy",
+                    "the live Wiki changed while checkpoint restore was preparing; retry the restore",
+                )
+                .with_details(json!({
+                    "checkpoint_restored": false,
+                    "retryable": true,
+                    "retry_after_ms": 100,
+                })));
+            }
+            loop {
+                match backup.step(-1)? {
+                    StepResult::Done => break,
+                    StepResult::Busy | StepResult::Locked
+                        if lock_started.elapsed() < BUSY_TIMEOUT =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    StepResult::Busy | StepResult::Locked => {
+                        return Err(AppError::new(
+                            "database_busy",
+                            "the live Wiki stayed busy during checkpoint restore",
+                        )
+                        .with_details(json!({
+                            "checkpoint_restored": false,
+                            "retryable": true,
+                            "retry_after_ms": 100,
+                        })));
+                    }
+                    StepResult::More => continue,
+                    _ => continue,
+                }
+            }
+        }
+        drop(safety);
+        drop(candidate);
+        drop(candidate_guard);
         Ok(CheckpointResponse {
             scope: self.scope.clone(),
             database: self.database_string(),

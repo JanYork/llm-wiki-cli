@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 
-import { archiveFor, checksumFor, targetFor } from '../npm/install.mjs'
+import { archiveFor, checksumFor, download, install, targetFor } from '../npm/install.mjs'
 
 const cargoToml = readFileSync('Cargo.toml', 'utf8')
 const cargoVersion = /^version = "([^"]+)"/m.exec(cargoToml)[1]
@@ -66,6 +70,125 @@ test('archive and checksum selection are exact', () => {
   const hash = 'a'.repeat(64)
   assert.equal(checksumFor(`${hash}  wanted.tar.gz\n`, 'wanted.tar.gz'), hash)
   assert.throws(() => checksumFor(`${hash}  other.tar.gz\n`, 'wanted.tar.gz'), /checksum/)
+})
+
+test('release downloads retry transient failures with a fresh timeout signal', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'lwc-npm-download-'))
+  const destination = join(directory, 'asset')
+  const signals = []
+  let attempts = 0
+  const fetchImpl = async (_url, options) => {
+    attempts += 1
+    signals.push(options.signal)
+    if (attempts === 1)
+      return { ok: false, status: 503 }
+    return { ok: true, arrayBuffer: async () => new TextEncoder().encode('asset') }
+  }
+
+  await download('https://github.test/asset', destination, fetchImpl, {
+    retries: 2,
+    retryDelayMs: 0,
+    timeoutMs: 100,
+  })
+
+  assert.equal(attempts, 2)
+  assert.equal(new Set(signals).size, 2)
+  assert.ok(signals.every(signal => signal instanceof AbortSignal))
+  assert.equal(await readFile(destination, 'utf8'), 'asset')
+})
+
+test('release downloads time out every attempt and stop at the retry limit', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'lwc-npm-download-'))
+  const destination = join(directory, 'asset')
+  const signals = []
+  const fetchImpl = async (_url, options) => {
+    signals.push(options.signal)
+    return new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
+    })
+  }
+
+  await assert.rejects(
+    download('https://github.test/asset', destination, fetchImpl, {
+      retries: 1,
+      retryDelayMs: 0,
+      timeoutMs: 5,
+    }),
+    (error) => {
+      assert.match(error.message, /download failed after 2 attempts/)
+      assert.equal(error.cause?.name, 'TimeoutError')
+      return true
+    },
+  )
+  assert.equal(signals.length, 2)
+  assert.ok(signals.every(signal => signal.aborted))
+})
+
+test('release downloads preserve the final transport cause after finite retries', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'lwc-npm-download-'))
+  const destination = join(directory, 'asset')
+  const causes = [new Error('reset-1'), new Error('reset-2'), new Error('reset-final')]
+  let attempts = 0
+  const fetchImpl = async () => {
+    throw causes[attempts++]
+  }
+
+  await assert.rejects(
+    download('https://github.test/asset', destination, fetchImpl, {
+      retries: 2,
+      retryDelayMs: 0,
+      timeoutMs: 100,
+    }),
+    (error) => {
+      assert.match(error.message, /download failed after 3 attempts/)
+      assert.equal(error.cause, causes[2])
+      return true
+    },
+  )
+  assert.equal(attempts, 3)
+})
+
+test('installer applies timeout signals to both GitHub release downloads', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'lwc-npm-install-'))
+  const destinationRoot = join(directory, 'package')
+  const tarCommand = join(directory, 'fake-tar')
+  const archive = new TextEncoder().encode('archive fixture')
+  const archiveHash = createHash('sha256').update(archive).digest('hex')
+  const requests = []
+  await writeFile(
+    tarCommand,
+    `#!/bin/sh
+stage="$4/lwc-9.8.7-x86_64-unknown-linux-gnu"
+mkdir -p "$stage"
+printf '#!/bin/sh\\nprintf "lwc 9.8.7\\n"\\n' > "$stage/lwc"
+chmod 755 "$stage/lwc"
+`,
+  )
+  await chmod(tarCommand, 0o755)
+  const fetchImpl = async (url, options) => {
+    requests.push({ url, signal: options.signal })
+    const contents = url.endsWith('/SHA256SUMS')
+      ? new TextEncoder().encode(`${archiveHash}  lwc-9.8.7-x86_64-unknown-linux-gnu.tar.gz\n`)
+      : archive
+    return { ok: true, arrayBuffer: async () => contents }
+  }
+
+  const installed = await install({
+    arch: 'x64',
+    destinationRoot,
+    fetchImpl,
+    platform: 'linux',
+    tarCommand,
+    version: '9.8.7',
+  })
+
+  assert.equal(requests.length, 2)
+  assert.deepEqual(
+    requests.map(request => request.url.split('/').at(-1)).sort(),
+    ['SHA256SUMS', 'lwc-9.8.7-x86_64-unknown-linux-gnu.tar.gz'],
+  )
+  assert.ok(requests.every(request => request.signal instanceof AbortSignal))
+  assert.match(await readFile(installed, 'utf8'), /lwc 9\.8\.7/)
 })
 
 test('npm package contains only declared files', () => {

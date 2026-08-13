@@ -1174,8 +1174,106 @@ fn run(cli: Cli) -> Result<Value> {
                 CheckpointCommand::Restore { name } => {
                     let mut store = Store::open(scope_name(store_path.scope), &store_path.path)?;
                     let response = store.checkpoint_restore(&name)?;
-                    store.materialize()?;
-                    to_json(response)
+                    let graph_work = work::start_graph_projection(
+                        scope_name(store_path.scope),
+                        &store_path.path,
+                    )
+                    .map(|response| Some(response["work"].clone()))
+                    .or_else(|error| {
+                        if error.code == "graph_disabled" {
+                            Ok(None)
+                        } else {
+                            Err(error)
+                        }
+                    });
+                    let graph_recovery_command = || {
+                        config::resolve(scope_name(store_path.scope), &store_path.path)
+                            .ok()
+                            .and_then(|current| match current.setting {
+                                config::GraphSetting::Disabled => None,
+                                config::GraphSetting::Grafeo => Some("grafeo"),
+                                config::GraphSetting::Surrealdb => Some("surrealdb"),
+                                config::GraphSetting::Inherit => {
+                                    unreachable!("resolved graph setting")
+                                }
+                            })
+                            .map_or_else(
+                                || {
+                                    format!(
+                                        "lwc --scope {} config show",
+                                        scope_name(store_path.scope),
+                                    )
+                                },
+                                |engine| {
+                                    format!(
+                                        "lwc --scope {} config set --graph {}",
+                                        scope_name(store_path.scope),
+                                        engine,
+                                    )
+                                },
+                            )
+                    };
+                    let materialized = store.materialize();
+                    let graph_work = match (graph_work, materialized) {
+                        (Ok(graph_work), Ok(_)) => graph_work,
+                        (Ok(graph_work), Err(error)) => {
+                            return Err(AppError::new(
+                                "checkpoint_restored_materialization_failed",
+                                format!(
+                                    "checkpoint restored canonically but Markdown materialization failed: {error}"
+                                ),
+                            )
+                            .with_details(json!({
+                                "checkpoint_restored": true,
+                                "checkpoint": name,
+                                "safety_checkpoint": response.safety_checkpoint,
+                                "graph_work": graph_work,
+                                "cause": error.code,
+                                "recovery_command": format!(
+                                    "lwc --scope {} maintenance materialize",
+                                    scope_name(store_path.scope),
+                                ),
+                            })));
+                        }
+                        (Err(error), Ok(_)) => {
+                            return Err(AppError::new(
+                                "graph_projection_failed",
+                                "checkpoint restored canonically but graph Work could not be queued",
+                            )
+                            .with_details(json!({
+                                "checkpoint_restored": true,
+                                "checkpoint": name,
+                                "safety_checkpoint": response.safety_checkpoint,
+                                "cause": error.code,
+                                "recovery_command": graph_recovery_command(),
+                            })));
+                        }
+                        (Err(graph_error), Err(materialize_error)) => {
+                            return Err(AppError::new(
+                                "checkpoint_restored_projection_failed",
+                                "checkpoint restored canonically but graph and Markdown projections failed",
+                            )
+                            .with_details(json!({
+                                "checkpoint_restored": true,
+                                "checkpoint": name,
+                                "safety_checkpoint": response.safety_checkpoint,
+                                "graph_cause": graph_error.code,
+                                "materialize_cause": materialize_error.code,
+                                "recovery_commands": [
+                                    format!(
+                                        "lwc --scope {} maintenance materialize",
+                                        scope_name(store_path.scope),
+                                    ),
+                                    graph_recovery_command(),
+                                ],
+                            })));
+                        }
+                    };
+                    let mut response = to_json(response)?;
+                    if let Some(graph_work) = graph_work {
+                        response["graph_work"] = graph_work;
+                    }
+                    Ok(response)
                 }
             }
         }
