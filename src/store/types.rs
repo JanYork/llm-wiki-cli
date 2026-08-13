@@ -743,6 +743,7 @@ pub struct ChangesetPublishInput {
     pub checkpoint: String,
     pub lint_issues: usize,
     pub lint_override_reason: Option<String>,
+    pub graph_documents: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -755,6 +756,8 @@ pub struct ChangesetCommitState {
     pub staged_operation_count: usize,
     pub lint_issues: usize,
     pub locked_publish_ms: u64,
+    pub source_id_remap: Vec<SparseSourceIdRemap>,
+    pub graph_documents: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -786,6 +789,7 @@ pub struct ChangesetRollbackState {
     pub rollback_revision: String,
     pub checkpoint: String,
     pub locked_rollback_ms: u64,
+    pub graph_documents: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -808,6 +812,10 @@ struct SparsePageInverse {
     slug: String,
     before: Option<SparsePageSnapshot>,
     after_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    after: Option<SparsePageSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inbound_links: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -832,6 +840,29 @@ struct SparseSourcePathSnapshot {
     tracked_path: String,
     revision: i64,
     observed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SparseTrackedPathRevision {
+    revision: i64,
+    source_id: i64,
+    observed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SparseTrackedPathInverse {
+    tracked_path: String,
+    before: Vec<SparseTrackedPathRevision>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    after: Vec<SparseTrackedPathRevision>,
+    after_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SparseSourceIdRemap {
+    pub draft_id: i64,
+    pub live_id: i64,
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -898,6 +929,8 @@ struct SparseInversePayload {
     meta: Vec<SparseMetaInverse>,
     #[serde(default)]
     sources: Vec<SparseSourceInverse>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    source_paths: Vec<SparseTrackedPathInverse>,
     #[serde(default)]
     tags: Vec<SparseTagInverse>,
 }

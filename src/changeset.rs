@@ -95,6 +95,8 @@ pub struct ChangesetRollbackResponse {
     pub locked_rollback_ms: u64,
     pub wal_checkpoint_ms: u64,
     pub materialization_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_work: Option<Value>,
 }
 
 pub fn begin(live: &StorePath, name: &str) -> Result<ChangesetBeginResponse> {
@@ -102,6 +104,7 @@ pub fn begin(live: &StorePath, name: &str) -> Result<ChangesetBeginResponse> {
     validate_name(name)?;
     let path = draft_path(live, name, true)?;
     reject_existing_draft(&path)?;
+    remove_draft_runtime(&path)?;
 
     let live_store = Store::open_for_read(scope_name(live.scope), &live.path)?;
     let base = live_store.identity()?;
@@ -111,7 +114,9 @@ pub fn begin(live: &StorePath, name: &str) -> Result<ChangesetBeginResponse> {
 
     let result = (|| -> Result<ChangesetDraftState> {
         let (mut draft, _) = Store::initialize(scope_name(live.scope), &path)?;
-        draft.changeset_begin_sparse(name, &base, &schema, &purpose, max_source_id)
+        let state = draft.changeset_begin_sparse(name, &base, &schema, &purpose, max_source_id)?;
+        fs::create_dir(crate::scope::database_runtime_root(&path)?)?;
+        Ok(state)
     })();
     let state = match result {
         Ok(state) => state,
@@ -137,6 +142,7 @@ pub fn resolve_effective(live: StorePath, name: Option<&str>) -> Result<StorePat
     };
     let path = draft_path(&live, name, false)?;
     validate_draft_binding(&live, name, &path, 0)?;
+    ensure_draft_runtime(&path)?;
     Ok(live.with_database(path))
 }
 
@@ -286,7 +292,22 @@ pub fn commit(
     let live_reader = Store::open_for_read(scope_name(live.scope), &live.path)?;
     if let Some(committed) = live_reader.changeset_committed_by_id(&state.id)? {
         drop(live_reader);
-        return finish_committed(live, &path, committed, started, 0, None);
+        let graph_work = if committed.graph_documents.is_empty() {
+            let graph = crate::external_graph::passive_status(scope_name(live.scope), &live.path)?;
+            if graph["engine"] == "disabled" {
+                None
+            } else {
+                Some(crate::work::start_graph_projection(
+                    scope_name(live.scope),
+                    &live.path,
+                )?["work"]
+                    .clone())
+            }
+        } else {
+            Store::open(scope_name(live.scope), &live.path)?
+                .schedule_graph_documents(&committed.graph_documents)?
+        };
+        return finish_committed(live, &path, committed, started, 0, graph_work);
     }
     let live_identity = live_reader.identity()?;
     let draft = Store::open_for_read(scope_name(live.scope), &path)?;
@@ -381,10 +402,11 @@ pub fn commit(
             checkpoint: checkpoint.checkpoint,
             lint_issues,
             lint_override_reason: reason.map(str::to_string),
+            graph_documents: graph_documents.clone(),
         },
     )?;
     let graph_work = live_store
-        .schedule_graph_documents(&graph_documents)
+        .schedule_graph_documents(&committed.graph_documents)
         .map_err(|error| {
             AppError::new(
                 "graph_projection_failed",
@@ -543,10 +565,25 @@ fn finish_rolled_back(
             "rolled_back": true,
             "changeset_id": rolled_back.changeset_id,
             "checkpoint": rolled_back.checkpoint,
-            "recovery_command": "lwc maintenance materialize",
+            "recovery_command": format!("lwc changeset rollback {}", rolled_back.changeset_id),
         })));
     }
     let materialization_ms = elapsed_millis(materialization_started);
+    let graph_work = Store::open(scope_name(live.scope), &live.path)?
+        .schedule_graph_documents(&rolled_back.graph_documents)
+        .map_err(|error| {
+            AppError::new(
+                "changeset_rolled_back_graph_projection_failed",
+                "changeset rolled back canonically but graph Work could not be queued",
+            )
+            .with_details(json!({
+                "rolled_back": true,
+                "changeset_id": rolled_back.changeset_id,
+                "checkpoint": rolled_back.checkpoint,
+                "cause": error.code,
+                "recovery_command": format!("lwc changeset rollback {}", rolled_back.changeset_id),
+            }))
+        })?;
     let wal_checkpoint_started = Instant::now();
     let wal_checkpointed = Store::open(scope_name(live.scope), &live.path)
         .is_ok_and(|store| store.try_checkpoint_wal());
@@ -566,6 +603,7 @@ fn finish_rolled_back(
         locked_rollback_ms: rolled_back.locked_rollback_ms,
         wal_checkpoint_ms,
         materialization_ms,
+        graph_work,
     })
 }
 
@@ -771,6 +809,7 @@ fn remove_draft_files(database: &Path) -> Result<()> {
             Err(error) => return Err(error.into()),
         }
     }
+    remove_draft_runtime(database)?;
     for path in paths {
         match fs::remove_file(&path) {
             Ok(()) => {}
@@ -779,6 +818,33 @@ fn remove_draft_files(database: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn remove_draft_runtime(database: &Path) -> Result<()> {
+    let runtime = crate::scope::database_runtime_root(database)?;
+    match fs::symlink_metadata(&runtime) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(invalid_path(&runtime))
+        }
+        Ok(_) => fs::remove_dir_all(&runtime).map_err(Into::into),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn ensure_draft_runtime(database: &Path) -> Result<()> {
+    let runtime = crate::scope::database_runtime_root(database)?;
+    match fs::symlink_metadata(&runtime) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(invalid_path(&runtime))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&runtime)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn database_sidecar(path: &Path, suffix: &str) -> PathBuf {

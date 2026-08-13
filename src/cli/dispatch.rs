@@ -77,9 +77,9 @@ fn run(cli: Cli) -> Result<Value> {
             Ok(response)
         }
         Command::Work { command } => {
-            changeset::reject_selector(selected_changeset.as_deref(), "work")?;
             ensure_scope_supported(cli.scope, false, "work")?;
-            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
+            let store_path =
+                resolve_effective_store_path(cli.scope, &cwd, selected_changeset.as_deref())?;
             match command {
                 WorkCommand::List => work::list(&store_path),
                 WorkCommand::Status { id } => work::status(&store_path, &id),

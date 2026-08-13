@@ -61,7 +61,10 @@ fn view_serves_get_only_without_mutating_the_project() {
     let index = request(address, "GET", "/");
     assert!(index.starts_with("HTTP/1.1 200"));
     assert!(index.contains("/assets/app.js"));
-    assert!(!index.contains("unsafe-inline"));
+    assert!(index.contains("script-src 'self'"));
+    assert!(index.contains("style-src-elem 'self'"));
+    assert!(index.contains("style-src-attr 'unsafe-inline'"));
+    assert!(!index.contains("style-src-elem 'unsafe-inline'"));
     let script = request(address, "GET", "/assets/app.js");
     assert!(script.starts_with("HTTP/1.1 200"));
     assert!(script.contains("content-type: application/javascript"));

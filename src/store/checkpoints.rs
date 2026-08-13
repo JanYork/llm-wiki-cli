@@ -174,6 +174,17 @@ fn load_sparse_page_snapshot(conn: &Connection, slug: &str) -> Result<Option<Spa
     Ok(Some(page))
 }
 
+fn load_sparse_page_inbound_links(conn: &Connection, slug: &str) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT from_slug FROM links
+         WHERE to_slug = ?1 AND from_slug <> ?1
+         ORDER BY from_slug",
+    )?;
+    Ok(statement
+        .query_map(params![slug], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 fn sparse_page_fingerprint(page: &SparsePageSnapshot) -> String {
     page_content_fingerprint(
         &page.title,
@@ -270,7 +281,56 @@ fn load_sparse_source_snapshot(
 }
 
 fn sparse_source_fingerprint(source: &SparseSourceSnapshot) -> String {
-    hash_content(&serde_json::to_string(source).unwrap_or_default())
+    let mut canonical = source.clone();
+    for path in &mut canonical.paths {
+        path.revision = 0;
+        path.observed_at.clear();
+    }
+    hash_content(&serde_json::to_string(&canonical).unwrap_or_default())
+}
+
+fn load_sparse_tracked_path(
+    conn: &Connection,
+    tracked_path: &str,
+) -> Result<Vec<SparseTrackedPathRevision>> {
+    let mut statement = conn.prepare(
+        "SELECT revision, source_id, observed_at
+         FROM source_path_revisions WHERE tracked_path = ?1 ORDER BY revision",
+    )?;
+    Ok(statement
+        .query_map([tracked_path], |row| {
+            Ok(SparseTrackedPathRevision {
+                revision: row.get(0)?,
+                source_id: row.get(1)?,
+                observed_at: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn sparse_tracked_path_fingerprint(revisions: &[SparseTrackedPathRevision]) -> String {
+    hash_content(&serde_json::to_string(revisions).unwrap_or_default())
+}
+
+fn project_sparse_tracked_path(
+    before: &[SparseTrackedPathRevision],
+    staged: &[SparseTrackedPathRevision],
+) -> Vec<SparseTrackedPathRevision> {
+    let mut projected = before.to_vec();
+    for revision in staged {
+        if projected
+            .last()
+            .is_some_and(|head| head.source_id == revision.source_id)
+        {
+            continue;
+        }
+        projected.push(SparseTrackedPathRevision {
+            revision: projected.last().map_or(1, |head| head.revision + 1),
+            source_id: revision.source_id,
+            observed_at: revision.observed_at.clone(),
+        });
+    }
+    projected
 }
 
 fn projected_sparse_tag_snapshot(

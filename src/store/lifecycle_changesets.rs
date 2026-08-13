@@ -694,9 +694,12 @@ impl Store {
             let after_fingerprint = draft
                 .page_mutation_fingerprint(&slug)?
                 .unwrap_or_else(|| "absent".into());
+            let after = load_sparse_page_snapshot(&draft.conn, &slug)?;
             pages.push(SparsePageInverse {
+                inbound_links: load_sparse_page_inbound_links(&self.conn, &slug)?,
                 slug,
                 before,
+                after,
                 after_fingerprint,
             });
         }
@@ -720,14 +723,6 @@ impl Store {
         }
         let mut sources = Vec::new();
         for source_id in changeset_created_source_ids(&draft.conn)? {
-            let before = load_sparse_source_snapshot(&self.conn, source_id)?;
-            if before.is_some() {
-                return Err(AppError::new(
-                    "changeset_conflict",
-                    format!("source identifier {source_id} was allocated by another write"),
-                )
-                .with_details(json!({"entity_type": "source", "identifier": source_id})));
-            }
             let after = load_sparse_source_snapshot(&draft.conn, source_id)?.ok_or_else(|| {
                 AppError::new(
                     "changeset_corrupt",
@@ -736,8 +731,20 @@ impl Store {
             })?;
             sources.push(SparseSourceInverse {
                 source_id,
-                before,
+                before: None,
                 after_fingerprint: sparse_source_fingerprint(&after),
+            });
+        }
+        let mut source_paths = Vec::new();
+        for tracked_path in draft.changeset_touched_source_paths()? {
+            let before = load_sparse_tracked_path(&self.conn, &tracked_path)?;
+            let staged = load_sparse_tracked_path(&draft.conn, &tracked_path)?;
+            let after = project_sparse_tracked_path(&before, &staged);
+            source_paths.push(SparseTrackedPathInverse {
+                tracked_path,
+                before,
+                after: after.clone(),
+                after_fingerprint: sparse_tracked_path_fingerprint(&after),
             });
         }
         let mut tags = Vec::new();
@@ -763,6 +770,7 @@ impl Store {
             pages,
             meta,
             sources,
+            source_paths,
             tags,
         };
         let encoded = serde_json::to_vec(&payload)
@@ -948,6 +956,7 @@ impl Store {
         })?;
         let inverse = load_sparse_inverse(&checkpoint_path(&self.database, checkpoint)?)?;
         let identity = self.identity()?;
+        let source_id_remap = load_sparse_source_id_remap(&self.conn, &history.id)?;
         let pages = inverse
             .payload
             .pages
@@ -955,8 +964,10 @@ impl Store {
             .map(|page| {
                 let before = load_sparse_page_snapshot(&self.conn, &page.slug)?;
                 Ok(SparsePageInverse {
+                    inbound_links: load_sparse_page_inbound_links(&self.conn, &page.slug)?,
                     slug: page.slug.clone(),
                     before,
+                    after: page.before.clone(),
                     after_fingerprint: page
                         .before
                         .as_ref()
@@ -987,7 +998,14 @@ impl Store {
             .sources
             .iter()
             .map(|entry| {
-                let before = load_sparse_source_snapshot(&self.conn, entry.source_id)?;
+                let live_id = source_id_remap
+                    .iter()
+                    .find(|remap| remap.draft_id == entry.source_id)
+                    .map_or(entry.source_id, |remap| remap.live_id);
+                let before = load_sparse_source_snapshot(&self.conn, live_id)?.map(|mut source| {
+                    source.id = entry.source_id;
+                    source
+                });
                 Ok(SparseSourceInverse {
                     source_id: entry.source_id,
                     before,
@@ -996,6 +1014,19 @@ impl Store {
                         .as_ref()
                         .map(sparse_source_fingerprint)
                         .unwrap_or_else(|| "absent".into()),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let source_paths = inverse
+            .payload
+            .source_paths
+            .iter()
+            .map(|entry| {
+                Ok(SparseTrackedPathInverse {
+                    tracked_path: entry.tracked_path.clone(),
+                    before: load_sparse_tracked_path(&self.conn, &entry.tracked_path)?,
+                    after: entry.before.clone(),
+                    after_fingerprint: sparse_tracked_path_fingerprint(&entry.before),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1018,6 +1049,7 @@ impl Store {
             pages,
             meta,
             sources,
+            source_paths,
             tags,
         };
         let encoded = serde_json::to_vec(&payload)
@@ -1158,12 +1190,20 @@ impl Store {
                     "rollback operation lacks rollback_revision",
                 )
             })?;
+        let graph_documents = detail
+            .get("graph_documents")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?
+            .unwrap_or_default();
         Ok(Some(ChangesetRollbackState {
             changeset_id: id.to_string(),
             name,
             rollback_revision: rollback_revision.to_string(),
             checkpoint: checkpoint.to_string(),
             locked_rollback_ms: 0,
+            graph_documents,
         }))
     }
 }

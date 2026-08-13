@@ -196,12 +196,20 @@ fn validate_config_file(config: ConfigFile) -> Result<ConfigFile> {
 }
 
 pub fn config_path_for_database(database: &Path) -> Result<PathBuf> {
-    let parent = database.parent().ok_or_else(|| {
+    let mut parent = database.parent().ok_or_else(|| {
         AppError::new(
             "invalid_config_path",
             "wiki database has no configuration directory",
         )
     })?;
+    if parent.file_name().and_then(|name| name.to_str()) == Some("changesets") {
+        parent = parent.parent().ok_or_else(|| {
+            AppError::new(
+                "invalid_config_path",
+                "changeset database has no configuration directory",
+            )
+        })?;
+    }
     Ok(parent.join("config.json"))
 }
 

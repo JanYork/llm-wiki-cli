@@ -9,6 +9,7 @@ use std::{
 const STORE_DIR: &str = ".lwc";
 const STORE_FILE: &str = "wiki.db";
 const PROJECT_ROOT_ENV: &str = "LWC_PROJECT_ROOT";
+const DRAFT_RUNTIME_PREFIX: &str = "draft-";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -46,6 +47,51 @@ impl StorePath {
     pub(crate) fn authority_path(&self) -> &Path {
         &self.authority_path
     }
+}
+
+pub(crate) fn database_runtime_root(database: &Path) -> Result<PathBuf> {
+    let parent = database.parent().ok_or_else(|| {
+        AppError::new(
+            "invalid_store_path",
+            "wiki database has no runtime directory",
+        )
+    })?;
+    if parent.file_name().and_then(|name| name.to_str()) == Some("changesets") {
+        let name = database
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                AppError::new(
+                    "invalid_store_path",
+                    "changeset database has no runtime name",
+                )
+            })?;
+        return Ok(parent.join(format!("{DRAFT_RUNTIME_PREFIX}{name}")));
+    }
+    Ok(parent.to_path_buf())
+}
+
+pub(crate) fn require_database_runtime_root(database: &Path) -> Result<PathBuf> {
+    let runtime = database_runtime_root(database)?;
+    let metadata = fs::symlink_metadata(&runtime).map_err(|error| {
+        AppError::new(
+            "invalid_store_path",
+            format!(
+                "wiki runtime path {} is unavailable: {error}",
+                runtime.display()
+            ),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AppError::new(
+            "invalid_store_path",
+            format!(
+                "wiki runtime path {} is not a real directory",
+                runtime.display()
+            ),
+        ));
+    }
+    Ok(runtime)
 }
 
 pub fn init_store_path(scope: Scope, cwd: &Path) -> Result<StorePath> {

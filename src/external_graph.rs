@@ -40,7 +40,7 @@ pub fn projection_keys(scope: &str, database: &Path) -> Result<Vec<(String, Stri
     let mut keys = document_keys(&conn)?;
     match setting {
         GraphSetting::Grafeo => {
-            let path = sidecar(database, setting);
+            let path = sidecar(database, setting)?;
             if path.exists() {
                 let graph = GrafeoDB::open(path).map_err(graph_error)?;
                 append_stale_keys(&mut keys, load_grafeo_documents(&graph)?);
@@ -48,7 +48,7 @@ pub fn projection_keys(scope: &str, database: &Path) -> Result<Vec<(String, Stri
             }
         }
         GraphSetting::Surrealdb => {
-            let path = sidecar(database, setting);
+            let path = sidecar(database, setting)?;
             if path.exists() {
                 let runtime = tokio::runtime::Runtime::new()
                     .map_err(|error| AppError::new("surrealdb_open_failed", error.to_string()))?;
@@ -86,7 +86,7 @@ pub fn project_documents(
 
     match setting {
         GraphSetting::Grafeo => {
-            let graph = GrafeoDB::open(sidecar(database, setting)).map_err(graph_error)?;
+            let graph = GrafeoDB::open(sidecar(database, setting)?).map_err(graph_error)?;
             if selected.is_none() {
                 append_stale_keys(&mut keys, load_grafeo_documents(&graph)?);
             }
@@ -151,7 +151,7 @@ pub fn status(scope: &str, database: &Path) -> Result<Value> {
             return Ok(json!({"engine": "disabled", "status": "disabled", "documents": 0}));
         }
         GraphSetting::Grafeo => {
-            let path = sidecar(database, setting);
+            let path = sidecar(database, setting)?;
             if !path.exists() {
                 return Ok(json!({"engine": "grafeo", "status": "pending", "documents": 0}));
             }
@@ -166,7 +166,7 @@ pub fn status(scope: &str, database: &Path) -> Result<Value> {
             usize::try_from(count).unwrap_or_default()
         }
         GraphSetting::Surrealdb => {
-            let path = sidecar(database, setting);
+            let path = sidecar(database, setting)?;
             if !path.exists() {
                 return Ok(json!({"engine": "surrealdb", "status": "pending", "documents": 0}));
             }
@@ -200,7 +200,7 @@ pub fn passive_status(scope: &str, database: &Path) -> Result<Value> {
     }
     Ok(json!({
         "engine": setting_name(setting),
-        "status": if sidecar(database, setting).exists() { "ready" } else { "pending" },
+        "status": if sidecar(database, setting)?.exists() { "ready" } else { "pending" },
     }))
 }
 
@@ -461,7 +461,7 @@ fn load_projected_documents(scope: &str, database: &Path) -> Result<Vec<Projecti
     match setting {
         GraphSetting::Disabled => Err(AppError::new("graph_disabled", "graph is disabled")),
         GraphSetting::Grafeo => {
-            let graph = GrafeoDB::open(sidecar(database, setting)).map_err(graph_error)?;
+            let graph = GrafeoDB::open(sidecar(database, setting)?).map_err(graph_error)?;
             let documents = load_grafeo_documents(&graph)?;
             graph.close().map_err(graph_error)?;
             Ok(documents)
@@ -737,7 +737,7 @@ fn grafeo_params(document: &ProjectionDocument) -> HashMap<String, GrafeoValue> 
 }
 
 async fn open_surreal(database: &Path) -> Result<Surreal<surrealdb::engine::local::Db>> {
-    let graph = Surreal::new::<SurrealKv>(sidecar(database, GraphSetting::Surrealdb))
+    let graph = Surreal::new::<SurrealKv>(sidecar(database, GraphSetting::Surrealdb)?)
         .await
         .map_err(surreal_error)?;
     graph
@@ -791,15 +791,14 @@ async fn replace_surreal(
     Ok(())
 }
 
-fn sidecar(database: &Path, setting: GraphSetting) -> std::path::PathBuf {
-    database
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(match setting {
+fn sidecar(database: &Path, setting: GraphSetting) -> Result<std::path::PathBuf> {
+    Ok(
+        crate::scope::require_database_runtime_root(database)?.join(match setting {
             GraphSetting::Grafeo => "graph-grafeo",
             GraphSetting::Surrealdb => "graph-surrealdb",
             GraphSetting::Disabled | GraphSetting::Inherit => "graph-disabled",
-        })
+        }),
+    )
 }
 
 fn setting_name(setting: GraphSetting) -> &'static str {

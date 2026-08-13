@@ -124,6 +124,7 @@ impl Store {
         confidence: f64,
         source_ids: &[i64],
     ) -> Result<Value> {
+        self.preflight_graph_runtime()?;
         let mut response = graph_relation_set_value(
             &mut self.conn,
             &self.scope,
@@ -159,6 +160,7 @@ impl Store {
         to: &str,
         reason: &str,
     ) -> Result<Value> {
+        self.preflight_graph_runtime()?;
         let mut response = graph_relation_retract_value(
             &mut self.conn,
             &self.scope,
@@ -206,13 +208,26 @@ impl Store {
         &self,
         documents: &[(String, String)],
     ) -> Result<Option<Value>> {
-        if documents.is_empty()
-            || config::resolve(&self.scope, &self.database)?.setting == GraphSetting::Disabled
-        {
+        if documents.is_empty() || !self.preflight_graph_runtime()? {
             return Ok(None);
         }
-        let response = crate::work::start_graph_documents(&self.scope, &self.database, documents)?;
+        let response = if crate::external_graph::passive_status(&self.scope, &self.database)?
+            ["status"]
+            == "pending"
+        {
+            crate::work::start_graph_projection(&self.scope, &self.database)?
+        } else {
+            crate::work::start_graph_documents(&self.scope, &self.database, documents)?
+        };
         Ok(Some(response["work"].clone()))
+    }
+
+    pub(crate) fn preflight_graph_runtime(&self) -> Result<bool> {
+        if config::resolve(&self.scope, &self.database)?.setting == GraphSetting::Disabled {
+            return Ok(false);
+        }
+        crate::scope::require_database_runtime_root(&self.database)?;
+        Ok(true)
     }
 
     fn graph_owner_document(&self, identifier: &str) -> Result<(String, String)> {

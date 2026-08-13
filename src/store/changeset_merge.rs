@@ -93,6 +93,15 @@ fn record_source_path_revision(
     tracked_path: &str,
     source_id: i64,
 ) -> Result<(i64, bool)> {
+    record_source_path_revision_at(tx, tracked_path, source_id, None)
+}
+
+fn record_source_path_revision_at(
+    tx: &Transaction<'_>,
+    tracked_path: &str,
+    source_id: i64,
+    observed_at: Option<&str>,
+) -> Result<(i64, bool)> {
     if tracked_path.trim().is_empty() {
         return Err(AppError::new(
             "invalid_input",
@@ -116,13 +125,20 @@ fn record_source_path_revision(
         return Ok((revision, false));
     }
     let revision = latest.map_or(1, |(revision, _)| revision + 1);
-    tx.execute(
-        &format!(
+    match observed_at {
+        Some(observed_at) => tx.execute(
             "INSERT INTO source_path_revisions(tracked_path, revision, source_id, observed_at)
-             VALUES (?1, ?2, ?3, {TIMESTAMP_SQL})"
-        ),
-        params![tracked_path, revision, source_id],
-    )?;
+             VALUES (?1, ?2, ?3, ?4)",
+            params![tracked_path, revision, source_id, observed_at],
+        )?,
+        None => tx.execute(
+            &format!(
+                "INSERT INTO source_path_revisions(tracked_path, revision, source_id, observed_at)
+                 VALUES (?1, ?2, ?3, {TIMESTAMP_SQL})"
+            ),
+            params![tracked_path, revision, source_id],
+        )?,
+    };
     Ok((revision, true))
 }
 
@@ -203,6 +219,20 @@ fn load_committed_changeset(conn: &Connection, id: &str) -> Result<Option<Change
                 "changeset commit operation lacks lint_issues",
             )
         })?;
+    let source_id_remap = detail
+        .get("source_id_remap")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?
+        .unwrap_or_default();
+    let graph_documents = detail
+        .get("graph_documents")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?
+        .unwrap_or_default();
     Ok(Some(ChangesetCommitState {
         changeset_id: id,
         name,
@@ -212,6 +242,8 @@ fn load_committed_changeset(conn: &Connection, id: &str) -> Result<Option<Change
         staged_operation_count,
         lint_issues,
         locked_publish_ms: 0,
+        source_id_remap,
+        graph_documents,
     }))
 }
 
@@ -291,17 +323,39 @@ fn publish_attached_changeset(
         )
         .optional()?
         .unwrap_or(false);
-    if sparse {
-        merge_sparse_candidate(&tx, begin_operation_id, true)?;
+    let source_id_remap = if sparse {
+        merge_sparse_candidate(&tx, begin_operation_id, true)?
     } else {
         let changed_search = changed_search_documents(&tx, "candidate")?;
         replace_main_from_attached(&tx, "candidate")?;
         refresh_changed_search_documents(&tx, changed_search)?;
-    }
+        Vec::new()
+    };
     changeset_test_fault("after_fts")?;
     validate_database_integrity(&tx)?;
     changeset_test_fault("after_integrity")?;
 
+    let source_id_map = source_id_remap
+        .iter()
+        .map(|entry| (entry.draft_id, entry.live_id))
+        .collect::<BTreeMap<_, _>>();
+    let graph_documents = input
+        .graph_documents
+        .iter()
+        .map(|(document_type, identifier)| {
+            if document_type != "source" {
+                return (document_type.clone(), identifier.clone());
+            }
+            let identifier = identifier
+                .parse::<i64>()
+                .ok()
+                .and_then(|draft_id| source_id_map.get(&draft_id).copied())
+                .map_or_else(|| identifier.clone(), |live_id| live_id.to_string());
+            (document_type.clone(), identifier)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let post_revision = record_operation(
         &tx,
         "changeset_commit",
@@ -313,6 +367,8 @@ fn publish_attached_changeset(
             "staged_operation_count": input.staged_operation_count,
             "lint_issues": input.lint_issues,
             "lint_override_reason": input.lint_override_reason,
+            "source_id_remap": &source_id_remap,
+            "graph_documents": &graph_documents,
         }),
     )?;
     tx.execute(
@@ -361,6 +417,8 @@ fn publish_attached_changeset(
         staged_operation_count: input.staged_operation_count,
         lint_issues: input.lint_issues,
         locked_publish_ms,
+        source_id_remap,
+        graph_documents,
     })
 }
 
@@ -368,8 +426,8 @@ fn merge_sparse_candidate(
     tx: &Transaction<'_>,
     begin_operation_id: i64,
     validate_operations: bool,
-) -> Result<()> {
-    let operations = {
+) -> Result<Vec<SparseSourceIdRemap>> {
+    let mut operations = {
         let mut statement = tx.prepare(
             "SELECT action, target, detail_json
              FROM candidate.operations WHERE id > ?1 ORDER BY id",
@@ -494,7 +552,11 @@ fn merge_sparse_candidate(
         }
     }
 
-    merge_sparse_sources(tx, &operations)?;
+    let source_id_remap = merge_sparse_sources(tx, &mut operations)?;
+    let source_id_map = source_id_remap
+        .iter()
+        .map(|entry| (entry.draft_id, entry.live_id))
+        .collect::<BTreeMap<_, _>>();
     for (action, target, detail) in &operations {
         let detail = serde_json::from_str::<Value>(detail)
             .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?;
@@ -502,7 +564,7 @@ fn merge_sparse_candidate(
     }
     changeset_test_fault("mid_copy")?;
     for slug in page_targets {
-        merge_sparse_page(tx, &slug)?;
+        merge_sparse_page(tx, &slug, &source_id_map)?;
     }
     merge_sparse_tags(tx, &operations)?;
     if operations
@@ -525,7 +587,7 @@ fn merge_sparse_candidate(
             [],
         )?;
     }
-    Ok(())
+    Ok(source_id_remap)
 }
 
 fn merge_sparse_tags(tx: &Transaction<'_>, operations: &[(String, String, String)]) -> Result<()> {

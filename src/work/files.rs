@@ -124,10 +124,7 @@ fn remove_file_if_present(path: &Path) -> io::Result<()> {
 }
 
 fn work_root(database: &Path) -> Result<PathBuf> {
-    let parent = database
-        .parent()
-        .ok_or_else(|| AppError::new("work_invalid", "wiki database has no parent directory"))?;
-    Ok(parent.join("work"))
+    Ok(crate::scope::require_database_runtime_root(database)?.join("work"))
 }
 
 fn ensure_root(root: &Path) -> Result<()> {

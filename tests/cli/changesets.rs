@@ -911,6 +911,557 @@ fn sparse_changeset_accepts_unchanged_multiple_provenance_fingerprint() {
 }
 
 #[test]
+fn changeset_work_watch_routes_to_the_draft_store() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let configured = world.ok(
+        &world.project,
+        &["config", "set", "--graph", "grafeo"],
+    );
+    if let Some(configured_work) = configured["work"]["id"].as_str() {
+        world.ok(&world.project, &["work", "watch", configured_work]);
+    }
+    let source = world.write("draft-work-source.md", "draft graph source");
+    let added = world.ok(
+        &world.project,
+        &["source", "add", as_str(&source)],
+    );
+    let source_id = added["source"]["id"].as_i64().unwrap().to_string();
+    let source_work = added["graph"]["work"]["id"].as_str().unwrap();
+    world.ok(&world.project, &["work", "watch", source_work]);
+    world.ok(&world.project, &["ingest", "next"]);
+    let analysis = world.write("draft-work-analysis.md", "draft graph analysis");
+    world.ok(
+        &world.project,
+        &["ingest", "analyze", &source_id, "--file", as_str(&analysis)],
+    );
+    for (slug, title, kind, contents) in [
+        (
+            "source-summary",
+            "Source summary",
+            "source",
+            "source summary links [[anchor]]",
+        ),
+        (
+            "anchor",
+            "Anchor",
+            "concept",
+            "anchor links [[source-summary]] and [[draft-work]]",
+        ),
+        (
+            "draft-work",
+            "Draft Work",
+            "concept",
+            "original draft work links [[anchor]]",
+        ),
+    ] {
+        let file = world.write(&format!("{slug}.md"), contents);
+        let page = world.ok(
+            &world.project,
+            &[
+                "page",
+                "put",
+                slug,
+                "--title",
+                title,
+                "--kind",
+                kind,
+                "--summary",
+                title,
+                "--file",
+                as_str(&file),
+                "--source",
+                &source_id,
+                "--provenance",
+                "agent-observed",
+            ],
+        );
+        let work = page["graph"]["work"]["id"].as_str().unwrap();
+        world.ok(&world.project, &["work", "watch", work]);
+    }
+    world.ok(&world.project, &["ingest", "complete", &source_id]);
+    world.ok(&world.project, &["changeset", "begin", "draft-work"]);
+    let body = world.write("draft-work.md", "draft graph work links [[anchor]]");
+    let staged = world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "draft-work",
+            "page",
+            "put",
+            "draft-work",
+            "--title",
+            "Draft Work",
+            "--summary",
+            "Draft Work",
+            "--file",
+            as_str(&body),
+            "--source",
+            &source_id,
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let draft_work = staged["graph"]["work"]["id"].as_str().unwrap();
+    let completed = world.ok(
+        &world.project,
+        &["--changeset", "draft-work", "work", "watch", draft_work],
+    );
+    assert_eq!(completed["work"]["state"], "succeeded", "{completed}");
+    let verified = world.ok(
+        &world.project,
+        &["--changeset", "draft-work", "graph", "verify"],
+    );
+    assert_eq!(verified["ok"], true, "{verified}");
+
+    let committed = world.ok(&world.project, &["changeset", "commit", "draft-work"]);
+    let commit_work = committed["graph_work"]["id"].as_str().unwrap();
+    world.ok(&world.project, &["work", "watch", commit_work]);
+    assert_eq!(
+        world.ok(&world.project, &["graph", "verify"])["ok"],
+        true
+    );
+    let rolled_back = world.ok(
+        &world.project,
+        &[
+            "changeset",
+            "rollback",
+            committed["changeset_id"].as_str().unwrap(),
+        ],
+    );
+    let rollback_work = rolled_back["graph_work"]["id"].as_str().unwrap();
+    world.ok(&world.project, &["work", "watch", rollback_work]);
+    assert_eq!(
+        world.ok(&world.project, &["graph", "verify"])["ok"],
+        true
+    );
+}
+
+#[test]
+fn changeset_work_and_graph_state_are_isolated_per_draft() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let configured = world.ok(
+        &world.project,
+        &["config", "set", "--graph", "grafeo"],
+    );
+    if let Some(work_id) = configured["work"]["id"].as_str() {
+        world.ok(&world.project, &["work", "watch", work_id]);
+    }
+
+    world.ok(&world.project, &["changeset", "begin", "draft-a"]);
+    world.ok(&world.project, &["changeset", "begin", "draft-b"]);
+    let page_a = world.write("draft-a-page.md", "draft A unique page");
+    let staged_a = world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "draft-a",
+            "page",
+            "put",
+            "draft-a-page",
+            "--title",
+            "Draft A page",
+            "--file",
+            as_str(&page_a),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let work_a = staged_a["graph"]["work"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let cross_status = world.command(
+        &world.project,
+        &["--changeset", "draft-b", "work", "status", &work_a],
+    );
+    let cross_watch = world.command(
+        &world.project,
+        &["--changeset", "draft-b", "work", "watch", &work_a],
+    );
+    let cross_cancel = world.command(
+        &world.project,
+        &["--changeset", "draft-b", "work", "cancel", &work_a],
+    );
+    let draft_b_work_list = world.ok(
+        &world.project,
+        &["--changeset", "draft-b", "work", "list"],
+    );
+    let cross_list_exposes_a = draft_b_work_list["works"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|work| work["id"] == work_a);
+    world.ok(
+        &world.project,
+        &["--changeset", "draft-a", "work", "watch", &work_a],
+    );
+
+    let page_b = world.write("draft-b-page.md", "draft B unique page");
+    let staged_b = world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "draft-b",
+            "page",
+            "put",
+            "draft-b-page",
+            "--title",
+            "Draft B page",
+            "--file",
+            as_str(&page_b),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let work_b = staged_b["graph"]["work"]["id"].as_str().unwrap();
+    world.ok(
+        &world.project,
+        &["--changeset", "draft-b", "work", "watch", work_b],
+    );
+    let verify_a = world.ok(
+        &world.project,
+        &["--changeset", "draft-a", "graph", "verify"],
+    );
+    let verify_b = world.ok(
+        &world.project,
+        &["--changeset", "draft-b", "graph", "verify"],
+    );
+    world.ok(&world.project, &["changeset", "discard", "draft-a"]);
+    world.ok(&world.project, &["changeset", "discard", "draft-b"]);
+    let runtime_removed = !world
+        .project
+        .join(".lwc/changesets/draft-draft-a")
+        .exists()
+        && !world
+            .project
+            .join(".lwc/changesets/draft-draft-b")
+            .exists();
+
+    assert!(
+        !cross_status.status.success()
+            && !cross_watch.status.success()
+            && !cross_cancel.status.success()
+            && !cross_list_exposes_a
+            && runtime_removed
+            && verify_a["ok"] == true
+            && verify_b["ok"] == true,
+        "draft isolation failed: cross_status={}, cross_watch={}, cross_cancel={}, \
+         cross_list_exposes_a={cross_list_exposes_a}, runtime_removed={runtime_removed}, \
+         verify_a={verify_a}, verify_b={verify_b}",
+        cross_status.status.success(),
+        cross_watch.status.success(),
+        cross_cancel.status.success(),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn changeset_graph_rejects_a_symlinked_draft_runtime() {
+    use std::os::unix::fs::symlink;
+
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(
+        &world.project,
+        &["config", "set", "--graph", "grafeo"],
+    );
+    world.ok(&world.project, &["changeset", "begin", "unsafe-runtime"]);
+    let runtime = world
+        .project
+        .join(".lwc/changesets/draft-unsafe-runtime");
+    let outside = world.project.join("outside-runtime");
+    fs::remove_dir(&runtime).unwrap();
+    fs::create_dir(&outside).unwrap();
+    symlink(&outside, &runtime).unwrap();
+
+    let page = world.write("unsafe-runtime-page.md", "unsafe runtime page");
+    let error = world.err(
+        &world.project,
+        &[
+            "--changeset",
+            "unsafe-runtime",
+            "page",
+            "put",
+            "unsafe-runtime-page",
+            "--title",
+            "Unsafe runtime page",
+            "--file",
+            as_str(&page),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    assert_eq!(error["error"]["code"], "changeset_path_invalid");
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    fs::remove_file(&runtime).unwrap();
+    fs::create_dir(&runtime).unwrap();
+    assert_eq!(
+        world.err(
+            &world.project,
+            &[
+                "--changeset",
+                "unsafe-runtime",
+                "page",
+                "show",
+                "unsafe-runtime-page",
+            ],
+        )["error"]["code"],
+        "page_not_found"
+    );
+    fs::remove_dir(&runtime).unwrap();
+    symlink(&outside, &runtime).unwrap();
+    let relation = world.err(
+        &world.project,
+        &[
+            "--changeset",
+            "unsafe-runtime",
+            "graph",
+            "relation",
+            "set",
+            "page:index",
+            "SUPPORTS",
+            "page:index",
+            "--provenance",
+            "agent-observed",
+            "--reason",
+            "must not partially persist",
+            "--confidence",
+            "0.8",
+        ],
+    );
+    assert_eq!(relation["error"]["code"], "changeset_path_invalid");
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    fs::remove_file(&runtime).unwrap();
+    fs::create_dir(&runtime).unwrap();
+    assert_eq!(
+        world.ok(
+            &world.project,
+            &[
+                "--changeset",
+                "unsafe-runtime",
+                "graph",
+                "relation",
+                "list",
+            ],
+        )["relations"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn changeset_safely_recreates_a_legacy_missing_draft_runtime() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(
+        &world.project,
+        &["config", "set", "--graph", "grafeo"],
+    );
+    world.ok(&world.project, &["changeset", "begin", "legacy-runtime"]);
+    let runtime = world
+        .project
+        .join(".lwc/changesets/draft-legacy-runtime");
+    fs::remove_dir(&runtime).unwrap();
+
+    let page = world.write("legacy-runtime-page.md", "legacy runtime page");
+    let staged = world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "legacy-runtime",
+            "page",
+            "put",
+            "legacy-runtime-page",
+            "--title",
+            "Legacy runtime page",
+            "--file",
+            as_str(&page),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let work = staged["graph"]["work"]["id"].as_str().unwrap();
+    world.ok(
+        &world.project,
+        &["--changeset", "legacy-runtime", "work", "watch", work],
+    );
+    assert_eq!(
+        world.ok(
+            &world.project,
+            &["--changeset", "legacy-runtime", "graph", "verify"],
+        )["ok"],
+        true
+    );
+}
+
+#[test]
+fn changeset_runtime_names_do_not_overlap_legacy_shared_roots() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    for name in ["work", "graph-grafeo", "graph-surrealdb"] {
+        let legacy = world.project.join(".lwc/changesets").join(name);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("legacy-marker"), "legacy derived state").unwrap();
+        world.ok(&world.project, &["changeset", "begin", name]);
+        world.ok(&world.project, &["changeset", "discard", name]);
+        assert_eq!(
+            fs::read_to_string(legacy.join("legacy-marker")).unwrap(),
+            "legacy derived state"
+        );
+    }
+}
+
+#[test]
+fn changeset_rollback_restores_a_dangling_link_that_predated_a_new_page() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let schema = world.write("schema.md", "# Test Wiki");
+    world.ok(&world.project, &["schema", "set", as_str(&schema)]);
+    let anchor = world.write("preexisting-anchor.md", "anchor links [[new-page]]");
+    world.ok(
+        &world.project,
+        &[
+            "page",
+            "put",
+            "anchor",
+            "--title",
+            "Anchor",
+            "--summary",
+            "Anchor",
+            "--file",
+            as_str(&anchor),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    world.ok(&world.project, &["changeset", "begin", "new-page"]);
+    let page = world.write("new-page.md", "new page links [[anchor]]");
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "new-page",
+            "page",
+            "put",
+            "new-page",
+            "--title",
+            "New page",
+            "--summary",
+            "New page",
+            "--file",
+            as_str(&page),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let committed = world.ok(&world.project, &["changeset", "commit", "new-page"]);
+    let rolled_back = world.ok(
+        &world.project,
+        &[
+            "changeset",
+            "rollback",
+            committed["changeset_id"].as_str().unwrap(),
+        ],
+    );
+    assert_eq!(rolled_back["status"], "rolled_back");
+    assert_eq!(
+        world.err(&world.project, &["page", "show", "new-page"])["error"]["code"],
+        "page_not_found"
+    );
+    assert_eq!(
+        world.ok(&world.project, &["page", "links", "anchor"])["missing"],
+        serde_json::json!(["new-page"])
+    );
+}
+
+#[test]
+fn changeset_rollback_restores_a_touched_page_with_a_preexisting_dangling_link() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let schema = world.write("schema-touched-link.md", "# Test Wiki");
+    world.ok(&world.project, &["schema", "set", as_str(&schema)]);
+    let original = world.write("anchor-original.md", "anchor links [[a-new-page]]");
+    world.ok(
+        &world.project,
+        &[
+            "page",
+            "put",
+            "z-anchor",
+            "--title",
+            "Anchor",
+            "--summary",
+            "Anchor",
+            "--file",
+            as_str(&original),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    world.ok(&world.project, &["changeset", "begin", "touched-link"]);
+    let updated = world.write(
+        "anchor-updated.md",
+        "updated anchor still links [[a-new-page]]",
+    );
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "touched-link",
+            "page",
+            "put",
+            "z-anchor",
+            "--title",
+            "Anchor",
+            "--summary",
+            "Anchor",
+            "--file",
+            as_str(&updated),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let page = world.write("touched-new-page.md", "new page links [[z-anchor]]");
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "touched-link",
+            "page",
+            "put",
+            "a-new-page",
+            "--title",
+            "New page",
+            "--summary",
+            "New page",
+            "--file",
+            as_str(&page),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let committed = world.ok(&world.project, &["changeset", "commit", "touched-link"]);
+    let rolled_back = world.ok(
+        &world.project,
+        &[
+            "changeset",
+            "rollback",
+            committed["changeset_id"].as_str().unwrap(),
+        ],
+    );
+    assert_eq!(rolled_back["status"], "rolled_back");
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "z-anchor"])["page"]["body"],
+        "anchor links [[a-new-page]]"
+    );
+    assert_eq!(
+        world.err(&world.project, &["page", "show", "a-new-page"])["error"]["code"],
+        "page_not_found"
+    );
+}
+
+#[test]
 fn changeset_reports_a_committed_materialization_failure_and_repairs_it() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
@@ -961,6 +1512,13 @@ fn changeset_reports_a_rolled_back_materialization_failure_and_retry_repairs_it(
         &["changeset", "commit", "rollback-projection-failure"],
     );
     let changeset_id = committed["changeset_id"].as_str().unwrap();
+    let configured = world.ok(
+        &world.project,
+        &["config", "set", "--graph", "grafeo"],
+    );
+    let configured_work = configured["work"]["id"].as_str().unwrap();
+    world.ok(&world.project, &["work", "watch", configured_work]);
+    assert_eq!(world.ok(&world.project, &["graph", "verify"])["ok"], true);
 
     let wiki = world.project.join(".lwc/wiki");
     let saved = world.project.join(".lwc/wiki-before-rollback-failure");
@@ -974,7 +1532,7 @@ fn changeset_reports_a_rolled_back_materialization_failure_and_retry_repairs_it(
     assert_eq!(error["error"]["details"]["rolled_back"], true);
     assert_eq!(
         error["error"]["details"]["recovery_command"],
-        "lwc maintenance materialize"
+        format!("lwc changeset rollback {changeset_id}")
     );
     assert_eq!(
         world.err(
@@ -988,6 +1546,9 @@ fn changeset_reports_a_rolled_back_materialization_failure_and_retry_repairs_it(
     fs::rename(saved, &wiki).unwrap();
     let repaired = world.ok(&world.project, &["changeset", "rollback", changeset_id]);
     assert_eq!(repaired["materialized"], true);
+    let graph_work = repaired["graph_work"]["id"].as_str().unwrap();
+    world.ok(&world.project, &["work", "watch", graph_work]);
+    assert_eq!(world.ok(&world.project, &["graph", "verify"])["ok"], true);
     assert!(
         !String::from_utf8(fs::read(wiki.join("index.md")).unwrap())
             .unwrap()
@@ -1116,4 +1677,572 @@ fn changeset_locked_recheck_rejects_a_draft_writer_that_finishes_during_commit()
         "page_not_found"
     );
     assert!(draft.is_file());
+}
+#[test]
+fn changeset_source_head_rollback_reprojects_the_previous_tracked_revision() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let configured = world.ok(
+        &world.project,
+        &["config", "set", "--graph", "grafeo"],
+    );
+    if let Some(work_id) = configured["work"]["id"].as_str() {
+        world.ok(&world.project, &["work", "watch", work_id]);
+    }
+
+    let tracked = world.write("tracked.md", "tracked revision v1");
+    let first = world.ok(
+        &world.project,
+        &["source", "add", as_str(&tracked)],
+    );
+    let first_id = first["source"]["id"].as_i64().unwrap().to_string();
+    let first_work = first["graph"]["work"]["id"].as_str().unwrap();
+    world.ok(&world.project, &["work", "watch", first_work]);
+
+    fs::write(&tracked, "tracked revision v2").unwrap();
+    world.ok(&world.project, &["changeset", "begin", "tracked-source"]);
+    let second = world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "tracked-source",
+            "source",
+            "add",
+            as_str(&tracked),
+        ],
+    );
+    let second_id = second["source"]["id"].as_i64().unwrap().to_string();
+    let second_work = second["graph"]["work"]["id"].as_str().unwrap();
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "tracked-source",
+            "work",
+            "watch",
+            second_work,
+        ],
+    );
+
+    let committed = world.ok(
+        &world.project,
+        &["changeset", "commit", "tracked-source"],
+    );
+    let commit_work = committed["graph_work"]["id"].as_str().unwrap();
+    world.ok(&world.project, &["work", "watch", commit_work]);
+    let rolled_back = world.ok(
+        &world.project,
+        &[
+            "changeset",
+            "rollback",
+            committed["changeset_id"].as_str().unwrap(),
+        ],
+    );
+    let rollback_work = rolled_back["graph_work"]["id"].as_str().unwrap();
+    world.ok(&world.project, &["work", "watch", rollback_work]);
+
+    let verified = world.ok(&world.project, &["graph", "verify"]);
+    assert_eq!(verified["ok"], true, "{verified}");
+    world.ok(
+        &world.project,
+        &["graph", "node", &format!("source:{first_id}")],
+    );
+    assert_eq!(
+        world.err(
+            &world.project,
+            &["graph", "node", &format!("source:{second_id}")],
+        )["error"]["code"],
+        "graph_node_not_found"
+    );
+}
+
+#[test]
+fn changeset_rollback_accepts_a_legacy_sparse_inverse_without_new_optional_fields() {
+    use sha2::{Digest, Sha256};
+
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    world.ok(&world.project, &["changeset", "begin", "legacy-inverse"]);
+    let body = world.write("legacy-inverse.md", "legacy inverse payload");
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "legacy-inverse",
+            "page",
+            "put",
+            "legacy-inverse",
+            "--title",
+            "Legacy inverse",
+            "--file",
+            as_str(&body),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let committed = world.ok(
+        &world.project,
+        &[
+            "changeset",
+            "commit",
+            "legacy-inverse",
+            "--allow-lint-issues",
+            "--reason",
+            "legacy sparse inverse compatibility fixture",
+        ],
+    );
+    let checkpoint = committed["checkpoint"].as_str().unwrap();
+    let inverse_path = world
+        .project
+        .join(".lwc/checkpoints")
+        .join(format!("{checkpoint}.db"));
+    let encoded = fs::read_to_string(inverse_path).unwrap();
+    let checksum_marker = ",\"checksum\":";
+    let marker = encoded.rfind(checksum_marker).unwrap();
+    let raw_payload = encoded[..marker].strip_prefix("{\"payload\":").unwrap();
+    let envelope: Value = serde_json::from_str(&encoded).unwrap();
+
+    assert!(envelope["payload"].get("source_paths").is_none());
+    assert!(envelope["payload"]["pages"][0]
+        .get("inbound_links")
+        .is_none());
+    assert_eq!(
+        envelope["checksum"].as_str().unwrap(),
+        Sha256::digest(raw_payload.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+
+    let rolled_back = world.ok(
+        &world.project,
+        &[
+            "changeset",
+            "rollback",
+            committed["changeset_id"].as_str().unwrap(),
+        ],
+    );
+    assert_eq!(rolled_back["status"], "rolled_back");
+    assert_eq!(
+        world.err(&world.project, &["page", "show", "legacy-inverse"])["error"]["code"],
+        "page_not_found"
+    );
+}
+#[test]
+fn changeset_remaps_a_source_id_taken_by_an_unrelated_live_path() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let configured = world.ok(
+        &world.project,
+        &["config", "set", "--graph", "grafeo"],
+    );
+    if let Some(work_id) = configured["work"]["id"].as_str() {
+        world.ok(&world.project, &["work", "watch", work_id]);
+    }
+
+    let path_a = world.write("a.md", "a v1");
+    let first_a = world.ok(&world.project, &["source", "add", as_str(&path_a)]);
+    let first_a_id = first_a["source"]["id"].as_i64().unwrap();
+    world.ok(
+        &world.project,
+        &["work", "watch", first_a["graph"]["work"]["id"].as_str().unwrap()],
+    );
+    let path_b = world.write("b.md", "b v1");
+    let first_b = world.ok(&world.project, &["source", "add", as_str(&path_b)]);
+    world.ok(
+        &world.project,
+        &["work", "watch", first_b["graph"]["work"]["id"].as_str().unwrap()],
+    );
+
+    fs::write(&path_a, "a v2").unwrap();
+    world.ok(&world.project, &["changeset", "begin", "source-remap"]);
+    let staged_a = world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "source-remap",
+            "source",
+            "add",
+            as_str(&path_a),
+        ],
+    );
+    let staged_id = staged_a["source"]["id"].as_i64().unwrap();
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "source-remap",
+            "work",
+            "watch",
+            staged_a["graph"]["work"]["id"].as_str().unwrap(),
+        ],
+    );
+    let page = world.write(
+        "remapped-source-page.md",
+        "remapped source evidence links [[remapped-source-page]]",
+    );
+    let staged_page = world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "source-remap",
+            "page",
+            "put",
+            "remapped-source-page",
+            "--title",
+            "Remapped source page",
+            "--summary",
+            "Cites the remapped draft source",
+            "--file",
+            as_str(&page),
+            "--source",
+            &staged_id.to_string(),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "source-remap",
+            "work",
+            "watch",
+            staged_page["graph"]["work"]["id"].as_str().unwrap(),
+        ],
+    );
+
+    fs::write(&path_b, "b v2").unwrap();
+    let second_b = world.ok(&world.project, &["source", "add", as_str(&path_b)]);
+    let second_b_id = second_b["source"]["id"].as_i64().unwrap();
+    assert_eq!(second_b_id, staged_id, "test did not force an ID collision");
+    world.ok(
+        &world.project,
+        &["work", "watch", second_b["graph"]["work"]["id"].as_str().unwrap()],
+    );
+
+    let committed = world.ok(&world.project, &["changeset", "commit", "source-remap"]);
+    world.ok(
+        &world.project,
+        &["work", "watch", committed["graph_work"]["id"].as_str().unwrap()],
+    );
+    let current = world.ok(&world.project, &["source", "status", "--all"]);
+    let checks = current["checks"].as_array().unwrap();
+    let remapped_a_id = checks
+        .iter()
+        .find(|check| check["tracked_path"] == "a.md")
+        .unwrap()["head_source_id"]
+        .as_i64()
+        .unwrap();
+    let current_b_id = checks
+        .iter()
+        .find(|check| check["tracked_path"] == "b.md")
+        .unwrap()["head_source_id"]
+        .as_i64()
+        .unwrap();
+    assert_ne!(remapped_a_id, staged_id);
+    assert_eq!(current_b_id, second_b_id);
+    assert_eq!(
+        world.ok(
+            &world.project,
+            &["source", "show", &remapped_a_id.to_string(), "--max-chars", "100"],
+        )["source"]["content"],
+        "a v2"
+    );
+    assert_eq!(
+        world.ok(
+            &world.project,
+            &["source", "show", &second_b_id.to_string(), "--max-chars", "100"],
+        )["source"]["content"],
+        "b v2"
+    );
+    let committed_page = world.ok(
+        &world.project,
+        &["page", "show", "remapped-source-page"],
+    );
+    assert_eq!(
+        committed_page["page"]["source_ids"],
+        serde_json::json!([remapped_a_id])
+    );
+    assert_eq!(world.ok(&world.project, &["graph", "verify"])["ok"], true);
+    let cited = world.ok(
+        &world.project,
+        &[
+            "graph",
+            "neighbors",
+            "page:remapped-source-page",
+            "--direction",
+            "outgoing",
+            "--edge-type",
+            "CITES",
+        ],
+    );
+    assert!(
+        cited["neighbors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["identifier"] == format!("source:{remapped_a_id}")),
+        "{cited}"
+    );
+
+    let rolled_back = world.ok(
+        &world.project,
+        &[
+            "changeset",
+            "rollback",
+            committed["changeset_id"].as_str().unwrap(),
+        ],
+    );
+    world.ok(
+        &world.project,
+        &["work", "watch", rolled_back["graph_work"]["id"].as_str().unwrap()],
+    );
+    let restored = world.ok(&world.project, &["source", "status", "--all"]);
+    let checks = restored["checks"].as_array().unwrap();
+    assert_eq!(
+        checks
+            .iter()
+            .find(|check| check["tracked_path"] == "a.md")
+            .unwrap()["head_source_id"],
+        first_a_id
+    );
+    assert_eq!(
+        checks
+            .iter()
+            .find(|check| check["tracked_path"] == "b.md")
+            .unwrap()["head_source_id"],
+        second_b_id
+    );
+    assert_eq!(world.ok(&world.project, &["graph", "verify"])["ok"], true);
+    assert_eq!(
+        world.err(
+            &world.project,
+            &["page", "show", "remapped-source-page"],
+        )["error"]["code"],
+        "page_not_found"
+    );
+    assert_eq!(
+        world.err(
+            &world.project,
+            &["graph", "node", "page:remapped-source-page"],
+        )["error"]["code"],
+        "graph_node_not_found"
+    );
+    world.ok(
+        &world.project,
+        &["graph", "node", &format!("source:{first_a_id}")],
+    );
+    world.ok(
+        &world.project,
+        &["graph", "node", &format!("source:{second_b_id}")],
+    );
+    assert_eq!(
+        world.err(
+            &world.project,
+            &["graph", "node", &format!("source:{remapped_a_id}")],
+        )["error"]["code"],
+        "graph_node_not_found"
+    );
+}
+
+#[test]
+fn changeset_rollback_rejects_a_page_repointed_to_the_source_id_collision() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+
+    let path_a = world.write("conflict-a.md", "a v1");
+    world.ok(&world.project, &["source", "add", as_str(&path_a)]);
+    let path_b = world.write("conflict-b.md", "b v1");
+    world.ok(&world.project, &["source", "add", as_str(&path_b)]);
+
+    fs::write(&path_a, "a v2").unwrap();
+    world.ok(
+        &world.project,
+        &["changeset", "begin", "page-source-remap-conflict"],
+    );
+    let staged = world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "page-source-remap-conflict",
+            "source",
+            "add",
+            as_str(&path_a),
+        ],
+    );
+    let collided_id = staged["source"]["id"].as_i64().unwrap().to_string();
+    let body = world.write(
+        "page-source-remap-conflict.md",
+        "same content [[page-source-remap-conflict]]",
+    );
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "page-source-remap-conflict",
+            "page",
+            "put",
+            "page-source-remap-conflict",
+            "--title",
+            "Page source remap conflict",
+            "--summary",
+            "Same summary",
+            "--file",
+            as_str(&body),
+            "--source",
+            &collided_id,
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+
+    fs::write(&path_b, "b v2").unwrap();
+    let collision = world.ok(&world.project, &["source", "add", as_str(&path_b)]);
+    assert_eq!(collision["source"]["id"].to_string(), collided_id);
+    let committed = world.ok(
+        &world.project,
+        &["changeset", "commit", "page-source-remap-conflict"],
+    );
+    let committed_source_id = world
+        .ok(
+            &world.project,
+            &["page", "show", "page-source-remap-conflict"],
+        )["page"]["source_ids"][0]
+        .as_i64()
+        .unwrap()
+        .to_string();
+    assert_ne!(committed_source_id, collided_id);
+
+    world.ok(
+        &world.project,
+        &[
+            "page",
+            "put",
+            "page-source-remap-conflict",
+            "--title",
+            "Page source remap conflict",
+            "--summary",
+            "Same summary",
+            "--file",
+            as_str(&body),
+            "--source",
+            &collided_id,
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let error = world.err(
+        &world.project,
+        &[
+            "changeset",
+            "rollback",
+            committed["changeset_id"].as_str().unwrap(),
+        ],
+    );
+    assert_eq!(error["error"]["code"], "changeset_rollback_conflict");
+    assert_eq!(
+        world
+            .ok(
+                &world.project,
+                &["page", "show", "page-source-remap-conflict"],
+            )["page"]["source_ids"],
+        serde_json::json!([collided_id.parse::<i64>().unwrap()])
+    );
+}
+
+#[test]
+fn changeset_commit_retry_reprojects_when_legacy_detail_lacks_graph_documents() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let configured = world.ok(
+        &world.project,
+        &["config", "set", "--graph", "grafeo"],
+    );
+    if let Some(work_id) = configured["work"]["id"].as_str() {
+        world.ok(&world.project, &["work", "watch", work_id]);
+    }
+
+    world.ok(&world.project, &["changeset", "begin", "retry-graph-queue"]);
+    let body = world.write(
+        "retry-graph-queue.md",
+        "retry graph queue [[retry-graph-queue]]",
+    );
+    let staged = world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "retry-graph-queue",
+            "page",
+            "put",
+            "retry-graph-queue",
+            "--title",
+            "Retry graph queue",
+            "--summary",
+            "Retry graph queue",
+            "--file",
+            as_str(&body),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "retry-graph-queue",
+            "work",
+            "watch",
+            staged["graph"]["work"]["id"].as_str().unwrap(),
+        ],
+    );
+
+    let work_root = world.project.join(".lwc/work");
+    let saved_work_root = world.project.join(".lwc/work-before-queue-failure");
+    fs::rename(&work_root, &saved_work_root).unwrap();
+    fs::write(&work_root, "blocks graph Work creation").unwrap();
+    let failed = world.err(
+        &world.project,
+        &["changeset", "commit", "retry-graph-queue"],
+    );
+    assert_eq!(failed["error"]["code"], "graph_projection_failed");
+    assert_eq!(failed["error"]["details"]["canonical_committed"], true);
+    let changeset_id = failed["error"]["details"]["changeset_id"]
+        .as_str()
+        .unwrap();
+    let database = world.project.join(".lwc/wiki.db");
+    let connection = Connection::open(database).unwrap();
+    let mut legacy_detail: Value = connection
+        .query_row(
+            "SELECT detail_json FROM operations
+             WHERE action = 'changeset_commit' AND target = ?1",
+            [changeset_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|detail| serde_json::from_str(&detail).unwrap())
+        .unwrap();
+    assert!(legacy_detail
+        .as_object_mut()
+        .unwrap()
+        .remove("graph_documents")
+        .is_some());
+    connection
+        .execute(
+            "UPDATE operations SET detail_json = ?2
+             WHERE action = 'changeset_commit' AND target = ?1",
+            rusqlite::params![changeset_id, serde_json::to_string(&legacy_detail).unwrap()],
+        )
+        .unwrap();
+
+    fs::remove_file(&work_root).unwrap();
+    fs::rename(saved_work_root, &work_root).unwrap();
+    let retried = world.ok(
+        &world.project,
+        &["changeset", "commit", "retry-graph-queue"],
+    );
+    let graph_work = retried["graph_work"]["id"].as_str().unwrap();
+    world.ok(&world.project, &["work", "watch", graph_work]);
+    let verified = world.ok(&world.project, &["graph", "verify"]);
+    assert_eq!(verified["ok"], true, "{verified}");
+    world.ok(&world.project, &["graph", "node", "page:retry-graph-queue"]);
 }

@@ -107,6 +107,7 @@ impl Store {
         I: IntoIterator<Item = Result<SourceAddInput>>,
     {
         let mutation_started = Instant::now();
+        self.preflight_graph_runtime()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -362,6 +363,7 @@ impl Store {
     }
 
     pub fn source_remove(&mut self, id: i64) -> Result<SourceRemoveResponse> {
+        self.preflight_graph_runtime()?;
         self.load_source_summary(id)?;
         let tx = self
             .conn
@@ -400,6 +402,10 @@ impl Store {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let affected_paths = paths
+            .iter()
+            .map(|(tracked_path, _)| tracked_path.clone())
+            .collect::<Vec<_>>();
         let mut removed_path_revisions = 0;
         let mut untracked_paths = Vec::new();
         for (tracked_path, head_source_id) in paths {
@@ -440,6 +446,7 @@ impl Store {
             &json!({
                 "removed_path_revisions": removed_path_revisions,
                 "untracked_paths": untracked_paths,
+                "affected_paths": affected_paths,
             }),
         )?;
         tx.commit()?;
@@ -460,6 +467,7 @@ impl Store {
     pub fn page_put(&mut self, input: PagePutInput) -> Result<PagePutResponse> {
         let mutation_started = Instant::now();
         validate_page_slug(&input.slug)?;
+        self.preflight_graph_runtime()?;
         let source_ids = dedupe_i64(input.source_ids);
         let explicit_provenance = normalize_explicit_provenance(input.provenance)?;
         let links = extract_links(&input.body);
@@ -697,6 +705,7 @@ impl Store {
     }
 
     pub fn page_remove(&mut self, slug: &str) -> Result<PageRemoveResponse> {
+        self.preflight_graph_runtime()?;
         self.load_page(slug)?;
         let tx = self
             .conn
