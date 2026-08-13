@@ -9,7 +9,7 @@ homepage = "https://github.com/JanYork/llm-wiki-cli"
 readme = "README.md"
 keywords = ["agent-memory-system", "ai-agents", "proactive-memory", "knowledge-bases", "context-engineering"]
 categories = ["command-line-utilities", "database"]
-exclude = [".agent/**", ".local-benchmarks/**", ".pi-subagents/**"]
+exclude = [".agent/**", ".local-benchmarks/**", ".pi-subagents/**", "docs/images/**"]
 
 [dependencies]
 axum = "0.8.9"

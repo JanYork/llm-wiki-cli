@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@i-xor/lwc"><img alt="npm: @i-xor/lwc" src="https://img.shields.io/badge/npm-%40i--xor%2Flwc-CB3837?logo=npm"></a>
+  <a href="https://crates.io/crates/lwc"><img alt="crates.io: lwc" src="https://img.shields.io/crates/v/lwc.svg"></a>
   <img alt="Node.js 22 or newer" src="https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs">
   <img alt="Platform: macOS, Linux, Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-666666">
   <a href="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml/badge.svg"></a>
@@ -18,7 +19,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/lwc-social-preview.png" alt="LWC — Proactive Memory for AI Agents" width="100%">
+  <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-social-preview.png" alt="LWC — Proactive Memory for AI Agents" width="100%">
 </p>
 
 `lwc` is an agent-driven proactive memory CLI for AI agents. It lets Agents
@@ -34,7 +35,7 @@ knowledge compounds instead of being rediscovered from raw chunks on every
 query.
 
 <p align="center">
-  <img src="docs/images/lwc-overview-en.png" alt="LWC product overview" width="820">
+  <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-overview-en.png" alt="LWC product overview" width="820">
 </p>
 
 ## LWC Is Agent Memory, Not RAG
@@ -61,7 +62,7 @@ does not require embeddings or a vector database, and it does not discard each
 synthesis after answering. It can complement RAG, but it is not query-time RAG.
 
 <p align="center">
-  <img src="docs/images/lwc-source-grounding-en.png" alt="LWC source grounding and traceability" width="820">
+  <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-source-grounding-en.png" alt="LWC source grounding and traceability" width="820">
 </p>
 
 ### The Agent operates LWC
@@ -132,7 +133,7 @@ This project adapts those ideas into an agent-first Rust CLI backed by SQLite.
 ## Core Design
 
 <p align="center">
-  <img src="docs/images/lwc-architecture-en.png" alt="LWC architecture" width="100%">
+  <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-architecture-en.png" alt="LWC architecture" width="100%">
 </p>
 
 The persistent knowledge model has three logical layers:
@@ -160,7 +161,7 @@ document graph are rebuilt indexes. Existing search stays document-only
 unless a granularity is requested:
 
 <p align="center">
-  <img src="docs/images/lwc-memory-graph-en.png" alt="LWC memory graph" width="100%">
+  <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-memory-graph-en.png" alt="LWC memory graph" width="100%">
 </p>
 
 ```bash
@@ -262,6 +263,12 @@ Install with npm (Node.js 22+):
 
 ```bash
 npm install --global @i-xor/lwc
+```
+
+Install from crates.io:
+
+```bash
+cargo install --locked lwc
 ```
 
 Install from GitHub:
@@ -758,7 +765,7 @@ language. Graphs use a single Obsidian-inspired 3D relationship view with small
 nodes, persistent labels, thin links, rotation, and zoom.
 
 <p align="center">
-  <img src="docs/images/lwc-codegraph-en.png" alt="LWC CodeGraph code intelligence" width="100%">
+  <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-codegraph-en.png" alt="LWC CodeGraph code intelligence" width="100%">
 </p>
 
 Code indexing is project-only and disabled until explicitly initialized. The

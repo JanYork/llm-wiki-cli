@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@i-xor/lwc"><img alt="npm: @i-xor/lwc" src="https://img.shields.io/badge/npm-%40i--xor%2Flwc-CB3837?logo=npm"></a>
+  <a href="https://crates.io/crates/lwc"><img alt="crates.io: lwc" src="https://img.shields.io/crates/v/lwc.svg"></a>
   <img alt="Node.js 22 or newer" src="https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs">
   <img alt="平台：macOS、Linux、Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-666666">
   <a href="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml/badge.svg"></a>
@@ -18,7 +19,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/lwc-agent-memory-zh.png" alt="LWC Agent 记忆" width="100%">
+  <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-agent-memory-zh.png" alt="LWC Agent 记忆" width="100%">
 </p>
 
 `lwc` 是一个由 Agent 驱动的主动记忆 CLI，让 AI Agent 能够跨会话自主召回、维护和
@@ -32,7 +33,7 @@ LWC 把经过筛选的文档转化为可长期维护的 Wiki。Agent 负责理�
 原始片段。
 
 <p align="center">
-  <img src="docs/images/lwc-overview-zh.png" alt="LWC 产品概览" width="820">
+  <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-overview-zh.png" alt="LWC 产品概览" width="820">
 </p>
 
 ## LWC 是 Agent 记忆，不是 RAG
@@ -57,7 +58,7 @@ LWC 不依赖 embedding 或向量数据库，也不会在回答完成后丢弃�
 与 RAG 配合，但它本身不是查询时 RAG。
 
 <p align="center">
-  <img src="docs/images/lwc-source-grounding-zh.png" alt="LWC 来源追溯与可靠回答" width="820">
+  <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-source-grounding-zh.png" alt="LWC 来源追溯与可靠回答" width="820">
 </p>
 
 ### LWC 应当由 Agent 操作
@@ -120,7 +121,7 @@ LWC 幂等 AgentTarget 安装器；只有尚未注册的 Agent 才按自身官�
 ## 核心设计
 
 <p align="center">
-  <img src="docs/images/lwc-architecture-zh.png" alt="LWC 架构图" width="100%">
+  <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-architecture-zh.png" alt="LWC 架构图" width="100%">
 </p>
 
 持久化知识模型分为三个逻辑层：
@@ -145,7 +146,7 @@ Markdown。命令成功时向 stdout 返回 JSON，失败时向 stderr 返回结
 文档，只有显式指定粒度才检索段句：
 
 <p align="center">
-  <img src="docs/images/lwc-memory-graph-zh.png" alt="LWC 记忆图" width="100%">
+  <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-memory-graph-zh.png" alt="LWC 记忆图" width="100%">
 </p>
 
 ```bash
@@ -236,6 +237,12 @@ Grafeo 与嵌入式 SurrealDB 使用 `.lwc/` 下可重建的 sidecar。每个
 
 ```bash
 npm install --global @i-xor/lwc
+```
+
+从 crates.io 安装：
+
+```bash
+cargo install --locked lwc
 ```
 
 从 GitHub 安装：
@@ -683,7 +690,7 @@ lwc view --port 4173 --no-open
 采用小节点、常驻标签、细连线，并支持旋转与缩放。
 
 <p align="center">
-  <img src="docs/images/lwc-codegraph-zh.png" alt="LWC 代码图" width="100%">
+  <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-codegraph-zh.png" alt="LWC 代码图" width="100%">
 </p>
 
 代码索引只支持项目级，默认不启用。首次显式执行 `lwc cg init` 时，LWC
