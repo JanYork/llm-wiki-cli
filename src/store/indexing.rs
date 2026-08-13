@@ -9,6 +9,7 @@ fn page_content_fingerprint(
     provenance: &[String],
     links: &[String],
 ) -> String {
+    let provenance = provenance.iter().collect::<BTreeSet<_>>();
     hash_content(
         &json!({
             "title": title,

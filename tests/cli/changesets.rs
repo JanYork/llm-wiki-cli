@@ -818,6 +818,99 @@ fn sparse_tag_only_changeset_lints_against_live_wiki_and_commits_cleanly() {
 }
 
 #[test]
+fn sparse_changeset_accepts_unchanged_multiple_provenance_fingerprint() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let schema = world.write("schema.md", "# Test Wiki");
+    world.ok(&world.project, &["schema", "set", as_str(&schema)]);
+    let anchor = world.write("anchor.md", "anchor links to [[multi-provenance]]");
+    world.ok(
+        &world.project,
+        &[
+            "page",
+            "put",
+            "anchor",
+            "--title",
+            "Anchor",
+            "--summary",
+            "Anchor",
+            "--file",
+            as_str(&anchor),
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    let body = world.write(
+        "multi-provenance.md",
+        "original body links to [[anchor]]",
+    );
+    world.ok(
+        &world.project,
+        &[
+            "page",
+            "put",
+            "multi-provenance",
+            "--title",
+            "Multi provenance",
+            "--summary",
+            "Multi provenance",
+            "--file",
+            as_str(&body),
+            "--provenance",
+            "user-provided",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+    assert_eq!(world.ok(&world.project, &["lint"])["total"], 0);
+    world.ok(&world.project, &["changeset", "begin", "multi-provenance"]);
+    let updated = world.write(
+        "multi-provenance-updated.md",
+        "updated body links to [[anchor]]",
+    );
+    world.ok(
+        &world.project,
+        &[
+            "--changeset",
+            "multi-provenance",
+            "page",
+            "put",
+            "multi-provenance",
+            "--title",
+            "Multi provenance",
+            "--summary",
+            "Multi provenance",
+            "--file",
+            as_str(&updated),
+            "--provenance",
+            "user-provided",
+            "--provenance",
+            "agent-observed",
+        ],
+    );
+
+    let committed = world.ok(
+        &world.project,
+        &["changeset", "commit", "multi-provenance"],
+    );
+    assert_eq!(committed["status"], "committed");
+    assert_eq!(committed["lint_issues"], 0);
+    let rolled_back = world.ok(
+        &world.project,
+        &[
+            "changeset",
+            "rollback",
+            committed["changeset_id"].as_str().unwrap(),
+        ],
+    );
+    assert_eq!(rolled_back["status"], "rolled_back");
+    assert_eq!(
+        world.ok(&world.project, &["page", "show", "multi-provenance"])["page"]["body"],
+        "original body links to [[anchor]]"
+    );
+}
+
+#[test]
 fn changeset_reports_a_committed_materialization_failure_and_repairs_it() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
