@@ -1,5 +1,5 @@
 use serde_json::Value;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use sha2::{Digest, Sha256};
 use std::{
     fs,
