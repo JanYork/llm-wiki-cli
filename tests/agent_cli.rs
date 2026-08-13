@@ -2001,6 +2001,10 @@ fn print_config_is_pure_and_pi_installs_an_mcp_tool_bridge() {
 #[cfg(unix)]
 #[test]
 fn every_advertised_global_target_round_trips_and_capability_gaps_are_explicit() {
+    #[cfg(target_os = "macos")]
+    let copilot_vscode_mcp = "Library/Application Support/Code/User/mcp.json";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let copilot_vscode_mcp = ".config/Code/User/mcp.json";
     let cases = [
         (
             "claude",
@@ -2069,7 +2073,7 @@ fn every_advertised_global_target_round_trips_and_capability_gaps_are_explicit()
         (
             "copilot-vscode",
             "strong",
-            "Library/Application Support/Code/User/mcp.json",
+            copilot_vscode_mcp,
             None,
             None,
             Some(".copilot/skills/using-lwc"),
