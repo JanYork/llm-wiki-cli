@@ -429,7 +429,12 @@ pub(super) fn install_native(
         .is_some_and(|manifest| manifest.version < 3 && post_matches(manifest))
     {
         let manifest = old_manifest.as_ref().expect("checked legacy manifest");
-        let snapshots = manifest.files.clone();
+        let mut snapshots = manifest.files.clone();
+        for file in &current {
+            if !snapshots.iter().any(|known| known.path == file.path) {
+                snapshots.push(file.clone());
+            }
+        }
         if let Err(error) = restore(manifest) {
             let _ = restore(&Manifest {
                 version: 1,

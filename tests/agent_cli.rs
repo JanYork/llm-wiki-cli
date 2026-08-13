@@ -995,6 +995,34 @@ fn refresh_upgrades_a_matching_v1_manifest_and_keeps_original_uninstall_snapshot
 
 #[cfg(unix)]
 #[test]
+fn refresh_upgrades_a_v1_manifest_that_did_not_track_new_accessories() {
+    let world = World::new();
+    world.ok(&["agent", "install", "--target", "pi", "--yes"]);
+    let manifest_path = world.home.join(".lwc/agent-installs/pi-global-global.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["version"] = 1.into();
+    manifest.as_object_mut().unwrap().remove("lwc_version");
+    manifest["files"] = serde_json::json!([]);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    world.ok(&["agent", "refresh", "--target", "pi"]);
+    let status = world.ok(&["agent", "status", "--target", "pi"]);
+    assert_eq!(status["targets"][0]["status"], "installed");
+    let upgraded: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert!(upgraded["files"].as_array().unwrap().iter().any(|file| {
+        file["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("skills/using-lwc/SKILL.md")
+    }));
+}
+
+#[cfg(unix)]
+#[test]
 fn refresh_reinstalls_accessories_created_by_an_older_lwc_version() {
     let world = World::new();
     world.ok(&["agent", "install", "--target", "codex", "--yes"]);
