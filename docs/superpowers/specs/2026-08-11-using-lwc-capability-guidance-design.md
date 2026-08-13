@@ -1,5 +1,10 @@
 # Using LWC Capability Guidance and First-Use Readiness
 
+> Superseded on 2026-08-12 by
+> `2026-08-12-lwc-agent-target-capability-matrix.md` for AgentTarget capability
+> classification and installation paths. The former three-strong/nine-weak
+> model is no longer authoritative.
+
 Status: approved
 Date: 2026-08-11
 Plan: `.agent/.plans/global-codegraph-agent-tags/`

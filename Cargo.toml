@@ -15,6 +15,7 @@ exclude = [".agent/**", ".local-benchmarks/**", ".pi-subagents/**"]
 axum = "0.8.9"
 clap = { version = "4.6", features = ["derive"] }
 grafeo = { version = "0.5.42", default-features = false, features = ["edge", "wal", "grafeo-file"] }
+jsonc-parser = { version = "0.33.1", features = ["cst", "serde_json"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 rusqlite = { version = "0.39", default-features = false, features = ["backup", "bundled"] }
 serde = { version = "1.0", features = ["derive"] }

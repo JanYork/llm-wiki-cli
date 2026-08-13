@@ -65,89 +65,47 @@ integrates sources, maintains citations and links, and decides what is worth
 recalling or writing back.
 
 Do not manually drive the routine `lwc` workflow unless you are developing or
-debugging the tool. Ask your Agent to activate the bundled `using-lwc` Skill
-instead—usually as `$using-lwc`. The setup below also registers `$using-wiki`
-where the Agent runtime supports named Skill commands.
+debugging the tool. Ask your Agent to activate the bundled canonical
+`using-lwc` Skill instead—usually as `$using-lwc`.
 
 ## Recommended: Ask Your Agent to Set Up LWC
 
-Paste this prompt into the Agent you use. It uses that Agent's own native
-settings to install the CLI and user-level Skills, initialize global memory,
-and add a minimal session-start reminder when Hooks are available—all without
-overwriting existing configuration.
+Paste this prompt into the Agent you use. It installs the global CLI, delegates
+all supported host configuration to LWC's idempotent AgentTarget installer, and
+uses native self-configuration only for an unregistered Agent.
 
 <details>
 <summary><strong>Copy the complete setup prompt</strong></summary>
 
 ```text
-Configure LWC completely for the current user and the Agent runtime executing
-this prompt. Perform the work and verify it; do not merely describe commands
-for me to run.
+Configure LWC completely for this user. Perform and verify the work; do not
+merely describe commands for me to run.
 
 Source of truth:
 - https://github.com/JanYork/llm-wiki-cli
 - https://github.com/JanYork/llm-wiki-cli/tree/main/skills/using-lwc
 
 Requirements:
-1. Read the repository README, SECURITY.md, the complete
-   skills/using-lwc/SKILL.md, and every directly required script/reference
-   before executing it. Record the source commit SHA used for installation.
-2. Use your own native user-level locations and mechanisms for Skills, global
-   instructions, and lifecycle Hooks. Do not ask the user to identify your
-   configuration files, assume another Agent's filenames, or configure other
-   installed Agent runtimes unless explicitly requested.
-3. Preserve all existing user configuration. Before changing an existing file
-   or Skill, create a timestamped backup; make every edit idempotent and do not
-   duplicate blocks when this prompt is run again.
-4. Install or update `skills/using-lwc` as the canonical user-level Skill. If
-   the runtime supports named Skill commands, register `$using-lwc` from that
-   canonical Skill and `$using-wiki` as a thin alias that delegates to it. Do
-   not copy the implementation into two independently maintained Skills. If the
-   runtime uses different invocation syntax, expose the closest native aliases
-   and report their exact names. Verify both entry points when supported.
-5. From the current host-authorized workspace root, run the canonical Skill's
-   bootstrap exactly as its instructions require. Let it install the official
-   SHA-256-verified LWC release when needed and initialize ~/.lwc global memory.
-   Validate the returned JSON, confirm `lwc` is globally callable on `PATH`,
-   run `lwc --version`, and inspect the global Wiki. Treat the returned absolute
-   path as diagnostics only; do not assign it to a routine shell variable. Do
-   not initialize any project Wiki unless the user explicitly
-   requests it for that project; never use global memory as a fallback for
-   project-specific writes.
-6. Apply the smallest complementary integration through your own native
-   configuration:
-   - Add a concise LWC routing rule to your additive user-level global
-     system/developer instructions. Do not replace your built-in prompt.
-   - Merge one LWC section into your user-level global instruction file,
-     whatever that file is named. Enclose it with the exact comments
-     `<!-- LWC_START -->` and `<!-- LWC_END -->`. On later runs, replace only
-     the content inside those markers and leave every user-owned line outside
-     them untouched. If only one marker exists, stop rather than guessing where
-     user content ends. The section should require use of the canonical LWC
-     Skill for substantive project, research, planning, debugging, decision,
-     or document-ingest work; recall before re-deriving; write back durable
-     findings; keep project and global scopes separate; respect the authorized
-     workspace boundary; and never store secrets, raw chain-of-thought,
-     transient logs, or unsupported guesses.
-   - When you support lifecycle Hooks, create or merge one native user-level
-     session-start Hook that invokes the bounded, read-only `lwc agent hook`.
-     It may report local readiness and load only explicitly enabled strong-tag
-     pages. It must not initialize or mutate a Wiki, enable a graph, download a
-     runtime, or build an index. Do not add per-prompt Wiki loading, replace
-     unrelated Hooks, or bypass Hook trust review. If you do not support Hooks,
-     rely on the global instructions and report that limitation instead of
-     inventing a mechanism.
-7. Keep the Skill, global instructions, and Hook short and complementary instead
-   of repeating the full policy. The canonical Skill remains authoritative.
-8. Validate every changed config file and Hook executable, confirm existing
-   config is preserved, and run the smallest safe smoke checks. Use only your
-   native supported configuration rather than inventing keys or filenames.
+1. Read this README, `SECURITY.md`, and `skills/using-lwc/SKILL.md`. Install the
+   official checksum-verified release if `lwc` is not globally callable; never
+   prefix routine commands with a private binary path or `LWC_PROJECT_ROOT`.
+2. Run `lwc --version`, initialize global memory once with
+   `lwc --scope global init` when missing, then run `lwc agent install --yes`.
+   This command detects installed supported Agents and safely installs their
+   MCP, Skill, Hook and Instructions using official locations. Do not recreate
+   that logic manually or install a native package for the same Agent as well.
+3. Inspect `lwc agent status --target all --location global`. Restart affected
+   Agents and complete their normal Hook trust review where required. Do not
+   initialize a project Wiki or either graph without explicit project consent.
+4. If the current runtime is not one of LWC's registered AgentTargets, use its
+   official user-level conventions to install the canonical `using-lwc` Skill,
+   an additive instruction block, `lwc serve --mcp`, and a bounded session Hook
+   only where those surfaces are officially supported. Preserve existing
+   configuration, remain idempotent, and report unsupported surfaces instead of
+   inventing paths or keys.
 
-Finish with a concise report containing: detected Agent runtime, installed LWC
-version and path, source commit, installed Skill and alias paths, global Wiki
-path, Hook/config files changed, backup paths, validation performed, unsupported
-integrations, and anything that requires a new Agent session or normal Hook
-trust approval.
+Finish with the LWC version, detected and configured Targets, status results,
+files changed, unsupported surfaces, and any restart or trust action remaining.
 ```
 
 </details>
@@ -335,12 +293,11 @@ in the current Agent runtime's user-level Skills directory. For Codex, from a
 local checkout:
 
 ```bash
-mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
-cp -R skills/using-lwc "${CODEX_HOME:-$HOME/.codex}/skills/"
+mkdir -p "$HOME/.agents/skills"
+cp -R skills/using-lwc "$HOME/.agents/skills/"
 ```
 
-The canonical invocation is `$using-lwc`. The setup prompt above also creates
-the optional `$using-wiki` alias without duplicating the Skill implementation.
+The canonical invocation is `$using-lwc`.
 
 When triggered, the Skill:
 
@@ -378,8 +335,11 @@ runtime-specific, so the setup prompt detects and configures the current host.
 
 ### Native Agent setup
 
-LWC can detect supported Agents and install CodeGraph MCP, marker-bounded LWC
-guidance, and native lifecycle hooks without relying on a particular host:
+LWC can detect supported Agents and install one unified read-only LWC MCP.
+All 12 registered AgentTargets are strong adapters: each installs every
+official file-based MCP, Skill, Hook, and Instructions surface available for
+that host and scope, while UI-owned, preview, or unsupported surfaces are
+reported explicitly.
 
 ```bash
 lwc agent install --yes
@@ -389,12 +349,32 @@ lwc agent refresh --target codex,claude
 lwc agent uninstall --target codex,claude --yes
 ```
 
-`--yes` selects detected Agents, global scope, and Claude Code's fused prompt
-hook. Repeated install and refresh are byte-idempotent; uninstall restores only
-owned state and leaves project indexes intact. Optional Codex, Claude Code, and
-Pi packages live under `integrations/`; installing a package does not grant or
-bypass native trust. Do not combine the direct installer and native package for
-the same Agent.
+`--yes` selects detected Agents, global scope, and each target's default
+lifecycle/prompt Hooks. Use `--no-prompt-hook` to omit Claude's per-prompt Hook. The installed
+entry is `lwc -> serve --mcp`; its single `lwc_explore`
+tool defaults to bounded Wiki memory and accepts explicit `code`/`all` modes.
+The requested `projectPath` must stay inside the workspace where the MCP host
+started LWC. It never downloads or initializes CodeGraph. Repeated install and refresh are
+byte-idempotent; uninstall restores only owned state and leaves project indexes
+intact. Optional Codex, Claude Code, and Pi packages live under `integrations/`;
+installing a package does not grant or bypass native trust. Do not combine the
+direct installer and native package for the same Agent. Each native package
+bundles the complete `using-lwc` Skill, so installation does not depend on a
+third-party Skill manager or any maintainer-specific environment.
+
+Pi exposes LWC MCP through its official extension bridge because Pi has no
+built-in MCP. Other Targets register only `lwc serve --mcp`; CodeGraph stays an
+internal LWC code-context plane and is never registered as a second Agent MCP.
+Officially UI-owned trust and permission settings remain user-managed. Preview
+surfaces are labeled as such, and partial project scopes install the supported
+surfaces instead of weakening or rejecting the whole Target. Kiro global paths
+honor `KIRO_HOME`.
+
+The target interface, registry order, detection rules, and MCP paths follow
+CodeGraph's MIT-licensed installer adapter design; LWC adds the unified LWC MCP,
+per-surface capability reporting, Skills and Hooks, shared-file ownership, and
+exact rollback.
+See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 Fresh project `lwc init` output and session/compaction Hooks expose bounded
 `LWC_READINESS` facts for the Wiki, physical document graph, CodeGraph runtime
@@ -787,8 +767,10 @@ lwc cg files
 
 All CodeGraph query capabilities are forwarded by `lwc cg`. Global lifecycle
 commands (`install`, `uninstall`, `upgrade`, `telemetry`, `daemon`, `daemons`)
-are blocked; only the exact Agent bridge `lwc cg serve --mcp` is allowed because
-LWC owns the runtime and enforces the project boundary. Initial,
+are blocked. The exact `lwc cg serve --mcp` bridge remains for legacy manual
+compatibility; new Agent integrations use `lwc serve --mcp`, which fuses
+bounded Wiki and CodeGraph exploration behind one read-only tool. LWC owns the
+runtime and enforces the project boundary. Initial,
 incremental, full, update, delete, reference-resolution, and recovery writes
 commit one owner file completely before the next; the current graph remains
 readable and historical document revisions are never refreshed.

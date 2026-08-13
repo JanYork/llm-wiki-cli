@@ -3,7 +3,8 @@ fn run(cli: Cli) -> Result<Value> {
     let selected_changeset = cli.changeset.clone();
     if !matches!(
         &cli.command,
-        Command::Init { .. }
+        Command::Serve { .. }
+            | Command::Init { .. }
             | Command::Work { .. }
             | Command::WorkRun { .. }
             | Command::Cg { .. }
@@ -23,6 +24,16 @@ fn run(cli: Cli) -> Result<Value> {
         }
     }
     match cli.command {
+        Command::Serve { mcp, path } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "serve")?;
+            if !mcp {
+                return Err(AppError::new(
+                    "invalid_serve_mode",
+                    "only `lwc serve --mcp` is supported",
+                ));
+            }
+            crate::mcp::serve(path.as_deref())
+        }
         Command::Init { no_git_exclude } => {
             changeset::reject_selector(selected_changeset.as_deref(), "init")?;
             ensure_scope_supported(cli.scope, false, "init")?;
@@ -674,14 +685,14 @@ fn run(cli: Cli) -> Result<Value> {
                     location,
                     yes,
                     print_config,
-                    no_codegraph_prompt_hook,
+                    no_prompt_hook,
                 } => crate::agent::install(
                     &cwd,
                     target.as_deref(),
                     location.map(Into::into),
                     yes,
                     print_config.as_deref(),
-                    !no_codegraph_prompt_hook,
+                    !no_prompt_hook,
                 ),
                 AgentCommand::Status { target, location } => crate::agent::status(
                     &cwd,
@@ -703,8 +714,14 @@ fn run(cli: Cli) -> Result<Value> {
                     location.map(Into::into),
                     yes,
                 ),
-                AgentCommand::Hook { agent, event } => {
-                    Ok(crate::agent::hook(agent.into(), &event, cli.scope, &cwd))
+                AgentCommand::Hook { agent, event, raw } => {
+                    let value = crate::agent::hook(agent.into(), &event, cli.scope, &cwd);
+                    if raw {
+                        print!("{}", value.as_str().unwrap_or_default());
+                        Ok(Value::Null)
+                    } else {
+                        Ok(value)
+                    }
                 }
             }
         }

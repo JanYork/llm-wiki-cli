@@ -152,9 +152,9 @@ lwc agent refresh --target codex,claude
 lwc agent uninstall --target codex,claude --yes
 ```
 
-`--yes` selects detected Agents, global scope, and Claude's fused CodeGraph
-prompt hook. Use `--target auto|all|none|csv`, `--location global|local`, or
-`--no-codegraph-prompt-hook` explicitly when those defaults are wrong. Install
+`--yes` selects detected Agents, global scope, and the default LWC lifecycle and
+prompt hooks. Use `--target auto|all|none|csv`, `--location global|local`, or
+`--no-prompt-hook` explicitly when those defaults are wrong. Install
 and refresh are byte-idempotent; uninstall restores exact owned state while
 preserving unrelated MCP entries, hooks, instructions, and project indexes.
 `--print-config` is pure. Optional Codex, Claude, and Pi packages under
@@ -403,9 +403,10 @@ If the task depends on current dirty or uncommitted code, run `sync` before the
 first structural query. Run it again after relevant working-tree files change.
 Do not run `index` as a routine freshness check. Never invoke global CodeGraph
 lifecycle commands through another binary; LWC blocks
-install/uninstall/upgrade/telemetry/daemon/daemons and permits only the exact
-Agent bridge `lwc cg serve --mcp`, preserving project ownership, runtime pinning,
-and telemetry policy.
+install/uninstall/upgrade/telemetry/daemon/daemons. Agent integrations register
+the unified `lwc serve --mcp`; its code mode lazily proxies only bounded
+`codegraph_explore` calls through the pinned project runtime without installing
+or initializing anything.
 
 ## Read-only project viewer (`lwc view`)
 

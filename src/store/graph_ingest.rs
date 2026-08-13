@@ -105,6 +105,10 @@ impl Store {
         crate::external_graph::status(&self.scope, &self.database)
     }
 
+    pub fn graph_passive_status(&self) -> Result<Value> {
+        crate::external_graph::passive_status(&self.scope, &self.database)
+    }
+
     pub fn graph_verify(&self) -> Result<Value> {
         crate::external_graph::verify(&self.scope, &self.database)
     }

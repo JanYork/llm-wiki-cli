@@ -172,6 +172,30 @@ fn readiness(context: &str) -> Value {
     serde_json::from_str(line).unwrap()
 }
 
+#[test]
+fn initialized_codegraph_keeps_consent_when_runtime_is_unavailable() {
+    let world = World::new(true);
+    let index = world.project.join(".lwc/codegraph");
+    fs::create_dir_all(&index).unwrap();
+    fs::write(index.join("codegraph.db"), b"fixture").unwrap();
+
+    let output = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "claude",
+            "--event",
+            "SessionStart",
+        ],
+        &serde_json::json!({"source": "startup", "cwd": world.project}).to_string(),
+    );
+    let readiness = readiness(&context(&output));
+    assert_eq!(readiness["code_graph"]["initialized"], true);
+    assert_eq!(readiness["code_graph"]["ready"], false);
+    assert_eq!(readiness["code_graph"]["requires_consent"], false);
+}
+
 #[cfg(unix)]
 fn prompt_hook_output(world: &World, binary: &PathBuf, input: &Value) -> Output {
     let mut command = world.command();
@@ -249,6 +273,40 @@ fn boundary_hook_loads_whole_budgeted_pages_without_reading_transcript() {
 }
 
 #[test]
+fn duplicate_pages_count_once_per_tag_budget() {
+    let world = World::new(true);
+    world.page("shared", "aaaa");
+    world.page("secondary", "bbbb");
+    world.enable_tag("Primary", "shared", "20", "100");
+    world.enable_tag("Secondary", "shared", "10", "8");
+    world.ok(&[
+        "tag",
+        "set",
+        "Secondary",
+        "secondary",
+        "--priority",
+        "1",
+        "--reason",
+        "second page",
+    ]);
+
+    let output = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "claude",
+            "--event",
+            "SessionStart",
+        ],
+        &serde_json::json!({"source": "startup", "cwd": world.project}).to_string(),
+    );
+    let context = context(&output);
+    assert!(context.contains("aaaa"));
+    assert!(context.contains("bbbb"));
+}
+
+#[test]
 fn fresh_init_recommends_both_graphs_without_enabling_them() {
     let world = World::new(false);
     let initialized = world.ok(&["init"]);
@@ -319,6 +377,58 @@ fn boundary_hook_reports_portable_graph_authorization_without_mutation() {
 }
 
 #[test]
+fn every_hook_adapter_emits_its_official_context_envelope() {
+    let world = World::new(true);
+    let cases = [
+        ("cursor", "session_start", "additional_context"),
+        (
+            "gemini",
+            "SessionStart",
+            "hookSpecificOutput.additionalContext",
+        ),
+        ("hermes", "pre_llm_call", "context"),
+        (
+            "antigravity",
+            "pre_invocation",
+            "injectSteps.0.ephemeralMessage",
+        ),
+        ("copilot-cli", "sessionStart", "additionalContext"),
+        (
+            "copilot-vscode",
+            "SessionStart",
+            "hookSpecificOutput.additionalContext",
+        ),
+        ("pi", "session_start", "additionalContext"),
+        ("generic", "SessionStart", "additionalContext"),
+    ];
+    for (agent, event, path) in cases {
+        let output = world.output(&["agent", "hook", "--agent", agent, "--event", event], "{}");
+        assert!(
+            output.status.success(),
+            "{agent}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let context = path.split('.').fold(&value, |value, part| {
+            part.parse::<usize>()
+                .map_or(&value[part], |index| &value[index])
+        });
+        assert!(
+            context
+                .as_str()
+                .is_some_and(|text| text.contains("LWC_READINESS")),
+            "{agent} did not inject readiness through {path}: {value}"
+        );
+        if agent == "gemini" {
+            assert!(value["hookSpecificOutput"].get("hookEventName").is_none());
+        }
+        if agent == "copilot-vscode" {
+            assert_eq!(value["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        }
+    }
+}
+
+#[test]
 fn boundary_hook_can_report_a_missing_wiki_without_creating_it() {
     let world = World::new(false);
     let input = serde_json::json!({"source": "startup", "cwd": world.project}).to_string();
@@ -335,8 +445,58 @@ fn boundary_hook_can_report_a_missing_wiki_without_creating_it() {
     );
     let readiness = readiness(&context(&output));
     assert_eq!(readiness["wiki"]["initialized"], false);
+    assert_eq!(readiness["md_trans"]["enabled"], false);
+    assert_eq!(readiness["md_trans"]["setting"], "disabled");
+    assert!(readiness["md_trans"]["available_engines"].is_array());
+    assert_eq!(
+        readiness["md_trans"]["configure"]["anydoc"],
+        "lwc --scope project config set --trans anydoc"
+    );
+    assert_eq!(
+        readiness["md_trans"]["configure"]["markitdown"],
+        "lwc --scope project config set --trans markitdown"
+    );
     assert_eq!(readiness["authorization"]["recommended_choice"], "1");
     assert!(!world.project.join(".lwc").exists());
+}
+
+#[test]
+fn boundary_hook_reports_a_configured_but_missing_trans_executable() {
+    let world = World::new(true);
+    world.ok(&["config", "set", "--trans", "markitdown"]);
+    let input = serde_json::json!({"source": "startup", "cwd": world.project}).to_string();
+    let mut child = world
+        .command()
+        .env("PATH", "")
+        .args([
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let readiness = readiness(&context(&output));
+    assert_eq!(readiness["md_trans"]["setting"], "markitdown");
+    assert_eq!(readiness["md_trans"]["origin"], "project");
+    assert_eq!(readiness["md_trans"]["enabled"], true);
+    assert_eq!(readiness["md_trans"]["executable_available"], false);
+    assert_eq!(
+        readiness["md_trans"]["available_engines"],
+        serde_json::json!([])
+    );
 }
 
 #[test]
@@ -514,6 +674,27 @@ fn hook_context_never_cuts_a_page_to_fit_the_hard_cap() {
     assert!(!context.contains(&body));
     assert!(context.contains("omitted_by_global_budget"));
     assert!(context.contains("\"included\":0"));
+}
+
+#[test]
+fn kiro_hook_prints_context_without_a_foreign_protocol_wrapper() {
+    let world = World::new(true);
+    let output = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "kiro",
+            "--event",
+            "SessionStart",
+            "--raw",
+        ],
+        "{}",
+    );
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("\nLWC_READINESS "), "{text}");
+    assert!(!text.starts_with('{'), "{text}");
 }
 
 #[test]

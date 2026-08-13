@@ -60,69 +60,42 @@ LWC 不依赖 embedding 或向量数据库，也不会在回答完成后丢弃�
 管理作用域、整合来源、维护引用与链接，以及判断哪些知识值得读取或写回。
 
 除非正在开发或排查 `lwc` 本身，否则人类不应手工驱动日常工作流。需要使用 LWC
-时，请让 Agent 激活配套的 `using-lwc` Skill，通常调用名为 `$using-lwc`。如果当前
-Agent 运行时支持命名 Skill 命令，下面的配置还会注册 `$using-wiki` 作为便捷别名。
+时，请让 Agent 激活规范的 `using-lwc` Skill，通常调用名为 `$using-lwc`。
 
 ## 让 Agent 自动完成安装与配置
 
-把下面的提示词交给你正在使用的 Agent。它会使用自身原生设置安装 CLI 和用户级
-Skill、初始化全局记忆，并在支持 Hook 时加入最小化的会话启动提醒；整个过程不会
-覆盖已有配置。
+把下面的提示词交给你正在使用的 Agent。它会安装全局 CLI，把已支持宿主的配置交给
+LWC 幂等 AgentTarget 安装器；只有尚未注册的 Agent 才按自身官方规范弱适配。
 
 <details>
 <summary><strong>复制完整配置提示词</strong></summary>
 
 ```text
-请为当前用户和正在执行本提示词的 Agent 运行时完整安装并配置 LWC。请直接执行并
-验证，不要只输出一份让我手工执行的教程。
+请为当前用户完整安装并配置 LWC。请直接执行并验证，不要只输出一份让我手工执行的
+教程。
 
 权威来源：
 - https://github.com/JanYork/llm-wiki-cli
 - https://github.com/JanYork/llm-wiki-cli/tree/main/skills/using-lwc
 
 要求：
-1. 执行前，完整阅读仓库 README、SECURITY.md、
-   skills/using-lwc/SKILL.md，以及它直接要求的脚本和参考文件。记录本次安装所用的
-   源码 commit SHA。
-2. 使用你自身原生的用户级 Skill、全局指令和生命周期 Hook 位置及配置机制。不要让
-   用户解释你的配置文件，不要套用其他 Agent 的文件名，也不要在未明确要求时顺带
-   配置机器上的其他 Agent 运行时。
-3. 保留所有已有用户配置；修改任何已有文件或 Skill 前先创建带时间戳的备份。所有
-   操作必须幂等，再次运行本提示词时不得重复追加配置块。
-4. 把 `skills/using-lwc` 安装或更新为规范的用户级 Skill。若运行时支持命名 Skill
-   命令，以它注册 $using-lwc，并把 $using-wiki 注册为指向规范 Skill 的轻量别名；
-   不要复制出两份独立维护的实现。若运行时使用其他调用语法，则注册最接近的原生
-   别名，并在报告中写明准确名称。在能力支持时验证两个入口都可发现。
-5. 在当前宿主授权的工作区根目录中，严格按照规范 Skill 的要求运行 bootstrap。
-   缺少兼容 CLI 时，允许它安装经过 SHA-256 校验的官方 LWC Release，并初始化
-   ~/.lwc 全局记忆。校验 bootstrap 返回的 JSON，确认 `lwc` 已能通过全局 PATH
-   直接调用，再运行 `lwc --version` 并检查全局 Wiki。返回的绝对路径只用于诊断，
-   不得保存成日常命令变量。除非用户针对某个项目明确要求，否则不要初始化任何项目 Wiki；
-   也不得用全局记忆代替项目级写入。
-6. 只通过你自身的原生配置加入最小且互补的集成：
-   - 在追加式的用户级全局 system/developer instructions 中加入一条简短的 LWC
-     路由规则，不得替换内置提示词。
-   - 在你的用户级全局指令文件中合并一个 LWC 区块，不论该文件叫什么，都使用固定
-     注释 `<!-- LWC_START -->` 与 `<!-- LWC_END -->` 包围。以后重复执行时，只替换
-     这两个标记之间的内容，标记之外的所有用户内容一律不得改动。如果只找到一个
-     标记，应停止修改，不能猜测用户内容的边界。区块应要求在实质性的项目、研究、
-     规划、调试、决策或文档摄取工作中使用规范的 LWC Skill；先读取再重复调查；把
-     可长期复用的结论写回；分离项目与全局作用域；遵守当前授权工作区边界；绝不
-     保存秘密、原始思维链、临时日志或没有依据的猜测。
-   - 如果你支持生命周期 Hook，则创建或合并一个调用有界、只读
-     `lwc agent hook` 的原生用户级会话启动 Hook。它可以报告本地就绪状态，并仅载入
-     已显式启用的强标签页面；不得初始化或修改 Wiki、启用图、下载运行时或建立索引。
-     不要增加每次提示都读取 Wiki 的 Hook，不要替换无关 Hook，也不要绕过 Hook 信任
-     审查。若你不支持 Hook，则使用全局指令作为降级方案并报告限制，不得臆造机制。
-7. Skill、全局指令和 Hook 应保持简短并各司其职，不要复制整份策略；规范 Skill
-   始终是唯一权威工作流。
-8. 校验每个修改过的配置文件和 Hook 可执行文件，确认旧配置仍然保留，并运行最小
-   安全冒烟检查。只使用你原生支持的配置，不得臆造字段或文件名。
+1. 阅读本 README、`SECURITY.md` 和 `skills/using-lwc/SKILL.md`。如果 `lwc` 尚不能
+   全局调用，安装经过 checksum 校验的官方 Release；日常命令不得拼接私有二进制路径
+   或 `LWC_PROJECT_ROOT`。
+2. 运行 `lwc --version`；全局记忆缺失时仅执行一次 `lwc --scope global init`；然后
+   执行 `lwc agent install --yes`。该命令会自动检测已安装的受支持 Agent，并按官方
+   路径安全安装 MCP、Skill、Hook 与 Instructions。不得手工重写这套逻辑，也不得给
+   同一个 Agent 同时安装原生包和直接配置。
+3. 检查 `lwc agent status --target all --location global`。按需重启受影响的 Agent，
+   并完成宿主正常的 Hook 信任审查。没有项目级明确授权时，不得初始化项目 Wiki 或
+   任一图能力。
+4. 如果当前运行时不在 LWC 已注册 AgentTarget 中，才按该运行时的官方用户级规范安装
+   规范 `using-lwc` Skill、追加式指导区块、`lwc serve --mcp`，并只在官方支持时安装
+   有界会话 Hook。保留已有配置、保证幂等；没有官方表面就报告不支持，不得猜路径或
+   配置键。
 
-最后给出简洁报告，包含：识别到的 Agent 运行时、LWC 版本与路径、源码 commit、
-Skill 与别名路径、全局 Wiki 路径、修改过的 Hook/配置文件、备份路径、验证结果、
-不受支持的集成，以及哪些变化需要新开 Agent 会话或完成正常的 Hook 信任确认后
-才能生效。
+最后报告 LWC 版本、检测并配置的 Target、status 结果、修改文件、不支持的能力，以及
+仍需完成的重启或信任操作。
 ```
 
 </details>
@@ -294,12 +267,11 @@ cargo install --locked --path .
 目录。以 Codex 为例，可在本地检出目录中执行：
 
 ```bash
-mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
-cp -R skills/using-lwc "${CODEX_HOME:-$HOME/.codex}/skills/"
+mkdir -p "$HOME/.agents/skills"
+cp -R skills/using-lwc "$HOME/.agents/skills/"
 ```
 
-规范调用名是 `$using-lwc`。上面的配置提示词还会创建可选的 `$using-wiki` 别名，
-但不会复制出另一份 Skill 实现。
+规范调用名是 `$using-lwc`。
 
 Skill 触发后会：
 
@@ -331,8 +303,9 @@ CLI 本身不绑定具体运行时：任何能够执行 CLI，并加载或适配
 
 ### 原生 Agent 配置
 
-LWC 可以检测已安装的 Agent，并配置 CodeGraph MCP、有边界标记的 LWC 指导和
-原生生命周期 Hook：
+LWC 可以检测已安装的 Agent，并配置一个统一只读的 LWC MCP。全部 12 个已注册
+AgentTarget 都是强适配：针对每个宿主和全局/项目范围，安装官方支持的 MCP、Skill、
+Hook 与 Instructions；由 UI 管理、处于 preview 或官方不支持的能力会被明确标记。
 
 ```bash
 lwc agent install --yes
@@ -342,10 +315,25 @@ lwc agent refresh --target codex,claude
 lwc agent uninstall --target codex,claude --yes
 ```
 
-`--yes` 默认选择检测到的 Agent、全局配置，并启用 Claude Code 融合后的 prompt
-Hook。重复安装和刷新逐字节幂等；卸载只恢复 LWC/CodeGraph 拥有的状态，不删除项目
-索引。`integrations/` 提供可选的 Codex、Claude Code 和 Pi 原生包；安装包不等于
-授权或信任，也不要为同一个 Agent 同时安装原生包和直接配置。
+`--yes` 默认选择检测到的 Agent、全局配置和各 Target 的默认生命周期/prompt Hook；使用
+`--no-prompt-hook` 可省略 Claude 的逐 prompt Hook。安装项固定为
+`lwc -> serve --mcp`；唯一的 `lwc_explore` 工具默认读取有界 Wiki
+记忆，并支持显式 `code`/`all` 模式；请求的 `projectPath` 必须位于 MCP 宿主启动 LWC
+时的工作区内，且绝不会在查询时下载或初始化 CodeGraph。重复安装
+和刷新逐字节幂等；卸载只恢复 LWC 拥有的状态，不删除项目索引。`integrations/` 提供
+可选的 Codex、Claude Code 和 Pi 原生包；安装包不等于授权或信任，也不要为同一个
+Agent 同时安装原生包和直接配置。每个原生包都内置完整的 `using-lwc` Skill，普通用户
+不依赖任何第三方 Skill 管理器或维护者本机环境。
+
+Pi 因官方没有内置 MCP，使用原生扩展桥接 LWC MCP。其余 Target 只注册
+`lwc serve --mcp`；CodeGraph 是 LWC 内部的代码上下文能力，不会作为第二个 Agent MCP
+暴露。由宿主 UI 管理的信任与权限仍由用户决定；preview 能力会明确标记。某个项目范围
+只支持部分能力时，安装器会安装这些能力，而不是把整个 Target 降级或拒绝。Kiro 全局
+路径遵循 `KIRO_HOME`。
+
+Target 接口、注册顺序、检测规则和 MCP 路径参考 CodeGraph 的 MIT 许可安装器适配设计；
+LWC 在其上增加统一 LWC MCP、逐能力状态、Skills、Hooks、共享文件所有权和精确回滚。
+许可证声明见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
 新项目执行 `lwc init` 后，以及会话开始/上下文压缩 Hook 中，都会输出有界的
 `LWC_READINESS`：包括 Wiki、物理文档图、CodeGraph 全局运行时与项目索引状态，
@@ -704,8 +692,9 @@ lwc cg files
 
 CodeGraph 的查询能力均可通过 `lwc cg` 使用。全局生命周期命令
 （`install`、`uninstall`、`upgrade`、`telemetry`、`daemon`、`daemons`）会被
-拒绝；只允许精确的 Agent 桥接命令 `lwc cg serve --mcp`，因为运行时由 LWC 管理且
-必须保持项目边界。首次、增量、全量、更新、
+拒绝。精确命令 `lwc cg serve --mcp` 仅保留为旧版手工桥接兼容；新的 Agent 集成统一
+使用 `lwc serve --mcp`，在一个只读工具后融合有界 Wiki 与 CodeGraph 探索。运行时仍由
+LWC 管理并保持项目边界。首次、增量、全量、更新、
 删除、引用解析和恢复写入都以所属文件为事务：一篇文件完全可用后才处理下一
 篇；当前图保持可读，历史文档版本永不刷新。
 

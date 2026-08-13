@@ -92,4 +92,4 @@ jobs:
           key: windows-codegraph
 
       - name: Test Windows CodeGraph path forwarding
-        run: cargo test --locked --test codegraph_cli_windows
+        run: cargo test --locked --test codegraph_cli_windows --test agent_cli_windows

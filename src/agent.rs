@@ -1,6 +1,6 @@
 use crate::{
     codegraph,
-    config::{self, GraphSetting},
+    config::{self, GraphSetting, TransSetting},
     error::{AppError, Result},
     scope::{Scope, init_store_path, resolve_read_store_paths},
     store::{PageRecord, Store, TagAutoloadPolicy, TagPageIdentity},
@@ -14,6 +14,7 @@ use std::{
 };
 
 mod install;
+mod targets;
 pub(crate) use install::{AgentLocation, install, refresh, status, uninstall};
 
 const MAX_INPUT_BYTES: u64 = 64 * 1024;
@@ -23,7 +24,15 @@ const MAX_CONTEXT_CHARS: usize = 100_000;
 pub(crate) enum AgentKind {
     Codex,
     Claude,
+    Cursor,
+    Gemini,
+    Hermes,
+    Antigravity,
+    CopilotCli,
+    CopilotVscode,
+    Kiro,
     Pi,
+    Generic,
 }
 
 enum HookEvent {
@@ -81,8 +90,7 @@ fn compile_hook(agent: AgentKind, event: &str, scope: Scope, cwd: &Path) -> Resu
                 Ok(envelope(agent, "UserPromptSubmit", context))
             }
         }
-        HookEvent::Prompt => Ok(json!({})),
-        HookEvent::Boundary => {
+        HookEvent::Prompt | HookEvent::Boundary => {
             let readiness = readiness(cwd)?;
             let context = match strong_context(scope, cwd, &readiness) {
                 Ok(context) => context,
@@ -114,8 +122,19 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
     let code_graph_runtime_installed = code_graph["installed"].as_bool().unwrap_or(false);
     let code_graph_initialized = code_graph["initialized"].as_bool().unwrap_or(false);
     let code_graph_ready = code_graph_runtime_installed && code_graph_initialized;
+    let trans = config::resolve_trans("project", &store.path)?;
+    let trans_engine = match trans.setting {
+        TransSetting::Anydoc => Some("anydoc"),
+        TransSetting::Markitdown => Some("markitdown"),
+        TransSetting::Disabled | TransSetting::Inherit => None,
+    };
+    let trans_available = trans_engine.is_some_and(install::command_exists);
+    let available_trans_engines = ["anydoc", "markitdown"]
+        .into_iter()
+        .filter(|engine| install::command_exists(engine))
+        .collect::<Vec<_>>();
     let document_graph_needs_consent = !document_graph_enabled;
-    let code_graph_needs_consent = !code_graph_ready;
+    let code_graph_needs_consent = !code_graph_initialized;
 
     let mut value = json!({
         "wiki": {
@@ -141,6 +160,18 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
             "requires_consent": code_graph_needs_consent,
             "initialize": "lwc --scope project cg init",
             "status": "lwc --scope project cg status",
+        },
+        "md_trans": {
+            "setting": trans.setting,
+            "origin": trans.origin,
+            "enabled": trans_engine.is_some(),
+            "executable_available": trans_available,
+            "available_engines": available_trans_engines,
+            "convert": "lwc --scope project trans INPUT --output OUTPUT.md",
+            "configure": {
+                "anydoc": "lwc --scope project config set --trans anydoc",
+                "markitdown": "lwc --scope project config set --trans markitdown",
+            },
         },
         "agent_integration": {
             "check": "lwc agent status --target auto --location global",
@@ -227,7 +258,10 @@ fn normalize_event(event: &str) -> Result<HookEvent> {
         | "compact"
         | "sessioncompact"
         | "precompact"
-        | "sessionbeforecompact" => Ok(HookEvent::Boundary),
+        | "sessionbeforecompact"
+        | "prellmcall"
+        | "preinvocation"
+        | "agentspawn" => Ok(HookEvent::Boundary),
         "userpromptsubmit" | "userpromptsubmitted" => Ok(HookEvent::Prompt),
         _ => Err(AppError::new(
             "unsupported_hook_event",
@@ -238,8 +272,17 @@ fn normalize_event(event: &str) -> Result<HookEvent> {
 
 fn envelope(agent: AgentKind, event: &str, context: String) -> Value {
     match agent {
-        AgentKind::Pi => json!({"additionalContext": context}),
-        AgentKind::Codex | AgentKind::Claude => json!({
+        AgentKind::Cursor => json!({"additional_context": context}),
+        AgentKind::Hermes => json!({"context": context}),
+        AgentKind::Antigravity => json!({"injectSteps": [{"ephemeralMessage": context}]}),
+        AgentKind::Kiro => Value::String(context),
+        AgentKind::CopilotCli | AgentKind::Pi | AgentKind::Generic => {
+            json!({"additionalContext": context})
+        }
+        AgentKind::Gemini => json!({
+            "hookSpecificOutput": {"additionalContext": context}
+        }),
+        AgentKind::Codex | AgentKind::Claude | AgentKind::CopilotVscode => json!({
             "hookSpecificOutput": {
                 "hookEventName": event,
                 "additionalContext": context,

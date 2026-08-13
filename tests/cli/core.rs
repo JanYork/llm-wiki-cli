@@ -107,6 +107,7 @@ fn canonical_graph_supports_exploration_paths_relations_impact_and_overview() {
         world.ok(&world.project, &["work", "watch", work_id])["work"]["state"],
         "succeeded"
     );
+    assert!(!world.project.join(".lwc/work/active").exists());
 
     let node = world.ok(&world.project, &["graph", "node", "page:alpha"]);
     assert_eq!(node["node"]["label"], "Alpha");

@@ -113,6 +113,30 @@ pub fn resolve_read_store_paths(
     }
 }
 
+pub fn resolve_explicit_read_store_paths(
+    scope: Scope,
+    project_path: &Path,
+) -> Result<Vec<StorePath>> {
+    let project =
+        || -> Result<Option<StorePath>> {
+            Ok(find_project_store(project_path, None)?
+                .map(|path| StorePath::new(Scope::Project, path)))
+        };
+    let global = || -> Result<Option<StorePath>> {
+        let path = global_store_path()?;
+        Ok(inspect_store_path(&path, None)?.then(|| StorePath::new(Scope::Global, path)))
+    };
+    let stores: Vec<StorePath> = match scope {
+        Scope::Project => project()?.into_iter().collect(),
+        Scope::Global => global()?.into_iter().collect(),
+        Scope::All => project()?.into_iter().chain(global()?).collect(),
+    };
+    if stores.is_empty() {
+        return Err(store_not_found("no requested Wiki scope is initialized"));
+    }
+    Ok(stores)
+}
+
 pub fn ensure_scope_supported(scope: Scope, allow_all: bool, command: &str) -> Result<()> {
     if scope == Scope::All && !allow_all {
         return Err(scope_not_supported(command));

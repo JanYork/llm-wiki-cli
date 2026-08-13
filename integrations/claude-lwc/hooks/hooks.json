@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "lwc agent hook --agent claude --event SessionStart",
+            "command": "lwc --scope all agent hook --agent claude --event SessionStart",
             "timeout": 2,
             "statusMessage": "Loading bounded LWC context..."
           }

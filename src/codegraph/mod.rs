@@ -399,45 +399,6 @@ pub fn prompt_hook(project: &Path, prompt: &str) -> Result<String> {
     })
 }
 
-pub(crate) fn installer(project: &Path, args: &[OsString]) -> Result<()> {
-    const TIMEOUT: Duration = Duration::from_secs(30);
-    let paths = Paths::from_project(fs::canonicalize(project)?)?;
-    install(&paths)?;
-    let executable = binary(&paths).ok_or_else(|| {
-        AppError::new("codegraph_runtime_missing", "CodeGraph runtime is missing")
-    })?;
-    let mut child = Command::new(executable)
-        .args(args)
-        .current_dir(&paths.project)
-        .env("CODEGRAPH_TELEMETRY", "0")
-        .env("DO_NOT_TRACK", "1")
-        .env("NO_COLOR", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            if status.success() {
-                return Ok(());
-            }
-            return Err(AppError::new(
-                "codegraph_installer_failed",
-                format!("CodeGraph installer exited with {status}"),
-            ));
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AppError::new(
-                "codegraph_installer_timeout",
-                "CodeGraph installer exceeded 30 seconds",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 fn execute(paths: &Paths, args: &[OsString], stream: bool) -> Result<Value> {
     let mut command = configured_command(paths, args)?;
     let (status, stdout, stderr) = if stream {
@@ -483,6 +444,63 @@ fn configured_command(paths: &Paths, args: &[OsString]) -> Result<Command> {
     let mut command = Command::new(&executable);
     command
         .args(args)
+        .current_dir(&paths.project)
+        .env("CODEGRAPH_DIR", ".lwc/codegraph")
+        .env("CODEGRAPH_TELEMETRY", "0")
+        .env("DO_NOT_TRACK", "1")
+        .env("NO_COLOR", "1")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home);
+    Ok(command)
+}
+
+pub(crate) fn mcp_command(project: &Path) -> Result<Command> {
+    let paths = Paths::from_project(fs::canonicalize(project)?)?;
+    for directory in [paths.project.join(".lwc"), paths.index.clone()] {
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(AppError::new(
+                    "codegraph_index_invalid",
+                    "CodeGraph index directories must be real project-local directories",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AppError::new(
+                    "codegraph_index_missing",
+                    "run `lwc cg init` to build the project code index",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let database = paths.index.join("codegraph.db");
+    match fs::symlink_metadata(&database) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(AppError::new(
+                "codegraph_index_invalid",
+                "CodeGraph database must be a regular project-local file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AppError::new(
+                "codegraph_index_missing",
+                "run `lwc cg init` to build the project code index",
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let executable = binary(&paths).ok_or_else(|| {
+        AppError::new(
+            "codegraph_runtime_missing",
+            "run `lwc cg init` to install the pinned CodeGraph runtime",
+        )
+    })?;
+    let home = paths.runtime.join("home");
+    let mut command = Command::new(executable);
+    command
+        .args(["serve", "--mcp"])
         .current_dir(&paths.project)
         .env("CODEGRAPH_DIR", ".lwc/codegraph")
         .env("CODEGRAPH_TELEMETRY", "0")

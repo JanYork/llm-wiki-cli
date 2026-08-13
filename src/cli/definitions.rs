@@ -168,6 +168,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serve LWC to Agent hosts over a foreground protocol transport.
+    Serve {
+        /// Use the standard MCP JSON-RPC protocol over stdin/stdout.
+        #[arg(long)]
+        mcp: bool,
+        /// Bind the MCP server to an explicit Agent workspace.
+        #[arg(long, value_name = "DIRECTORY", requires = "mcp")]
+        path: Option<PathBuf>,
+    },
     /// Initialize the selected Wiki, locally exclude project state from Git, and materialize it.
     #[command(after_help = "Examples:\n  lwc init\n  lwc --scope global init")]
     Init {
@@ -536,7 +545,7 @@ enum LoadCommand {
 
 #[derive(Subcommand)]
 enum AgentCommand {
-    /// Install LWC and CodeGraph integration into detected or selected Agents.
+    /// Install LWC integration into detected or selected Agents.
     Install {
         #[arg(long)]
         target: Option<String>,
@@ -546,8 +555,8 @@ enum AgentCommand {
         yes: bool,
         #[arg(long)]
         print_config: Option<String>,
-        #[arg(long)]
-        no_codegraph_prompt_hook: bool,
+        #[arg(long = "no-prompt-hook", alias = "no-codegraph-prompt-hook")]
+        no_prompt_hook: bool,
     },
     /// Inspect installed Agent integrations.
     Status {
@@ -578,6 +587,9 @@ enum AgentCommand {
         agent: AgentArg,
         #[arg(long)]
         event: String,
+        /// Print raw context for hosts whose command hooks consume stdout directly.
+        #[arg(long)]
+        raw: bool,
     },
 }
 
@@ -600,7 +612,16 @@ impl From<AgentLocationArg> for crate::agent::AgentLocation {
 enum AgentArg {
     Codex,
     Claude,
+    Cursor,
+    Gemini,
+    Hermes,
+    Antigravity,
+    CopilotCli,
+    #[value(alias = "copilot")]
+    CopilotVscode,
+    Kiro,
     Pi,
+    Generic,
 }
 
 impl From<AgentArg> for crate::agent::AgentKind {
@@ -608,7 +629,15 @@ impl From<AgentArg> for crate::agent::AgentKind {
         match value {
             AgentArg::Codex => Self::Codex,
             AgentArg::Claude => Self::Claude,
+            AgentArg::Cursor => Self::Cursor,
+            AgentArg::Gemini => Self::Gemini,
+            AgentArg::Hermes => Self::Hermes,
+            AgentArg::Antigravity => Self::Antigravity,
+            AgentArg::CopilotCli => Self::CopilotCli,
+            AgentArg::CopilotVscode => Self::CopilotVscode,
+            AgentArg::Kiro => Self::Kiro,
             AgentArg::Pi => Self::Pi,
+            AgentArg::Generic => Self::Generic,
         }
     }
 }

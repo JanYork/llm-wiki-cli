@@ -193,6 +193,17 @@ pub fn status(scope: &str, database: &Path) -> Result<Value> {
     }))
 }
 
+pub fn passive_status(scope: &str, database: &Path) -> Result<Value> {
+    let setting = config::resolve(scope, database)?.setting;
+    if setting == GraphSetting::Disabled {
+        return Ok(json!({"engine": "disabled", "status": "disabled"}));
+    }
+    Ok(json!({
+        "engine": setting_name(setting),
+        "status": if sidecar(database, setting).exists() { "ready" } else { "pending" },
+    }))
+}
+
 pub fn node(scope: &str, database: &Path, identifier: &str) -> Result<Value> {
     let documents = load_projected_documents(scope, database)?;
     let document = documents

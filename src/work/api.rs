@@ -19,9 +19,11 @@ pub fn status(store: &StorePath, id: &str) -> Result<Value> {
 }
 
 pub fn watch(store: &StorePath, id: &str) -> Result<Value> {
+    let root = work_root(&store.path)?;
     loop {
         let state = load_state(store, id)?;
         if terminal(&state.state) {
+            release_active(&root, id)?;
             return Ok(json!({"work": state}));
         }
         thread::sleep(Duration::from_millis(250));

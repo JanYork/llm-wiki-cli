@@ -1,7 +1,7 @@
 {
   "name": "pi-lwc",
   "version": "0.1.0",
-  "description": "Durable LWC Wiki context for Pi with a CodeGraph CLI bridge.",
+  "description": "Durable LWC context for Pi with a unified read-only MCP bridge.",
   "type": "module",
   "license": "Apache-2.0",
   "author": "JanYork",
@@ -10,6 +10,9 @@
     "url": "git+https://github.com/JanYork/llm-wiki-cli.git"
   },
   "keywords": ["pi-package", "pi-extension", "memory", "wiki", "codegraph"],
+  "peerDependencies": {
+    "typebox": "*"
+  },
   "files": ["extensions", "skills", "README.md"],
   "pi": {
     "extensions": ["./extensions/lwc.js"],

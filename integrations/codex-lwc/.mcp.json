@@ -1,9 +1,9 @@
 {
   "mcpServers": {
-    "codegraph": {
+    "lwc": {
       "type": "stdio",
       "command": "lwc",
-      "args": ["cg", "serve", "--mcp"]
+      "args": ["serve", "--mcp"]
     }
   }
 }
