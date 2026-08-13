@@ -1,4 +1,5 @@
 use serde_json::Value;
+#[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -133,6 +134,11 @@ fn write_executable(path: &Path) {
     )
     .unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn write_executable(path: &Path) {
+    fs::write(path.with_extension("exe"), []).unwrap();
 }
 
 #[cfg(unix)]

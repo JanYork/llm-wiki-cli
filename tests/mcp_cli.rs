@@ -1,10 +1,11 @@
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 use std::{
     fs,
     io::Write,
     path::Path,
     process::{Command, Stdio},
-    time::{Duration, Instant},
 };
 
 fn run_mcp(messages: &[Value]) -> std::process::Output {
