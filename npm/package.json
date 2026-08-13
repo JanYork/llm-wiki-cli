@@ -1,6 +1,6 @@
 {
   "name": "@i-xor/lwc",
-  "version": "0.14.5",
+  "version": "0.14.6",
   "description": "Agent-driven proactive memory CLI for AI agents — autonomously recall, maintain, and evolve persistent, source-grounded knowledge across sessions.",
   "keywords": [
     "agent-memory-system",

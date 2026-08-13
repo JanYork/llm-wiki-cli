@@ -791,6 +791,7 @@ fn sparse_tag_only_changeset_lints_against_live_wiki_and_commits_cleanly() {
         )
         .unwrap();
     assert_eq!(staged_dependencies, 0);
+    drop(draft);
 
     let lint = world.ok(
         &world.project,
