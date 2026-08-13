@@ -259,6 +259,13 @@ Most users should use the Agent setup prompt above. The manual commands below
 are for maintainers, debugging, or Agent environments that cannot install the
 companion Skill.
 
+Install with Homebrew (prebuilt bottles are available for Apple silicon macOS
+and x86_64 Linux):
+
+```bash
+brew install JanYork/tap/lwc
+```
+
 Install with npm (Node.js 22+):
 
 ```bash

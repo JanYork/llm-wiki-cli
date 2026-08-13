@@ -233,6 +233,12 @@ Grafeo 与嵌入式 SurrealDB 使用 `.lwc/` 下可重建的 sidecar。每个
 大多数用户应直接使用上面的 Agent 配置提示词。下面的手动命令主要用于维护、排障，
 或无法安装配套 Skill 的 Agent 环境。
 
+使用 Homebrew 安装（提供 Apple 芯片 macOS 与 x86_64 Linux 预编译 Bottle）：
+
+```bash
+brew install JanYork/tap/lwc
+```
+
 使用 npm 安装（Node.js 22+）：
 
 ```bash
