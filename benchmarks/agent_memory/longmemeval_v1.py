@@ -115,9 +115,13 @@ def _evaluate_entry(
         for message in session:
             if not isinstance(message, dict):
                 raise AdapterError(f"session {session_id} contains a non-object message")
+            if isinstance(message.get("content"), str) and not message["content"].strip():
+                continue
             normalized = dict(message)
             normalized.setdefault("timestamp", date)
             messages.append(normalized)
+        if not messages:
+            raise AdapterError(f"session {session_id} has no non-empty messages")
         memory_id = f"{session_id}:{occurrence}"
         date_by_memory_id[memory_id] = date
         memories.append((memory_id, session_id, messages))

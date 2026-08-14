@@ -233,6 +233,29 @@ class LongMemEvalV1Tests(unittest.TestCase):
         self.assertEqual(len(sources), 3)
         self.assertEqual(sum('"session_id":"s1"' in source for source in sources), 2)
 
+    def test_empty_official_messages_are_ignored(self) -> None:
+        entries = json.loads(self.dataset.read_text(encoding="utf-8"))
+        entries[0]["haystack_sessions"][0].append({"role": "user", "content": ""})
+        self.dataset.write_text(json.dumps([entries[0]]), encoding="utf-8")
+        state = self.root / "empty-message-state"
+
+        report = evaluate_dataset(
+            data_path=self.dataset,
+            state_root=state,
+            output_path=self.root / "empty-message.json",
+            upstream_revision="test-revision",
+            lwc_commit="test-lwc-commit",
+            binary=lwc_binary(),
+        )
+
+        self.assertTrue(report["complete"])
+        source = next(
+            path.read_text(encoding="utf-8")
+            for path in state.glob("*/sources/*.md")
+            if "cobalt passport" in path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(source.count("## user @ 2024-01-01"), 1)
+
 
 class AmlApiTests(unittest.TestCase):
     def setUp(self) -> None:
