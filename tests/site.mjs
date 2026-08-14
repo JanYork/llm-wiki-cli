@@ -11,6 +11,7 @@ const files = {
   js: "site/assets/site.js",
   socialEn: "site/assets/social-card.png",
   socialZh: "site/assets/social-card-zh-CN.png",
+  sitemap: "site/sitemap.xml",
   workflow: ".github/workflows/pages.yml",
   ci: ".github/workflows/ci.yml",
 };
@@ -25,6 +26,12 @@ function metaContent(html, key) {
     .find((candidate) => attribute(candidate, "property") === key || attribute(candidate, "name") === key);
   assert.ok(tag, `meta ${key} is missing`);
   return attribute(tag, "content");
+}
+
+function structuredData(html) {
+  const blocks = [...html.matchAll(/<script\b[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/g)];
+  assert.equal(blocks.length, 1, "expected exactly one JSON-LD block");
+  return JSON.parse(blocks[0][1]);
 }
 
 function pngDimensions(path) {
@@ -139,6 +146,56 @@ test("both locales expose complete localized social metadata", () => {
   }
 });
 
+test("both locales expose truthful SoftwareApplication data and license text", () => {
+  const expected = {
+    en: {
+      url: "https://janyork.github.io/llm-wiki-cli/",
+      description: "LWC gives AI Agents durable, source-grounded memory across sessions, projects, and tools.",
+    },
+    zh: {
+      url: "https://janyork.github.io/llm-wiki-cli/zh-CN/",
+      description: "LWC 为 AI Agent 提供可跨会话、跨项目与跨工具持续使用的、来源可追溯的持久记忆。",
+    },
+  };
+
+  for (const locale of ["en", "zh"]) {
+    const html = page(locale);
+    const data = structuredData(html);
+    assert.equal(data["@context"], "https://schema.org");
+    assert.equal(data["@type"], "SoftwareApplication");
+    assert.equal(data.name, "LWC");
+    assert.equal(data.url, expected[locale].url);
+    assert.equal(data.description, expected[locale].description);
+    assert.equal(data.description, metaContent(html, "description"));
+    assert.equal(data.applicationCategory, "DeveloperApplication");
+    assert.equal(data.operatingSystem, "macOS, Linux, Windows");
+    assert.equal(data.isAccessibleForFree, true);
+    assert.deepEqual(data.offers, { "@type": "Offer", price: 0, priceCurrency: "USD" });
+    assert.equal(data.license, "https://github.com/JanYork/llm-wiki-cli/blob/main/LICENSE");
+    assert.equal(data.downloadUrl, "https://github.com/JanYork/llm-wiki-cli/releases");
+    assert.equal(data.sameAs, "https://github.com/JanYork/llm-wiki-cli");
+    assert.ok(html.includes("Apache-2.0"), `${locale} visible license is not Apache-2.0`);
+    assert.doesNotMatch(html, /\bMIT(?: License)?\b/);
+    assert.doesNotMatch(html, /<meta\b[^>]*name="keywords"/i);
+    for (const unsupported of ["aggregateRating", "review", "softwareVersion"])
+      assert.equal(data[unsupported], undefined, `${unsupported} must not be fabricated or stale`);
+  }
+});
+
+test("the sitemap contains exactly the two reciprocal locale URLs", () => {
+  const sitemap = read(files.sitemap);
+  assert.equal([...sitemap.matchAll(/<url>/g)].length, 2);
+  assert.equal([...sitemap.matchAll(/<loc>/g)].length, 2);
+  for (const url of [
+    "https://janyork.github.io/llm-wiki-cli/",
+    "https://janyork.github.io/llm-wiki-cli/zh-CN/",
+  ]) assert.ok(sitemap.includes(`<loc>${url}</loc>`), `${url} is missing from sitemap`);
+  for (const hreflang of ["en", "zh-CN", "x-default"])
+    assert.equal([...sitemap.matchAll(new RegExp(`hreflang="${hreflang}"`, "g"))].length, 2);
+  assert.doesNotMatch(sitemap, /<(?:lastmod|changefreq|priority)>/);
+  assert.equal(existsSync(resolve(root, "site/robots.txt")), false);
+});
+
 test("both pages contain the exact normative README Agent prompt", () => {
   const expected = setupPrompt();
   assert.equal(embeddedPrompt(page("en")), expected);
@@ -164,7 +221,10 @@ test("assets resolve from both locale directories and controls stay accessible",
     assert.match(html, /<button[^>]+data-copy-target="agent-setup-prompt"[^>]*>\s*[^<\s][^<]*<\/button>/);
     assert.match(html, /<summary>\s*[^<\s][^<]*<\/summary>/);
     assert.match(html, /<nav[^>]+aria-label="[^"]+"/);
-    assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)/);
+    for (const script of html.matchAll(/<script\b[^>]*>/g)) {
+      if (attribute(script[0], "src")) continue;
+      assert.equal(attribute(script[0], "type"), "application/ld+json", "executable inline script is forbidden");
+    }
     assert.doesNotMatch(html, /\sstyle="/);
   }
 });
