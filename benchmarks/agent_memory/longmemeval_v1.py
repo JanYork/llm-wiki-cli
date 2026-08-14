@@ -93,7 +93,10 @@ def _evaluate_entry(
         raise AdapterError(f"haystack arrays differ in length for {question_id}")
 
     memories = []
-    for session_id, session, date in zip(session_ids, sessions, dates, strict=True):
+    date_by_memory_id: dict[str, object] = {}
+    for occurrence, (session_id, session, date) in enumerate(
+        zip(session_ids, sessions, dates, strict=True)
+    ):
         session_id = _text(session_id, "haystack_session_id")
         if not isinstance(session, list) or not session:
             raise AdapterError(f"session {session_id} must be a non-empty message list")
@@ -104,7 +107,9 @@ def _evaluate_entry(
             normalized = dict(message)
             normalized.setdefault("timestamp", date)
             messages.append(normalized)
-        memories.append((session_id, session_id, messages))
+        memory_id = f"{session_id}:{occurrence}"
+        date_by_memory_id[memory_id] = date
+        memories.append((memory_id, session_id, messages))
 
     scope_id = f"longmemeval-v1:{dataset_sha256}:{question_id}"
     backend.add_many(scope_id, memories)
@@ -112,12 +117,11 @@ def _evaluate_entry(
     evidence = backend.search(scope_id, question, 50)
     latency_ms = (time.perf_counter() - started) * 1000.0
     ranked_ids = [item.session_id for item in evidence if item.session_id]
-    date_by_id = dict(zip(session_ids, dates, strict=True))
     ranked_items = [
         {
             "corpus_id": item.session_id,
             "text": item.content,
-            "timestamp": date_by_id.get(item.session_id),
+            "timestamp": date_by_memory_id.get(item.id),
         }
         for item in evidence
         if item.session_id

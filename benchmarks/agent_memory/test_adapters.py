@@ -193,6 +193,32 @@ class LongMemEvalV1Tests(unittest.TestCase):
         self.assertTrue(report["partial"])
         self.assertEqual(report["instances_processed"], 1)
 
+    def test_duplicate_session_ids_preserve_each_occurrence(self) -> None:
+        entries = json.loads(self.dataset.read_text(encoding="utf-8"))
+        entry = entries[0]
+        entry["haystack_session_ids"].append("s1")
+        entry["haystack_dates"].append("2024-01-04")
+        entry["haystack_sessions"].append(
+            [{"role": "user", "content": "A later occurrence has different content."}]
+        )
+        self.dataset.write_text(json.dumps([entry]), encoding="utf-8")
+        state = self.root / "duplicate-state"
+
+        report = evaluate_dataset(
+            data_path=self.dataset,
+            state_root=state,
+            output_path=self.root / "duplicate.json",
+            upstream_revision="test-revision",
+            binary=lwc_binary(),
+        )
+
+        self.assertTrue(report["complete"])
+        sources = [
+            path.read_text(encoding="utf-8") for path in state.glob("*/sources/*.md")
+        ]
+        self.assertEqual(len(sources), 3)
+        self.assertEqual(sum('"session_id":"s1"' in source for source in sources), 2)
+
 
 class AmlApiTests(unittest.TestCase):
     def setUp(self) -> None:
