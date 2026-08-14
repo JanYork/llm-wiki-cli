@@ -15,7 +15,10 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> ·
+  <a href="README.ja.md">日本語</a> · <a href="README.es.md">Español</a> ·
+  <a href="README.pt-BR.md">Português (Brasil)</a> · <a href="README.fr.md">Français</a> ·
+  <a href="README.ru.md">Русский</a>
 </p>
 
 <p align="center">
@@ -73,7 +76,7 @@ LWC 不依赖 embedding 或向量数据库，也不会在回答完成后丢弃�
 ## 让 Agent 自动完成安装与配置
 
 把下面的提示词交给你正在使用的 Agent。它会安装全局 CLI，把已支持宿主的配置交给
-LWC 幂等 AgentTarget 安装器；只有尚未注册的 Agent 才按自身官方规范弱适配。
+LWC 的幂等 AgentTarget 安装器；只有尚未注册的 Agent 才按自身官方规范完成配置。
 
 <details>
 <summary><strong>复制完整配置提示词</strong></summary>
@@ -88,7 +91,7 @@ LWC 幂等 AgentTarget 安装器；只有尚未注册的 Agent 才按自身官�
 
 要求：
 1. 阅读本 README、`SECURITY.md` 和 `skills/using-lwc/SKILL.md`。如果 `lwc` 尚不能
-   全局调用，安装经过 checksum 校验的官方 Release；日常命令不得拼接私有二进制路径
+   全局调用，安装经过校验和验证的官方 Release；日常命令不得拼接私有二进制路径
    或 `LWC_PROJECT_ROOT`。
 2. 运行 `lwc --version`；全局记忆缺失时仅执行一次 `lwc --scope global init`；然后
    执行 `lwc agent install --yes`。该命令会自动检测已安装的受支持 Agent，并按官方
@@ -99,8 +102,8 @@ LWC 幂等 AgentTarget 安装器；只有尚未注册的 Agent 才按自身官�
    任一图能力。
 4. 如果当前运行时不在 LWC 已注册 AgentTarget 中，才按该运行时的官方用户级规范安装
    规范 `using-lwc` Skill、追加式指导区块、`lwc serve --mcp`，并只在官方支持时安装
-   有界会话 Hook。保留已有配置、保证幂等；没有官方表面就报告不支持，不得猜路径或
-   配置键。
+   有界会话 Hook。保留已有配置、保证幂等；某项能力没有官方配置入口时就报告不支持，
+   不得猜测路径或配置键。
 
 最后报告 LWC 版本、检测并配置的 Target、status 结果、修改文件、不支持的能力，以及
 仍需完成的重启或信任操作。
@@ -129,20 +132,20 @@ LWC 幂等 AgentTarget 安装器；只有尚未注册的 Agent 才按自身官�
 | 层 | 内容 | 约束 |
 | --- | --- | --- |
 | Raw sources | 经过筛选的输入内容的不可变快照 | 通过 `source` 加入，不改写来源事实。 |
-| Wiki | Agent 维护的页面、引用、链接和来源类型 | 通过 `page` 更新；引用来源，并分类需要长期保留的非来源知识。 |
+| Wiki | Agent 维护的页面、引用、链接和溯源信息 | 通过 `page` 更新；引用来源，并分类需要长期保留的非来源知识。 |
 | Schema and purpose | 维护规则与项目目标 | 约束后续每一次 ingest 和修订。 |
 
-SQLite 是唯一的规范事实源。Markdown 树是供人和 Obsidian 等工具使用的可重建
+SQLite 是唯一的权威事实源。Markdown 树是供人和 Obsidian 等工具使用的可重建
 投影。Agent 通过 `lwc` 修改知识，而不是直接编辑 `.lwc/wiki.db` 或投影出来的
 Markdown。命令成功时向 stdout 返回 JSON，失败时向 stderr 返回结构化 JSON。
 
-对于当前格式的 store，读取命令保持只读；新版 CLI 第一次打开可写的旧版 store
-时，会先在事务中完成一次 schema 迁移，再继续读取。
+对于当前格式的存储，读取命令始终只读；新版 CLI 第一次打开可写的旧版存储时，
+会先在事务中完成一次数据库结构迁移，再继续读取。
 
 ## 分层检索与知识图
 
 每个当前 Source 和 Wiki 页面都会被确定性拆分并索引为段、句和规范化词。SQLite
-仍是权威数据源；Span FTS 与类型化规范图都是可重建索引。现有搜索默认仍只返回
+仍是权威数据源；Span FTS 和可选的外部文档图都是可重建索引。现有搜索默认仍只返回
 文档，只有显式指定粒度才检索段句：
 
 <p align="center">
@@ -184,7 +187,7 @@ lwc graph relation retract page:implementation DEPENDS_ON page:policy \
   --reason "该依赖已被新证据取代"
 ```
 
-关系理由是持久内容，不得写入凭证、秘密或原始思维链。
+关系说明会被长期保存，不得写入凭证、秘密或原始思维链。
 
 SQLite 文档仍是唯一权威数据。图默认禁用；需要图遍历时显式选择一个外部引擎。
 配置按内置、全局、项目三层解析，项目值可继承：
@@ -331,7 +334,7 @@ CLI 本身不绑定具体运行时：任何能够执行 CLI，并加载或适配
 
 LWC 可以检测已安装的 Agent，并配置一个统一只读的 LWC MCP。全部 12 个已注册
 AgentTarget 都是强适配：针对每个宿主和全局/项目范围，安装官方支持的 MCP、Skill、
-Hook 与 Instructions；由 UI 管理、处于 preview 或官方不支持的能力会被明确标记。
+Hook 与 Instructions；由 UI 管理、处于预览阶段或官方不支持的能力会被明确标记。
 
 ```bash
 lwc agent install --yes
@@ -353,7 +356,7 @@ Agent 同时安装原生包和直接配置。每个原生包都内置完整的 `
 
 Pi 因官方没有内置 MCP，使用原生扩展桥接 LWC MCP。其余 Target 只注册
 `lwc serve --mcp`；CodeGraph 是 LWC 内部的代码上下文能力，不会作为第二个 Agent MCP
-暴露。由宿主 UI 管理的信任与权限仍由用户决定；preview 能力会明确标记。某个项目范围
+暴露。由宿主 UI 管理的信任与权限仍由用户决定；处于预览阶段的能力会明确标记。某个项目范围
 只支持部分能力时，安装器会安装这些能力，而不是把整个 Target 降级或拒绝。Kiro 全局
 路径遵循 `KIRO_HOME`。
 
@@ -378,7 +381,7 @@ LWC 在其上增加统一 LWC MCP、逐能力状态、Skills、Hooks、共享文
 Work、初始化 CodeGraph，并分别核验两个结果。选择“稍后”不会修改任何状态，也不会
 阻塞当前任务。原生插件可以把相同编号渲染成自己的 UI，但绝不依赖勾选能力。
 
-强标签用于不经过搜索、按上限完整载入少量核心规则或手册：
+强标签用于绕过搜索，在明确上限内完整载入少量核心规则或手册：
 
 ```bash
 lwc tag set "运维手册" incident-response --priority 100 --reason "主响应手册"
@@ -387,8 +390,8 @@ lwc tag autoload "运维手册" --enable --priority 100 --limit 3 \
   --max-chars 50000 --reason "会话边界必须载入"
 ```
 
-它不是根据分词自动推断的搜索标签；系统会先按索引、篇数和字符预算选页，再把完整
-页面放入 Agent 上下文，绝不会一次载入全部分词关系。
+它不是由 token 自动推导的搜索机制；系统会先按数量和字符预算选页，再把完整页面
+放入 Agent 上下文。
 
 ## 快速开始
 
@@ -413,7 +416,7 @@ printf '# Purpose\nBuild a durable project Wiki.\n' | lwc purpose set -
 lwc source add-dir docs/
 ```
 
-没有显式标题的文件会确定性地使用来源路径作为可读标题；内容相同的文件会通过
+没有显式标题的文件会确定性地使用来源标识作为可读标题；内容相同的文件会通过
 SHA-256 去重。
 
 解析后位于当前项目 Wiki 根目录之外的来源必须显式传入
@@ -525,10 +528,10 @@ lwc page put architecture-decision \
   --provenance hypothesis
 ```
 
-`page put` 会整体替换引用集合和显式 provenance 集合。更新前先读取旧页面，再重复
-传入所有仍有效的 `--source`，以及非来源类的 `--provenance`。不要显式传
+`page put` 会整体替换引用集合和显式溯源信息集合。更新前先读取旧页面，再重复
+传入所有仍有效的 `--source`，以及不基于来源的 `--provenance`。不要显式传
 `source-grounded`，它由引用自动推导。页面读取、context、search、source refs 和
-Markdown 投影都会返回 provenance，但 provenance 不参与搜索排序。
+Markdown 投影都会返回溯源信息，但溯源信息不参与搜索排序。
 
 ### 4. 查询已沉淀的 Wiki
 
@@ -556,7 +559,8 @@ lwc page show source-1
 8. 用 `search`、`context`、`graph` 和 `lint` 持续维护 Wiki 的一致性。
 
 完整操作约定见 [docs/agent-workflow.md](docs/agent-workflow.md)。
-运行 `lwc --help` 或 `lwc <command> --help`，可以查看面向 Agent 编写的前置条件、状态变化、副作用和下一步动作。
+运行 `lwc --help` 或 `lwc <command> --help`，可以查看面向 Agent 编写的前置条件、
+状态变化、副作用和下一步动作。
 
 ## 原子化多命令变更
 
@@ -574,14 +578,14 @@ lwc --scope project changeset show architecture-refresh
 lwc --scope project changeset commit architecture-refresh
 ```
 
-草稿读取能看到同一批已暂存变更，而 live SQLite 与 Markdown 保持不变。草稿从小型
-稀疏 overlay 开始，不复制或 checkpoint 整个 live Wiki。`changeset show` 只报告
-暂存操作、revision 和可提交状态，不运行 lint。commit 只校验和应用触达实体，因此无关
-live 写入会保留；同一实体的 revision 冲突会失败，不覆盖任何一方。空草稿和 lint
+草稿读取能看到同一批已暂存变更，而正式 SQLite 与 Markdown 保持不变。草稿使用轻量
+稀疏覆盖层，不复制或 checkpoint 整个正式 Wiki。`changeset show` 只报告暂存操作、
+版本号和可提交状态，不运行 lint。commit 只校验和应用本批涉及的实体，因此其他正式
+写入会保留；同一实体发生版本冲突时提交失败，不覆盖任何一方。空草稿和 lint
 问题都会阻止提交；没有强制提交或自动合并。只有经过
 审计、且并非本批变更新增的既有债务，才能使用
 `--allow-lint-issues --reason "reviewed pre-existing debt"`。提交后，还要用原先
-固定的检索问题在 live 状态复验。commit 会在发布前冻结已审查的草稿；此后的暂存
+固定的检索问题在正式状态复验。commit 会在发布前冻结已审查的草稿；此后的暂存
 写入会返回 `changeset_frozen`。此时只能重试同一次 commit 完成恢复，或在明确冲突
 后 discard，不能再向冻结草稿追加工作。
 
@@ -599,7 +603,7 @@ materialization 工作，不要重复执行知识变更；应执行响应中给�
 
 稀疏 commit 当前为 Source 新增/ingest、Page put/remove、schema、purpose 和记录型
 search 提供精确 patch。检索权重与显式语义关系暂未提供稀疏 inverse patch，会在创建
-checkpoint、获取 live 写锁或修改 live Wiki 前返回 `changeset_sparse_unsupported`；
+checkpoint、获取正式库写锁或修改正式 Wiki 前返回 `changeset_sparse_unsupported`；
 当前应将它们作为直接的单实体事务执行。
 
 ## 作用域
@@ -621,8 +625,8 @@ lwc --scope all search "shared term"
 lwc --scope all context
 ```
 
-知识写入始终是显式的。`all` 不会隐式创建跨 store 的引用或链接；`search --record`
-只会向每个选中的 store 追加查询操作记录。
+知识写入始终是显式的。`all` 不会隐式创建不同存储之间的引用或链接；`search --record`
+只会向每个选中的存储追加查询操作记录。
 
 ## 搜索与 CJK 文本
 
@@ -646,7 +650,8 @@ lwc --scope all context
 - 固定系数和“数值越低越相关”的 rank 让 `--scope all` 中的 project/global 结果
   保持可比。
 
-这里刻意不依赖词典分词。目标是在产品名、代号、混合语言术语和新出现词汇上保持稳定行为，而不依赖外部分词词典。
+这里刻意不依赖词典分词，目的是让产品名、代号、混合语言术语和新词都能保持稳定的
+检索行为。
 
 ### 显式检索权重与反馈
 
@@ -716,12 +721,19 @@ lwc cg impact UserService
 lwc cg files
 ```
 
+LWC 固定版本的 CodeGraph 运行时目前可识别以下语言和代码相关格式：TypeScript、TSX、JavaScript、JSX、
+ArkTS、Python、Go、Rust、Java、C、C++、C#、Razor、PHP、Ruby、Swift、Kotlin、
+Dart、Svelte、Vue、Astro、Liquid、Pascal、Scala、Lua、Luau、Objective-C、R、
+Solidity、Nix、YAML、Twig、XML、`.properties`、CFML、CFScript、CFQuery、COBOL、
+VB.NET、Erlang 和 Terraform。YAML、Twig 和 `.properties` 仅以文件级方式跟踪，
+框架解析器仍可补充关系；XML 用于提取 MyBatis Mapper 映射。
+
 CodeGraph 的查询能力均可通过 `lwc cg` 使用。全局生命周期命令
 （`install`、`uninstall`、`upgrade`、`telemetry`、`daemon`、`daemons`）会被
 拒绝。精确命令 `lwc cg serve --mcp` 仅保留为旧版手工桥接兼容；新的 Agent 集成统一
-使用 `lwc serve --mcp`，在一个只读工具后融合有界 Wiki 与 CodeGraph 探索。运行时仍由
+使用 `lwc serve --mcp`，通过一个只读工具提供有界的 Wiki 与 CodeGraph 探索。运行时仍由
 LWC 管理并保持项目边界。首次、增量、全量、更新、
-删除、引用解析和恢复写入都以所属文件为事务：一篇文件完全可用后才处理下一
+删除、引用解析和恢复写入都以归属文件为事务：一篇文件完全可用后才处理下一
 篇；当前图保持可读，历史文档版本永不刷新。
 
 ## 维护与投影
@@ -745,15 +757,15 @@ lwc log --limit 20
 
 说明：
 
-- 维护命令会立即返回持久化 `work`。使用 `work status` 查看进度，或使用
+- 维护命令会立即返回可持久追踪的 `work`。使用 `work status` 查看进度，或使用
   `work watch` 等待完成并读取 `work.result`。v10 到 v11 的 schema 迁移也会
   自动进入同一机制，普通命令不会再在前台执行迁移。
 - `lint` 默认完全只读；只有这次检查确实需要进入持久操作历史时才加 `--record`。
 - `maintenance reindex` 从 SQLite 重建派生搜索产物。
 - `maintenance materialize` 从 SQLite 重建投影出来的 Markdown 树。
-- `maintenance compact` 只尝试执行 WAL truncate checkpoint，不再暗中执行全量 FTS
-  优化。应在 Wiki 空闲时运行，并检查返回的 `busy` 与 `after_bytes`；存在活动 reader
-  时会快速返回，不修改 canonical 内容。
+- `maintenance compact` 只尝试执行 WAL truncate checkpoint，不会顺带执行全量 FTS
+  优化。应在 Wiki 空闲时运行，并检查返回的 `busy` 与 `after_bytes`；存在活动读取进程
+  时会快速返回，不修改权威内容。
 - 搜索查询默认是私有的；只有需要把查询文本写入持久化操作日志时，才加 `--record`。
 
 `lwc checkpoint create <NAME>` 使用 SQLite 在线备份 API。执行
@@ -763,9 +775,9 @@ checkpoint，再恢复数据库并重建投影。受保护删除使用 `source r
 路径的当前来源时，该路径会明确停止跟踪，不会把旧版本悄悄恢复成“当前版本”。
 
 多来源 ingest 或大范围页面替换应优先使用 changeset，而不是手动 checkpoint：
-commit 使用稀疏 inverse patch，在短事务中只发布触达的 canonical 实体，并增量更新
-live Markdown；不会自动复制整库。发布后会尝试 WAL truncate；
-`wal_checkpointed=false` 表示活动 reader 阻止了立即截断，不表示 canonical commit
+commit 使用稀疏 inverse patch，在短事务中只发布本批涉及的权威实体，并增量更新
+正式 Markdown；不会自动复制整库。发布后会尝试 WAL truncate；
+`wal_checkpointed=false` 表示活动读取进程阻止了立即截断，不表示权威数据提交
 失败。
 
 需要文件系统级外部备份时，应先停止正在运行的 `lwc` 命令并复制完整 `.lwc/`
@@ -774,7 +786,7 @@ live Markdown；不会自动复制整库。发布后会尝试 WAL truncate；
 ## 基准测试集
 
 可选基准会把本地 UTF-8 语料导入临时 Wiki，并报告导入耗时、搜索 P50/P95、
-Recall@5/10、MRR，以及 compact 前后的存储占用。Ground truth 使用 JSONL
+Recall@5/10、MRR，以及 compact 前后的存储占用。基准答案使用 JSONL
 描述查询与期望命中的语料相对路径：
 
 ```bash
@@ -806,7 +818,8 @@ cargo test --test search_benchmark -- --ignored --nocapture
 - 不提供 Web UI 或桌面 UI；
 - 不提供直接编辑数据库的工作模式。
 
-如果投影出来的 Markdown 漂移了，就重建它；如果 SQLite schema 有问题，就通过 CLI 和 migration 修复，而不是手改。
+如果投影出来的 Markdown 发生漂移，就重建它；如果 SQLite 数据库结构有问题，就通过
+CLI 和迁移修复，不要手工修改。
 
 ## 参与贡献
 

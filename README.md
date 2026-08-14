@@ -15,7 +15,10 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> ·
+  <a href="README.ja.md">日本語</a> · <a href="README.es.md">Español</a> ·
+  <a href="README.pt-BR.md">Português (Brasil)</a> · <a href="README.fr.md">Français</a> ·
+  <a href="README.ru.md">Русский</a>
 </p>
 
 <p align="center">
@@ -792,6 +795,14 @@ lwc cg callees UserService
 lwc cg impact UserService
 lwc cg files
 ```
+
+The pinned runtime recognizes these languages and code-oriented formats:
+TypeScript, TSX, JavaScript, JSX, ArkTS, Python, Go, Rust, Java, C, C++, C#,
+Razor, PHP, Ruby, Swift, Kotlin, Dart, Svelte, Vue, Astro, Liquid, Pascal,
+Scala, Lua, Luau, Objective-C, R, Solidity, Nix, YAML, Twig, XML,
+`.properties`, CFML, CFScript, CFQuery, COBOL, VB.NET, Erlang, and Terraform.
+YAML, Twig, and `.properties` are tracked at file level; framework resolvers may
+still add relationships. XML is recognized for MyBatis mapper extraction.
 
 All CodeGraph query capabilities are forwarded by `lwc cg`. Global lifecycle
 commands (`install`, `uninstall`, `upgrade`, `telemetry`, `daemon`, `daemons`)
