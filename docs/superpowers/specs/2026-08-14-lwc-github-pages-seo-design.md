@@ -26,8 +26,9 @@ The approved option is a complete but restrained SEO pass:
 1. complete localized Open Graph and X/Twitter Card metadata;
 2. add one 1200 x 630 PNG social card per locale using the existing Memory
    Atlas visual language;
-3. add localized `SoftwareApplication` JSON-LD grounded in public repository
-   facts;
+3. add localized, truthful `SoftwareApplication` JSON-LD grounded in public
+   repository facts, without claiming Google Software App rich-result
+   eligibility;
 4. publish a two-URL XML sitemap with reciprocal language alternates;
 5. add static regression coverage and publicly verify the deployed result.
 
@@ -62,6 +63,11 @@ logos, usage metrics, or unsupported claims.
 
 Each page embeds one static JSON-LD block with `@type: SoftwareApplication`.
 Its user-facing text and URL are localized; stable product facts are shared.
+This is generic schema.org product metadata for machine-readable identity. It
+is not expected to qualify for Google's Software App rich result because Google
+currently requires a real `aggregateRating` or `review` in addition to the app
+name and offer. LWC has no first-party rating or review evidence, so adding
+either field would be misleading.
 
 Required fields:
 
@@ -82,7 +88,9 @@ sameAs                repository URL
 
 The markup intentionally omits the current release version so a site-only
 change cannot leave structured data stale after the next CLI release. It also
-omits ratings and reviews because no such first-party evidence exists.
+omits ratings and reviews because no such first-party evidence exists. Tests
+validate truthful schema syntax and field consistency; they must not claim
+Google rich-result eligibility.
 
 `WebSite` site-name markup is excluded while LWC is hosted under the
 `/llm-wiki-cli/` path. Google's site-name feature applies at the domain or
@@ -156,12 +164,12 @@ require:
 - Google recommends JSON-LD and requires structured data to represent visible,
   truthful page content:
   <https://developers.google.com/search/docs/appearance/structured-data/sd-policies>
-- Google's `SoftwareApplication` documentation requires a name and offer, and
-  supports application category and operating system:
+- Google's `SoftwareApplication` rich-result documentation additionally
+  requires a real rating or review; the generic schema in this design does not
+  claim that eligibility:
   <https://developers.google.com/search/docs/appearance/structured-data/software-app>
 - Google recommends root-level, absolute canonical URLs in XML sitemaps:
   <https://developers.google.com/search/docs/crawling-indexing/sitemaps/build-sitemap>
 - Open Graph requires title, type, URL, and image, and recommends image alt and
   dimensions:
   <https://ogp.me/>
-
