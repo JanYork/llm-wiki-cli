@@ -1,5 +1,8 @@
 # Search and graph benchmarks
 
+For LongMemEval-S, the Agent Memory Leaderboard Add/Search contract, and
+LongMemEval-V2, see [agent-memory benchmark adapters](agent_memory/README.md).
+
 This repo ships an opt-in local benchmark for lexical source retrieval, import
 cost, and storage amplification. Normal integration tests cover compiled-page
 ranking and workflow correctness.
