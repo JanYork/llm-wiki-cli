@@ -4,3 +4,4 @@
 .DS_Store
 *.swp
 web/node_modules/
+.local-benchmarks/
