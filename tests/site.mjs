@@ -19,6 +19,14 @@ const read = (path) => readFileSync(resolve(root, path), "utf8").replaceAll("\r\
 const page = (locale) => read(files[locale]);
 const attribute = (tag, name) => tag.match(new RegExp(`\\b${name}="([^"]+)"`))?.[1];
 
+function metaContent(html, key) {
+  const tag = [...html.matchAll(/<meta\b[^>]*>/g)]
+    .map((match) => match[0])
+    .find((candidate) => attribute(candidate, "property") === key || attribute(candidate, "name") === key);
+  assert.ok(tag, `meta ${key} is missing`);
+  return attribute(tag, "content");
+}
+
 function pngDimensions(path) {
   const png = readFileSync(resolve(root, path));
   assert.equal(png.subarray(1, 4).toString(), "PNG", `${path} is not a PNG`);
@@ -87,6 +95,48 @@ test("locale pages share structure and independently canonical metadata", () => 
 
   assert.match(en, /<a[^>]+data-locale="zh-CN"[^>]+href="zh-CN\/"/);
   assert.match(zh, /<a[^>]+data-locale="en"[^>]+href="\.\.\/"/);
+});
+
+test("both locales expose complete localized social metadata", () => {
+  const expected = {
+    en: {
+      title: "LWC — Proactive Memory for AI Agents",
+      description: "A durable, source-grounded Wiki that your Agent can recall and maintain across sessions.",
+      image: "https://janyork.github.io/llm-wiki-cli/assets/social-card.png",
+      alt: "LWC Memory Atlas: source evidence flows into a maintained Wiki and the next Agent session.",
+      locale: "en_US",
+      alternate: "zh_CN",
+    },
+    zh: {
+      title: "LWC — AI Agent 的主动记忆系统",
+      description: "一套由 Agent 主动维护、来源可追溯、能够跨会话持续使用的持久 Wiki。",
+      image: "https://janyork.github.io/llm-wiki-cli/assets/social-card-zh-CN.png",
+      alt: "LWC 记忆图册：来源证据进入持续维护的 Wiki，并在下一次 Agent 会话中成为可用上下文。",
+      locale: "zh_CN",
+      alternate: "en_US",
+    },
+  };
+
+  for (const locale of ["en", "zh"]) {
+    const html = page(locale);
+    const values = expected[locale];
+    assert.equal(metaContent(html, "og:site_name"), "LWC");
+    assert.equal(metaContent(html, "og:title"), values.title);
+    assert.equal(metaContent(html, "og:description"), values.description);
+    assert.equal(metaContent(html, "og:locale"), values.locale);
+    assert.equal(metaContent(html, "og:locale:alternate"), values.alternate);
+    assert.equal(metaContent(html, "og:image"), values.image);
+    assert.equal(metaContent(html, "og:image:secure_url"), values.image);
+    assert.equal(metaContent(html, "og:image:type"), "image/png");
+    assert.equal(metaContent(html, "og:image:width"), "1200");
+    assert.equal(metaContent(html, "og:image:height"), "630");
+    assert.equal(metaContent(html, "og:image:alt"), values.alt);
+    assert.equal(metaContent(html, "twitter:card"), "summary_large_image");
+    assert.equal(metaContent(html, "twitter:title"), values.title);
+    assert.equal(metaContent(html, "twitter:description"), values.description);
+    assert.equal(metaContent(html, "twitter:image"), values.image);
+    assert.equal(metaContent(html, "twitter:image:alt"), values.alt);
+  }
 });
 
 test("both pages contain the exact normative README Agent prompt", () => {
