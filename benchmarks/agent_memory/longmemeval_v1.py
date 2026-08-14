@@ -23,6 +23,7 @@ def evaluate_dataset(
     state_root: Path,
     output_path: Path,
     upstream_revision: str,
+    lwc_commit: str,
     binary: str | Path = "lwc",
     limit: int | None = None,
 ) -> dict[str, Any]:
@@ -33,6 +34,8 @@ def evaluate_dataset(
         raise AdapterError(f"dataset does not exist: {data_path}")
     if not upstream_revision.strip():
         raise AdapterError("upstream_revision must be non-empty")
+    if not lwc_commit.strip():
+        raise AdapterError("lwc_commit must be non-empty")
     if limit is not None and (isinstance(limit, bool) or limit < 1):
         raise AdapterError("limit must be a positive integer")
 
@@ -69,6 +72,14 @@ def evaluate_dataset(
         "dataset_sha256": dataset_sha256,
         "upstream_revision": upstream_revision,
         "lwc_version": _lwc_version(binary),
+        "lwc_commit": lwc_commit,
+        "adapter_config": {
+            "state_root": str(state_root),
+            "search_limit": 50,
+            "source_type": "source",
+            "granularity": "passage",
+            "scope": "isolated-per-question",
+        },
         "retrieval_log": str(log_path),
         "text_only": True,
         "metrics": _aggregate(scored),
@@ -240,6 +251,7 @@ def main() -> None:
     parser.add_argument("--state-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--upstream-revision", required=True)
+    parser.add_argument("--lwc-commit", required=True)
     parser.add_argument("--lwc-binary", default="lwc")
     parser.add_argument("--limit", type=int)
     args = parser.parse_args()
@@ -248,6 +260,7 @@ def main() -> None:
         state_root=args.state_root,
         output_path=args.output,
         upstream_revision=args.upstream_revision,
+        lwc_commit=args.lwc_commit,
         binary=args.lwc_binary,
         limit=args.limit,
     )

@@ -148,6 +148,7 @@ class LongMemEvalV1Tests(unittest.TestCase):
             state_root=state,
             output_path=output,
             upstream_revision="test-revision",
+            lwc_commit="test-lwc-commit",
             binary=lwc_binary(),
         )
 
@@ -160,6 +161,17 @@ class LongMemEvalV1Tests(unittest.TestCase):
         self.assertEqual(report["metrics"]["recall_at_10"], 1.0)
         self.assertEqual(report["metrics"]["mrr"], 1.0)
         self.assertEqual(report["upstream_revision"], "test-revision")
+        self.assertEqual(report["lwc_commit"], "test-lwc-commit")
+        self.assertEqual(
+            report["adapter_config"],
+            {
+                "state_root": str(state.resolve()),
+                "search_limit": 50,
+                "source_type": "source",
+                "granularity": "passage",
+                "scope": "isolated-per-question",
+            },
+        )
         self.assertEqual(
             report["dataset_sha256"], hashlib.sha256(self.dataset.read_bytes()).hexdigest()
         )
@@ -185,6 +197,7 @@ class LongMemEvalV1Tests(unittest.TestCase):
             state_root=self.root / "state",
             output_path=self.root / "partial.json",
             upstream_revision="test-revision",
+            lwc_commit="test-lwc-commit",
             binary=lwc_binary(),
             limit=1,
         )
@@ -209,6 +222,7 @@ class LongMemEvalV1Tests(unittest.TestCase):
             state_root=state,
             output_path=self.root / "duplicate.json",
             upstream_revision="test-revision",
+            lwc_commit="test-lwc-commit",
             binary=lwc_binary(),
         )
 
