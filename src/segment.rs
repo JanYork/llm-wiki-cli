@@ -153,8 +153,10 @@ fn non_overlapping_candidates(
     for ((kind, parent), children) in ordered.iter().zip(direct_children) {
         let mut cursor = parent.start;
         for child in children {
-            if let Some(range) = trim_range(content, cursor..child.start) {
-                passages.push((*kind, range));
+            if cursor < child.start {
+                if let Some(range) = trim_range(content, cursor..child.start) {
+                    passages.push((*kind, range));
+                }
             }
             cursor = cursor.max(child.end);
         }
@@ -318,6 +320,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["let x = 1;", "println!(\"{x}\");"]
         );
+    }
+
+    #[test]
+    fn segments_adjacent_nested_lists_without_overlapping_range_panic() {
+        let content = concat!(
+            "* Classic Rock-inspired Indie Bands:\n",
+            "\t+ Greta Van Fleet\n",
+            "\t+ Rival Sons\n",
+            "\t+ The Black Keys\n",
+            "\t+ Royal Blood\n",
+            "* Indie Bands with a Classic Rock Influence:\n",
+            "\t+ Arctic Monkeys\n",
+            "\t+ The Strokes\n",
+        );
+
+        let document = segment_document(content).unwrap();
+
+        assert!(!document.passages.is_empty());
+        assert!(document.passages.iter().all(|passage| {
+            passage.range.start <= passage.range.end && passage.range.end <= content.len()
+        }));
     }
 
     #[test]
