@@ -178,6 +178,7 @@ def _entry_metrics(ranked_ids: list[str], answers: list[str]) -> dict[str, float
 
 
 def _ndcg(ranked_ids: list[str], answers: list[str], cutoff: int) -> float:
+    # Match LongMemEval's pinned eval_utils.py exactly, including its rank-2 discount.
     actual = 0.0
     for index, item in enumerate(ranked_ids[:cutoff]):
         if item in answers:

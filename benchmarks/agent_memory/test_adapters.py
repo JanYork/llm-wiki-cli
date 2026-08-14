@@ -14,7 +14,7 @@ import urllib.request
 
 from benchmarks.agent_memory.aml_api import create_server
 from benchmarks.agent_memory.lwc_backend import ConflictError, LwcBackend
-from benchmarks.agent_memory.longmemeval_v1 import evaluate_dataset
+from benchmarks.agent_memory.longmemeval_v1 import _ndcg, evaluate_dataset
 
 
 def lwc_binary() -> Path:
@@ -205,6 +205,9 @@ class LongMemEvalV1Tests(unittest.TestCase):
         self.assertFalse(report["complete"])
         self.assertTrue(report["partial"])
         self.assertEqual(report["instances_processed"], 1)
+
+    def test_ndcg_matches_pinned_upstream_rank_two_discount(self) -> None:
+        self.assertEqual(_ndcg(["miss", "answer"], ["answer"], 5), 1.0)
 
     def test_duplicate_session_ids_preserve_each_occurrence(self) -> None:
         entries = json.loads(self.dataset.read_text(encoding="utf-8"))
