@@ -153,10 +153,10 @@ fn non_overlapping_candidates(
     for ((kind, parent), children) in ordered.iter().zip(direct_children) {
         let mut cursor = parent.start;
         for child in children {
-            if cursor < child.start {
-                if let Some(range) = trim_range(content, cursor..child.start) {
-                    passages.push((*kind, range));
-                }
+            if cursor < child.start
+                && let Some(range) = trim_range(content, cursor..child.start)
+            {
+                passages.push((*kind, range));
             }
             cursor = cursor.max(child.end);
         }
