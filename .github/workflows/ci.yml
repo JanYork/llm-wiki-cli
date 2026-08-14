@@ -64,6 +64,9 @@ jobs:
       - name: Test npm package
         run: node --test tests/npm_package.mjs
 
+      - name: Test GitHub Pages site
+        run: node --test tests/site.mjs
+
       - name: Validate native Agent integrations
         run: |
           node --test ../../tests/integrations.mjs

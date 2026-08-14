@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="LWC 为 AI Agent 提供可跨会话、跨项目与跨工具持续使用的、来源可追溯的持久记忆。">
+  <meta name="theme-color" content="#EAF0FF">
+  <title>LWC — AI Agent 的主动记忆系统</title>
+  <link rel="canonical" href="https://janyork.github.io/llm-wiki-cli/zh-CN/">
+  <link rel="alternate" hreflang="en" href="https://janyork.github.io/llm-wiki-cli/">
+  <link rel="alternate" hreflang="zh-CN" href="https://janyork.github.io/llm-wiki-cli/zh-CN/">
+  <link rel="alternate" hreflang="x-default" href="https://janyork.github.io/llm-wiki-cli/">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="LWC — AI Agent 的主动记忆系统">
+  <meta property="og:description" content="一套由 Agent 主动维护、来源可追溯、能够跨会话持续使用的持久 Wiki。">
+  <meta property="og:url" content="https://janyork.github.io/llm-wiki-cli/zh-CN/">
+  <meta property="og:locale" content="zh_CN">
+  <meta property="og:locale:alternate" content="en_US">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;700&amp;family=Commit+Mono:wght@400;600&amp;family=Literata:opsz,wght@7..72,300;7..72,700&amp;display=swap">
+  <link rel="stylesheet" href="../assets/site.css">
+  <script src="../assets/site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到正文</a>
+
+  <header class="site-header">
+    <nav class="nav shell" aria-label="主导航">
+      <a class="wordmark" href="./" aria-label="LWC 中文首页">LWC <small>记忆图册</small></a>
+      <div class="nav-links">
+        <a class="nav-link" href="#how-it-works">工作方式</a>
+        <a class="nav-link" href="#capabilities">核心能力</a>
+        <a class="nav-link" href="https://github.com/JanYork/llm-wiki-cli/wiki">Wiki</a>
+        <a class="nav-link" href="https://github.com/JanYork/llm-wiki-cli">GitHub</a>
+      </div>
+      <div class="nav-actions">
+        <a class="language-link" data-locale="en" href="../" lang="en">English</a>
+        <a class="button button--small" href="#install">让 Agent 安装</a>
+      </div>
+      <details class="mobile-nav">
+        <summary>菜单</summary>
+        <ul>
+          <li><a href="#how-it-works">工作方式</a></li>
+          <li><a href="#capabilities">核心能力</a></li>
+          <li><a href="#install">让 Agent 安装</a></li>
+          <li><a href="https://github.com/JanYork/llm-wiki-cli/wiki">Wiki</a></li>
+          <li><a href="https://github.com/JanYork/llm-wiki-cli">GitHub</a></li>
+          <li><a data-locale="en" href="../" lang="en">English</a></li>
+        </ul>
+      </details>
+    </nav>
+  </header>
+
+  <main id="main">
+    <header class="hero shell" id="hero">
+      <div class="hero__copy">
+        <p class="eyebrow">AI Agent 的主动记忆</p>
+        <h1>让记忆跨越每一次会话。</h1>
+        <p class="hero__lede">LWC 为 AI Agent 提供一套持久、来源可追溯的 Wiki，让它们在编码、研究、运维和知识工作中主动回忆、维护并持续改进记忆。</p>
+        <div class="hero__actions">
+          <a class="button" href="#install">让 Agent 安装 <span aria-hidden="true">→</span></a>
+          <a class="button button--secondary" href="https://github.com/JanYork/llm-wiki-cli/wiki">浏览 Wiki</a>
+        </div>
+      </div>
+
+      <div class="relay" aria-hidden="true">
+        <svg viewBox="0 0 520 530" role="img">
+          <path class="relay__orbit" d="M66 115C170 20 381 31 459 152C536 271 457 452 294 485C137 517 24 416 34 276C39 207 45 147 66 115Z" />
+          <path class="relay__line" d="M112 259C160 259 171 259 212 259" />
+          <path class="relay__line relay__line--2" d="M308 259C354 259 369 259 409 259" />
+          <rect class="relay__node" x="44" y="211" width="128" height="96" rx="18" />
+          <rect class="relay__node relay__node--wiki" x="202" y="193" width="116" height="132" rx="20" />
+          <rect class="relay__node" x="390" y="211" width="90" height="96" rx="18" />
+          <circle class="relay__dot" cx="91" cy="211" r="7" />
+          <circle class="relay__dot" cx="436" cy="307" r="7" />
+          <rect class="relay__tag" x="91" y="96" width="86" height="34" rx="17" />
+          <rect class="relay__tag" x="222" y="73" width="92" height="34" rx="17" />
+          <rect class="relay__tag" x="342" y="112" width="112" height="34" rx="17" />
+          <rect class="relay__tag" x="89" y="393" width="114" height="34" rx="17" />
+          <text class="relay__micro" x="134" y="117">标签</text>
+          <text class="relay__micro" x="268" y="94">文档图</text>
+          <text class="relay__micro" x="398" y="133">词图</text>
+          <text class="relay__micro" x="146" y="414">代码图</text>
+          <text class="relay__label" x="108" y="254">来源</text>
+          <text class="relay__label" x="108" y="273">证据</text>
+          <text class="relay__label relay__label--inverse" x="260" y="252">维护中的</text>
+          <text class="relay__label relay__label--inverse" x="260" y="272">WIKI</text>
+          <text class="relay__label" x="435" y="254">下一次</text>
+          <text class="relay__label" x="435" y="273">会话</text>
+        </svg>
+      </div>
+    </header>
+
+    <section class="trust shell" id="trust">
+      <h2>源于设计的可信</h2>
+      <ul class="trust__list">
+        <li><strong>由 Agent 操作</strong><span>为 Agent 直接使用而设计。</span></li>
+        <li><strong>以来源为依据</strong><span>记忆保留证据与来源证明。</span></li>
+        <li><strong>作用域明确</strong><span>全局记忆与项目记忆彼此分离。</span></li>
+        <li><strong>可审计</strong><span>结构化输出让工作过程可检查。</span></li>
+      </ul>
+    </section>
+
+    <section class="section" id="how-it-works">
+      <div class="shell">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">工作方式</p>
+            <h2>从可靠证据到有效回忆。</h2>
+          </div>
+          <p>LWC 把记忆变成一项持续维护的项目资产：以来源为依据，整理成 Wiki，并只在当前任务需要时载入。</p>
+        </div>
+        <ol class="steps">
+          <li class="step">
+            <span class="step__number">01 / 加入证据</span>
+            <h3>收录真正重要的内容。</h3>
+            <p>记录页面、导入来源或转换文档，同时保留知识从何而来的证明。</p>
+          </li>
+          <li class="step">
+            <span class="step__number">02 / 维护 Wiki</span>
+            <h3>让记忆保持连贯。</h3>
+            <p>通过可审计的 CLI 工作流检索、校验、打标签、修订并连接知识。</p>
+          </li>
+          <li class="step">
+            <span class="step__number">03 / 带着上下文回忆</span>
+            <h3>从理解现状开始。</h3>
+            <p>Agent 在最有用的时刻载入有限记忆、强标签内容和图关系上下文。</p>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="section capabilities" id="capabilities">
+      <div class="shell">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">能力分层</p>
+            <h2>不只是一个笔记文件夹。</h2>
+          </div>
+          <p>你可以只使用持久 Wiki；当关系探索与代码结构确有价值时，再启用对应的图能力。</p>
+        </div>
+        <div class="capability-layout">
+          <article class="capability-primary">
+            <span class="capability-primary__label">核心层</span>
+            <h3>持久 Wiki 记忆</h3>
+            <p>来源支撑的页面、检索、上下文载入、标签、Changeset、Checkpoint 与结构化 JSON 契约共同构成持久基础。</p>
+          </article>
+          <ul class="capability-list">
+            <li class="capability-item">
+              <span class="capability-item__label">关系层</span>
+              <h3>文档知识图</h3>
+              <p>项目页面、来源、链接、来源证明与语义关系构成一个可验证的物理图。</p>
+            </li>
+            <li class="capability-item">
+              <span class="capability-item__label">发现层</span>
+              <h3>词图网</h3>
+              <p>词项在有限范围内揭示文档之间的高信号联系，无需一次载入全部高密度词汇。</p>
+            </li>
+            <li class="capability-item">
+              <span class="capability-item__label">可选代码层</span>
+              <h3>代码图网</h3>
+              <p>当任务涉及代码结构时，通过 LWC 探索符号、调用方、文件与变更影响。</p>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="install">
+      <div class="shell install-layout">
+        <div class="install-copy">
+          <p class="eyebrow">Agent 安装</p>
+          <h2>直接让你的 Agent 完成配置。</h2>
+          <p>复制完整提示词。它会要求 Agent 使用 LWC 官方安装器、保留现有配置、验证每一项集成能力，并在启用项目记忆或图能力之前先征得同意。</p>
+          <p class="target-examples"><strong>AgentTarget 示例</strong>Claude Code、Codex、Cursor、OpenCode、Gemini CLI、Kiro、Hermes、Antigravity 与 Pi。这里仅列举示例，并非完整清单。</p>
+          <a class="manual-link" href="https://github.com/JanYork/llm-wiki-cli#installation">更希望手动安装？查看官方安装方式 →</a>
+        </div>
+        <div class="prompt-panel">
+          <div class="prompt-panel__bar">
+            <span>完整配置提示词</span>
+            <button class="copy-button" type="button" data-copy-target="agent-setup-prompt" data-copy-status="copy-status" data-copy-label="复制提示词" data-copy-success="已复制" data-copy-failure="请手动选择并复制提示词。">复制提示词</button>
+          </div>
+          <pre class="prompt" id="agent-setup-prompt"><code data-agent-prompt>Configure LWC completely for this user. Perform and verify the work; do not
+merely describe commands for me to run.
+
+Source of truth:
+- https://github.com/JanYork/llm-wiki-cli
+- https://github.com/JanYork/llm-wiki-cli/tree/main/skills/using-lwc
+
+Requirements:
+1. Read this README, `SECURITY.md`, and `skills/using-lwc/SKILL.md`. Install the
+   official checksum-verified release if `lwc` is not globally callable; never
+   prefix routine commands with a private binary path or `LWC_PROJECT_ROOT`.
+2. Run `lwc --version`, initialize global memory once with
+   `lwc --scope global init` when missing, then run `lwc agent install --yes`.
+   This command detects installed supported Agents and safely installs their
+   MCP, Skill, Hook and Instructions using official locations. Do not recreate
+   that logic manually or install a native package for the same Agent as well.
+3. Inspect `lwc agent status --target all --location global`. Restart affected
+   Agents and complete their normal Hook trust review where required. Do not
+   initialize a project Wiki or either graph without explicit project consent.
+4. If the current runtime is not one of LWC's registered AgentTargets, use its
+   official user-level conventions to install the canonical `using-lwc` Skill,
+   an additive instruction block, `lwc serve --mcp`, and a bounded session Hook
+   only where those surfaces are officially supported. Preserve existing
+   configuration, remain idempotent, and report unsupported surfaces instead of
+   inventing paths or keys.
+
+Finish with the LWC version, detected and configured Targets, status results,
+files changed, unsupported surfaces, and any restart or trust action remaining.</code></pre>
+          <p class="copy-status" id="copy-status" role="status" aria-live="polite"></p>
+        </div>
+      </div>
+    </section>
+
+    <section class="resources shell" id="resources">
+      <h2>项目资源</h2>
+      <ul class="resource-index">
+        <li><a href="https://github.com/JanYork/llm-wiki-cli/wiki"><strong>Wiki</strong><span>完整文档</span></a></li>
+        <li><a href="https://github.com/JanYork/llm-wiki-cli/releases"><strong>版本发布</strong><span>下载</span></a></li>
+        <li><a href="https://github.com/JanYork/llm-wiki-cli"><strong>GitHub</strong><span>源代码</span></a></li>
+        <li><a href="https://github.com/JanYork/llm-wiki-cli/issues"><strong>问题反馈</strong><span>报告与跟踪</span></a></li>
+        <li><a href="https://github.com/JanYork/llm-wiki-cli/security/policy"><strong>安全</strong><span>安全报告</span></a></li>
+        <li><a href="https://github.com/JanYork/llm-wiki-cli/blob/main/LICENSE"><strong>许可证</strong><span>MIT</span></a></li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="shell">
+      <p>LWC 采用 MIT 许可证开源。</p>
+      <p>英文是项目规范正文。<a data-locale="en" href="../" lang="en">Read in English</a></p>
+    </div>
+  </footer>
+</body>
+</html>

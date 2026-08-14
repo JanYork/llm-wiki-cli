@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="LWC gives AI Agents durable, source-grounded memory across sessions, projects, and tools.">
+  <meta name="theme-color" content="#EAF0FF">
+  <title>LWC — Proactive Memory for AI Agents</title>
+  <link rel="canonical" href="https://janyork.github.io/llm-wiki-cli/">
+  <link rel="alternate" hreflang="en" href="https://janyork.github.io/llm-wiki-cli/">
+  <link rel="alternate" hreflang="zh-CN" href="https://janyork.github.io/llm-wiki-cli/zh-CN/">
+  <link rel="alternate" hreflang="x-default" href="https://janyork.github.io/llm-wiki-cli/">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="LWC — Proactive Memory for AI Agents">
+  <meta property="og:description" content="A durable, source-grounded Wiki that your Agent can recall and maintain across sessions.">
+  <meta property="og:url" content="https://janyork.github.io/llm-wiki-cli/">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:locale:alternate" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;700&amp;family=Commit+Mono:wght@400;600&amp;family=Literata:opsz,wght@7..72,300;7..72,700&amp;display=swap">
+  <link rel="stylesheet" href="assets/site.css">
+  <script src="assets/site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <nav class="nav shell" aria-label="Primary navigation">
+      <a class="wordmark" href="./" aria-label="LWC home">LWC <small>Memory Atlas</small></a>
+      <div class="nav-links">
+        <a class="nav-link" href="#how-it-works">How it works</a>
+        <a class="nav-link" href="#capabilities">Capabilities</a>
+        <a class="nav-link" href="https://github.com/JanYork/llm-wiki-cli/wiki">Wiki</a>
+        <a class="nav-link" href="https://github.com/JanYork/llm-wiki-cli">GitHub</a>
+      </div>
+      <div class="nav-actions">
+        <a class="language-link" data-locale="zh-CN" href="zh-CN/" lang="zh-CN">中文</a>
+        <a class="button button--small" href="#install">Install with your Agent</a>
+      </div>
+      <details class="mobile-nav">
+        <summary>Menu</summary>
+        <ul>
+          <li><a href="#how-it-works">How it works</a></li>
+          <li><a href="#capabilities">Capabilities</a></li>
+          <li><a href="#install">Install with your Agent</a></li>
+          <li><a href="https://github.com/JanYork/llm-wiki-cli/wiki">Wiki</a></li>
+          <li><a href="https://github.com/JanYork/llm-wiki-cli">GitHub</a></li>
+          <li><a data-locale="zh-CN" href="zh-CN/" lang="zh-CN">中文</a></li>
+        </ul>
+      </details>
+    </nav>
+  </header>
+
+  <main id="main">
+    <header class="hero shell" id="hero">
+      <div class="hero__copy">
+        <p class="eyebrow">Proactive memory for AI Agents</p>
+        <h1>Memory that survives the session.</h1>
+        <p class="hero__lede">LWC gives AI Agents a durable, source-grounded Wiki they can recall, maintain, and improve across coding, research, operations, and knowledge work.</p>
+        <div class="hero__actions">
+          <a class="button" href="#install">Install with your Agent <span aria-hidden="true">→</span></a>
+          <a class="button button--secondary" href="https://github.com/JanYork/llm-wiki-cli/wiki">Explore the Wiki</a>
+        </div>
+      </div>
+
+      <div class="relay" aria-hidden="true">
+        <svg viewBox="0 0 520 530" role="img">
+          <path class="relay__orbit" d="M66 115C170 20 381 31 459 152C536 271 457 452 294 485C137 517 24 416 34 276C39 207 45 147 66 115Z" />
+          <path class="relay__line" d="M112 259C160 259 171 259 212 259" />
+          <path class="relay__line relay__line--2" d="M308 259C354 259 369 259 409 259" />
+          <rect class="relay__node" x="44" y="211" width="128" height="96" rx="18" />
+          <rect class="relay__node relay__node--wiki" x="202" y="193" width="116" height="132" rx="20" />
+          <rect class="relay__node" x="390" y="211" width="90" height="96" rx="18" />
+          <circle class="relay__dot" cx="91" cy="211" r="7" />
+          <circle class="relay__dot" cx="436" cy="307" r="7" />
+          <rect class="relay__tag" x="91" y="96" width="86" height="34" rx="17" />
+          <rect class="relay__tag" x="222" y="73" width="92" height="34" rx="17" />
+          <rect class="relay__tag" x="342" y="112" width="112" height="34" rx="17" />
+          <rect class="relay__tag" x="89" y="393" width="114" height="34" rx="17" />
+          <text class="relay__micro" x="134" y="117">TAG</text>
+          <text class="relay__micro" x="268" y="94">DOC GRAPH</text>
+          <text class="relay__micro" x="398" y="133">WORD GRAPH</text>
+          <text class="relay__micro" x="146" y="414">CODEGRAPH</text>
+          <text class="relay__label" x="108" y="254">SOURCE</text>
+          <text class="relay__label" x="108" y="273">EVIDENCE</text>
+          <text class="relay__label relay__label--inverse" x="260" y="252">MAINTAINED</text>
+          <text class="relay__label relay__label--inverse" x="260" y="272">WIKI</text>
+          <text class="relay__label" x="435" y="254">NEXT</text>
+          <text class="relay__label" x="435" y="273">SESSION</text>
+        </svg>
+      </div>
+    </header>
+
+    <section class="trust shell" id="trust">
+      <h2>Trust by design</h2>
+      <ul class="trust__list">
+        <li><strong>Agent-operated</strong><span>Designed for Agents to use directly.</span></li>
+        <li><strong>Source-grounded</strong><span>Memory keeps evidence and provenance.</span></li>
+        <li><strong>Explicitly scoped</strong><span>Global and project memory stay distinct.</span></li>
+        <li><strong>Auditable</strong><span>Structured output makes work inspectable.</span></li>
+      </ul>
+    </section>
+
+    <section class="section" id="how-it-works">
+      <div class="shell">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">How it works</p>
+            <h2>From evidence to useful recall.</h2>
+          </div>
+          <p>LWC makes memory a maintained project asset: grounded in sources, shaped into a Wiki, and loaded only when the current task needs it.</p>
+        </div>
+        <ol class="steps">
+          <li class="step">
+            <span class="step__number">01 / Add evidence</span>
+            <h3>Bring in what matters.</h3>
+            <p>Record pages, ingest sources, or convert documents while preserving where knowledge came from.</p>
+          </li>
+          <li class="step">
+            <span class="step__number">02 / Maintain the Wiki</span>
+            <h3>Keep memory coherent.</h3>
+            <p>Search, lint, tag, revise, and connect knowledge through audited CLI workflows.</p>
+          </li>
+          <li class="step">
+            <span class="step__number">03 / Recall with context</span>
+            <h3>Start informed.</h3>
+            <p>Agents load bounded memory, strong tags, and graph context at the moment they become useful.</p>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="section capabilities" id="capabilities">
+      <div class="shell">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Capability layers</p>
+            <h2>More than a folder of notes.</h2>
+          </div>
+          <p>Use the durable Wiki on its own, then enable graph capabilities where relationships and code structure justify them.</p>
+        </div>
+        <div class="capability-layout">
+          <article class="capability-primary">
+            <span class="capability-primary__label">Core layer</span>
+            <h3>Persistent Wiki memory</h3>
+            <p>Source-backed pages, retrieval, context loading, tags, changesets, checkpoints, and structured JSON contracts form the durable foundation.</p>
+          </article>
+          <ul class="capability-list">
+            <li class="capability-item">
+              <span class="capability-item__label">Relationship layer</span>
+              <h3>Document knowledge graph</h3>
+              <p>Project pages, sources, links, provenance, and semantic relations become a verifiable physical graph.</p>
+            </li>
+            <li class="capability-item">
+              <span class="capability-item__label">Discovery layer</span>
+              <h3>Word graph</h3>
+              <p>Terms reveal bounded, high-signal connections across documents without loading the entire vocabulary at once.</p>
+            </li>
+            <li class="capability-item">
+              <span class="capability-item__label">Optional code layer</span>
+              <h3>CodeGraph</h3>
+              <p>Explore symbols, callers, files, and change impact through LWC when code structure is part of the task.</p>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="install">
+      <div class="shell install-layout">
+        <div class="install-copy">
+          <p class="eyebrow">Agent installation</p>
+          <h2>Ask your Agent to set it up.</h2>
+          <p>Copy the complete prompt. It tells your Agent to use LWC's official installer, preserve existing configuration, verify every integration surface, and ask before enabling project memory or graphs.</p>
+          <p class="target-examples"><strong>AgentTarget examples</strong>Claude Code, Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes, Antigravity, and Pi. Examples are not exhaustive.</p>
+          <a class="manual-link" href="https://github.com/JanYork/llm-wiki-cli#installation">Prefer manual installation? Read the official options →</a>
+        </div>
+        <div class="prompt-panel">
+          <div class="prompt-panel__bar">
+            <span>Complete setup prompt</span>
+            <button class="copy-button" type="button" data-copy-target="agent-setup-prompt" data-copy-status="copy-status" data-copy-label="Copy prompt" data-copy-success="Copied" data-copy-failure="Select and copy the prompt manually.">Copy prompt</button>
+          </div>
+          <pre class="prompt" id="agent-setup-prompt"><code data-agent-prompt>Configure LWC completely for this user. Perform and verify the work; do not
+merely describe commands for me to run.
+
+Source of truth:
+- https://github.com/JanYork/llm-wiki-cli
+- https://github.com/JanYork/llm-wiki-cli/tree/main/skills/using-lwc
+
+Requirements:
+1. Read this README, `SECURITY.md`, and `skills/using-lwc/SKILL.md`. Install the
+   official checksum-verified release if `lwc` is not globally callable; never
+   prefix routine commands with a private binary path or `LWC_PROJECT_ROOT`.
+2. Run `lwc --version`, initialize global memory once with
+   `lwc --scope global init` when missing, then run `lwc agent install --yes`.
+   This command detects installed supported Agents and safely installs their
+   MCP, Skill, Hook and Instructions using official locations. Do not recreate
+   that logic manually or install a native package for the same Agent as well.
+3. Inspect `lwc agent status --target all --location global`. Restart affected
+   Agents and complete their normal Hook trust review where required. Do not
+   initialize a project Wiki or either graph without explicit project consent.
+4. If the current runtime is not one of LWC's registered AgentTargets, use its
+   official user-level conventions to install the canonical `using-lwc` Skill,
+   an additive instruction block, `lwc serve --mcp`, and a bounded session Hook
+   only where those surfaces are officially supported. Preserve existing
+   configuration, remain idempotent, and report unsupported surfaces instead of
+   inventing paths or keys.
+
+Finish with the LWC version, detected and configured Targets, status results,
+files changed, unsupported surfaces, and any restart or trust action remaining.</code></pre>
+          <p class="copy-status" id="copy-status" role="status" aria-live="polite"></p>
+        </div>
+      </div>
+    </section>
+
+    <section class="resources shell" id="resources">
+      <h2>Project resources</h2>
+      <ul class="resource-index">
+        <li><a href="https://github.com/JanYork/llm-wiki-cli/wiki"><strong>Wiki</strong><span>Documentation</span></a></li>
+        <li><a href="https://github.com/JanYork/llm-wiki-cli/releases"><strong>Releases</strong><span>Downloads</span></a></li>
+        <li><a href="https://github.com/JanYork/llm-wiki-cli"><strong>GitHub</strong><span>Source code</span></a></li>
+        <li><a href="https://github.com/JanYork/llm-wiki-cli/issues"><strong>Issues</strong><span>Report and track</span></a></li>
+        <li><a href="https://github.com/JanYork/llm-wiki-cli/security/policy"><strong>Security</strong><span>Report safely</span></a></li>
+        <li><a href="https://github.com/JanYork/llm-wiki-cli/blob/main/LICENSE"><strong>License</strong><span>MIT</span></a></li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="shell">
+      <p>LWC is open source under the MIT License.</p>
+      <p>English is the normative project copy. <a data-locale="zh-CN" href="zh-CN/" lang="zh-CN">阅读中文版</a></p>
+    </div>
+  </footer>
+</body>
+</html>
