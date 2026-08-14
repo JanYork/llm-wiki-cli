@@ -77,7 +77,7 @@ class LwcBackend:
                 path = source_dir / f"{digest}.md"
                 receipt = source_dir / f"{digest}.added"
                 if path.exists():
-                    if path.read_text(encoding="utf-8") != body:
+                    if path.read_bytes() != body.encode("utf-8"):
                         raise ConflictError(f"memory_id reused with different content: {memory_id}")
                     if receipt.exists():
                         continue

@@ -42,7 +42,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(root.name, hashlib.sha256(scope.encode()).hexdigest())
 
     def test_add_is_idempotent_and_rejects_changed_retry(self) -> None:
-        messages = [{"role": "user", "content": "remember indigo-orchid"}]
+        messages = [{"role": "user", "content": "remember indigo-orchid\r\nsecond line"}]
 
         self.backend.add("user-a", "request-1", "session-1", messages)
         self.backend.add("user-a", "request-1", "session-1", messages)
