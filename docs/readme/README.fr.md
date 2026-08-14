@@ -9,11 +9,11 @@
   <img alt="Plateformes : macOS, Linux et Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-666666">
   <a href="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://skills.sh/janyork/llm-wiki-cli/using-lwc"><img alt="skills.sh : using-lwc" src="https://img.shields.io/badge/skills.sh-using--lwc-000000?logo=vercel"></a>
-  <a href="LICENSE"><img alt="Licence : Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="../../LICENSE"><img alt="Licence : Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> ·
+  <a href="../../README.md">English</a> · <a href="../../README.zh-CN.md">简体中文</a> ·
   <a href="README.ja.md">日本語</a> · <a href="README.es.md">Español</a> ·
   <a href="README.pt-BR.md">Português (Brasil)</a> · <a href="README.fr.md">Français</a> ·
   <a href="README.ru.md">Русский</a>
@@ -241,7 +241,7 @@ cargo install --locked --path .
 
 ## Skill compagnon pour agents
 
-Le dépôt contient [`skills/using-lwc`](skills/using-lwc), un Agent Skill qui fait de `lwc` une couche de mémoire proactive pour les sessions substantielles. Installez-le depuis [skills.sh](https://skills.sh/JanYork/llm-wiki-cli) :
+Le dépôt contient [`skills/using-lwc`](../../skills/using-lwc), un Agent Skill qui fait de `lwc` une couche de mémoire proactive pour les sessions substantielles. Installez-le depuis [skills.sh](https://skills.sh/JanYork/llm-wiki-cli) :
 
 ```bash
 npx skills add JanYork/llm-wiki-cli --skill using-lwc -g
@@ -288,7 +288,7 @@ lwc agent uninstall --target codex,claude --yes
 
 Pi expose le MCP LWC via son pont d’extension officiel, car il n’intègre pas MCP. Les autres Targets n’enregistrent que `lwc serve --mcp` ; CodeGraph reste un plan interne de contexte et ne devient jamais un second MCP. Les réglages de confiance et permissions pilotés par l’interface restent gérés par l’utilisateur. Les points d’intégration en préversion sont signalés, et les périmètres partiels installent ce qui est pris en charge sans dégrader ni rejeter tout le Target. Les chemins globaux Kiro respectent `KIRO_HOME`.
 
-L’interface Target, l’ordre du registre, les règles de détection et les chemins MCP suivent le modèle d’adaptateur de l’installateur CodeGraph sous licence MIT. LWC y ajoute le MCP unifié, le rapport par surface, Skills et Hooks, la propriété des fichiers partagés et un rollback exact. Voir [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+L’interface Target, l’ordre du registre, les règles de détection et les chemins MCP suivent le modèle d’adaptateur de l’installateur CodeGraph sous licence MIT. LWC y ajoute le MCP unifié, le rapport par surface, Skills et Hooks, la propriété des fichiers partagés et un rollback exact. Voir [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md).
 
 La sortie `lwc init` et les Hooks de début/compactage exposent des faits `LWC_READINESS` bornés sur le Wiki, le graphe physique, le runtime et l’index CodeGraph, ainsi que les commandes d’intégration. L’état du graphe distingue consentement configuré et projection en attente ou en échec. La détection est en lecture seule et n’active ni n’initialise jamais de graphe. Lorsque les deux nécessitent une autorisation, la base portable est du texte simple :
 
@@ -445,7 +445,7 @@ lwc page show source-1
 7. Placer une ingestion multicommande ou une révision large dans un changeset, valider le brouillon et publier atomiquement.
 8. Employer `search`, `context`, `graph` et `lint` pour maintenir la cohérence.
 
-Voir [docs/agent-workflow.md](docs/agent-workflow.md) pour le contrat complet. `lwc --help` et `lwc <command> --help` détaillent préconditions, transitions, effets et actions suivantes.
+Voir [docs/agent-workflow.md](../../docs/agent-workflow.md) pour le contrat complet. `lwc --help` et `lwc <command> --help` détaillent préconditions, transitions, effets et actions suivantes.
 
 ## Modifications atomiques multicommandes
 
@@ -605,7 +605,7 @@ LWC_BENCH_BINARY="$PWD/target/release/lwc" \
 cargo test --test search_benchmark -- --ignored --nocapture
 ```
 
-`cargo test --all-targets` couvre recherche page-first, filtres type/kind, fenêtres UTF-8, conditions d’ingestion, précision du graphe, migrations, lint et compactage WAL. Voir [benchmarks/README.md](benchmarks/README.md) pour le contrat et les comparaisons loyales.
+`cargo test --all-targets` couvre recherche page-first, filtres type/kind, fenêtres UTF-8, conditions d’ingestion, précision du graphe, migrations, lint et compactage WAL. Voir [benchmarks/README.md](../../benchmarks/README.md) pour le contrat et les comparaisons loyales.
 
 ## Limites et non-objectifs
 
@@ -635,8 +635,8 @@ Issues et pull requests sont bienvenus, notamment sur :
 - les contrats durables de citation et d’entretien des pages ;
 - la qualité de recherche dans les corpus techniques multilingues.
 
-Lisez [CONTRIBUTING.md](CONTRIBUTING.md) avant d’ouvrir une pull request. Signalez les problèmes de sécurité selon [SECURITY.md](SECURITY.md).
+Lisez [CONTRIBUTING.md](../../CONTRIBUTING.md) avant d’ouvrir une pull request. Signalez les problèmes de sécurité selon [SECURITY.md](../../SECURITY.md).
 
 ## Licence
 
-Sous [licence Apache 2.0](LICENSE).
+Sous [licence Apache 2.0](../../LICENSE).

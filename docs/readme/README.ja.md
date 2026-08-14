@@ -11,11 +11,11 @@
   <img alt="対応プラットフォーム: macOS、Linux、Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-666666">
   <a href="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://skills.sh/janyork/llm-wiki-cli/using-lwc"><img alt="skills.sh: using-lwc" src="https://img.shields.io/badge/skills.sh-using--lwc-000000?logo=vercel"></a>
-  <a href="LICENSE"><img alt="ライセンス: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="../../LICENSE"><img alt="ライセンス: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> ·
+  <a href="../../README.md">English</a> · <a href="../../README.zh-CN.md">简体中文</a> ·
   <a href="README.ja.md">日本語</a> · <a href="README.es.md">Español</a> ·
   <a href="README.pt-BR.md">Português (Brasil)</a> · <a href="README.fr.md">Français</a> ·
   <a href="README.ru.md">Русский</a>
@@ -304,7 +304,7 @@ cargo install --locked --path .
 
 ## エージェント向け Skill
 
-このリポジトリには [`skills/using-lwc`](skills/using-lwc) が含まれています。
+このリポジトリには [`skills/using-lwc`](../../skills/using-lwc) が含まれています。
 これは、内容のあるセッションで `lwc` をプロアクティブメモリ層として使うための
 Agent Skill です。[skills.sh](https://skills.sh/JanYork/llm-wiki-cli) から導入できます。
 
@@ -395,7 +395,7 @@ Target インターフェース、レジストリ順、検出規則、MCP パス
 CodeGraph インストーラー用アダプター設計に基づいています。LWC はその上に、統合
 LWC MCP、機能ごとの状態報告、Skills、Hooks、共有ファイルの所有権、正確な
 ロールバックを追加しています。詳しくは
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) を参照してください。
+[`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md) を参照してください。
 
 新規プロジェクトの `lwc init` 出力と、セッション開始・圧縮時の Hook は、境界付きの
 `LWC_READINESS` 情報を提供します。Wiki、物理文書グラフ、CodeGraph ランタイムと
@@ -603,7 +603,7 @@ lwc page show source-1
 7. 複数コマンドの ingest や広範な改訂は 1 つの changeset に入れ、草稿を検証してから原子的に公開する。
 8. `search`、`context`、`graph`、`lint` で Wiki の整合性を保ち続ける。
 
-完全な運用契約は [docs/agent-workflow.md](docs/agent-workflow.md) にあります。
+完全な運用契約は [docs/agent-workflow.md](../../docs/agent-workflow.md) にあります。
 エージェント向けの前提条件、状態遷移、副作用、次の操作は、`lwc --help` または
 `lwc <command> --help` で確認できます。
 
@@ -863,7 +863,7 @@ cargo test --test search_benchmark -- --ignored --nocapture
 通常の `cargo test --all-targets` は、page-first search、type/kind filter、UTF-8 source
 window、ingest completion gate、graph precision、migration、lint、WAL compact を
 対象にします。workload contract と公平な前後比較の規則は
-[benchmarks/README.md](benchmarks/README.md) を参照してください。
+[benchmarks/README.md](../../benchmarks/README.md) を参照してください。
 
 ## 制約と対象外
 
@@ -894,9 +894,9 @@ issue と pull request を歓迎します。特に次の領域への貢献を求
 - 長期引用とページ保守の契約。
 - 多言語技術 corpus の検索品質。
 
-pull request を作る前に [CONTRIBUTING.md](CONTRIBUTING.md) をお読みください。
-security issue は [SECURITY.md](SECURITY.md) に従って報告してください。
+pull request を作る前に [CONTRIBUTING.md](../../CONTRIBUTING.md) をお読みください。
+security issue は [SECURITY.md](../../SECURITY.md) に従って報告してください。
 
 ## ライセンス
 
-[Apache License 2.0](LICENSE) の下で提供します。
+[Apache License 2.0](../../LICENSE) の下で提供します。

@@ -9,11 +9,11 @@
   <img alt="Платформы: macOS, Linux и Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-666666">
   <a href="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/JanYork/llm-wiki-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://skills.sh/janyork/llm-wiki-cli/using-lwc"><img alt="skills.sh: using-lwc" src="https://img.shields.io/badge/skills.sh-using--lwc-000000?logo=vercel"></a>
-  <a href="LICENSE"><img alt="Лицензия: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="../../LICENSE"><img alt="Лицензия: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> ·
+  <a href="../../README.md">English</a> · <a href="../../README.zh-CN.md">简体中文</a> ·
   <a href="README.ja.md">日本語</a> · <a href="README.es.md">Español</a> ·
   <a href="README.pt-BR.md">Português (Brasil)</a> · <a href="README.fr.md">Français</a> ·
   <a href="README.ru.md">Русский</a>
@@ -239,7 +239,7 @@ cargo install --locked --path .
 
 ## Сопутствующий Skill для агентов
 
-Репозиторий включает [`skills/using-lwc`](skills/using-lwc) — Agent Skill, который использует `lwc` как проактивный слой памяти в содержательных сеансах. Установка через [skills.sh](https://skills.sh/JanYork/llm-wiki-cli):
+Репозиторий включает [`skills/using-lwc`](../../skills/using-lwc) — Agent Skill, который использует `lwc` как проактивный слой памяти в содержательных сеансах. Установка через [skills.sh](https://skills.sh/JanYork/llm-wiki-cli):
 
 ```bash
 npx skills add JanYork/llm-wiki-cli --skill using-lwc -g
@@ -286,7 +286,7 @@ lwc agent uninstall --target codex,claude --yes
 
 Pi публикует MCP LWC через официальный мост расширений, поскольку не имеет встроенного MCP. Другие Targets регистрируют только `lwc serve --mcp`; CodeGraph остаётся внутренним уровнем контекста и не становится вторым MCP. Настройки доверия и разрешений, принадлежащие UI, остаются за пользователем. Preview-поверхности помечаются, а частичная проектная поддержка устанавливает доступные части, не ослабляя и не отклоняя весь Target. Глобальные пути Kiro учитывают `KIRO_HOME`.
 
-Интерфейс Target, порядок реестра, правила обнаружения и пути MCP следуют адаптеру установщика CodeGraph под MIT. LWC добавляет единый MCP, отчёт по поверхностям, Skills и Hooks, владение общими файлами и точный rollback. См. [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Интерфейс Target, порядок реестра, правила обнаружения и пути MCP следуют адаптеру установщика CodeGraph под MIT. LWC добавляет единый MCP, отчёт по поверхностям, Skills и Hooks, владение общими файлами и точный rollback. См. [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md).
 
 Вывод `lwc init` и Hooks начала/сжатия показывают ограниченные факты `LWC_READINESS` о Wiki, физическом графе, среде выполнения и индексе CodeGraph, а также команды интеграции. Готовность графа различает настроенное согласие и ожидающую или неудачную проекцию. Обнаружение только читает и не включает графы. Когда оба требуют разрешения, переносимая основа — простой текст:
 
@@ -443,7 +443,7 @@ lwc page show source-1
 7. Поместить многошаговый ingest или широкую правку в changeset, проверить черновик и атомарно опубликовать.
 8. Поддерживать связность через `search`, `context`, `graph` и `lint`.
 
-Полный контракт — в [docs/agent-workflow.md](docs/agent-workflow.md). `lwc --help` и `lwc <command> --help` показывают предусловия, переходы, эффекты и следующие действия.
+Полный контракт — в [docs/agent-workflow.md](../../docs/agent-workflow.md). `lwc --help` и `lwc <command> --help` показывают предусловия, переходы, эффекты и следующие действия.
 
 ## Атомарные многошаговые изменения
 
@@ -603,7 +603,7 @@ LWC_BENCH_BINARY="$PWD/target/release/lwc" \
 cargo test --test search_benchmark -- --ignored --nocapture
 ```
 
-`cargo test --all-targets` покрывает page-first поиск, фильтры type/kind, UTF-8 окна, условия ingest, точность графа, миграции, lint и WAL compact. Контракт и правила честного сравнения — в [benchmarks/README.md](benchmarks/README.md).
+`cargo test --all-targets` покрывает page-first поиск, фильтры type/kind, UTF-8 окна, условия ingest, точность графа, миграции, lint и WAL compact. Контракт и правила честного сравнения — в [benchmarks/README.md](../../benchmarks/README.md).
 
 ## Ограничения и нецели
 
@@ -633,8 +633,8 @@ Issues и pull requests приветствуются, особенно по те
 - долговечные контракты цитирования и поддержки страниц;
 - качество поиска в многоязычных технических корпусах.
 
-Перед pull request прочитайте [CONTRIBUTING.md](CONTRIBUTING.md). О проблемах безопасности сообщайте по [SECURITY.md](SECURITY.md).
+Перед pull request прочитайте [CONTRIBUTING.md](../../CONTRIBUTING.md). О проблемах безопасности сообщайте по [SECURITY.md](../../SECURITY.md).
 
 ## Лицензия
 
-Проект распространяется по [Apache License 2.0](LICENSE).
+Проект распространяется по [Apache License 2.0](../../LICENSE).
