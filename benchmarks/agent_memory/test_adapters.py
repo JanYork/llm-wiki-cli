@@ -3,8 +3,12 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
 
+from benchmarks.agent_memory.aml_api import create_server
 from benchmarks.agent_memory.lwc_backend import ConflictError, LwcBackend
 from benchmarks.agent_memory.longmemeval_v1 import evaluate_dataset
 
@@ -184,6 +188,140 @@ class LongMemEvalV1Tests(unittest.TestCase):
         self.assertFalse(report["complete"])
         self.assertTrue(report["partial"])
         self.assertEqual(report["instances_processed"], 1)
+
+
+class AmlApiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        backend = LwcBackend(
+            Path(self.temp.name) / "state",
+            binary=lwc_binary(),
+            timeout=30,
+        )
+        self.server = create_server(backend, host="127.0.0.1", port=0)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self._stop_server)
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def _stop_server(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        payload: object | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, object]]:
+        body = None if payload is None else json.dumps(payload).encode()
+        request = urllib.request.Request(
+            self.base_url + path,
+            data=body,
+            method=method,
+            headers={"Content-Type": "application/json", **(headers or {})},
+        )
+        try:
+            response = urllib.request.urlopen(request, timeout=30)
+        except urllib.error.HTTPError as error:
+            try:
+                return error.code, json.loads(error.read())
+            finally:
+                error.close()
+        with response:
+            return response.status, json.loads(response.read())
+
+    def test_health_add_search_retry_and_scope_isolation(self) -> None:
+        status, health = self.request("GET", "/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(health, {"status": "ok"})
+
+        add = {
+            "request_id": "request-a",
+            "messages": [{"role": "user", "timestamp": 1_704_067_200_000, "content": "indigo-orchid belongs to user A"}],
+            "user_id": "user-a",
+            "session_id": "session-a",
+        }
+        status, response = self.request("POST", "/add", add)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            response,
+            {
+                "success": True,
+                "request_id": "request-a",
+                "user_id": "user-a",
+                "session_id": "session-a",
+            },
+        )
+        self.assertEqual(self.request("POST", "/add", add)[0], 200)
+
+        changed = dict(add)
+        changed["messages"] = [{"role": "user", "content": "changed"}]
+        self.assertEqual(self.request("POST", "/add", changed)[0], 409)
+
+        self.request(
+            "POST",
+            "/add",
+            {
+                "request_id": "request-b",
+                "messages": [{"role": "user", "content": "amber-comet belongs to user B"}],
+                "user_id": "user-b",
+                "session_id": "session-b",
+            },
+        )
+        status, search = self.request(
+            "POST",
+            "/search",
+            {"query": "indigo orchid", "user_id": "user-a", "top_k": 1},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(search["data"]), 1)
+        self.assertIn("indigo-orchid", search["data"][0]["content"])
+        self.assertNotIn("amber-comet", search["data"][0]["content"])
+        self.assertTrue(search["data"][0]["id"])
+
+    def test_validation_and_authentication(self) -> None:
+        self.assertEqual(self.request("POST", "/add", {"messages": []})[0], 422)
+
+        backend = LwcBackend(
+            Path(self.temp.name) / "auth-state",
+            binary=lwc_binary(),
+            timeout=30,
+        )
+        protected = create_server(
+            backend,
+            host="127.0.0.1",
+            port=0,
+            api_key="secret-test-key",
+        )
+        thread = threading.Thread(target=protected.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{protected.server_port}"
+            with urllib.request.urlopen(url + "/health", timeout=10) as response:
+                self.assertEqual(response.status, 200)
+            request = urllib.request.Request(
+                url + "/search",
+                data=json.dumps(
+                    {"query": "needle", "user_id": "user", "top_k": 1}
+                ).encode(),
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request, timeout=10)
+            self.assertEqual(caught.exception.code, 401)
+            caught.exception.close()
+            request.add_header("Authorization", "Bearer secret-test-key")
+            with urllib.request.urlopen(request, timeout=10) as response:
+                self.assertEqual(response.status, 200)
+        finally:
+            protected.shutdown()
+            protected.server_close()
+            thread.join(timeout=5)
 
 
 if __name__ == "__main__":

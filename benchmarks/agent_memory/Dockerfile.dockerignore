@@ -1,0 +1,9 @@
+**
+!Cargo.toml
+!Cargo.lock
+!src/**
+!web/dist/**
+!skills/using-lwc/**
+!integrations/pi-lwc/extensions/lwc.js
+!benchmarks/agent_memory/**
+benchmarks/agent_memory/__pycache__/
