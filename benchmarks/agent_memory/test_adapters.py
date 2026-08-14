@@ -1,7 +1,11 @@
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -322,6 +326,135 @@ class AmlApiTests(unittest.TestCase):
             protected.shutdown()
             protected.server_close()
             thread.join(timeout=5)
+
+
+class LongMemEvalV2Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        configured = os.environ.get("LME_V2_ROOT")
+        if not configured:
+            raise unittest.SkipTest("LME_V2_ROOT is not configured")
+        cls.upstream = Path(configured).resolve()
+        cls.patch = Path(__file__).with_name("longmemeval_v2.patch")
+        patch_check = subprocess.run(
+            ["git", "-C", str(cls.upstream), "apply", "--check", str(cls.patch)],
+            capture_output=True,
+            text=True,
+        )
+        if patch_check.returncode != 0:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(cls.upstream),
+                    "apply",
+                    "--reverse",
+                    "--check",
+                    str(cls.patch),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        sys.path.insert(0, str(cls.upstream))
+        importlib.invalidate_caches()
+        importlib.import_module("memory_modules")
+        module = importlib.import_module("benchmarks.agent_memory.longmemeval_v2")
+        cls.LwcMemory = module.LwcMemory
+        from memory_modules.memory import MEMORY_TYPES, load_memory
+
+        cls.load_memory = staticmethod(load_memory)
+        if MEMORY_TYPES.get("lwc") is not cls.LwcMemory:
+            raise AssertionError("LwcMemory was not registered as memory_type=lwc")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        upstream = str(getattr(cls, "upstream", ""))
+        if upstream in sys.path:
+            sys.path.remove(upstream)
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def memory(self, name: str = "state"):
+        return self.LwcMemory(
+            {
+                "state_root": str((self.root / name).resolve()),
+                "lwc_binary": str(lwc_binary()),
+                "search_limit": 3,
+                "command_timeout_seconds": 30,
+            }
+        )
+
+    @staticmethod
+    def trajectory(trajectory_id: str, needle: str) -> dict[str, object]:
+        return {
+            "id": trajectory_id,
+            "goal": f"Locate {needle}",
+            "outcome": f"Found {needle} in the cedar panel.",
+            "start_url": "https://example.test/start",
+            "states": [
+                {
+                    "url": "https://example.test/item",
+                    "action": "open the cedar panel",
+                    "thought": "inspect the labelled compartment",
+                    "accessibility_tree": f"The stored marker is {needle}.",
+                    "screenshot": "/fixture/trajectory-screen.png",
+                }
+            ],
+            "answer_gold": "private evaluator answer must not be indexed",
+            "eval_function": "private evaluator function must not be indexed",
+        }
+
+    def test_insert_query_preserves_trajectory_without_gold_or_query_image(self) -> None:
+        memory = self.memory()
+        memory.insert(self.trajectory("trajectory-a", "indigo-orchid"))
+
+        context = memory.query(
+            "Where is the indigo orchid?",
+            query_image="/private/question-image.png",
+        )
+
+        self.assertTrue(context)
+        self.assertTrue(all(item["type"] == "text" and item["value"] for item in context))
+        indexed = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (self.root / "state").rglob("sources/*.md")
+        )
+        self.assertIn("open the cedar panel", indexed)
+        self.assertIn("indigo-orchid", indexed)
+        self.assertNotIn("private evaluator answer", indexed)
+        self.assertNotIn("private evaluator function", indexed)
+        self.assertNotIn("/private/question-image.png", "\n".join(item["value"] for item in context))
+
+    def test_instances_are_isolated_even_with_one_state_root(self) -> None:
+        first = self.memory("shared")
+        second = self.memory("shared")
+        self.assertNotEqual(first.scope_id, second.scope_id)
+        first.insert(self.trajectory("trajectory-a", "indigo-orchid"))
+        second.insert(self.trajectory("trajectory-b", "amber-comet"))
+
+        evidence = first.query("amber comet")
+
+        self.assertFalse(any("amber-comet" in item["value"] for item in evidence))
+
+    def test_saved_memory_relocates_and_loads_backend(self) -> None:
+        state_root = (self.root / "creator-state").resolve()
+        memory = self.memory("creator-state")
+        memory.insert(self.trajectory("trajectory-a", "indigo-orchid"))
+        saved = self.root / "saved"
+        memory.save_memory(saved)
+        config_text = (saved / "memory_config.json").read_text(encoding="utf-8")
+        self.assertNotIn(str(state_root), config_text)
+
+        moved = self.root / "moved"
+        shutil.move(saved, moved)
+        loaded = self.load_memory(moved)
+
+        self.assertEqual(loaded.backend.state_root, (moved / "lwc_state").resolve())
+        self.assertTrue(loaded.query("indigo orchid"))
 
 
 if __name__ == "__main__":

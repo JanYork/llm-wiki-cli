@@ -1,0 +1,7 @@
+diff --git a/memory_modules/__init__.py b/memory_modules/__init__.py
+--- a/memory_modules/__init__.py
++++ b/memory_modules/__init__.py
+@@ -1,2 +1,3 @@
+ """Memory module implementations for LongMemEval-V2."""
+ 
++from benchmarks.agent_memory.longmemeval_v2 import LwcMemory  # noqa: E402,F401
