@@ -9,6 +9,8 @@ const files = {
   zh: "site/zh-CN/index.html",
   css: "site/assets/site.css",
   js: "site/assets/site.js",
+  socialEn: "site/assets/social-card.png",
+  socialZh: "site/assets/social-card-zh-CN.png",
   workflow: ".github/workflows/pages.yml",
   ci: ".github/workflows/ci.yml",
 };
@@ -16,6 +18,13 @@ const files = {
 const read = (path) => readFileSync(resolve(root, path), "utf8").replaceAll("\r\n", "\n");
 const page = (locale) => read(files[locale]);
 const attribute = (tag, name) => tag.match(new RegExp(`\\b${name}="([^"]+)"`))?.[1];
+
+function pngDimensions(path) {
+  const png = readFileSync(resolve(root, path));
+  assert.equal(png.subarray(1, 4).toString(), "PNG", `${path} is not a PNG`);
+  assert.equal(png.subarray(12, 16).toString(), "IHDR", `${path} has no IHDR chunk`);
+  return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
+}
 
 function setupPrompt() {
   const section = read("README.md").split("## Recommended: Ask Your Agent to Set Up LWC\n")[1];
@@ -48,6 +57,11 @@ function sectionContract(html) {
 
 test("the bilingual site and shared deployment files exist", () => {
   for (const path of Object.values(files)) assert.ok(existsSync(resolve(root, path)), `${path} is missing`);
+});
+
+test("localized social cards are 1200 by 630 PNGs", () => {
+  assert.deepEqual(pngDimensions(files.socialEn), { width: 1200, height: 630 });
+  assert.deepEqual(pngDimensions(files.socialZh), { width: 1200, height: 630 });
 });
 
 test("locale pages share structure and independently canonical metadata", () => {

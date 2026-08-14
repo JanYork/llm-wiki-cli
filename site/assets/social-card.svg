@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title description">
+  <title id="title">LWC — Proactive Memory for AI Agents</title>
+  <desc id="description">Source evidence flows into a maintained Wiki and forward to the next Agent session.</desc>
+  <defs>
+    <pattern id="grid" width="34" height="34" patternUnits="userSpaceOnUse">
+      <path d="M34 0H0V34" fill="none" stroke="#B8C6EE" stroke-opacity=".34" />
+    </pattern>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#0B1739" flood-opacity=".15" />
+    </filter>
+  </defs>
+
+  <rect width="1200" height="630" fill="#EAF0FF" />
+  <rect width="1200" height="630" fill="url(#grid)" />
+  <rect width="1200" height="12" fill="#2452D6" />
+  <circle cx="1120" cy="84" r="118" fill="#FF6848" fill-opacity=".14" />
+
+  <g transform="translate(74 72)">
+    <text x="0" y="62" fill="#2452D6" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="24" font-weight="700" letter-spacing="5">LWC / MEMORY ATLAS</text>
+    <text x="0" y="180" fill="#0B1739" font-family="Georgia, 'Times New Roman', serif" font-size="64" font-weight="700">Proactive memory</text>
+    <text x="0" y="254" fill="#0B1739" font-family="Georgia, 'Times New Roman', serif" font-size="64" font-weight="700">for AI Agents.</text>
+    <text x="4" y="318" fill="#33466F" font-family="Arial, Helvetica, sans-serif" font-size="25">Durable. Source-grounded.</text>
+    <text x="4" y="352" fill="#33466F" font-family="Arial, Helvetica, sans-serif" font-size="25">Ready for the next session.</text>
+
+    <g transform="translate(0 397)">
+      <rect width="505" height="72" rx="36" fill="#0B1739" />
+      <circle cx="39" cy="36" r="11" fill="#FF6848" />
+      <text x="68" y="45" fill="#FFFFFF" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="21" font-weight="700" letter-spacing="1">SOURCE → WIKI → NEXT SESSION</text>
+    </g>
+  </g>
+
+  <g transform="translate(706 96)" filter="url(#shadow)">
+    <rect width="420" height="438" rx="42" fill="#0B1739" />
+    <path d="M48 92C117 22 292 26 364 122C431 210 363 345 240 373C107 404 24 315 33 217C38 157 25 117 48 92Z" fill="none" stroke="#B8C6EE" stroke-width="2" stroke-opacity=".45" />
+    <path d="M98 222H172M248 222H322" stroke="#B8C6EE" stroke-width="4" stroke-linecap="round" />
+    <circle cx="134" cy="222" r="7" fill="#FF6848" />
+    <circle cx="286" cy="222" r="7" fill="#FF6848" />
+    <rect x="54" y="174" width="112" height="96" rx="18" fill="#EAF0FF" />
+    <rect x="166" y="150" width="96" height="144" rx="20" fill="#2452D6" />
+    <rect x="262" y="174" width="104" height="96" rx="18" fill="#EAF0FF" />
+    <text x="110" y="213" text-anchor="middle" fill="#0B1739" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">SOURCE</text>
+    <text x="110" y="236" text-anchor="middle" fill="#33466F" font-family="Arial, Helvetica, sans-serif" font-size="13">EVIDENCE</text>
+    <text x="214" y="211" text-anchor="middle" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700">MAINTAINED</text>
+    <text x="214" y="234" text-anchor="middle" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700">WIKI</text>
+    <text x="314" y="213" text-anchor="middle" fill="#0B1739" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">NEXT</text>
+    <text x="314" y="236" text-anchor="middle" fill="#33466F" font-family="Arial, Helvetica, sans-serif" font-size="13">SESSION</text>
+    <g fill="#B8C6EE" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="700" letter-spacing="1">
+      <text x="61" y="76">SOURCE-GROUNDED</text>
+      <text x="246" y="334">AUDITABLE</text>
+      <text x="58" y="363">EXPLICITLY SCOPED</text>
+    </g>
+  </g>
+</svg>
