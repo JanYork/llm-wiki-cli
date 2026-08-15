@@ -150,6 +150,7 @@ class LongMemEvalV1Tests(unittest.TestCase):
             upstream_revision="test-revision",
             lwc_commit="test-lwc-commit",
             binary=lwc_binary(),
+            workers=2,
         )
 
         self.assertTrue(report["complete"])
@@ -171,6 +172,7 @@ class LongMemEvalV1Tests(unittest.TestCase):
                 "granularity": "passage",
                 "scope": "isolated-per-question",
                 "acknowledged_sensitive_question_ids": [],
+                "workers": 2,
             },
         )
         self.assertEqual(

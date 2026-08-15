@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import math
@@ -27,6 +28,7 @@ def evaluate_dataset(
     binary: str | Path = "lwc",
     limit: int | None = None,
     acknowledge_sensitive_question_ids: set[str] | None = None,
+    workers: int = 1,
 ) -> dict[str, Any]:
     data_path = Path(data_path).resolve()
     output_path = Path(output_path).resolve()
@@ -39,6 +41,8 @@ def evaluate_dataset(
         raise AdapterError("lwc_commit must be non-empty")
     if limit is not None and (isinstance(limit, bool) or limit < 1):
         raise AdapterError("limit must be a positive integer")
+    if isinstance(workers, bool) or workers < 1:
+        raise AdapterError("workers must be a positive integer")
 
     raw = data_path.read_bytes()
     dataset_sha256 = hashlib.sha256(raw).hexdigest()
@@ -62,17 +66,20 @@ def evaluate_dataset(
     records: list[dict[str, Any]] = []
     scored: list[dict[str, Any]] = []
 
-    for entry in selected:
+    def run_entry(entry: object) -> tuple[dict[str, Any], dict[str, Any] | None]:
         question_id = _text(entry.get("question_id"), "question_id") if isinstance(entry, dict) else ""
-        record, measurement = _evaluate_entry(
+        return _evaluate_entry(
             backend,
             dataset_sha256,
             entry,
             acknowledge_sensitive_source=question_id in acknowledged_question_ids,
         )
-        records.append(record)
-        if measurement is not None:
-            scored.append(measurement)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for record, measurement in executor.map(run_entry, selected):
+            records.append(record)
+            if measurement is not None:
+                scored.append(measurement)
 
     log_path = output_path.with_suffix(".jsonl")
     _write_atomic(
@@ -99,6 +106,7 @@ def evaluate_dataset(
             "granularity": "passage",
             "scope": "isolated-per-question",
             "acknowledged_sensitive_question_ids": sorted(acknowledged_question_ids),
+            "workers": workers,
         },
         "retrieval_log": str(log_path),
         "text_only": True,
@@ -286,6 +294,7 @@ def main() -> None:
     parser.add_argument("--lwc-binary", default="lwc")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--acknowledge-sensitive-question-id", action="append", default=[])
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
     report = evaluate_dataset(
         data_path=args.data,
@@ -296,6 +305,7 @@ def main() -> None:
         binary=args.lwc_binary,
         limit=args.limit,
         acknowledge_sensitive_question_ids=set(args.acknowledge_sensitive_question_id),
+        workers=args.workers,
     )
     print(json.dumps(report, indent=2, ensure_ascii=False))
 

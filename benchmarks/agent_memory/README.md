@@ -73,6 +73,10 @@ python3 -m benchmarks.agent_memory.longmemeval_v1 \
   --lwc-binary "$PWD/target/release/lwc"
 ```
 
+Use `--workers 4` to evaluate isolated questions concurrently. Recall and MRR
+are unchanged; latency percentiles then describe four-way load rather than an
+idle single-query run. The report records the worker count.
+
 Only a report with `complete=true`, `instances_processed=500`, and
 `instances_retrieval_scored=470` is a complete LongMemEval-S retrieval result.
 This runner measures retrieval, not downstream answer generation.
