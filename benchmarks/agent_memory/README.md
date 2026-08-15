@@ -77,6 +77,12 @@ Only a report with `complete=true`, `instances_processed=500`, and
 `instances_retrieval_scored=470` is a complete LongMemEval-S retrieval result.
 This runner measures retrieval, not downstream answer generation.
 
+The pinned dataset contains one inert PEM placeholder in question `c7cf7dfd`.
+The runner does not bypass LWC's sensitive-source gate automatically. After
+reviewing that snapshot and verifying the dataset hash above, resume with
+`--acknowledge-sensitive-question-id c7cf7dfd`; the report records every such
+question ID.
+
 ## Agent Memory Leaderboard Add/Search API
 
 Start a local service:

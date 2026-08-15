@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 
 from benchmarks.agent_memory.aml_api import create_server
-from benchmarks.agent_memory.lwc_backend import ConflictError, LwcBackend
+from benchmarks.agent_memory.lwc_backend import AdapterError, ConflictError, LwcBackend
 from benchmarks.agent_memory.longmemeval_v1 import _ndcg, evaluate_dataset
 
 
@@ -170,6 +170,7 @@ class LongMemEvalV1Tests(unittest.TestCase):
                 "source_type": "source",
                 "granularity": "passage",
                 "scope": "isolated-per-question",
+                "acknowledged_sensitive_question_ids": [],
             },
         )
         self.assertEqual(
@@ -258,6 +259,37 @@ class LongMemEvalV1Tests(unittest.TestCase):
             if "cobalt passport" in path.read_text(encoding="utf-8")
         )
         self.assertEqual(source.count("## user @ 2024-01-01"), 1)
+
+    def test_sensitive_marker_requires_question_specific_acknowledgement(self) -> None:
+        entries = json.loads(self.dataset.read_text(encoding="utf-8"))
+        entries[0]["haystack_sessions"][0][0]["content"] += (
+            "\n-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+        )
+        self.dataset.write_text(json.dumps([entries[0]]), encoding="utf-8")
+        state = self.root / "sensitive-state"
+
+        with self.assertRaisesRegex(AdapterError, "possible_secret_detected"):
+            evaluate_dataset(
+                data_path=self.dataset,
+                state_root=state,
+                output_path=self.root / "sensitive.json",
+                upstream_revision="test-revision",
+                lwc_commit="test-lwc-commit",
+                binary=lwc_binary(),
+            )
+
+        report = evaluate_dataset(
+            data_path=self.dataset,
+            state_root=state,
+            output_path=self.root / "acknowledged.json",
+            upstream_revision="test-revision",
+            lwc_commit="test-lwc-commit",
+            binary=lwc_binary(),
+            acknowledge_sensitive_question_ids={"q1"},
+        )
+
+        self.assertTrue(report["complete"])
+        self.assertEqual(report["adapter_config"]["acknowledged_sensitive_question_ids"], ["q1"])
 
 
 class AmlApiTests(unittest.TestCase):

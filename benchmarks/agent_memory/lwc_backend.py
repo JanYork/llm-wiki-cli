@@ -60,6 +60,8 @@ class LwcBackend:
         self,
         scope_id: str,
         memories: list[tuple[str, str, list[dict[str, object]]]],
+        *,
+        acknowledge_sensitive_source: bool = False,
     ) -> None:
         scope_id = self._required_text(scope_id, "scope_id")
         prepared = [self._prepare_memory(*memory) for memory in memories]
@@ -99,7 +101,10 @@ class LwcBackend:
                 manifest_path,
                 json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n",
             )
-            self._run(root, ["source", "add-manifest", str(manifest_path)])
+            command = ["source", "add-manifest", str(manifest_path)]
+            if acknowledge_sensitive_source:
+                command.append("--acknowledge-sensitive-source")
+            self._run(root, command)
             for _, receipt in pending:
                 self._write_atomic(receipt, "added\n")
 

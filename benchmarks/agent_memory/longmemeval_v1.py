@@ -26,6 +26,7 @@ def evaluate_dataset(
     lwc_commit: str,
     binary: str | Path = "lwc",
     limit: int | None = None,
+    acknowledge_sensitive_question_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     data_path = Path(data_path).resolve()
     output_path = Path(output_path).resolve()
@@ -45,12 +46,30 @@ def evaluate_dataset(
     if not isinstance(dataset, list) or not dataset:
         raise AdapterError("dataset must be a non-empty JSON array")
     selected = dataset[:limit] if limit is not None else dataset
+    acknowledged_question_ids = set(acknowledge_sensitive_question_ids or ())
+    dataset_question_ids = {
+        _text(entry.get("question_id"), "question_id")
+        for entry in dataset
+        if isinstance(entry, dict)
+    }
+    unknown_acknowledgements = acknowledged_question_ids - dataset_question_ids
+    if unknown_acknowledgements:
+        raise AdapterError(
+            "acknowledged sensitive question IDs are absent from the dataset: "
+            + ", ".join(sorted(unknown_acknowledgements))
+        )
     backend = LwcBackend(state_root, binary=binary)
     records: list[dict[str, Any]] = []
     scored: list[dict[str, Any]] = []
 
     for entry in selected:
-        record, measurement = _evaluate_entry(backend, dataset_sha256, entry)
+        question_id = _text(entry.get("question_id"), "question_id") if isinstance(entry, dict) else ""
+        record, measurement = _evaluate_entry(
+            backend,
+            dataset_sha256,
+            entry,
+            acknowledge_sensitive_source=question_id in acknowledged_question_ids,
+        )
         records.append(record)
         if measurement is not None:
             scored.append(measurement)
@@ -79,6 +98,7 @@ def evaluate_dataset(
             "source_type": "source",
             "granularity": "passage",
             "scope": "isolated-per-question",
+            "acknowledged_sensitive_question_ids": sorted(acknowledged_question_ids),
         },
         "retrieval_log": str(log_path),
         "text_only": True,
@@ -92,6 +112,8 @@ def _evaluate_entry(
     backend: LwcBackend,
     dataset_sha256: str,
     entry: object,
+    *,
+    acknowledge_sensitive_source: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     if not isinstance(entry, dict):
         raise AdapterError("every dataset entry must be an object")
@@ -127,7 +149,11 @@ def _evaluate_entry(
         memories.append((memory_id, session_id, messages))
 
     scope_id = f"longmemeval-v1:{dataset_sha256}:{question_id}"
-    backend.add_many(scope_id, memories)
+    backend.add_many(
+        scope_id,
+        memories,
+        acknowledge_sensitive_source=acknowledge_sensitive_source,
+    )
     started = time.perf_counter()
     evidence = backend.search(scope_id, question, 50)
     latency_ms = (time.perf_counter() - started) * 1000.0
@@ -259,6 +285,7 @@ def main() -> None:
     parser.add_argument("--lwc-commit", required=True)
     parser.add_argument("--lwc-binary", default="lwc")
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--acknowledge-sensitive-question-id", action="append", default=[])
     args = parser.parse_args()
     report = evaluate_dataset(
         data_path=args.data,
@@ -268,6 +295,7 @@ def main() -> None:
         lwc_commit=args.lwc_commit,
         binary=args.lwc_binary,
         limit=args.limit,
+        acknowledge_sensitive_question_ids=set(args.acknowledge_sensitive_question_id),
     )
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
