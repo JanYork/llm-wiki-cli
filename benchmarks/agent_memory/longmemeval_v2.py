@@ -176,4 +176,3 @@ class LwcMemory(Memory):
         )
         self.scope_id = scope_id
         self.backend = backend
-
