@@ -846,7 +846,7 @@ fn trans_set_replaces_selected_engine_args_and_unset_restores_inherit() {
     let stored: Value =
         serde_json::from_str(&fs::read_to_string(world.project.join(".lwc/config.json")).unwrap())
             .unwrap();
-    assert_eq!(stored["version"], 3);
+    assert_eq!(stored["version"], 4);
     assert_eq!(stored["trans"]["setting"], "markitdown");
     assert_eq!(stored["trans"]["timeout_seconds"], 240);
     assert_eq!(stored["trans"]["anydoc_args"], serde_json::json!(["only"]));
@@ -862,7 +862,7 @@ fn trans_set_replaces_selected_engine_args_and_unset_restores_inherit() {
     let stored: Value =
         serde_json::from_str(&fs::read_to_string(world.project.join(".lwc/config.json")).unwrap())
             .unwrap();
-    assert_eq!(stored["version"], 3);
+    assert_eq!(stored["version"], 4);
     assert_eq!(stored["trans"]["setting"], "inherit");
     assert_eq!(stored["trans"]["timeout_seconds"], 120);
     assert_eq!(stored["trans"]["anydoc_args"], serde_json::json!([]));
@@ -870,7 +870,7 @@ fn trans_set_replaces_selected_engine_args_and_unset_restores_inherit() {
 }
 
 #[test]
-fn v2_config_stays_compatible_and_migrates_to_v3_on_write() {
+fn v2_config_stays_compatible_and_migrates_to_v4_on_write() {
     let world = TestWorld::new();
     world.ok(&world.project, &["init"]);
 
@@ -912,7 +912,7 @@ fn v2_config_stays_compatible_and_migrates_to_v3_on_write() {
     assert_eq!(updated["trans"]["origin"], "project");
 
     let stored: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-    assert_eq!(stored["version"], 3);
+    assert_eq!(stored["version"], 4);
     assert_eq!(stored["graph"]["setting"], "surrealdb");
     assert_eq!(stored["trans"]["setting"], "anydoc");
     assert_eq!(stored["trans"]["timeout_seconds"], 15);

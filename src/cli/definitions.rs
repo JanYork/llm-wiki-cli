@@ -201,6 +201,11 @@ enum Command {
         #[command(subcommand)]
         command: CgCommand,
     },
+    /// Run a read-only OfficeCLI command through LWC's pinned global runtime.
+    Office {
+        #[command(subcommand)]
+        command: OfficeCommand,
+    },
     /// Start a foreground, loopback-only, read-only project viewer.
     #[command(
         long_about = "Start the read-only LWC viewer on 127.0.0.1. The viewer never refreshes, migrates, or mutates project state."
@@ -279,7 +284,7 @@ enum Command {
         #[command(subcommand)]
         command: IngestCommand,
     },
-    /// Inspect and update the layered graph and trans settings.
+    /// Inspect and update layered graph, trans, and global Office settings.
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -426,6 +431,14 @@ enum CgCommand {
     /// Report local runtime and index availability without downloading or writing.
     Status,
     /// Forward a project-scoped CodeGraph command through the pinned runtime.
+    #[command(external_subcommand)]
+    Run(Vec<OsString>),
+}
+
+#[derive(Subcommand)]
+#[command(disable_help_subcommand = true)]
+enum OfficeCommand {
+    /// Forward a read-only command through the pinned OfficeCLI runtime.
     #[command(external_subcommand)]
     Run(Vec<OsString>),
 }
@@ -876,9 +889,9 @@ This prevents completion after merely indexing raw text or writing a detached su
 
 #[derive(Subcommand)]
 enum ConfigCommand {
-    /// Show effective graph and trans configuration plus value origins.
+    /// Show effective graph, trans, and Office configuration plus value origins.
     Show,
-    /// Atomically set graph and trans configuration.
+    /// Atomically set graph, trans, and Office configuration.
     Set {
         /// Select disabled, grafeo, surrealdb, or inherit.
         #[arg(long)]
@@ -886,6 +899,9 @@ enum ConfigCommand {
         /// Select disabled, anydoc, or markitdown.
         #[arg(long)]
         trans: Option<String>,
+        /// Select disabled or officecli. Office configuration is global-only.
+        #[arg(long)]
+        office: Option<String>,
         /// Override the trans timeout in seconds (1..=900).
         #[arg(long = "trans-timeout")]
         trans_timeout: Option<u16>,

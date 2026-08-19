@@ -289,6 +289,10 @@ fn detected_yes_install_is_idempotent_and_uninstall_restores_exact_user_bytes() 
     assert!(claude_guidance.contains("LWC_AGENT_START"));
     assert!(codex_guidance.contains("LWC_READINESS.md_trans"));
     assert!(claude_guidance.contains("LWC_READINESS.md_trans"));
+    assert!(codex_guidance.contains("LWC_READINESS.office"));
+    assert!(claude_guidance.contains("LWC_READINESS.office"));
+    assert!(codex_guidance.contains("config set --office officecli"));
+    assert!(claude_guidance.contains("config set --office officecli"));
     assert_onboarding_guidance(&codex_guidance);
     assert_onboarding_guidance(&claude_guidance);
 

@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const CONFIG_VERSION: u32 = 3;
+pub const CONFIG_VERSION: u32 = 4;
 pub const DEFAULT_TRANS_TIMEOUT_SECONDS: u16 = 120;
 pub const MIN_TRANS_TIMEOUT_SECONDS: u16 = 1;
 pub const MAX_TRANS_TIMEOUT_SECONDS: u16 = 900;
@@ -30,6 +30,13 @@ pub enum TransSetting {
     Anydoc,
     Markitdown,
     Inherit,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OfficeSetting {
+    Disabled,
+    Officecli,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -60,6 +67,8 @@ pub struct ConfigFile {
     pub graph: GraphSettings,
     #[serde(default = "default_trans")]
     pub trans: TransSettings,
+    #[serde(default = "default_office")]
+    pub office: OfficeSetting,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -77,10 +86,17 @@ pub struct EffectiveTransConfig {
     pub markitdown_args: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EffectiveOfficeConfig {
+    pub setting: OfficeSetting,
+    pub origin: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ConfigPatch {
     pub graph: Option<GraphSetting>,
     pub trans: Option<TransSettings>,
+    pub office: Option<OfficeSetting>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -89,6 +105,16 @@ struct ConfigFileV2 {
     pub version: u32,
     #[serde(default = "default_graph")]
     pub graph: GraphSettings,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ConfigFileV3 {
+    pub version: u32,
+    #[serde(default = "default_graph")]
+    pub graph: GraphSettings,
+    #[serde(default = "default_trans")]
+    pub trans: TransSettings,
 }
 
 fn inherit_graph() -> GraphSetting {
@@ -118,12 +144,17 @@ fn default_trans() -> TransSettings {
     }
 }
 
+fn default_office() -> OfficeSetting {
+    OfficeSetting::Disabled
+}
+
 impl Default for ConfigFile {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
             graph: default_graph(),
             trans: default_trans(),
+            office: default_office(),
         }
     }
 }
@@ -151,6 +182,17 @@ pub fn parse_trans_setting(value: &str) -> Result<TransSetting> {
         _ => Err(AppError::new(
             "invalid_trans_engine",
             format!("unsupported trans engine '{value}'; use disabled, anydoc, or markitdown"),
+        )),
+    }
+}
+
+pub fn parse_office_setting(value: &str) -> Result<OfficeSetting> {
+    match value {
+        "disabled" => Ok(OfficeSetting::Disabled),
+        "officecli" => Ok(OfficeSetting::Officecli),
+        _ => Err(AppError::new(
+            "invalid_office_engine",
+            format!("unsupported office engine '{value}'; use disabled or officecli"),
         )),
     }
 }
@@ -236,6 +278,18 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                     version: CONFIG_VERSION,
                     graph: legacy.graph,
                     trans: default_trans(),
+                    office: default_office(),
+                });
+            }
+            if version == 3 {
+                let legacy: ConfigFileV3 = serde_json::from_value(value).map_err(|error| {
+                    AppError::new("invalid_config", format!("invalid config: {error}"))
+                })?;
+                return validate_config_file(ConfigFile {
+                    version: CONFIG_VERSION,
+                    graph: legacy.graph,
+                    trans: legacy.trans,
+                    office: default_office(),
                 });
             }
             if version != u64::from(CONFIG_VERSION) {
@@ -315,6 +369,21 @@ pub fn resolve_trans(scope: &str, database: &Path) -> Result<EffectiveTransConfi
     Ok(effective)
 }
 
+pub fn resolve_office() -> Result<EffectiveOfficeConfig> {
+    let setting = match global_config_path() {
+        Some(path) => load_file(&path)?.office,
+        None => OfficeSetting::Disabled,
+    };
+    Ok(EffectiveOfficeConfig {
+        setting,
+        origin: if setting == OfficeSetting::Disabled {
+            "built-in".to_owned()
+        } else {
+            "global".to_owned()
+        },
+    })
+}
+
 pub fn build_trans_settings(
     database: &Path,
     setting: TransSetting,
@@ -373,6 +442,9 @@ pub fn update(database: &Path, patch: ConfigPatch) -> Result<(PathBuf, ConfigFil
     }
     if let Some(trans) = patch.trans {
         config.trans = trans;
+    }
+    if let Some(office) = patch.office {
+        config.office = office;
     }
     validate_config_file(config.clone())?;
     let bytes = serde_json::to_vec_pretty(&config)
@@ -474,10 +546,12 @@ fn is_explicit_credential_flag(flag: &str) -> bool {
 pub fn response(scope: &str, database: &Path) -> Result<Value> {
     let graph = resolve_graph(scope, database)?;
     let trans = resolve_trans(scope, database)?;
+    let office = resolve_office()?;
     Ok(json!({
         "scope": scope,
         "path": config_path_for_database(database)?,
         "graph": graph,
         "trans": trans,
+        "office": office,
     }))
 }

@@ -1,6 +1,6 @@
 use crate::{
     codegraph,
-    config::{self, GraphSetting, TransSetting},
+    config::{self, GraphSetting, OfficeSetting, TransSetting},
     error::{AppError, Result},
     scope::{Scope, init_store_path, resolve_read_store_paths},
     store::{PageRecord, Store, TagAutoloadPolicy, TagPageIdentity},
@@ -135,6 +135,10 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
         .collect::<Vec<_>>();
     let document_graph_needs_consent = !document_graph_enabled;
     let code_graph_needs_consent = !code_graph_initialized;
+    let office = config::resolve_office()?;
+    let office_status = crate::office::status()?;
+    let office_enabled = office.setting == OfficeSetting::Officecli;
+    let office_runtime_installed = office_status["installed"].as_bool().unwrap_or(false);
 
     let mut value = json!({
         "wiki": {
@@ -172,6 +176,19 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
                 "anydoc": "lwc --scope project config set --trans anydoc",
                 "markitdown": "lwc --scope project config set --trans markitdown",
             },
+        },
+        "office": {
+            "setting": office.setting,
+            "origin": office.origin,
+            "enabled": office_enabled,
+            "runtime_installed": office_runtime_installed,
+            "runtime_health": office_status["runtime_health"],
+            "version": office_status["version"],
+            "ready": office_enabled && office_runtime_installed,
+            "requires_consent": !office_enabled,
+            "configure": "lwc --scope global config set --office officecli",
+            "disable": "lwc --scope global config set --office disabled",
+            "command": "lwc office COMMAND ...",
         },
         "agent_integration": {
             "check": "lwc agent status --target auto --location global",

@@ -25,3 +25,12 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## OfficeCLI
+
+LWC can optionally download and execute a pinned OfficeCLI binary for read-only
+Office document access:
+https://github.com/iOfficeAI/OfficeCLI
+
+OfficeCLI is licensed under the Apache License 2.0. It is not bundled with LWC
+and is downloaded only after explicit global enablement.

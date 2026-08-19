@@ -456,6 +456,16 @@ fn boundary_hook_can_report_a_missing_wiki_without_creating_it() {
         readiness["md_trans"]["configure"]["markitdown"],
         "lwc --scope project config set --trans markitdown"
     );
+    assert_eq!(readiness["office"]["setting"], "disabled");
+    assert_eq!(readiness["office"]["enabled"], false);
+    assert_eq!(readiness["office"]["runtime_installed"], false);
+    assert_eq!(readiness["office"]["ready"], false);
+    assert_eq!(readiness["office"]["requires_consent"], true);
+    assert_eq!(
+        readiness["office"]["configure"],
+        "lwc --scope global config set --office officecli"
+    );
+    assert_eq!(readiness["office"]["command"], "lwc office COMMAND ...");
     assert_eq!(readiness["authorization"]["recommended_choice"], "1");
     assert!(!world.project.join(".lwc").exists());
 }
@@ -497,6 +507,40 @@ fn boundary_hook_reports_a_configured_but_missing_trans_executable() {
         readiness["md_trans"]["available_engines"],
         serde_json::json!([])
     );
+}
+
+#[test]
+fn boundary_hook_reports_enabled_office_without_downloading_it() {
+    let world = World::new(true);
+    world.ok(&["--scope", "global", "init"]);
+    world.ok(&[
+        "--scope",
+        "global",
+        "config",
+        "set",
+        "--office",
+        "officecli",
+    ]);
+    let input = serde_json::json!({"source": "startup", "cwd": world.project}).to_string();
+    let output = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ],
+        &input,
+    );
+    let readiness = readiness(&context(&output));
+    assert_eq!(readiness["office"]["setting"], "officecli");
+    assert_eq!(readiness["office"]["origin"], "global");
+    assert_eq!(readiness["office"]["enabled"], true);
+    assert_eq!(readiness["office"]["runtime_installed"], false);
+    assert_eq!(readiness["office"]["ready"], false);
+    assert_eq!(readiness["office"]["requires_consent"], false);
+    assert!(!world.home.join(".lwc/runtime/officecli").exists());
 }
 
 #[test]

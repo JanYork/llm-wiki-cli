@@ -246,6 +246,28 @@ LWC configuration. See the official [Anydoc](https://github.com/firecrawl/anydoc
 and [MarkItDown](https://github.com/microsoft/markitdown) documentation for
 supported formats and optional flags.
 
+OfficeCLI reading is a separate global, opt-in capability. When an Office read
+is needed, enable it once; the first command downloads the pinned binary into
+the versioned global LWC runtime cache and verifies its SHA-256:
+
+```bash
+lwc --scope global config set --office officecli
+lwc office view report.docx text
+lwc office get workbook.xlsx /Sheet1/A1 --json
+lwc office query slides.pptx 'shape[fill=FF0000]'
+lwc --scope global config set --office disabled
+```
+
+`lwc office` passes through OfficeCLI's `view`, `get`, `query`, `validate`,
+`dump`, `raw`, and `help` commands, their arguments, output, and exit status.
+All modifying, installer, plugin, resident, and server commands are rejected.
+LWC disables OfficeCLI auto-update and resident mode, never falls back to a
+binary from `PATH`, and does not delete the cached runtime when disabled. Read
+commands may still create an explicitly requested derived output (`--out` or
+`--save`) or open a browser; they do not modify the source Office document.
+See [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) and
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
 Grafeo and embedded SurrealDB use disposable sidecars under `.lwc/`. Each
 `graph-project` Work commits one current Source/Page and its owned links,
 citations, and explicit relations before starting the next document. Updates
@@ -409,7 +431,7 @@ See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 Fresh project `lwc init` output and session/compaction Hooks expose bounded
 `LWC_READINESS` facts for the Wiki, physical document graph, CodeGraph runtime
-and project index, plus Agent integration commands. Physical graph readiness
+and project index, optional Office capability, plus Agent integration commands. Physical graph readiness
 distinguishes configured consent from a pending or failed projection. Detection
 is read-only and never enables or initializes a graph. When both graphs need
 authorization, the portable baseline is plain text, so Agents without checkbox
@@ -427,6 +449,10 @@ Grafeo, waits for and verifies its projection Work, initializes CodeGraph, and
 checks both results independently. `Later` changes nothing and does not block
 the primary task. Native plugins may render the same choice IDs with their own
 UI, but checkbox support is never required.
+
+When an actual Word, Excel, or PowerPoint read is requested, Agents inspect
+`LWC_READINESS.office` and ask before globally enabling OfficeCLI. Readiness
+detection itself never enables or downloads the runtime.
 
 Strong tags provide bounded full-page loading for core rules and runbooks:
 

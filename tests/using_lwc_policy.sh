@@ -33,6 +33,7 @@ capabilities=(
   code-graph
   strong-context
   document-conversion
+  office-reading
   agent-onboarding
   recovery-maintenance
 )
@@ -106,6 +107,8 @@ for expected in \
   'config set --trans anydoc' \
   'config set --trans markitdown' \
   'trans INPUT --output OUTPUT.md' \
+  'config set --office officecli' \
+  'lwc office COMMAND' \
   'config set --graph grafeo' \
   'config set --graph surrealdb'; do
   grep -Fq -- "$expected" "${skill_documents[@]}" || {

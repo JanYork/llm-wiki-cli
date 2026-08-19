@@ -224,6 +224,25 @@ lwc source add OUTPUT.md
 [Anydoc](https://github.com/firecrawl/anydoc) 与
 [MarkItDown](https://github.com/microsoft/markitdown) 官方文档为准。
 
+OfficeCLI 读取是另一项默认关闭的全局能力。确实需要读取 Office 文件时，先显式启用；
+首次调用会把锁定版本下载到 LWC 的全局版本化运行时缓存，并校验 SHA-256：
+
+```bash
+lwc --scope global config set --office officecli
+lwc office view report.docx text
+lwc office get workbook.xlsx /Sheet1/A1 --json
+lwc office query slides.pptx 'shape[fill=FF0000]'
+lwc --scope global config set --office disabled
+```
+
+`lwc office` 原样透传 OfficeCLI 的 `view`、`get`、`query`、`validate`、
+`dump`、`raw`、`help` 及其参数、输出和退出码；所有修改、安装、插件、常驻进程和
+服务命令都会被拒绝。LWC 会关闭 OfficeCLI 自动更新与 resident 模式，不会回退到
+`PATH` 中的二进制，禁用能力时也不会删除已有缓存。读取命令仍可通过 `--out` 或
+`--save` 生成明确指定的派生文件，或打开浏览器，但不会修改源 Office 文档。参见
+[OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) 与
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+
 Grafeo 与嵌入式 SurrealDB 使用 `.lwc/` 下可重建的 sidecar。每个
 `graph-project` Work 会先完整提交一篇当前 Source/Page 及其自有链接、引用和显式关系，
 确认可用后才开始下一篇。更新和删除只排入实际触及的文档；重建和恢复也使用相同的
@@ -365,8 +384,8 @@ LWC 在其上增加统一 LWC MCP、逐能力状态、Skills、Hooks、共享文
 许可证声明见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
 新项目执行 `lwc init` 后，以及会话开始/上下文压缩 Hook 中，都会输出有界的
-`LWC_READINESS`：包括 Wiki、物理文档图、CodeGraph 全局运行时与项目索引状态，
-以及 Agent 集成检查命令。物理图会区分“已经授权配置”和“投影仍在等待或失败”。
+`LWC_READINESS`：包括 Wiki、物理文档图、CodeGraph 全局运行时与项目索引状态、可选
+Office 能力，以及 Agent 集成检查命令。物理图会区分“已经授权配置”和“投影仍在等待或失败”。
 检测过程只读，不会静默启用或初始化任何图。当两个图都需要授权时，最低兼容协议
 使用纯文本，因此不支持勾选框的 Agent 也能正常工作：
 
@@ -380,6 +399,10 @@ LWC 在其上增加统一 LWC MCP、逐能力状态、Skills、Hooks、共享文
 用户明确选择 `1` 后，Agent 才会按需初始化项目 Wiki、启用 Grafeo、等待并验证投影
 Work、初始化 CodeGraph，并分别核验两个结果。选择“稍后”不会修改任何状态，也不会
 阻塞当前任务。原生插件可以把相同编号渲染成自己的 UI，但绝不依赖勾选能力。
+
+当任务确实需要读取 Word、Excel 或 PowerPoint 时，Agent 会检查
+`LWC_READINESS.office`，并在全局启用 OfficeCLI 前主动询问。仅检测 readiness 不会
+启用或下载运行时。
 
 强标签用于绕过搜索，在明确上限内完整载入少量核心规则或手册：
 

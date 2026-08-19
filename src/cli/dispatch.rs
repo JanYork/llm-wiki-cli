@@ -8,6 +8,7 @@ fn run(cli: Cli) -> Result<Value> {
             | Command::Work { .. }
             | Command::WorkRun { .. }
             | Command::Cg { .. }
+            | Command::Office { .. }
             | Command::View { .. }
             | Command::Trans { .. }
             | Command::Agent { .. }
@@ -101,6 +102,12 @@ fn run(cli: Cli) -> Result<Value> {
                 CgCommand::Status => codegraph::status(&store_path),
                 CgCommand::Run(args) => codegraph::run(&store_path, &args),
             }
+        }
+        Command::Office {
+            command: OfficeCommand::Run(args),
+        } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "office")?;
+            crate::office::run(&cwd, &args)
         }
         Command::View { port, no_open } => {
             changeset::reject_selector(selected_changeset.as_deref(), "view")?;
@@ -827,13 +834,20 @@ fn run(cli: Cli) -> Result<Value> {
                 ConfigCommand::Set {
                     graph,
                     trans,
+                    office,
                     trans_timeout,
                     trans_args,
                 } => {
-                    if graph.is_none() && trans.is_none() {
+                    if graph.is_none() && trans.is_none() && office.is_none() {
                         return Err(AppError::new(
                             "invalid_input",
-                            "config set requires --graph or --trans",
+                            "config set requires --graph, --trans, or --office",
+                        ));
+                    }
+                    if office.is_some() && cli.scope != Scope::Global {
+                        return Err(AppError::new(
+                            "office_config_global_only",
+                            "Office capability configuration requires `--scope global`",
                         ));
                     }
                     if trans.is_none() && (trans_timeout.is_some() || !trans_args.is_empty()) {
@@ -856,11 +870,16 @@ fn run(cli: Cli) -> Result<Value> {
                         )?),
                         None => None,
                     };
+                    let office_setting = office
+                        .as_deref()
+                        .map(config::parse_office_setting)
+                        .transpose()?;
                     config::update(
                         &store_path.path,
                         config::ConfigPatch {
                             graph: graph_setting,
                             trans: trans_setting,
+                            office: office_setting,
                         },
                     )?;
                     Store::open(scope_name(store_path.scope), &store_path.path)?;
@@ -893,6 +912,7 @@ fn run(cli: Cli) -> Result<Value> {
                         config::ConfigPatch {
                             graph: graph.then_some(config::GraphSetting::Inherit),
                             trans: trans.then_some(config::inherit_trans_settings()),
+                            office: None,
                         },
                     )?;
                     Store::open(scope_name(store_path.scope), &store_path.path)?;
