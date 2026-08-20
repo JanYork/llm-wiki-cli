@@ -30,6 +30,7 @@ function files(directory) {
 test("canonical LWC Skill is bundled identically for every native plugin", () => {
   const canonical = join(root, "skills/using-lwc");
   const expected = files(canonical);
+  assert.ok(expected.includes("references/temporal-memory.md"));
   for (const integration of ["codex-lwc", "claude-lwc", "pi-lwc"]) {
     const copy = join(root, `integrations/${integration}/skills/using-lwc`);
     assert.deepEqual(files(copy), expected, integration);

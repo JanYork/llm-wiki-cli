@@ -6,6 +6,7 @@
 - Bootstrap and scope
 - Command families
 - Recall and retrieval
+- Temporal memory
 - Sources and ingest
 - Pages and changesets
 - Strong tags and lifecycle context
@@ -80,6 +81,7 @@ writes while only write-back waits for the answer.
 | --- | --- | --- |
 | `init`, `purpose`, `schema` | Create and govern one Wiki | Canonical metadata/Markdown |
 | `context`, `search`, `span` | Bounded recall | Read-only unless `search --record` |
+| `remember`, `memory` | Bounded temporal events, recall, feedback, status, and retention | One event/feedback write or explicit maintenance; recall/status are read-only |
 | `source` | Immutable evidence snapshots and lineage | One source/path observation per unit |
 | `ingest` | Persistent integration state machine | One source job transition |
 | `page` | Compiled durable knowledge | One page transaction |
@@ -122,6 +124,24 @@ guessing a replacement.
 
 Search is private/read-only by default. Add `--record` only when the query itself
 belongs in durable history. Do not record sensitive query wording.
+
+## Temporal memory
+
+Use temporal memory for event history, not stable Wiki facts. Normal recording
+is one command and already performs bounded maintenance:
+
+```bash
+lwc remember --json '{...}'
+lwc memory recall "<query>" --limit 5
+lwc memory show <EVENT_ID>
+lwc memory feedback <EVENT_ID> --signal useful --reason "<reason>"
+lwc memory status
+lwc memory maintain
+```
+
+Do not run recall before every record, infer semantic duplicates, or run
+`memory maintain` after each event. Follow `references/temporal-memory.md` for
+the record/skip and temporal-first/Wiki-first rules.
 
 ## Strong tags and lifecycle context
 

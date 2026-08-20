@@ -1,6 +1,6 @@
 use crate::{
     codegraph,
-    config::{self, GraphSetting, OfficeSetting, TransSetting},
+    config::{self, GraphSetting, MemorySetting, OfficeSetting, TransSetting},
     error::{AppError, Result},
     scope::{Scope, init_store_path, resolve_read_store_paths},
     store::{PageRecord, Store, TagAutoloadPolicy, TagPageIdentity},
@@ -133,6 +133,8 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
         .into_iter()
         .filter(|engine| install::command_exists(engine))
         .collect::<Vec<_>>();
+    let memory = config::resolve_memory("project", &store.path)?;
+    let memory_enabled = memory.setting == MemorySetting::Enabled;
     let document_graph_needs_consent = !document_graph_enabled;
     let code_graph_needs_consent = !code_graph_initialized;
     let office = config::resolve_office()?;
@@ -176,6 +178,18 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
                 "anydoc": "lwc --scope project config set --trans anydoc",
                 "markitdown": "lwc --scope project config set --trans markitdown",
             },
+        },
+        "memory": {
+            "setting": memory.setting,
+            "origin": memory.origin,
+            "enabled": memory_enabled,
+            "ready": memory_enabled && wiki_initialized,
+            "max_age_days": memory.max_age_days,
+            "max_bytes": memory.max_bytes,
+            "record": "lwc remember --json '{...}'",
+            "recall": "lwc memory recall QUERY --limit 5",
+            "status": "lwc memory status",
+            "maintain": "lwc memory maintain",
         },
         "office": {
             "setting": office.setting,

@@ -5,10 +5,11 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 skill="$repo_root/skills/using-lwc/SKILL.md"
 policy="$repo_root/skills/using-lwc/references/memory-policy.md"
 manual="$repo_root/skills/using-lwc/references/operations-manual.md"
+temporal="$repo_root/skills/using-lwc/references/temporal-memory.md"
 metadata="$repo_root/skills/using-lwc/agents/openai.yaml"
 skill_documents=("$skill" "$repo_root"/skills/using-lwc/references/*.md)
 
-if rg -n '\"\$LWC\"|LWC=.decoded-lwc_path.|export LWC_PROJECT_ROOT=.decoded-project_root.' \
+if grep -En '\"\$LWC\"|LWC=.decoded-lwc_path.|export LWC_PROJECT_ROOT=.decoded-project_root.' \
   "${skill_documents[@]}"; then
   printf 'using-lwc guidance must invoke global lwc directly from the current project\n' >&2
   exit 1
@@ -34,6 +35,7 @@ capabilities=(
   strong-context
   document-conversion
   office-reading
+  temporal-memory
   agent-onboarding
   recovery-maintenance
 )
@@ -59,6 +61,38 @@ for capability in "${capabilities[@]}"; do
       exit 1
     }
   done
+done
+
+grep -Fq -- 'references/temporal-memory.md' \
+  "$repo_root/skills/using-lwc/references/trigger-playbook.md" || {
+  printf 'trigger playbook does not route temporal memory\n' >&2
+  exit 1
+}
+
+for expected in \
+  'Record when future work may need what changed, why, what was tried, the outcome, or what remains unresolved.' \
+  'Skip routine progress, transient tool output, secrets, stable Wiki facts, and ordinary chat turns.' \
+  'Recall temporal memory first for before, when, changed, why, prior attempts, repeated failures, unresolved work, or incident timelines.' \
+  'Recall the Wiki first for current architecture, instructions, and stable facts.' \
+  "lwc remember --json '{...}'" \
+  'lwc memory recall "<query>" --limit 5' \
+  'lwc memory show <EVENT_ID>' \
+  'lwc memory feedback <EVENT_ID> --signal useful --reason "<reason>"' \
+  'lwc memory status' \
+  'lwc memory maintain'; do
+  grep -Fq -- "$expected" "$temporal" || {
+    printf 'missing temporal-memory guidance: %s\n' "$expected" >&2
+    exit 1
+  }
+done
+
+for expected in \
+  '| `remember`, `memory`' \
+  '## Temporal memory'; do
+  grep -Fq -- "$expected" "$manual" || {
+    printf 'operations manual does not expose temporal memory: %s\n' "$expected" >&2
+    exit 1
+  }
 done
 
 skill_lines="$(wc -l < "$skill" | tr -d ' ')"
@@ -202,12 +236,12 @@ grep -Fq -- 'revision conflict' "$repo_root/README.md" || {
   printf 'missing English changeset conflict contract\n' >&2
   exit 1
 }
-grep -Fq -- 'revision 冲突' "$repo_root/README.zh-CN.md" || {
+grep -Fq -- '同一实体发生版本冲突' "$repo_root/README.zh-CN.md" || {
   printf 'missing Chinese changeset conflict contract\n' >&2
   exit 1
 }
 
-if rg -n 'using_lwc_(bootstrap|policy)\.sh' "$repo_root/.github/workflows" >/dev/null; then
+if grep -ERn 'using_lwc_(bootstrap|policy)\.sh' "$repo_root/.github/workflows" >/dev/null; then
   printf 'using-lwc Skill checks must remain local-only\n' >&2
   exit 1
 fi

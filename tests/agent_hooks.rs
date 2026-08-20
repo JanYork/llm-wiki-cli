@@ -544,6 +544,98 @@ fn boundary_hook_reports_enabled_office_without_downloading_it() {
 }
 
 #[test]
+fn temporal_memory_readiness_is_bounded_and_hook_is_read_only() {
+    let world = World::new(true);
+    world.ok(&[
+        "config",
+        "set",
+        "--memory",
+        "enabled",
+        "--memory-max-age-days",
+        "30",
+        "--memory-max-bytes",
+        "4096",
+    ]);
+    world.ok(&[
+        "remember",
+        "--json",
+        r#"{"type":"验证","context":"Hook 不应读取事件正文","observed":["敏感事件正文"]}"#,
+    ]);
+    let database = world.project.join(".lwc/wiki.db");
+    let snapshot = || {
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        let mut values = Vec::new();
+        for table in [
+            "memory_events",
+            "memory_fragments",
+            "memory_changes",
+            "memory_evidence",
+            "memory_relations",
+            "memory_feedback",
+            "memory_hint_state",
+            "memory_fts",
+        ] {
+            values.push(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            );
+        }
+        let state = conn
+            .query_row(
+                "SELECT record_attempts, inserted_events, idempotent_replays,
+                        feedback_useful, feedback_not_useful, age_evictions,
+                        capacity_evictions, event_count, logical_bytes
+                 FROM memory_state WHERE id = 1",
+                [],
+                |row| {
+                    Ok((0..9)
+                        .map(|index| row.get::<_, i64>(index).unwrap())
+                        .collect::<Vec<_>>())
+                },
+            )
+            .unwrap();
+        values.extend(state);
+        values
+    };
+    let before = snapshot();
+    let input = serde_json::json!({"source": "startup", "cwd": world.project}).to_string();
+    let output = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ],
+        &input,
+    );
+    let readiness = readiness(&context(&output));
+    assert_eq!(
+        readiness["memory"],
+        serde_json::json!({
+            "setting": "enabled",
+            "origin": "project",
+            "enabled": true,
+            "ready": true,
+            "max_age_days": 30,
+            "max_bytes": 4096,
+            "record": "lwc remember --json '{...}'",
+            "recall": "lwc memory recall QUERY --limit 5",
+            "status": "lwc memory status",
+            "maintain": "lwc memory maintain"
+        })
+    );
+    let rendered = serde_json::to_string(&readiness["memory"]).unwrap();
+    assert!(!rendered.contains("敏感事件正文"));
+    assert!(!rendered.contains("events"));
+    assert!(!rendered.contains("hints"));
+    assert_eq!(snapshot(), before);
+}
+
+#[test]
 fn boundary_hook_omits_authorization_when_both_graphs_are_configured() {
     let world = World::new(true);
     fs::write(

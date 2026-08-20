@@ -65,6 +65,7 @@ completion evidence.
 | Rules/runbooks that require deterministic full-page loading | `references/strong-context.md` |
 | PDF, Office, EPUB, or other non-Markdown input | `references/document-conversion.md` |
 | Read Word, Excel, or PowerPoint without modifying the source | `references/office-reading.md` |
+| What changed/when/why, prior attempts, unresolved work, event recording | `references/temporal-memory.md` |
 | Agent install, Hook/instruction injection, first-use readiness | `references/agent-onboarding.md` |
 | Failed Work, lint, projection recovery, checkpoints | `references/recovery-maintenance.md` |
 

@@ -444,6 +444,30 @@ fn codex_global_install_honors_the_official_codex_home() {
     );
 }
 
+#[test]
+fn agent_install_bundles_temporal_memory_reference_byte_identically() {
+    let world = World::new();
+    world.ok(&[
+        "agent",
+        "install",
+        "--target",
+        "codex",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    let relative = "references/temporal-memory.md";
+    assert_eq!(
+        fs::read(world.home.join(".agents/skills/using-lwc").join(relative)).unwrap(),
+        fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("skills/using-lwc")
+                .join(relative)
+        )
+        .unwrap()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn kiro_global_install_honors_kiro_home_and_installs_official_accessories() {

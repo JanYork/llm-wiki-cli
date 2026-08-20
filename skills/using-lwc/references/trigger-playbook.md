@@ -20,6 +20,9 @@ Classify before calling tools:
 | New substantive session | bootstrap once, bounded context, one search |
 | Context compaction/resume | restore strong tags and only task-relevant memory |
 | Research/debug/design | recall prior evidence/decisions before re-deriving |
+| Before/when/changed/why/prior attempts | read `references/temporal-memory.md`, then bounded temporal recall |
+| Meaningful verified event boundary | record one temporal capsule when future work may need the history |
+| Stable current conclusion | update the Wiki; keep temporal memory as its history |
 | Structural code question | check CodeGraph once; use it if ready |
 | Document relationship question | check physical graph once; use it if ready |
 | Non-Markdown source | configure one converter only when needed |
@@ -30,6 +33,10 @@ Classify before calling tools:
 The Automatic self-use loop is: classify, recall once, inspect current evidence,
 solve, capture at milestones, validate, finish. Widen retrieval by one query,
 kind, scope, or granularity at a time after a miss.
+
+Read `references/temporal-memory.md` before the first temporal record or recall
+decision. Temporal memory is history; the Wiki remains the first source for
+current architecture, instructions, and stable facts.
 
 Hooks are signals, not commands to mutate. At a lifecycle boundary, use the
 provided readiness facts to decide whether the current task is substantive enough

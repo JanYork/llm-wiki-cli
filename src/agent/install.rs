@@ -98,6 +98,10 @@ const SKILL_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../skills/using-lwc/references/strong-context.md"),
     ),
     (
+        "references/temporal-memory.md",
+        include_bytes!("../../skills/using-lwc/references/temporal-memory.md"),
+    ),
+    (
         "references/trigger-playbook.md",
         include_bytes!("../../skills/using-lwc/references/trigger-playbook.md"),
     ),
