@@ -841,15 +841,39 @@ fn superseding_event_completes_the_old_pattern_without_merging_other_entities() 
         "superseded_event"
     );
 
-    let history = world.ok(&["memory", "recall", "甲版", "--include-superseded"]);
+    let weak_current = remember(
+        &world,
+        &serde_json::json!({
+            "type": "旁支记录",
+            "context": "甲版旁支",
+            "observed": ["只有一个查询词命中"]
+        }),
+    );
+    let history = world.ok(&["memory", "recall", "甲版 支付网关", "--include-superseded"]);
     let history = history["results"].as_array().unwrap();
-    assert_eq!(history.len(), 2);
+    assert_eq!(history.len(), 3);
     assert!(history.iter().any(|result| {
         result["event"]["id"] == old["event"]["id"] && result["state"] == "superseded"
     }));
     assert!(history.iter().any(|result| {
         result["event"]["id"] == replacement["event"]["id"] && result["state"] == "current"
     }));
+    let old_position = history
+        .iter()
+        .position(|result| result["event"]["id"] == old["event"]["id"])
+        .unwrap();
+    let weak_position = history
+        .iter()
+        .position(|result| result["event"]["id"] == weak_current["event"]["id"])
+        .unwrap();
+    assert!(
+        history[old_position]["rank"].as_f64().unwrap()
+            < history[weak_position]["rank"].as_f64().unwrap()
+    );
+    assert!(
+        old_position < weak_position,
+        "a stronger superseded lexical hit must rank before a weaker current hit"
+    );
 
     let inventory_results = world.ok(&["memory", "recall", "库存失败"]);
     assert_eq!(inventory_results["results"].as_array().unwrap().len(), 1);

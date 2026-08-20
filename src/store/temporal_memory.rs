@@ -1102,9 +1102,8 @@ fn memory_feedback_score(conn: &Connection, event_id: &str) -> Result<i64> {
 pub fn sort_memory_results(results: &mut [MemoryRecallResult]) {
     results.sort_by(|left, right| {
         let state_priority = |state: &str| if state == "current" { 0 } else { 1 };
-        state_priority(&left.state)
-            .cmp(&state_priority(&right.state))
-            .then_with(|| left.rank.total_cmp(&right.rank))
+        left.rank
+            .total_cmp(&right.rank)
             .then_with(|| {
                 right.explanation.feedback.cmp(&left.explanation.feedback)
             })
@@ -1112,6 +1111,9 @@ pub fn sort_memory_results(results: &mut [MemoryRecallResult]) {
                 right.event["occurred_at"]
                     .as_str()
                     .cmp(&left.event["occurred_at"].as_str())
+            })
+            .then_with(|| {
+                state_priority(&left.state).cmp(&state_priority(&right.state))
             })
             .then_with(|| left.scope.cmp(&right.scope))
             .then_with(|| {
