@@ -484,6 +484,10 @@ enum MemoryCommand {
         #[arg(long)]
         reason: String,
     },
+    /// Report bounded temporal-memory storage and outcome metrics.
+    Status,
+    /// Enforce configured age and capacity retention now.
+    Maintain,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

@@ -404,6 +404,8 @@ fn every_public_command_exposes_renderable_help() {
         "memory recall",
         "memory show",
         "memory feedback",
+        "memory status",
+        "memory maintain",
         "graph",
         "graph related",
         "graph explore",

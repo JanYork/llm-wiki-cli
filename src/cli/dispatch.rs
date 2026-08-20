@@ -875,6 +875,16 @@ fn run(cli: Cli) -> Result<Value> {
                         &reason,
                     )
                 }
+                MemoryCommand::Status => {
+                    ensure_scope_supported(cli.scope, false, "memory status")?;
+                    let path = resolve_live_store_path(cli.scope, &cwd)?;
+                    Store::open_for_read(scope_name(path.scope), &path.path)?.memory_status()
+                }
+                MemoryCommand::Maintain => {
+                    ensure_scope_supported(cli.scope, false, "memory maintain")?;
+                    let path = resolve_live_store_path(cli.scope, &cwd)?;
+                    Store::open(scope_name(path.scope), &path.path)?.memory_maintain()
+                }
             }
         }
         Command::Config { command } => {

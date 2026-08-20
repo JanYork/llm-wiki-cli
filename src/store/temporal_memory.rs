@@ -29,6 +29,8 @@ fn create_temporal_memory_schema(tx: &Transaction<'_>) -> Result<()> {
             value TEXT NOT NULL CHECK(TRIM(value) <> ''),
             PRIMARY KEY(event_id, kind, ordinal)
         );
+        CREATE INDEX memory_fragments_kind
+        ON memory_fragments(kind, event_id);
 
         CREATE TABLE memory_changes(
             event_id TEXT NOT NULL REFERENCES memory_events(id) ON DELETE CASCADE,
@@ -391,16 +393,34 @@ impl Store {
             }),
         )?;
         let event = load_memory_event(&tx, &event_id)?;
+        let retention = enforce_memory_retention(
+            &tx,
+            settings.max_age_days,
+            settings.max_bytes,
+            Some(&event_id),
+            true,
+        )?;
         let pressure = memory_pressure(&tx, settings.max_bytes)?;
+        let retained: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_events WHERE id = ?1)",
+            [&event_id],
+            |row| row.get(0),
+        )?;
+        let hints = if retained {
+            emit_memory_hints(&tx, &event_id, &input, settings.max_bytes)?
+        } else {
+            prune_memory_hint_state(&tx, settings.max_bytes, false)?;
+            Vec::new()
+        };
         tx.commit()?;
         Ok(json!({
             "scope": scope,
             "database": database,
             "created": true,
             "event": event,
-            "retention": empty_memory_retention(),
+            "retention": retention,
             "pressure": pressure,
-            "hints": [],
+            "hints": hints,
         }))
     }
 }
@@ -1100,4 +1120,633 @@ pub fn sort_memory_results(results: &mut [MemoryRecallResult]) {
                     .cmp(&right.event["id"].as_str())
             })
     });
+}
+
+#[derive(Default)]
+struct MemoryEvictions {
+    count: i64,
+    logical_bytes: i64,
+    event_ids: Vec<String>,
+    affected_clusters: BTreeSet<(String, String)>,
+}
+
+impl MemoryEvictions {
+    fn add(
+        &mut self,
+        event_id: String,
+        logical_bytes: i64,
+        event_type: String,
+        context: String,
+    ) {
+        self.count += 1;
+        self.logical_bytes += logical_bytes;
+        self.affected_clusters.insert((event_type, context));
+        if self.event_ids.len() < 100 {
+            self.event_ids.push(event_id);
+        }
+    }
+}
+
+fn enforce_memory_retention(
+    tx: &Transaction<'_>,
+    max_age_days: u32,
+    max_bytes: u64,
+    retained_event_id: Option<&str>,
+    fail_if_over_capacity: bool,
+) -> Result<Value> {
+    let age_sql = format!(
+        "SELECT e.id, e.logical_bytes, e.event_type, e.context
+         FROM memory_events e
+         WHERE JULIANDAY(e.occurred_at) < JULIANDAY('now', '-' || ?1 || ' days')
+           AND NOT ({MEMORY_EVENT_PROTECTED_SQL})
+         ORDER BY e.occurred_at, e.recorded_at, e.id
+         LIMIT 100"
+    );
+    let mut age = MemoryEvictions::default();
+    loop {
+        let batch = {
+            let mut statement = tx.prepare(&age_sql)?;
+            statement
+                .query_map([i64::from(max_age_days)], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if batch.is_empty() {
+            break;
+        }
+        for (event_id, logical_bytes, event_type, context) in batch {
+            delete_memory_event(tx, &event_id)?;
+            age.add(event_id, logical_bytes, event_type, context);
+        }
+    }
+    apply_memory_evictions(tx, "age", &age)?;
+
+    let capacity_sql = format!(
+        "SELECT e.id, e.logical_bytes, e.event_type, e.context
+         FROM memory_events e
+         WHERE (?1 IS NULL OR e.id <> ?1)
+           AND NOT ({MEMORY_EVENT_PROTECTED_SQL})
+         ORDER BY e.occurred_at, e.recorded_at, e.id
+         LIMIT 1"
+    );
+    let mut capacity = MemoryEvictions::default();
+    loop {
+        let logical_bytes: i64 = tx.query_row(
+            "SELECT logical_bytes FROM memory_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let logical_bytes = u64::try_from(logical_bytes)
+            .map_err(|_| AppError::new("corrupt_store", "memory logical bytes are negative"))?;
+        if logical_bytes <= max_bytes {
+            break;
+        }
+        let candidate = tx
+            .query_row(&capacity_sql, [retained_event_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .optional()?;
+        let Some((event_id, event_bytes, event_type, context)) = candidate else {
+            if fail_if_over_capacity {
+                return Err(AppError::new(
+                    "memory_capacity_exceeded",
+                    format!(
+                        "temporal memory cannot fit within the configured {max_bytes}-byte limit without deleting protected events"
+                    ),
+                ));
+            }
+            break;
+        };
+        delete_memory_event(tx, &event_id)?;
+        capacity.add(event_id, event_bytes, event_type, context);
+        tx.execute(
+            "UPDATE memory_state
+             SET capacity_evictions = capacity_evictions + 1,
+                 event_count = event_count - 1,
+                 logical_bytes = logical_bytes - ?1
+             WHERE id = 1",
+            [event_bytes],
+        )?;
+    }
+    record_memory_eviction_operation(tx, "capacity", &capacity)?;
+    prune_affected_memory_cluster_hints(tx, &age, &capacity)?;
+
+    Ok(json!({
+        "age_evicted": age.count,
+        "capacity_evicted": capacity.count,
+        "logical_bytes_removed": age.logical_bytes + capacity.logical_bytes,
+    }))
+}
+
+fn prune_affected_memory_cluster_hints(
+    tx: &Transaction<'_>,
+    age: &MemoryEvictions,
+    capacity: &MemoryEvictions,
+) -> Result<()> {
+    for (event_type, context) in age
+        .affected_clusters
+        .union(&capacity.affected_clusters)
+    {
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM memory_events WHERE event_type = ?1 AND context = ?2",
+            params![event_type, context],
+            |row| row.get(0),
+        )?;
+        if count < 5 {
+            tx.execute(
+                "DELETE FROM memory_hint_state
+                 WHERE hint_type = 'exact-context-cluster' AND candidate_key = ?1",
+                [memory_cluster_candidate_key(event_type, context)],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn delete_memory_event(tx: &Transaction<'_>, event_id: &str) -> Result<()> {
+    tx.execute("DELETE FROM memory_fts WHERE event_id = ?1", [event_id])?;
+    if tx.execute("DELETE FROM memory_events WHERE id = ?1", [event_id])? != 1 {
+        return Err(AppError::new(
+            "corrupt_store",
+            format!("memory event '{event_id}' disappeared during retention"),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_memory_evictions(
+    tx: &Transaction<'_>,
+    reason: &str,
+    evictions: &MemoryEvictions,
+) -> Result<()> {
+    if evictions.count == 0 {
+        return Ok(());
+    }
+    let counter = if reason == "age" {
+        "age_evictions"
+    } else {
+        "capacity_evictions"
+    };
+    tx.execute(
+        &format!(
+            "UPDATE memory_state
+             SET {counter} = {counter} + ?1,
+                 event_count = event_count - ?1,
+                 logical_bytes = logical_bytes - ?2
+             WHERE id = 1"
+        ),
+        params![evictions.count, evictions.logical_bytes],
+    )?;
+    record_memory_eviction_operation(tx, reason, evictions)
+}
+
+fn record_memory_eviction_operation(
+    tx: &Transaction<'_>,
+    reason: &str,
+    evictions: &MemoryEvictions,
+) -> Result<()> {
+    if evictions.count == 0 {
+        return Ok(());
+    }
+    record_operation(
+        tx,
+        "memory_retention",
+        reason,
+        &json!({
+            "reason": reason,
+            "event_ids": evictions.event_ids,
+            "count": evictions.count,
+            "logical_bytes_removed": evictions.logical_bytes,
+            "identifiers_truncated": evictions.count as usize > evictions.event_ids.len(),
+        }),
+    )
+    .map(|_| ())
+}
+
+struct MemoryHintCandidate {
+    candidate_key: String,
+    hint_type: &'static str,
+    reason: &'static str,
+    event_ids: Vec<String>,
+}
+
+fn emit_memory_hints(
+    tx: &Transaction<'_>,
+    event_id: &str,
+    input: &MemoryEventInput,
+    max_bytes: u64,
+) -> Result<Vec<Value>> {
+    prune_memory_hint_state(tx, max_bytes, false)?;
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    let relations = {
+        let mut statement = tx.prepare(
+            "SELECT relation_type, target_event_id FROM memory_relations
+             WHERE event_id = ?1 AND relation_type IN ('contradicts', 'supersedes')
+             ORDER BY ordinal",
+        )?;
+        statement
+            .query_map([event_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (relation_type, target) in relations {
+        push_memory_hint_candidate(
+            &mut candidates,
+            &mut seen,
+            MemoryHintCandidate {
+                candidate_key: format!("relation:{relation_type}:{target}"),
+                hint_type: "relation-review",
+                reason: "显式冲突或替代链需要复核",
+                event_ids: vec![event_id.to_owned(), target],
+            },
+        );
+    }
+
+    let cluster_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM memory_events
+         WHERE event_type = ?1 AND context = ?2",
+        params![&input.event_type, &input.context],
+        |row| row.get(0),
+    )?;
+    if cluster_count >= 5 {
+        let mut statement = tx.prepare(
+            "SELECT id FROM memory_events
+             WHERE event_type = ?1 AND context = ?2
+             ORDER BY occurred_at, recorded_at, id LIMIT 5",
+        )?;
+        let event_ids = statement
+            .query_map(params![&input.event_type, &input.context], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        push_memory_hint_candidate(
+            &mut candidates,
+            &mut seen,
+            MemoryHintCandidate {
+                candidate_key: memory_cluster_candidate_key(&input.event_type, &input.context),
+                hint_type: "exact-context-cluster",
+                reason: "至少五条事件具有完全相同的类型和上下文",
+                event_ids,
+            },
+        );
+    }
+
+    let aged_unresolved = {
+        let mut statement = tx.prepare(
+            "SELECT DISTINCT e.id
+             FROM memory_fragments fragment
+             JOIN memory_events e ON e.id = fragment.event_id
+             WHERE fragment.kind = 'unresolved'
+               AND JULIANDAY(e.occurred_at) <= JULIANDAY('now', '-14 days')
+             ORDER BY e.occurred_at, e.id LIMIT 100",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for unresolved_id in aged_unresolved {
+        push_memory_hint_candidate(
+            &mut candidates,
+            &mut seen,
+            MemoryHintCandidate {
+                candidate_key: format!("unresolved:{unresolved_id}"),
+                hint_type: "aged-unresolved",
+                reason: "未决事件已经超过十四天",
+                event_ids: vec![unresolved_id],
+            },
+        );
+    }
+
+    let logical_bytes = memory_logical_bytes_state(tx)?;
+    if logical_bytes as f64 / max_bytes as f64 >= 0.8 {
+        push_memory_hint_candidate(
+            &mut candidates,
+            &mut seen,
+            MemoryHintCandidate {
+                candidate_key: "pressure:store".to_owned(),
+                hint_type: "storage-pressure",
+                reason: "时序记忆存储压力已经达到百分之八十",
+                event_ids: Vec::new(),
+            },
+        );
+    }
+
+    let mut hints = Vec::new();
+    for candidate in candidates {
+        let cooling_down: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_hint_state WHERE candidate_key = ?1)",
+            [&candidate.candidate_key],
+            |row| row.get(0),
+        )?;
+        if cooling_down {
+            continue;
+        }
+        tx.execute(
+            &format!(
+                "INSERT INTO memory_hint_state(
+                    candidate_key, hint_type, last_emitted_at, next_eligible_at
+                 ) VALUES (?1, ?2, {TIMESTAMP_SQL}, STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now', '+7 days'))"
+            ),
+            params![&candidate.candidate_key, candidate.hint_type],
+        )?;
+        hints.push(json!({
+            "candidate_key": candidate.candidate_key,
+            "type": candidate.hint_type,
+            "reason": candidate.reason,
+            "event_ids": candidate.event_ids,
+        }));
+        if hints.len() == 3 {
+            break;
+        }
+    }
+    Ok(hints)
+}
+
+fn push_memory_hint_candidate(
+    candidates: &mut Vec<MemoryHintCandidate>,
+    seen: &mut BTreeSet<String>,
+    candidate: MemoryHintCandidate,
+) {
+    if seen.insert(candidate.candidate_key.clone()) {
+        candidates.push(candidate);
+    }
+}
+
+fn memory_cluster_candidate_key(event_type: &str, context: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(event_type.as_bytes());
+    digest.update([0]);
+    digest.update(context.as_bytes());
+    let hash: String = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("cluster:{hash}")
+}
+
+fn prune_memory_hint_state(
+    tx: &Transaction<'_>,
+    max_bytes: u64,
+    prune_all_clusters: bool,
+) -> Result<usize> {
+    let mut pruned = tx.execute(
+        "DELETE FROM memory_hint_state
+         WHERE JULIANDAY(next_eligible_at) <= JULIANDAY('now')",
+        [],
+    )?;
+    if prune_all_clusters {
+        let active_clusters = {
+            let mut statement = tx.prepare(
+                "SELECT event_type, context FROM memory_events
+                 GROUP BY event_type, context HAVING COUNT(*) >= 5",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok(memory_cluster_candidate_key(
+                        &row.get::<_, String>(0)?,
+                        &row.get::<_, String>(1)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?
+        };
+        let stored_clusters = {
+            let mut statement = tx.prepare(
+                "SELECT candidate_key FROM memory_hint_state
+                 WHERE hint_type = 'exact-context-cluster'",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for candidate_key in stored_clusters {
+            if !active_clusters.contains(&candidate_key) {
+                pruned += tx.execute(
+                    "DELETE FROM memory_hint_state WHERE candidate_key = ?1",
+                    [candidate_key],
+                )?;
+            }
+        }
+    }
+    pruned += tx.execute(
+        "DELETE FROM memory_hint_state
+         WHERE hint_type = 'relation-review'
+           AND NOT EXISTS (
+               SELECT 1 FROM memory_relations relation
+               WHERE candidate_key = 'relation:' || relation.relation_type || ':' || relation.target_event_id
+                 AND relation.relation_type IN ('contradicts', 'supersedes')
+                 AND (
+                     relation.relation_type = 'supersedes'
+                     OR NOT EXISTS (
+                         SELECT 1 FROM memory_relations resolution
+                         WHERE resolution.relation_type = 'resolves'
+                           AND resolution.target_event_id = relation.event_id
+                     )
+                 )
+           )",
+        [],
+    )?;
+    pruned += tx.execute(
+        "DELETE FROM memory_hint_state
+         WHERE hint_type = 'aged-unresolved'
+           AND NOT EXISTS (
+               SELECT 1 FROM memory_events e
+               JOIN memory_fragments fragment ON fragment.event_id = e.id
+               WHERE e.id = SUBSTR(candidate_key, INSTR(candidate_key, ':') + 1)
+                 AND fragment.kind = 'unresolved'
+                 AND JULIANDAY(e.occurred_at) <= JULIANDAY('now', '-14 days')
+           )",
+        [],
+    )?;
+    if memory_logical_bytes_state(tx)? as f64 / (max_bytes as f64) < 0.8 {
+        pruned += tx.execute(
+            "DELETE FROM memory_hint_state WHERE hint_type = 'storage-pressure'",
+            [],
+        )?;
+    }
+    Ok(pruned)
+}
+
+fn memory_logical_bytes_state(conn: &Connection) -> Result<u64> {
+    let logical_bytes: i64 = conn.query_row(
+        "SELECT logical_bytes FROM memory_state WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    u64::try_from(logical_bytes)
+        .map_err(|_| AppError::new("corrupt_store", "memory logical bytes are negative"))
+}
+
+fn memory_pending_hint_count(conn: &Connection, max_bytes: u64) -> Result<i64> {
+    let clusters: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM (
+             SELECT 1 FROM memory_events
+             GROUP BY event_type, context HAVING COUNT(*) >= 5
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let relations: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM (
+             SELECT relation.relation_type, relation.target_event_id
+             FROM memory_relations relation
+             WHERE relation.relation_type IN ('contradicts', 'supersedes')
+               AND (
+                   relation.relation_type = 'supersedes'
+                   OR NOT EXISTS (
+                       SELECT 1 FROM memory_relations resolution
+                       WHERE resolution.relation_type = 'resolves'
+                         AND resolution.target_event_id = relation.event_id
+                   )
+               )
+             GROUP BY relation.relation_type, relation.target_event_id
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let unresolved: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT e.id)
+         FROM memory_events e
+         JOIN memory_fragments fragment ON fragment.event_id = e.id
+         WHERE fragment.kind = 'unresolved'
+           AND JULIANDAY(e.occurred_at) <= JULIANDAY('now', '-14 days')",
+        [],
+        |row| row.get(0),
+    )?;
+    let pressure = i64::from(memory_logical_bytes_state(conn)? as f64 / max_bytes as f64 >= 0.8);
+    Ok(clusters + relations + unresolved + pressure)
+}
+
+impl Store {
+    pub fn memory_status(&self) -> Result<Value> {
+        let settings = config::resolve_memory(&self.scope, &self.database)?;
+        let (
+            record_attempts,
+            inserted_events,
+            idempotent_replays,
+            feedback_useful,
+            feedback_not_useful,
+            age_evictions,
+            capacity_evictions,
+            event_count,
+            logical_bytes,
+        ): (i64, i64, i64, i64, i64, i64, i64, i64, i64) = self.conn.query_row(
+            "SELECT record_attempts, inserted_events, idempotent_replays,
+                    feedback_useful, feedback_not_useful, age_evictions,
+                    capacity_evictions, event_count, logical_bytes
+             FROM memory_state WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )?;
+        let protected: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM memory_events e WHERE {MEMORY_EVENT_PROTECTED_SQL}"),
+            [],
+            |row| row.get(0),
+        )?;
+        let superseded: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_events e
+             WHERE EXISTS (
+                 SELECT 1 FROM memory_relations relation
+                 WHERE relation.target_event_id = e.id
+                   AND relation.relation_type = 'supersedes'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        let pending_hints = memory_pending_hint_count(&self.conn, settings.max_bytes)?;
+        Ok(json!({
+            "scope": self.scope,
+            "database": self.database.to_string_lossy(),
+            "policy": {
+                "setting": settings.setting,
+                "origin": settings.origin,
+                "max_age_days": settings.max_age_days,
+                "max_bytes": settings.max_bytes,
+            },
+            "retained": {
+                "events": event_count,
+                "protected": protected,
+                "superseded": superseded,
+                "logical_bytes": logical_bytes,
+            },
+            "pressure": memory_pressure(&self.conn, settings.max_bytes)?,
+            "counters": {
+                "record_attempts": record_attempts,
+                "inserted_events": inserted_events,
+                "idempotent_replays": idempotent_replays,
+                "feedback_useful": feedback_useful,
+                "feedback_not_useful": feedback_not_useful,
+                "age_evictions": age_evictions,
+                "capacity_evictions": capacity_evictions,
+            },
+            "pending_hints": pending_hints,
+        }))
+    }
+
+    pub fn memory_maintain(&mut self) -> Result<Value> {
+        let settings = config::resolve_memory(&self.scope, &self.database)?;
+        if settings.setting == config::MemorySetting::Disabled {
+            return Err(AppError::new(
+                "memory_disabled",
+                "temporal memory is disabled for this scope",
+            ));
+        }
+        let scope = self.scope.clone();
+        let database = self.database.to_string_lossy().into_owned();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let retention = enforce_memory_retention(
+            &tx,
+            settings.max_age_days,
+            settings.max_bytes,
+            None,
+            false,
+        )?;
+        let hints_pruned = prune_memory_hint_state(&tx, settings.max_bytes, true)?;
+        let pressure = memory_pressure(&tx, settings.max_bytes)?;
+        record_operation(
+            &tx,
+            "memory_maintain",
+            "memory",
+            &json!({
+                "retention": retention,
+                "hint_rows_pruned": hints_pruned,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(json!({
+            "scope": scope,
+            "database": database,
+            "retention": retention,
+            "hints_pruned": hints_pruned,
+            "pressure": pressure,
+        }))
+    }
 }

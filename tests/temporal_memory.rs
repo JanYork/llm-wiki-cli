@@ -294,6 +294,7 @@ fn version_13_store_migrates_temporal_tables_transactionally() {
         "memory_feedback",
         "memory_feedback_event",
         "memory_fragments",
+        "memory_fragments_kind",
         "memory_fts",
         "memory_hint_state",
         "memory_relations",
@@ -579,7 +580,7 @@ fn same_request_and_payload_is_idempotent_across_processes() {
     assert_eq!(replay["created"], false);
     assert_eq!(replay["event"]["id"], first["event"]["id"]);
 
-    let conn = Connection::open(database).unwrap();
+    let conn = Connection::open(&database).unwrap();
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM memory_events", [], |row| row
             .get::<_, i64>(0))
@@ -1097,4 +1098,822 @@ fn recall_scope_all_is_read_only_and_memory_rejects_changesets() {
         staged_feedback["error"]["code"],
         "changeset_command_unsupported"
     );
+}
+
+#[test]
+fn age_retention_evicts_only_expired_unprotected_events() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+    world.ok(&[
+        "config",
+        "set",
+        "--memory",
+        "enabled",
+        "--memory-max-age-days",
+        "50000",
+        "--memory-max-bytes",
+        "1000000",
+    ]);
+    let pinned = remember(
+        &world,
+        &serde_json::json!({
+            "type": "历史事件",
+            "context": "过期但固定的记忆",
+            "occurred_at": "2000-01-01T00:00:00Z",
+            "pinned": true,
+            "observed": ["固定事件必须保留"]
+        }),
+    );
+    let ordinary = remember(
+        &world,
+        &serde_json::json!({
+            "type": "历史事件",
+            "context": "应该淡忘的普通记忆",
+            "occurred_at": "2000-01-02T00:00:00Z",
+            "observed": ["普通事件已经过期"]
+        }),
+    );
+    world.ok(&[
+        "config",
+        "set",
+        "--memory",
+        "enabled",
+        "--memory-max-age-days",
+        "1",
+        "--memory-max-bytes",
+        "1000000",
+    ]);
+    let triggered = remember(&world, &minimal_capsule("触发年龄维护", None));
+    assert_eq!(triggered["retention"]["age_evicted"], 1);
+    assert_eq!(triggered["retention"]["capacity_evicted"], 0);
+    assert!(
+        triggered["retention"]["logical_bytes_removed"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+
+    let conn = Connection::open(&database).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM memory_events", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert!(
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_events WHERE id = ?1)",
+            [pinned["event"]["id"].as_str().unwrap()],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    );
+    assert!(
+        !conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_events WHERE id = ?1)",
+                [ordinary["event"]["id"].as_str().unwrap()],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT age_evictions, capacity_evictions, event_count
+             FROM memory_state WHERE id = 1",
+            [],
+            |row| Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?
+            )),
+        )
+        .unwrap(),
+        (1, 0, 2)
+    );
+    let retention_log: String = conn
+        .query_row(
+            "SELECT detail_json FROM operations
+             WHERE action = 'memory_retention' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!retention_log.contains("应该淡忘的普通记忆"));
+    drop(conn);
+
+    let immediately_expired = remember(
+        &world,
+        &serde_json::json!({
+            "type": "历史事件",
+            "context": "写入时已经过期",
+            "occurred_at": "1999-01-01T00:00:00Z",
+            "observed": ["同一事务内淘汰"]
+        }),
+    );
+    assert_eq!(immediately_expired["retention"]["age_evicted"], 1);
+    assert!(
+        !Connection::open(database)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_events WHERE id = ?1)",
+                [immediately_expired["event"]["id"].as_str().unwrap()],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn recall_filters_expired_events_before_physical_maintenance() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+    world.ok(&[
+        "config",
+        "set",
+        "--memory",
+        "enabled",
+        "--memory-max-age-days",
+        "50000",
+        "--memory-max-bytes",
+        "1000000",
+    ]);
+    let expired = remember(
+        &world,
+        &serde_json::json!({
+            "type": "历史事件",
+            "context": "尚未物理清理的过期记忆",
+            "occurred_at": "2000-01-01T00:00:00Z",
+            "observed": ["读取时必须先隐藏"]
+        }),
+    );
+    world.ok(&[
+        "config",
+        "set",
+        "--memory",
+        "enabled",
+        "--memory-max-age-days",
+        "1",
+        "--memory-max-bytes",
+        "1000000",
+    ]);
+
+    let recalled = world.ok(&["memory", "recall", "尚未物理清理"]);
+    assert!(recalled["results"].as_array().unwrap().is_empty());
+    assert!(
+        Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_events WHERE id = ?1)",
+                [expired["event"]["id"].as_str().unwrap()],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    );
+
+    let maintained = world.ok(&["memory", "maintain"]);
+    assert_eq!(maintained["retention"]["age_evicted"], 1);
+    assert_eq!(
+        Connection::open(database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM memory_events", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+fn complete_memory_snapshot(database: &Path) -> (i64, i64, i64, i64, i64, i64) {
+    let conn = Connection::open(database).unwrap();
+    conn.query_row(
+        "SELECT record_attempts, inserted_events, age_evictions,
+                    capacity_evictions, event_count, logical_bytes
+             FROM memory_state WHERE id = 1",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn byte_budget_evicts_oldest_unprotected_and_rolls_back_when_blocked() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+    let oldest = remember(
+        &world,
+        &serde_json::json!({
+            "type": "容量事件",
+            "context": "最旧普通事件",
+            "occurred_at": "2026-08-01T00:00:00Z",
+            "observed": ["容量样本甲"]
+        }),
+    );
+    remember(
+        &world,
+        &serde_json::json!({
+            "type": "容量事件",
+            "context": "固定容量事件",
+            "occurred_at": "2026-08-02T00:00:00Z",
+            "pinned": true,
+            "observed": ["固定容量样本"]
+        }),
+    );
+    let newer = remember(
+        &world,
+        &serde_json::json!({
+            "type": "容量事件",
+            "context": "较新普通事件",
+            "occurred_at": "2026-08-03T00:00:00Z",
+            "observed": ["容量样本乙"]
+        }),
+    );
+    let incoming = serde_json::json!({
+        "type": "容量事件",
+        "context": "最新普通事件",
+        "occurred_at": "2026-08-04T00:00:00Z",
+        "observed": ["容量样本丙"]
+    });
+    let sizing = TestWorld::new();
+    sizing.ok(&["init"]);
+    let incoming_bytes = remember(&sizing, &incoming)["event"]["logical_bytes"]
+        .as_u64()
+        .unwrap();
+    let current_bytes = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT logical_bytes FROM memory_state WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let current_bytes = u64::try_from(current_bytes).unwrap();
+    let max_bytes = (current_bytes + incoming_bytes - 1).to_string();
+    world.ok(&[
+        "config",
+        "set",
+        "--memory",
+        "enabled",
+        "--memory-max-age-days",
+        "365",
+        "--memory-max-bytes",
+        &max_bytes,
+    ]);
+    let inserted = remember(&world, &incoming);
+    assert_eq!(inserted["retention"]["capacity_evicted"], 1);
+    let conn = Connection::open(&database).unwrap();
+    assert!(
+        !conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_events WHERE id = ?1)",
+                [oldest["event"]["id"].as_str().unwrap()],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    );
+    assert!(
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_events WHERE id = ?1)",
+            [newer["event"]["id"].as_str().unwrap()],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT event_count FROM memory_state WHERE id = 1",
+            [],
+            |row| { row.get::<_, i64>(0) }
+        )
+        .unwrap(),
+        3
+    );
+
+    let blocked = TestWorld::new();
+    let initialized = blocked.ok(&["init"]);
+    let blocked_database = database_path(&initialized);
+    let protected = remember(
+        &blocked,
+        &serde_json::json!({
+            "type": "容量事件",
+            "context": "唯一固定事件",
+            "pinned": true,
+            "observed": ["不能被容量策略删除"]
+        }),
+    );
+    let max_bytes = (protected["event"]["logical_bytes"].as_u64().unwrap() + 1).to_string();
+    blocked.ok(&[
+        "config",
+        "set",
+        "--memory",
+        "enabled",
+        "--memory-max-age-days",
+        "365",
+        "--memory-max-bytes",
+        &max_bytes,
+    ]);
+    let before = complete_memory_snapshot(&blocked_database);
+    let operations_before: i64 = Connection::open(&blocked_database)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+        .unwrap();
+    let raw = serde_json::to_string(&minimal_capsule("无法容纳的新事件", None)).unwrap();
+    let error = blocked.err(&["remember", "--json", &raw]);
+    assert_eq!(error["error"]["code"], "memory_capacity_exceeded");
+    assert_eq!(complete_memory_snapshot(&blocked_database), before);
+    assert_eq!(
+        Connection::open(&blocked_database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM operations", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        operations_before
+    );
+}
+
+#[test]
+fn unresolved_pinned_and_open_contradiction_events_are_protected() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+    world.ok(&[
+        "config",
+        "set",
+        "--memory",
+        "enabled",
+        "--memory-max-age-days",
+        "50000",
+        "--memory-max-bytes",
+        "1000000",
+    ]);
+    let contradicted = remember(
+        &world,
+        &serde_json::json!({
+            "type": "判断",
+            "context": "旧容量判断",
+            "occurred_at": "2000-01-01T00:00:00Z",
+            "decision": ["容量足够"]
+        }),
+    );
+    let contradiction = remember(
+        &world,
+        &serde_json::json!({
+            "type": "判断",
+            "context": "容量判断冲突",
+            "occurred_at": "2000-01-02T00:00:00Z",
+            "decision": ["容量不足"],
+            "relations": [{
+                "type": "contradicts",
+                "target": contradicted["event"]["id"],
+                "basis": "两次测量不一致"
+            }]
+        }),
+    );
+    let unresolved = remember(
+        &world,
+        &serde_json::json!({
+            "type": "待办",
+            "context": "长期未决问题",
+            "occurred_at": "2000-01-03T00:00:00Z",
+            "unresolved": ["仍需确认容量来源"]
+        }),
+    );
+    let pinned = remember(
+        &world,
+        &serde_json::json!({
+            "type": "证据",
+            "context": "固定历史证据",
+            "occurred_at": "2000-01-04T00:00:00Z",
+            "pinned": true,
+            "observed": ["人工确认必须保留"]
+        }),
+    );
+    world.ok(&[
+        "config",
+        "set",
+        "--memory",
+        "enabled",
+        "--memory-max-age-days",
+        "1",
+        "--memory-max-bytes",
+        "1000000",
+    ]);
+    remember(&world, &minimal_capsule("触发保护检查", None));
+
+    let conn = Connection::open(&database).unwrap();
+    for event in [&contradicted, &contradiction, &unresolved, &pinned] {
+        assert!(
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_events WHERE id = ?1)",
+                [event["event"]["id"].as_str().unwrap()],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+        );
+    }
+    drop(conn);
+
+    let resolved = remember(
+        &world,
+        &serde_json::json!({
+            "type": "结论",
+            "context": "容量冲突已解决",
+            "outcome": ["复测确认容量不足"],
+            "relations": [{
+                "type": "resolves",
+                "target": contradiction["event"]["id"],
+                "basis": "复测结果一致"
+            }]
+        }),
+    );
+    assert_eq!(resolved["retention"]["age_evicted"], 2);
+    let conn = Connection::open(database).unwrap();
+    for event in [&contradicted, &contradiction] {
+        assert!(
+            !conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM memory_events WHERE id = ?1)",
+                    [event["event"]["id"].as_str().unwrap()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+    }
+    for event in [&unresolved, &pinned, &resolved] {
+        assert!(
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_events WHERE id = ?1)",
+                [event["event"]["id"].as_str().unwrap()],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+        );
+    }
+}
+
+#[test]
+fn exact_context_cluster_yields_a_candidate_without_merging_events() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+    let capsule = serde_json::json!({
+        "type": "重复故障",
+        "context": "支付回调超时",
+        "observed": ["回调超过十秒"]
+    });
+    let mut ids = std::collections::BTreeSet::new();
+    for index in 0..5 {
+        let recorded = remember(&world, &capsule);
+        ids.insert(recorded["event"]["id"].as_str().unwrap().to_owned());
+        if index < 4 {
+            assert!(recorded["hints"].as_array().unwrap().is_empty());
+        } else {
+            assert_eq!(recorded["hints"].as_array().unwrap().len(), 1);
+            assert_eq!(recorded["hints"][0]["type"], "exact-context-cluster");
+        }
+    }
+    let cooled = remember(&world, &capsule);
+    assert!(
+        cooled["hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hint| hint["type"] != "exact-context-cluster")
+    );
+    let similar = remember(
+        &world,
+        &serde_json::json!({
+            "type": "重复故障",
+            "context": "支付回调偶发超时",
+            "observed": ["文字相似但不是同一上下文"]
+        }),
+    );
+    assert!(
+        similar["hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hint| hint["type"] != "exact-context-cluster")
+    );
+    assert_eq!(ids.len(), 5);
+    assert_eq!(
+        Connection::open(database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM memory_events", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
+}
+
+#[test]
+fn hints_are_bounded_cooled_down_and_pruned() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+    world.ok(&[
+        "config",
+        "set",
+        "--memory",
+        "enabled",
+        "--memory-max-age-days",
+        "50000",
+        "--memory-max-bytes",
+        "1000000",
+    ]);
+    let cluster = serde_json::json!({
+        "type": "候选聚类",
+        "context": "同一部署故障",
+        "occurred_at": "2000-01-01T00:00:00Z",
+        "observed": ["同一确定性模式"]
+    });
+    let mut target = Value::Null;
+    for _ in 0..4 {
+        target = remember(&world, &cluster);
+    }
+    remember(
+        &world,
+        &serde_json::json!({
+            "type": "长期待办",
+            "context": "过期未决候选",
+            "occurred_at": "2000-01-02T00:00:00Z",
+            "unresolved": ["需要长期复核"]
+        }),
+    );
+    let target_id = target["event"]["id"].as_str().unwrap();
+    assert!(
+        Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_events WHERE id = ?1)",
+                [target_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    );
+    let final_capsule = serde_json::json!({
+        "type": "候选聚类",
+        "context": "同一部署故障",
+        "occurred_at": "2000-01-03T00:00:00Z",
+        "observed": ["同一确定性模式"],
+        "relations": [{
+            "type": "supersedes",
+            "target": target_id,
+            "basis": "形成显式替代链"
+        }]
+    });
+    let sizer = TestWorld::new();
+    sizer.ok(&["init"]);
+    sizer.ok(&[
+        "config",
+        "set",
+        "--memory",
+        "enabled",
+        "--memory-max-age-days",
+        "50000",
+    ]);
+    let sizing_target = remember(&sizer, &cluster);
+    let mut sizing_capsule = final_capsule.clone();
+    sizing_capsule["relations"][0]["target"] = sizing_target["event"]["id"].clone();
+    let final_bytes = remember(&sizer, &sizing_capsule)["event"]["logical_bytes"]
+        .as_u64()
+        .unwrap();
+    let current_bytes = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT logical_bytes FROM memory_state WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let current_bytes = u64::try_from(current_bytes).unwrap();
+    let max_bytes = ((current_bytes + final_bytes) * 100 / 85).to_string();
+    world.ok(&[
+        "config",
+        "set",
+        "--memory",
+        "enabled",
+        "--memory-max-age-days",
+        "50000",
+        "--memory-max-bytes",
+        &max_bytes,
+    ]);
+    assert!(
+        Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_events WHERE id = ?1)",
+                [target_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        world.ok(&["memory", "show", target_id])["event"]["id"],
+        target_id
+    );
+    let emitted = remember(&world, &final_capsule);
+    assert_eq!(emitted["hints"].as_array().unwrap().len(), 3);
+    let emitted_types = emitted["hints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hint| hint["type"].as_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(emitted_types.len(), 3);
+    let cooled = remember(&world, &cluster);
+    assert!(
+        cooled["hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hint| { !emitted_types.contains(hint["type"].as_str().unwrap()) })
+    );
+
+    world.ok(&[
+        "config",
+        "set",
+        "--memory",
+        "enabled",
+        "--memory-max-age-days",
+        "1",
+        "--memory-max-bytes",
+        "1000000",
+    ]);
+    remember(&world, &minimal_capsule("触发自动候选清理", None));
+    let conn = Connection::open(database).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM memory_hint_state
+             WHERE hint_type IN ('exact-context-cluster', 'relation-review', 'storage-pressure')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn relation_hints_distinguish_relation_types_and_clear_resolved_conflicts() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+    let target = remember(&world, &minimal_capsule("关系提示目标", None));
+    let target_id = target["event"]["id"].as_str().unwrap();
+    let superseding = remember(
+        &world,
+        &serde_json::json!({
+            "type": "关系事件",
+            "context": "显式替代关系",
+            "decision": ["替代旧事件"],
+            "relations": [{
+                "type": "supersedes",
+                "target": target_id,
+                "basis": "替代关系提示"
+            }]
+        }),
+    );
+    let supersedes_key = superseding["hints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hint| hint["type"] == "relation-review")
+        .unwrap()["candidate_key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let contradiction = remember(
+        &world,
+        &serde_json::json!({
+            "type": "关系事件",
+            "context": "显式冲突关系",
+            "decision": ["反驳旧事件"],
+            "relations": [{
+                "type": "contradicts",
+                "target": target_id,
+                "basis": "冲突关系提示"
+            }]
+        }),
+    );
+    let contradiction_key = contradiction["hints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hint| hint["type"] == "relation-review")
+        .unwrap()["candidate_key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(supersedes_key, contradiction_key);
+
+    remember(
+        &world,
+        &serde_json::json!({
+            "type": "关系事件",
+            "context": "冲突已经解决",
+            "outcome": ["冲突复核完成"],
+            "relations": [{
+                "type": "resolves",
+                "target": contradiction["event"]["id"],
+                "basis": "验证后的最终结论"
+            }]
+        }),
+    );
+    world.ok(&["memory", "maintain"]);
+    let conn = Connection::open(database).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM memory_hint_state WHERE candidate_key = ?1",
+            [&contradiction_key],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(world.ok(&["memory", "status"])["pending_hints"], 1);
+}
+
+#[test]
+fn memory_status_reports_pressure_outcomes_without_event_text() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+    let prior_capsule = serde_json::json!({
+        "request_id": "status-retry",
+        "type": "状态样本",
+        "context": "状态输出绝不能泄露这段正文",
+        "decision": ["旧状态"]
+    });
+    let prior = remember(&world, &prior_capsule);
+    remember(&world, &prior_capsule);
+    let replacement = remember(
+        &world,
+        &serde_json::json!({
+            "type": "状态样本",
+            "context": "状态统计替代事件",
+            "pinned": true,
+            "decision": ["新状态"],
+            "relations": [{
+                "type": "supersedes",
+                "target": prior["event"]["id"],
+                "basis": "状态统计测试"
+            }]
+        }),
+    );
+    world.ok(&[
+        "memory",
+        "feedback",
+        replacement["event"]["id"].as_str().unwrap(),
+        "--signal",
+        "useful",
+        "--reason",
+        "验证状态计数",
+    ]);
+    let before = memory_read_snapshot(&database);
+    let status = world.ok(&["memory", "status"]);
+    assert_eq!(status["retained"]["events"], 2);
+    assert_eq!(status["retained"]["protected"], 1);
+    assert_eq!(status["retained"]["superseded"], 1);
+    assert!(status["retained"]["logical_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(status["policy"]["max_age_days"], 365);
+    assert_eq!(status["policy"]["max_bytes"], 268_435_456_u64);
+    assert_eq!(status["counters"]["record_attempts"], 3);
+    assert_eq!(status["counters"]["inserted_events"], 2);
+    assert_eq!(status["counters"]["idempotent_replays"], 1);
+    assert_eq!(status["counters"]["feedback_useful"], 1);
+    assert_eq!(status["counters"]["feedback_not_useful"], 0);
+    assert_eq!(status["counters"]["age_evictions"], 0);
+    assert_eq!(status["counters"]["capacity_evictions"], 0);
+    assert_eq!(status["pending_hints"], 1);
+    assert!(
+        !serde_json::to_string(&status)
+            .unwrap()
+            .contains("状态输出绝不能泄露这段正文")
+    );
+    assert_eq!(memory_read_snapshot(&database), before);
+}
+
+#[test]
+fn memory_maintain_rejects_scope_all_and_changesets() {
+    let world = TestWorld::new();
+    world.ok(&["init"]);
+    world.ok(&["--scope", "global", "init"]);
+    let all = world.err(&["--scope", "all", "memory", "maintain"]);
+    assert_eq!(all["error"]["code"], "scope_not_supported");
+
+    world.ok(&["changeset", "begin", "memory-maintain"]);
+    let staged = world.err(&["--changeset", "memory-maintain", "memory", "maintain"]);
+    assert_eq!(staged["error"]["code"], "changeset_command_unsupported");
 }
