@@ -120,7 +120,7 @@ SQLite remains authoritative. Schema version 14 adds:
 - `memory_feedback`: append-only useful/not-useful reuse outcomes.
 - `memory_hint_state`: operational cooldown state for emitted candidate keys.
 - `memory_state`: one aggregate row for attempts, inserted events, idempotent
-  replays, recalls/hits, eviction counts, event count, and logical payload bytes.
+  replays, eviction counts, event count, and logical payload bytes.
 - `memory_fts`: derived contentless FTS5 index containing context and all
   searchable semantic text.
 
@@ -176,6 +176,10 @@ An event is protected when it is pinned, has an unresolved fragment, or
 participates in an unresolved explicit contradiction. LWC does not guess
 whether evidence is unique. Automatic deletion records only identifiers,
 counts, and byte totals in the operation log, never event text.
+
+Recall applies the same age rule as a query filter, so expired ordinary events
+stop appearing even when no later write has yet physically removed them.
+`remember` and explicit maintenance perform the physical deletion.
 
 This design prevents unbounded logical growth without relying on semantic
 deduplication. SQLite/WAL physical reclamation remains the separate existing
@@ -234,8 +238,8 @@ copies must remain byte-identical.
 
 - retained/protected/superseded event counts and logical payload bytes;
 - configured age/byte limits and pressure ratio;
-- record attempts, inserted events, idempotent replays, recalls, recalls with
-  results, feedback counts, and age/capacity evictions;
+- record attempts, inserted events, idempotent replays, feedback counts, and
+  age/capacity evictions;
 - pending consolidation-candidate count without event bodies.
 
 A focused ignored benchmark compares ordinary lexical ordering with temporal
