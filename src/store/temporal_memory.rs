@@ -725,3 +725,379 @@ fn empty_memory_retention() -> Value {
         "logical_bytes_removed": 0,
     })
 }
+
+const MEMORY_EVENT_PROTECTED_SQL: &str = "
+    e.pinned = 1
+    OR EXISTS (
+        SELECT 1 FROM memory_fragments unresolved
+        WHERE unresolved.event_id = e.id AND unresolved.kind = 'unresolved'
+    )
+    OR EXISTS (
+        SELECT 1 FROM memory_relations contradiction
+        WHERE contradiction.relation_type = 'contradicts'
+          AND (contradiction.event_id = e.id OR contradiction.target_event_id = e.id)
+          AND NOT EXISTS (
+              SELECT 1 FROM memory_relations resolution
+              WHERE resolution.relation_type = 'resolves'
+                AND resolution.target_event_id = contradiction.event_id
+          )
+    )";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryRecallResult {
+    pub scope: String,
+    pub event: Value,
+    pub state: String,
+    pub rank: f64,
+    pub explanation: MemoryRecallExplanation,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryRecallExplanation {
+    pub lexical_rank: f64,
+    pub feedback: i64,
+    pub matched_via: String,
+}
+
+#[derive(Debug)]
+struct MemoryCandidate {
+    lexical_rank: f64,
+    matched_via: &'static str,
+}
+
+impl Store {
+    pub fn memory_recall(
+        &self,
+        query: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+        include_superseded: bool,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecallResult>> {
+        if !(1..=1000).contains(&limit) {
+            return Err(AppError::new(
+                "invalid_limit",
+                "limit must be between 1 and 1000",
+            ));
+        }
+        let tokens = tokenize_for_query(query);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let since = normalize_memory_query_timestamp(&self.conn, "since", since)?;
+        let until = normalize_memory_query_timestamp(&self.conn, "until", until)?;
+        if let (Some(since), Some(until)) = (&since, &until)
+            && since > until
+        {
+            return Err(AppError::new(
+                "invalid_input",
+                "since must not be later than until",
+            ));
+        }
+        let settings = config::resolve_memory(&self.scope, &self.database)?;
+        let match_query = tokens
+            .iter()
+            .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let candidate_limit = limit.saturating_mul(8).clamp(limit, 1000);
+        let direct = {
+            let sql = format!(
+                "SELECT memory_fts.event_id,
+                        bm25(memory_fts, 0.0, 2.0, 4.0, 1.0) AS lexical_rank
+                 FROM memory_fts
+                 JOIN memory_events e ON e.id = memory_fts.event_id
+                 WHERE memory_fts MATCH ?1
+                   AND (
+                       JULIANDAY(e.occurred_at) >= JULIANDAY('now', '-' || ?2 || ' days')
+                       OR {MEMORY_EVENT_PROTECTED_SQL}
+                   )
+                   AND (?3 IS NULL OR JULIANDAY(e.occurred_at) >= JULIANDAY(?3))
+                   AND (?4 IS NULL OR JULIANDAY(e.occurred_at) <= JULIANDAY(?4))
+                 ORDER BY lexical_rank, e.occurred_at DESC, e.id
+                 LIMIT ?5"
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            statement
+                .query_map(
+                    params![
+                        match_query,
+                        i64::from(settings.max_age_days),
+                        since.as_deref(),
+                        until.as_deref(),
+                        candidate_limit as i64,
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut candidates = BTreeMap::<String, MemoryCandidate>::new();
+        for (event_id, lexical_rank) in direct {
+            let current_id = current_visible_memory_id(
+                &self.conn,
+                &event_id,
+                settings.max_age_days,
+                since.as_deref(),
+                until.as_deref(),
+            )?;
+            if include_superseded || current_id == event_id {
+                keep_memory_candidate(
+                    &mut candidates,
+                    event_id.clone(),
+                    lexical_rank,
+                    "direct",
+                );
+            }
+            if current_id != event_id {
+                keep_memory_candidate(
+                    &mut candidates,
+                    current_id,
+                    lexical_rank,
+                    "superseded_event",
+                );
+            }
+        }
+
+        let mut results = Vec::with_capacity(candidates.len());
+        for (event_id, candidate) in candidates {
+            let current_id = current_visible_memory_id(
+                &self.conn,
+                &event_id,
+                settings.max_age_days,
+                since.as_deref(),
+                until.as_deref(),
+            )?;
+            let feedback = memory_feedback_score(&self.conn, &event_id)?;
+            let adjustment = candidate.lexical_rank.abs().max(1e-6)
+                * 0.05
+                * feedback.clamp(-3, 3) as f64;
+            results.push(MemoryRecallResult {
+                scope: self.scope.clone(),
+                event: load_memory_event(&self.conn, &event_id)?,
+                state: if current_id == event_id {
+                    "current".to_owned()
+                } else {
+                    "superseded".to_owned()
+                },
+                rank: candidate.lexical_rank - adjustment,
+                explanation: MemoryRecallExplanation {
+                    lexical_rank: candidate.lexical_rank,
+                    feedback,
+                    matched_via: candidate.matched_via.to_owned(),
+                },
+            });
+        }
+        sort_memory_results(&mut results);
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    pub fn memory_show(&self, event_id: &str) -> Result<Value> {
+        let event_id = event_id.trim();
+        if event_id.is_empty() {
+            return Err(AppError::new("invalid_input", "event_id must not be empty"));
+        }
+        Ok(json!({
+            "scope": self.scope,
+            "database": self.database.to_string_lossy(),
+            "event": load_memory_event(&self.conn, event_id)?,
+        }))
+    }
+
+    pub fn memory_feedback(
+        &mut self,
+        event_id: &str,
+        signal: &str,
+        reason: &str,
+    ) -> Result<Value> {
+        let event_id = event_id.trim();
+        let reason = reason.trim();
+        if event_id.is_empty() || reason.is_empty() {
+            return Err(AppError::new(
+                "invalid_input",
+                "event_id and reason must not be empty",
+            ));
+        }
+        if !matches!(signal, "useful" | "not-useful") {
+            return Err(AppError::new(
+                "invalid_input",
+                "signal must be useful or not-useful",
+            ));
+        }
+        let settings = config::resolve_memory(&self.scope, &self.database)?;
+        if settings.setting == config::MemorySetting::Disabled {
+            return Err(AppError::new(
+                "memory_disabled",
+                "temporal memory is disabled for this scope",
+            ));
+        }
+        let scope = self.scope.clone();
+        let database = self.database.to_string_lossy().into_owned();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_events WHERE id = ?1)",
+            [event_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(AppError::new(
+                "memory_event_not_found",
+                event_id.to_owned(),
+            ));
+        }
+        let created_at: String = tx.query_row(&format!("SELECT {TIMESTAMP_SQL}"), [], |row| {
+            row.get(0)
+        })?;
+        tx.execute(
+            "INSERT INTO memory_feedback(event_id, signal, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![event_id, signal, reason, &created_at],
+        )?;
+        let counter = if signal == "useful" {
+            "feedback_useful"
+        } else {
+            "feedback_not_useful"
+        };
+        tx.execute(
+            &format!("UPDATE memory_state SET {counter} = {counter} + 1 WHERE id = 1"),
+            [],
+        )?;
+        record_operation(
+            &tx,
+            "memory_feedback",
+            event_id,
+            &json!({"signal": signal}),
+        )?;
+        tx.commit()?;
+        Ok(json!({
+            "scope": scope,
+            "database": database,
+            "event_id": event_id,
+            "signal": signal,
+            "reason": reason,
+            "created_at": created_at,
+        }))
+    }
+}
+
+fn normalize_memory_query_timestamp(
+    conn: &Connection,
+    name: &str,
+    value: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Err(AppError::new(
+            "invalid_input",
+            format!("{name} must not be empty"),
+        ));
+    }
+    conn.query_row(
+        "SELECT STRFTIME('%Y-%m-%dT%H:%M:%fZ', ?1)",
+        [value],
+        |row| row.get::<_, Option<String>>(0),
+    )?
+    .map(Some)
+    .ok_or_else(|| AppError::new("invalid_input", format!("{name} is not a valid timestamp")))
+}
+
+fn current_visible_memory_id(
+    conn: &Connection,
+    event_id: &str,
+    max_age_days: u32,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Result<String> {
+    let sql = format!(
+        "SELECT relation.event_id
+         FROM memory_relations relation
+         JOIN memory_events e ON e.id = relation.event_id
+         WHERE relation.relation_type = 'supersedes'
+           AND relation.target_event_id = ?1
+           AND (
+               JULIANDAY(e.occurred_at) >= JULIANDAY('now', '-' || ?2 || ' days')
+               OR {MEMORY_EVENT_PROTECTED_SQL}
+           )
+           AND (?3 IS NULL OR JULIANDAY(e.occurred_at) >= JULIANDAY(?3))
+           AND (?4 IS NULL OR JULIANDAY(e.occurred_at) <= JULIANDAY(?4))
+         ORDER BY e.occurred_at DESC, e.recorded_at DESC, e.id
+         LIMIT 1"
+    );
+    let mut current = event_id.to_owned();
+    loop {
+        let next = conn
+            .query_row(
+                &sql,
+                params![&current, i64::from(max_age_days), since, until],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(next) = next else {
+            return Ok(current);
+        };
+        current = next;
+    }
+}
+
+fn keep_memory_candidate(
+    candidates: &mut BTreeMap<String, MemoryCandidate>,
+    event_id: String,
+    lexical_rank: f64,
+    matched_via: &'static str,
+) {
+    match candidates.entry(event_id) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(MemoryCandidate {
+                lexical_rank,
+                matched_via,
+            });
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            let current = entry.get_mut();
+            if lexical_rank < current.lexical_rank
+                || (lexical_rank == current.lexical_rank && matched_via == "direct")
+            {
+                current.lexical_rank = lexical_rank;
+                current.matched_via = matched_via;
+            }
+        }
+    }
+}
+
+fn memory_feedback_score(conn: &Connection, event_id: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(CASE signal WHEN 'useful' THEN 1 ELSE -1 END), 0)
+         FROM memory_feedback WHERE event_id = ?1",
+        [event_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+pub fn sort_memory_results(results: &mut [MemoryRecallResult]) {
+    results.sort_by(|left, right| {
+        let state_priority = |state: &str| if state == "current" { 0 } else { 1 };
+        state_priority(&left.state)
+            .cmp(&state_priority(&right.state))
+            .then_with(|| left.rank.total_cmp(&right.rank))
+            .then_with(|| {
+                right.explanation.feedback.cmp(&left.explanation.feedback)
+            })
+            .then_with(|| {
+                right.event["occurred_at"]
+                    .as_str()
+                    .cmp(&left.event["occurred_at"].as_str())
+            })
+            .then_with(|| left.scope.cmp(&right.scope))
+            .then_with(|| {
+                left.event["id"]
+                    .as_str()
+                    .cmp(&right.event["id"].as_str())
+            })
+    });
+}

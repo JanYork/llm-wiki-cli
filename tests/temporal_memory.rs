@@ -733,3 +733,368 @@ fn remember_rejects_scope_all_and_changesets() {
     let staged = world.err(&["--changeset", "memory-write", "remember", "--json", &raw]);
     assert_eq!(staged["error"]["code"], "changeset_command_unsupported");
 }
+
+#[test]
+fn recall_is_bounded_cjk_searchable_and_time_filterable() {
+    let world = TestWorld::new();
+    world.ok(&["init"]);
+    let older = remember(
+        &world,
+        &serde_json::json!({
+            "type": "策略变更",
+            "context": "支付失败重试策略",
+            "occurred_at": "2026-08-01T09:00:00Z",
+            "decision": ["支付失败最多重试三次"]
+        }),
+    );
+    let newer = remember(
+        &world,
+        &serde_json::json!({
+            "type": "策略变更",
+            "context": "支付失败重试策略",
+            "occurred_at": "2026-08-15T09:00:00Z",
+            "decision": ["支付失败最多重试两次"]
+        }),
+    );
+    remember(
+        &world,
+        &serde_json::json!({
+            "type": "故障",
+            "context": "库存同步延迟",
+            "occurred_at": "2026-08-18T09:00:00Z",
+            "observed": ["库存同步队列出现积压"]
+        }),
+    );
+
+    let bounded = world.ok(&["memory", "recall", "支付重试", "--limit", "1"]);
+    assert_eq!(bounded["query"], "支付重试");
+    assert_eq!(bounded["results"].as_array().unwrap().len(), 1);
+    assert_eq!(bounded["results"][0]["event"]["id"], newer["event"]["id"]);
+
+    let windowed = world.ok(&[
+        "memory",
+        "recall",
+        "支付重试",
+        "--since",
+        "2026-08-10T00:00:00Z",
+        "--until",
+        "2026-08-20T00:00:00Z",
+        "--limit",
+        "10",
+    ]);
+    assert_eq!(windowed["results"].as_array().unwrap().len(), 1);
+    assert_eq!(windowed["results"][0]["event"]["id"], newer["event"]["id"]);
+    assert_ne!(windowed["results"][0]["event"]["id"], older["event"]["id"]);
+
+    let invalid = world.err(&["memory", "recall", "支付重试", "--limit", "0"]);
+    assert_eq!(invalid["error"]["code"], "invalid_limit");
+}
+
+#[test]
+fn superseding_event_completes_the_old_pattern_without_merging_other_entities() {
+    let world = TestWorld::new();
+    world.ok(&["init"]);
+    let old = remember(
+        &world,
+        &serde_json::json!({
+            "type": "策略变更",
+            "context": "支付网关甲版重试三次",
+            "occurred_at": "2026-08-01T09:00:00Z",
+            "decision": ["旧支付策略"]
+        }),
+    );
+    let old_id = old["event"]["id"].as_str().unwrap();
+    let replacement = remember(
+        &world,
+        &serde_json::json!({
+            "type": "策略变更",
+            "context": "支付网关乙版重试两次",
+            "occurred_at": "2026-08-15T09:00:00Z",
+            "decision": ["新支付策略"],
+            "relations": [{
+                "type": "supersedes",
+                "target": old_id,
+                "basis": "支付网关限流规则变化"
+            }]
+        }),
+    );
+    let inventory = remember(
+        &world,
+        &serde_json::json!({
+            "type": "策略变更",
+            "context": "库存失败重试三次",
+            "occurred_at": "2026-08-16T09:00:00Z",
+            "decision": ["库存策略保持三次"]
+        }),
+    );
+
+    let current = world.ok(&["memory", "recall", "甲版"]);
+    assert_eq!(current["results"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        current["results"][0]["event"]["id"],
+        replacement["event"]["id"]
+    );
+    assert_eq!(current["results"][0]["state"], "current");
+    assert_eq!(
+        current["results"][0]["explanation"]["matched_via"],
+        "superseded_event"
+    );
+
+    let history = world.ok(&["memory", "recall", "甲版", "--include-superseded"]);
+    let history = history["results"].as_array().unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().any(|result| {
+        result["event"]["id"] == old["event"]["id"] && result["state"] == "superseded"
+    }));
+    assert!(history.iter().any(|result| {
+        result["event"]["id"] == replacement["event"]["id"] && result["state"] == "current"
+    }));
+
+    let inventory_results = world.ok(&["memory", "recall", "库存失败"]);
+    assert_eq!(inventory_results["results"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        inventory_results["results"][0]["event"]["id"],
+        inventory["event"]["id"]
+    );
+}
+
+#[test]
+fn scope_all_recall_merges_project_and_global_memories() {
+    let world = TestWorld::new();
+    world.ok(&["init"]);
+    world.ok(&["--scope", "global", "init"]);
+    let project = remember(
+        &world,
+        &serde_json::json!({
+            "type": "经验",
+            "context": "跨作用域召回",
+            "learned": ["项目记忆"]
+        }),
+    );
+    let raw = serde_json::to_string(&serde_json::json!({
+        "type": "经验",
+        "context": "跨作用域召回",
+        "learned": ["全局记忆"]
+    }))
+    .unwrap();
+    let global = world.ok(&["--scope", "global", "remember", "--json", &raw]);
+
+    let recalled = world.ok(&[
+        "--scope",
+        "all",
+        "memory",
+        "recall",
+        "跨作用域召回",
+        "--limit",
+        "10",
+    ]);
+    let results = recalled["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().any(|result| {
+        result["scope"] == "project" && result["event"]["id"] == project["event"]["id"]
+    }));
+    assert!(results.iter().any(|result| {
+        result["scope"] == "global" && result["event"]["id"] == global["event"]["id"]
+    }));
+}
+
+#[test]
+fn feedback_is_append_only_and_reranks_only_matching_memories() {
+    let world = TestWorld::new();
+    let initialized = world.ok(&["init"]);
+    let database = database_path(&initialized);
+    let useful = remember(
+        &world,
+        &serde_json::json!({
+            "type": "经验",
+            "context": "批处理超时恢复",
+            "occurred_at": "2026-08-01T09:00:00Z",
+            "learned": ["采用小批量策略"]
+        }),
+    );
+    let not_useful = remember(
+        &world,
+        &serde_json::json!({
+            "type": "经验",
+            "context": "批处理超时恢复",
+            "occurred_at": "2026-08-15T09:00:00Z",
+            "learned": ["采用全量重启"]
+        }),
+    );
+    let useful_id = useful["event"]["id"].as_str().unwrap();
+    let not_useful_id = not_useful["event"]["id"].as_str().unwrap();
+
+    for reason in ["这次直接帮助定位", "另一次复用仍然有效"] {
+        let feedback = world.ok(&[
+            "memory", "feedback", useful_id, "--signal", "useful", "--reason", reason,
+        ]);
+        assert_eq!(feedback["event_id"], useful_id);
+        assert_eq!(feedback["signal"], "useful");
+    }
+    world.ok(&[
+        "memory",
+        "feedback",
+        not_useful_id,
+        "--signal",
+        "not-useful",
+        "--reason",
+        "没有帮助解决本次问题",
+    ]);
+
+    let conn = Connection::open(database).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM memory_feedback", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT feedback_useful, feedback_not_useful FROM memory_state WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap(),
+        (2, 1)
+    );
+
+    let recalled = world.ok(&["memory", "recall", "批处理超时恢复"]);
+    assert_eq!(recalled["results"][0]["event"]["id"], useful["event"]["id"]);
+    assert_eq!(recalled["results"][0]["explanation"]["feedback"], 2);
+    let unrelated = world.ok(&["memory", "recall", "办公室门禁"]);
+    assert!(unrelated["results"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn memory_show_returns_the_complete_capsule_and_relations() {
+    let world = TestWorld::new();
+    world.ok(&["init"]);
+    let prior = remember(&world, &minimal_capsule("旧部署步骤", Some("show-prior")));
+    let prior_id = prior["event"]["id"].as_str().unwrap();
+    let full = remember(
+        &world,
+        &serde_json::json!({
+            "type": "复盘",
+            "context": "部署超时复盘",
+            "observed": ["健康检查等待过短"],
+            "decision": ["延长健康检查窗口"],
+            "constraints": ["不能中断现有请求"],
+            "learned": ["先观测再切流"],
+            "unresolved": ["仍需观察峰值流量"],
+            "outcome": ["灰度发布成功"],
+            "changes": [{
+                "subject": "健康检查窗口",
+                "before": "30 秒",
+                "after": "90 秒",
+                "reason": "冷启动需要更久"
+            }],
+            "evidence": [{
+                "reference": "运维记录 2026-08-20",
+                "excerpt": "90 秒后实例稳定"
+            }],
+            "relations": [{
+                "type": "supersedes",
+                "target": prior_id,
+                "basis": "新步骤已经验证"
+            }]
+        }),
+    );
+    let event_id = full["event"]["id"].as_str().unwrap();
+
+    let shown = world.ok(&["memory", "show", event_id]);
+    assert_eq!(shown["scope"], "project");
+    assert_eq!(shown["event"], full["event"]);
+}
+
+fn memory_read_snapshot(database: &Path) -> (i64, (i64, i64, i64, i64, i64)) {
+    let conn = Connection::open(database).unwrap();
+    let operations = conn
+        .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+        .unwrap();
+    let state = conn
+        .query_row(
+            "SELECT record_attempts, inserted_events, idempotent_replays,
+                    feedback_useful, feedback_not_useful
+             FROM memory_state WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    (operations, state)
+}
+
+#[test]
+fn recall_scope_all_is_read_only_and_memory_rejects_changesets() {
+    let world = TestWorld::new();
+    let project = world.ok(&["init"]);
+    let global = world.ok(&["--scope", "global", "init"]);
+    let event = remember(&world, &minimal_capsule("只读跨作用域召回", None));
+    let raw = serde_json::to_string(&minimal_capsule("只读跨作用域召回", None)).unwrap();
+    world.ok(&["--scope", "global", "remember", "--json", &raw]);
+    let project_database = database_path(&project);
+    let global_database = database_path(&global);
+    let before = (
+        memory_read_snapshot(&project_database),
+        memory_read_snapshot(&global_database),
+    );
+
+    let recalled = world.ok(&["--scope", "all", "memory", "recall", "只读跨作用域"]);
+    assert_eq!(recalled["results"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        before,
+        (
+            memory_read_snapshot(&project_database),
+            memory_read_snapshot(&global_database)
+        )
+    );
+
+    let event_id = event["event"]["id"].as_str().unwrap();
+    let all_feedback = world.err(&[
+        "--scope",
+        "all",
+        "memory",
+        "feedback",
+        event_id,
+        "--signal",
+        "useful",
+        "--reason",
+        "不允许跨库写入",
+    ]);
+    assert_eq!(all_feedback["error"]["code"], "scope_not_supported");
+
+    world.ok(&["changeset", "begin", "memory-read"]);
+    let staged_recall = world.err(&[
+        "--changeset",
+        "memory-read",
+        "memory",
+        "recall",
+        "只读跨作用域",
+    ]);
+    assert_eq!(
+        staged_recall["error"]["code"],
+        "changeset_command_unsupported"
+    );
+    let staged_feedback = world.err(&[
+        "--changeset",
+        "memory-read",
+        "memory",
+        "feedback",
+        event_id,
+        "--signal",
+        "useful",
+        "--reason",
+        "不允许写入草稿库",
+    ]);
+    assert_eq!(
+        staged_feedback["error"]["code"],
+        "changeset_command_unsupported"
+    );
+}

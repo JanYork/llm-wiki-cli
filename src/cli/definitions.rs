@@ -293,6 +293,14 @@ enum Command {
         #[arg(long, value_name = "JSON|-|@PATH")]
         json: String,
     },
+    /// Recall, inspect, and rate temporal-memory events.
+    #[command(
+        after_help = "Examples:\n  lwc memory recall \"payment retry\" --limit 5\n  lwc memory show EVENT_ID\n  lwc memory feedback EVENT_ID --signal useful --reason \"prevented a repeated failure\""
+    )]
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
     /// Inspect and update layered graph, trans, memory, and global Office settings.
     Config {
         #[command(subcommand)]
@@ -450,6 +458,47 @@ enum OfficeCommand {
     /// Forward a read-only command through the pinned OfficeCLI runtime.
     #[command(external_subcommand)]
     Run(Vec<OsString>),
+}
+
+#[derive(Subcommand)]
+enum MemoryCommand {
+    /// Search a bounded set of temporal memories without changing them.
+    Recall {
+        query: String,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long)]
+        include_superseded: bool,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Return one complete event capsule by identifier.
+    Show { event_id: String },
+    /// Append an explicit usefulness judgment without rewriting the event.
+    Feedback {
+        event_id: String,
+        #[arg(long, value_enum)]
+        signal: MemoryFeedbackSignalArg,
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MemoryFeedbackSignalArg {
+    Useful,
+    NotUseful,
+}
+
+impl MemoryFeedbackSignalArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Useful => "useful",
+            Self::NotUseful => "not-useful",
+        }
+    }
 }
 
 #[derive(Subcommand)]

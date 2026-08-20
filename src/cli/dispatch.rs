@@ -826,6 +826,57 @@ fn run(cli: Cli) -> Result<Value> {
             let input = store::parse_memory_capsule(&raw)?;
             Store::open(scope_name(store_path.scope), &store_path.path)?.remember(input)
         }
+        Command::Memory { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "memory")?;
+            match command {
+                MemoryCommand::Recall {
+                    query,
+                    since,
+                    until,
+                    include_superseded,
+                    limit,
+                } => {
+                    ensure_scope_supported(cli.scope, true, "memory recall")?;
+                    require_text("query", &query)?;
+                    validate_limit(limit)?;
+                    let paths = resolve_live_read_store_paths(cli.scope, &cwd, true)?;
+                    let mut results = Vec::new();
+                    for path in paths {
+                        let store =
+                            Store::open_for_read(scope_name(path.scope), &path.path)?;
+                        results.extend(store.memory_recall(
+                            &query,
+                            since.as_deref(),
+                            until.as_deref(),
+                            include_superseded,
+                            limit,
+                        )?);
+                    }
+                    store::sort_memory_results(&mut results);
+                    results.truncate(limit);
+                    Ok(json!({"query": query, "results": results}))
+                }
+                MemoryCommand::Show { event_id } => {
+                    ensure_scope_supported(cli.scope, false, "memory show")?;
+                    let path = resolve_live_store_path(cli.scope, &cwd)?;
+                    Store::open_for_read(scope_name(path.scope), &path.path)?
+                        .memory_show(&event_id)
+                }
+                MemoryCommand::Feedback {
+                    event_id,
+                    signal,
+                    reason,
+                } => {
+                    ensure_scope_supported(cli.scope, false, "memory feedback")?;
+                    let path = resolve_live_store_path(cli.scope, &cwd)?;
+                    Store::open(scope_name(path.scope), &path.path)?.memory_feedback(
+                        &event_id,
+                        signal.as_str(),
+                        &reason,
+                    )
+                }
+            }
+        }
         Command::Config { command } => {
             ensure_scope_supported(cli.scope, false, "config")?;
             if selected_changeset.is_some() {
