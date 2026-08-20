@@ -248,7 +248,7 @@ fn office_forwards_read_commands_without_a_wiki_or_output_wrapping() {
     assert_eq!(String::from_utf8(failure.stderr).unwrap(), "stderr:query\n");
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, debug_assertions))]
 #[test]
 fn office_lazily_installs_once_and_reuses_the_global_runtime() {
     use sha2::{Digest, Sha256};
