@@ -545,7 +545,21 @@ mod tests {
 
         let conn = Connection::open(&database).unwrap();
         conn.execute_batch(
-            "DROP TABLE page_tags;
+            "DROP TABLE memory_fts;
+             DROP TABLE IF EXISTS memory_fts_data;
+             DROP TABLE IF EXISTS memory_fts_idx;
+             DROP TABLE IF EXISTS memory_fts_content;
+             DROP TABLE IF EXISTS memory_fts_docsize;
+             DROP TABLE IF EXISTS memory_fts_config;
+             DROP TABLE memory_feedback;
+             DROP TABLE memory_relations;
+             DROP TABLE memory_evidence;
+             DROP TABLE memory_changes;
+             DROP TABLE memory_fragments;
+             DROP TABLE memory_hint_state;
+             DROP TABLE memory_state;
+             DROP TABLE memory_events;
+             DROP TABLE page_tags;
              DROP TABLE tags;
              DROP TABLE search_fts;
              DROP TABLE retrieval_feedback;
