@@ -2,9 +2,9 @@
 
 ## Status
 
-Approved for implementation on 2026-08-20 after the preceding design discussion.
-This document converts that agreement into an implementation contract. It does
-not claim the feature already exists.
+Implemented on 2026-08-20 after the preceding design discussion. This document
+is the shipped behavior contract for the normalized SQLite model, CLI, retention
+policy, Agent routing, and read-only Hook boundary.
 
 ## Goal
 
