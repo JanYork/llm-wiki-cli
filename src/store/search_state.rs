@@ -37,10 +37,24 @@ fn attached_store_identity(conn: &Connection) -> Result<StoreIdentity> {
 }
 
 fn validate_changeset_table_inventory(conn: &Connection, schema: &str) -> Result<()> {
-    const TABLES: [&str; 28] = [
+    const TABLES: [&str; 42] = [
         "changesets",
         "ingest_jobs",
         "links",
+        "memory_changes",
+        "memory_events",
+        "memory_evidence",
+        "memory_feedback",
+        "memory_fragments",
+        "memory_fts",
+        "memory_fts_config",
+        "memory_fts_content",
+        "memory_fts_data",
+        "memory_fts_docsize",
+        "memory_fts_idx",
+        "memory_hint_state",
+        "memory_relations",
+        "memory_state",
         "meta",
         "operations",
         "page_provenance",

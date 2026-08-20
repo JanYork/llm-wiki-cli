@@ -210,6 +210,7 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
         PRAGMA user_version = {USER_VERSION};
         "
     ))?;
+    create_temporal_memory_schema(&tx)?;
     create_changeset_state(&tx)?;
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('schema', ?1)",
@@ -341,12 +342,14 @@ fn validate_store_read_only(conn: &Connection) -> Result<()> {
             'meta', 'sources', 'pages', 'page_sources', 'page_provenance', 'links',
             'operations', 'ingest_jobs', 'source_path_revisions', 'retrieval_weights',
             'retrieval_feedback', 'changesets', 'search_fts', 'search_spans',
-            'span_fts', 'semantic_relations'
+            'span_fts', 'semantic_relations', 'memory_events', 'memory_fragments',
+            'memory_changes', 'memory_evidence', 'memory_relations', 'memory_feedback',
+            'memory_hint_state', 'memory_state', 'memory_fts'
          )",
         [],
         |row| row.get(0),
     )?;
-    if essential_tables != 16 {
+    if essential_tables != 25 {
         return Err(AppError::new(
             "corrupt_store",
             "wiki database schema is incomplete",
@@ -421,6 +424,15 @@ fn validate_store(conn: &Connection) -> Result<()> {
         "SELECT span_id, span_type, document_type, document_identifier, parent_identifier, ordinal, byte_start, byte_end, content_fingerprint, segmenter_version, active FROM search_spans LIMIT 0",
         "SELECT rowid, span_id, span_type, document_type, document_identifier, title_terms, path_terms, body_terms FROM span_fts LIMIT 0",
         "SELECT id, relation_type, from_identifier, to_identifier, confidence, provenance, reason, source_ids_json, created_at, updated_at FROM semantic_relations LIMIT 0",
+        "SELECT id, request_id, fingerprint, event_type, context, occurred_at, recorded_at, valid_from, valid_until, pinned, logical_bytes FROM memory_events LIMIT 0",
+        "SELECT event_id, kind, ordinal, value FROM memory_fragments LIMIT 0",
+        "SELECT event_id, ordinal, subject, before_value, after_value, reason FROM memory_changes LIMIT 0",
+        "SELECT event_id, ordinal, reference, excerpt FROM memory_evidence LIMIT 0",
+        "SELECT event_id, ordinal, relation_type, target_event_id, basis FROM memory_relations LIMIT 0",
+        "SELECT id, event_id, signal, reason, created_at FROM memory_feedback LIMIT 0",
+        "SELECT candidate_key, hint_type, last_emitted_at, next_eligible_at FROM memory_hint_state LIMIT 0",
+        "SELECT id, record_attempts, inserted_events, idempotent_replays, feedback_useful, feedback_not_useful, age_evictions, capacity_evictions, event_count, logical_bytes FROM memory_state LIMIT 0",
+        "SELECT rowid, event_id, event_type, context_terms, content_terms FROM memory_fts LIMIT 0",
     ] {
         conn.prepare(sql).map_err(|error| {
             AppError::new(

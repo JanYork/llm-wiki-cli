@@ -284,7 +284,7 @@ enum Command {
         #[command(subcommand)]
         command: IngestCommand,
     },
-    /// Inspect and update layered graph, trans, and global Office settings.
+    /// Inspect and update layered graph, trans, memory, and global Office settings.
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -889,9 +889,9 @@ This prevents completion after merely indexing raw text or writing a detached su
 
 #[derive(Subcommand)]
 enum ConfigCommand {
-    /// Show effective graph, trans, and Office configuration plus value origins.
+    /// Show effective graph, trans, memory, and Office configuration plus value origins.
     Show,
-    /// Atomically set graph, trans, and Office configuration.
+    /// Atomically set graph, trans, memory, and Office configuration.
     Set {
         /// Select disabled, grafeo, surrealdb, or inherit.
         #[arg(long)]
@@ -902,6 +902,15 @@ enum ConfigCommand {
         /// Select disabled or officecli. Office configuration is global-only.
         #[arg(long)]
         office: Option<String>,
+        /// Select disabled, enabled, or inherit.
+        #[arg(long)]
+        memory: Option<String>,
+        /// Maximum retained memory age in days.
+        #[arg(long = "memory-max-age-days")]
+        memory_max_age_days: Option<u32>,
+        /// Maximum logical memory payload bytes.
+        #[arg(long = "memory-max-bytes")]
+        memory_max_bytes: Option<u64>,
         /// Override the trans timeout in seconds (1..=900).
         #[arg(long = "trans-timeout")]
         trans_timeout: Option<u16>,
@@ -909,12 +918,14 @@ enum ConfigCommand {
         #[arg(long = "trans-arg", allow_hyphen_values = true)]
         trans_args: Vec<String>,
     },
-    /// Restore graph and trans settings to their inherited defaults.
+    /// Restore graph, trans, or memory settings to their inherited defaults.
     Unset {
         #[arg(long)]
         graph: bool,
         #[arg(long)]
         trans: bool,
+        #[arg(long)]
+        memory: bool,
     },
 }
 

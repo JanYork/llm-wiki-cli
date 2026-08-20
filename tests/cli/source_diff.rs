@@ -26,6 +26,7 @@ fn read_commands_migrate_v6_store_to_structured_provenance() {
 
     let database = world.project.join(".lwc/wiki.db");
     let conn = Connection::open(&database).unwrap();
+    drop_temporal_schema(&conn);
     conn.execute_batch(
         "DROP TABLE page_tags;
          DROP TABLE tags;
@@ -51,7 +52,7 @@ fn read_commands_migrate_v6_store_to_structured_provenance() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     conn.prepare("SELECT page_slug, provenance FROM page_provenance LIMIT 0")
         .unwrap();
 }
@@ -65,6 +66,7 @@ fn read_commands_migrate_v7_without_guessing_source_path_history() {
 
     let database = world.project.join(".lwc/wiki.db");
     let conn = Connection::open(&database).unwrap();
+    drop_temporal_schema(&conn);
     conn.execute_batch(
         "DROP TABLE page_tags;
          DROP TABLE tags;
@@ -91,7 +93,7 @@ fn read_commands_migrate_v7_without_guessing_source_path_history() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     assert_eq!(tracked, 0, "migration must not guess a legacy path head");
 
     let source_id = added["source"]["id"].as_i64().unwrap().to_string();
@@ -113,6 +115,7 @@ fn read_commands_atomically_migrate_a_v8_store_to_weighted_retrieval() {
 
     let database = world.project.join(".lwc/wiki.db");
     let conn = Connection::open(&database).unwrap();
+    drop_temporal_schema(&conn);
     conn.execute_batch(
         "DROP TABLE page_tags;
          DROP TABLE tags;
@@ -140,7 +143,7 @@ fn read_commands_atomically_migrate_a_v8_store_to_weighted_retrieval() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     conn.prepare("SELECT path_terms FROM search_fts LIMIT 0")
         .unwrap();
     conn.prepare("SELECT weight FROM retrieval_weights LIMIT 0")
@@ -163,6 +166,7 @@ fn failed_v8_migration_leaves_version_and_schema_unchanged() {
     world.ok(&world.project, &["init"]);
     let database = world.project.join(".lwc/wiki.db");
     let conn = Connection::open(&database).unwrap();
+    drop_temporal_schema(&conn);
     conn.execute_batch(
         "DROP TABLE page_tags;
          DROP TABLE tags;
@@ -225,6 +229,7 @@ fn read_commands_atomically_migrate_a_v9_store_to_changeset_metadata() {
 
     let database = world.project.join(".lwc/wiki.db");
     let conn = Connection::open(&database).unwrap();
+    drop_temporal_schema(&conn);
     conn.execute_batch(
         "DROP TABLE page_tags;
          DROP TABLE tags;
@@ -243,7 +248,7 @@ fn read_commands_atomically_migrate_a_v9_store_to_changeset_metadata() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     for key in ["store_id", "store_revision"] {
         let value: String = conn
             .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
@@ -262,6 +267,7 @@ fn failed_v9_changeset_migration_leaves_version_and_schema_unchanged() {
     world.ok(&world.project, &["init"]);
     let database = world.project.join(".lwc/wiki.db");
     let conn = Connection::open(&database).unwrap();
+    drop_temporal_schema(&conn);
     conn.execute_batch(
         "DROP TABLE page_tags;
          DROP TABLE tags;

@@ -817,6 +817,7 @@ fn read_commands_transparently_migrate_a_writable_v5_store() {
 
     let database = world.project.join(".lwc/wiki.db");
     let conn = Connection::open(&database).unwrap();
+    drop_temporal_schema(&conn);
     conn.execute_batch(
         "DROP TABLE page_tags;
          DROP TABLE tags;
@@ -854,7 +855,7 @@ fn read_commands_transparently_migrate_a_writable_v5_store() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 13,
+        version, 14,
         "context should migrate a writable legacy store"
     );
 }
@@ -898,7 +899,7 @@ fn v10_commands_migrate_inline_without_building_a_graph() {
         migrated
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        13
+        14
     );
     let old_graph_tables: i64 = migrated
         .query_row(

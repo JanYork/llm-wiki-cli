@@ -124,6 +124,10 @@ fn prepare_store(
         migrate_tags(conn)?;
         version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     }
+    if version == TAGS_VERSION {
+        migrate_temporal_memory(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
     if version != USER_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
@@ -533,14 +537,14 @@ fn migrate_external_graph_schema(conn: &mut Connection) -> Result<()> {
 fn migrate_tags(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current == USER_VERSION {
+    if (TAGS_VERSION..=USER_VERSION).contains(&current) {
         tx.commit()?;
         return Ok(());
     }
     if current != EXTERNAL_GRAPH_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
-            format!("cannot migrate wiki database version {current} to {USER_VERSION}"),
+            format!("cannot migrate wiki database version {current} to {TAGS_VERSION}"),
         ));
     }
     tx.execute_batch(
@@ -571,19 +575,19 @@ fn migrate_tags(conn: &mut Connection) -> Result<()> {
     .map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to prepare v{USER_VERSION} tag schema: {error}"),
+            format!("failed to prepare v{TAGS_VERSION} tag schema: {error}"),
         )
     })?;
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![USER_VERSION.to_string()],
+        params![TAGS_VERSION.to_string()],
     )?;
-    tx.pragma_update(None, "user_version", USER_VERSION)?;
+    tx.pragma_update(None, "user_version", TAGS_VERSION)?;
     tx.commit().map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to commit v{USER_VERSION} tag migration: {error}"),
+            format!("failed to commit v{TAGS_VERSION} tag migration: {error}"),
         )
     })
 }

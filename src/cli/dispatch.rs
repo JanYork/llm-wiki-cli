@@ -835,13 +835,20 @@ fn run(cli: Cli) -> Result<Value> {
                     graph,
                     trans,
                     office,
+                    memory,
+                    memory_max_age_days,
+                    memory_max_bytes,
                     trans_timeout,
                     trans_args,
                 } => {
-                    if graph.is_none() && trans.is_none() && office.is_none() {
+                    if graph.is_none()
+                        && trans.is_none()
+                        && office.is_none()
+                        && memory.is_none()
+                    {
                         return Err(AppError::new(
                             "invalid_input",
-                            "config set requires --graph, --trans, or --office",
+                            "config set requires --graph, --trans, --memory, or --office",
                         ));
                     }
                     if office.is_some() && cli.scope != Scope::Global {
@@ -854,6 +861,14 @@ fn run(cli: Cli) -> Result<Value> {
                         return Err(AppError::new(
                             "invalid_input",
                             "config set requires --trans when using --trans-timeout or --trans-arg",
+                        ));
+                    }
+                    if memory.is_none()
+                        && (memory_max_age_days.is_some() || memory_max_bytes.is_some())
+                    {
+                        return Err(AppError::new(
+                            "invalid_input",
+                            "config set requires --memory when using memory limits",
                         ));
                     }
 
@@ -874,12 +889,22 @@ fn run(cli: Cli) -> Result<Value> {
                         .as_deref()
                         .map(config::parse_office_setting)
                         .transpose()?;
+                    let memory_setting = match memory {
+                        Some(memory) => Some(config::build_memory_settings(
+                            &store_path.path,
+                            config::parse_memory_setting(&memory)?,
+                            memory_max_age_days,
+                            memory_max_bytes,
+                        )?),
+                        None => None,
+                    };
                     config::update(
                         &store_path.path,
                         config::ConfigPatch {
                             graph: graph_setting,
                             trans: trans_setting,
                             office: office_setting,
+                            memory: memory_setting,
                         },
                     )?;
                     Store::open(scope_name(store_path.scope), &store_path.path)?;
@@ -900,11 +925,15 @@ fn run(cli: Cli) -> Result<Value> {
                     }
                     Ok(response)
                 }
-                ConfigCommand::Unset { graph, trans } => {
-                    if !graph && !trans {
+                ConfigCommand::Unset {
+                    graph,
+                    trans,
+                    memory,
+                } => {
+                    if !graph && !trans && !memory {
                         return Err(AppError::new(
                             "invalid_input",
-                            "config unset requires --graph or --trans",
+                            "config unset requires --graph, --trans, or --memory",
                         ));
                     }
                     config::update(
@@ -913,6 +942,7 @@ fn run(cli: Cli) -> Result<Value> {
                             graph: graph.then_some(config::GraphSetting::Inherit),
                             trans: trans.then_some(config::inherit_trans_settings()),
                             office: None,
+                            memory: memory.then_some(config::inherit_memory_settings()),
                         },
                     )?;
                     Store::open(scope_name(store_path.scope), &store_path.path)?;

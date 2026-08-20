@@ -9,10 +9,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const CONFIG_VERSION: u32 = 4;
+pub const CONFIG_VERSION: u32 = 5;
 pub const DEFAULT_TRANS_TIMEOUT_SECONDS: u16 = 120;
 pub const MIN_TRANS_TIMEOUT_SECONDS: u16 = 1;
 pub const MAX_TRANS_TIMEOUT_SECONDS: u16 = 900;
+pub const DEFAULT_MEMORY_MAX_AGE_DAYS: u32 = 365;
+pub const DEFAULT_MEMORY_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -39,6 +41,14 @@ pub enum OfficeSetting {
     Officecli,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemorySetting {
+    Disabled,
+    Enabled,
+    Inherit,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GraphSettings {
@@ -61,6 +71,17 @@ pub struct TransSettings {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct MemorySettings {
+    #[serde(default = "inherit_memory")]
+    pub setting: MemorySetting,
+    #[serde(default = "default_memory_max_age_days")]
+    pub max_age_days: u32,
+    #[serde(default = "default_memory_max_bytes")]
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     pub version: u32,
     #[serde(default = "default_graph")]
@@ -69,6 +90,8 @@ pub struct ConfigFile {
     pub trans: TransSettings,
     #[serde(default = "default_office")]
     pub office: OfficeSetting,
+    #[serde(default = "default_memory")]
+    pub memory: MemorySettings,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -92,11 +115,20 @@ pub struct EffectiveOfficeConfig {
     pub origin: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EffectiveMemoryConfig {
+    pub setting: MemorySetting,
+    pub origin: String,
+    pub max_age_days: u32,
+    pub max_bytes: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ConfigPatch {
     pub graph: Option<GraphSetting>,
     pub trans: Option<TransSettings>,
     pub office: Option<OfficeSetting>,
+    pub memory: Option<MemorySettings>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -117,12 +149,28 @@ struct ConfigFileV3 {
     pub trans: TransSettings,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ConfigFileV4 {
+    pub version: u32,
+    #[serde(default = "default_graph")]
+    pub graph: GraphSettings,
+    #[serde(default = "default_trans")]
+    pub trans: TransSettings,
+    #[serde(default = "default_office")]
+    pub office: OfficeSetting,
+}
+
 fn inherit_graph() -> GraphSetting {
     GraphSetting::Inherit
 }
 
 fn inherit_trans() -> TransSetting {
     TransSetting::Inherit
+}
+
+fn inherit_memory() -> MemorySetting {
+    MemorySetting::Inherit
 }
 
 fn default_graph() -> GraphSettings {
@@ -148,6 +196,22 @@ fn default_office() -> OfficeSetting {
     OfficeSetting::Disabled
 }
 
+fn default_memory_max_age_days() -> u32 {
+    DEFAULT_MEMORY_MAX_AGE_DAYS
+}
+
+fn default_memory_max_bytes() -> u64 {
+    DEFAULT_MEMORY_MAX_BYTES
+}
+
+fn default_memory() -> MemorySettings {
+    MemorySettings {
+        setting: MemorySetting::Inherit,
+        max_age_days: default_memory_max_age_days(),
+        max_bytes: default_memory_max_bytes(),
+    }
+}
+
 impl Default for ConfigFile {
     fn default() -> Self {
         Self {
@@ -155,6 +219,7 @@ impl Default for ConfigFile {
             graph: default_graph(),
             trans: default_trans(),
             office: default_office(),
+            memory: default_memory(),
         }
     }
 }
@@ -197,6 +262,18 @@ pub fn parse_office_setting(value: &str) -> Result<OfficeSetting> {
     }
 }
 
+pub fn parse_memory_setting(value: &str) -> Result<MemorySetting> {
+    match value {
+        "disabled" => Ok(MemorySetting::Disabled),
+        "enabled" => Ok(MemorySetting::Enabled),
+        "inherit" => Ok(MemorySetting::Inherit),
+        _ => Err(AppError::new(
+            "invalid_memory_setting",
+            format!("unsupported memory setting '{value}'; use disabled, enabled, or inherit"),
+        )),
+    }
+}
+
 pub fn validate_trans_timeout(timeout_seconds: u16) -> Result<u16> {
     if (MIN_TRANS_TIMEOUT_SECONDS..=MAX_TRANS_TIMEOUT_SECONDS).contains(&timeout_seconds) {
         return Ok(timeout_seconds);
@@ -234,6 +311,14 @@ fn validate_trans_settings(trans: &TransSettings) -> Result<()> {
 
 fn validate_config_file(config: ConfigFile) -> Result<ConfigFile> {
     validate_trans_settings(&config.trans)?;
+    if config.memory.setting == MemorySetting::Enabled
+        && (config.memory.max_age_days == 0 || config.memory.max_bytes == 0)
+    {
+        return Err(AppError::new(
+            "invalid_config",
+            "enabled memory requires positive max_age_days and max_bytes",
+        ));
+    }
     Ok(config)
 }
 
@@ -279,6 +364,7 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                     graph: legacy.graph,
                     trans: default_trans(),
                     office: default_office(),
+                    memory: default_memory(),
                 });
             }
             if version == 3 {
@@ -290,6 +376,19 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                     graph: legacy.graph,
                     trans: legacy.trans,
                     office: default_office(),
+                    memory: default_memory(),
+                });
+            }
+            if version == 4 {
+                let legacy: ConfigFileV4 = serde_json::from_value(value).map_err(|error| {
+                    AppError::new("invalid_config", format!("invalid config: {error}"))
+                })?;
+                return validate_config_file(ConfigFile {
+                    version: CONFIG_VERSION,
+                    graph: legacy.graph,
+                    trans: legacy.trans,
+                    office: legacy.office,
+                    memory: default_memory(),
                 });
             }
             if version != u64::from(CONFIG_VERSION) {
@@ -384,6 +483,39 @@ pub fn resolve_office() -> Result<EffectiveOfficeConfig> {
     })
 }
 
+pub fn resolve_memory(scope: &str, database: &Path) -> Result<EffectiveMemoryConfig> {
+    let mut effective = EffectiveMemoryConfig {
+        setting: MemorySetting::Enabled,
+        origin: "built-in".to_owned(),
+        max_age_days: default_memory_max_age_days(),
+        max_bytes: default_memory_max_bytes(),
+    };
+
+    if let Some(path) = global_config_path() {
+        let global = load_file(&path)?;
+        if global.memory.setting != MemorySetting::Inherit {
+            effective = EffectiveMemoryConfig {
+                setting: global.memory.setting,
+                origin: "global".to_owned(),
+                max_age_days: global.memory.max_age_days,
+                max_bytes: global.memory.max_bytes,
+            };
+        }
+    }
+    if scope == "project" {
+        let project = load_file(&config_path_for_database(database)?)?;
+        if project.memory.setting != MemorySetting::Inherit {
+            effective = EffectiveMemoryConfig {
+                setting: project.memory.setting,
+                origin: "project".to_owned(),
+                max_age_days: project.memory.max_age_days,
+                max_bytes: project.memory.max_bytes,
+            };
+        }
+    }
+    Ok(effective)
+}
+
 pub fn build_trans_settings(
     database: &Path,
     setting: TransSetting,
@@ -427,6 +559,44 @@ pub fn inherit_trans_settings() -> TransSettings {
     default_trans()
 }
 
+pub fn build_memory_settings(
+    database: &Path,
+    setting: MemorySetting,
+    max_age_days: Option<u32>,
+    max_bytes: Option<u64>,
+) -> Result<MemorySettings> {
+    let existing = load_file(&config_path_for_database(database)?)?;
+    let mut memory = if existing.memory.setting == MemorySetting::Inherit {
+        default_memory()
+    } else {
+        existing.memory
+    };
+    memory.setting = setting;
+    if let Some(max_age_days) = max_age_days {
+        if max_age_days == 0 {
+            return Err(AppError::new(
+                "invalid_input",
+                "memory max age days must be positive",
+            ));
+        }
+        memory.max_age_days = max_age_days;
+    }
+    if let Some(max_bytes) = max_bytes {
+        if max_bytes == 0 {
+            return Err(AppError::new(
+                "invalid_input",
+                "memory max bytes must be positive",
+            ));
+        }
+        memory.max_bytes = max_bytes;
+    }
+    Ok(memory)
+}
+
+pub fn inherit_memory_settings() -> MemorySettings {
+    default_memory()
+}
+
 pub fn update(database: &Path, patch: ConfigPatch) -> Result<(PathBuf, ConfigFile)> {
     let path = config_path_for_database(database)?;
     reject_symlink(&path)?;
@@ -445,6 +615,9 @@ pub fn update(database: &Path, patch: ConfigPatch) -> Result<(PathBuf, ConfigFil
     }
     if let Some(office) = patch.office {
         config.office = office;
+    }
+    if let Some(memory) = patch.memory {
+        config.memory = memory;
     }
     validate_config_file(config.clone())?;
     let bytes = serde_json::to_vec_pretty(&config)
@@ -547,11 +720,13 @@ pub fn response(scope: &str, database: &Path) -> Result<Value> {
     let graph = resolve_graph(scope, database)?;
     let trans = resolve_trans(scope, database)?;
     let office = resolve_office()?;
+    let memory = resolve_memory(scope, database)?;
     Ok(json!({
         "scope": scope,
         "path": config_path_for_database(database)?,
         "graph": graph,
         "trans": trans,
         "office": office,
+        "memory": memory,
     }))
 }

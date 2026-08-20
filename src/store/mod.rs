@@ -1,4 +1,5 @@
 include!("types.rs");
+include!("temporal_memory.rs");
 include!("lifecycle_changesets.rs");
 include!("content_search.rs");
 include!("graph_ingest.rs");

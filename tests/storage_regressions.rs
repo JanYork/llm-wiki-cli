@@ -70,7 +70,7 @@ fn wal_path(database: &Path) -> PathBuf {
 }
 
 #[test]
-fn new_store_has_v13_tag_schema_constraints_and_cascades() {
+fn new_store_has_v14_tag_schema_constraints_and_cascades() {
     let world = TestWorld::new();
     let initialized = world.ok(&["init"]);
     let database = database_path(&initialized);
@@ -92,7 +92,7 @@ fn new_store_has_v13_tag_schema_constraints_and_cascades() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     let indexes = {
         let mut statement = conn
             .prepare(
@@ -141,7 +141,21 @@ fn new_store_has_v13_tag_schema_constraints_and_cascades() {
 fn downgrade_tag_schema_to_v12(database: &Path) {
     let conn = Connection::open(database).unwrap();
     conn.execute_batch(
-        "DROP TABLE page_tags;
+        "DROP TABLE memory_fts;
+         DROP TABLE IF EXISTS memory_fts_data;
+         DROP TABLE IF EXISTS memory_fts_idx;
+         DROP TABLE IF EXISTS memory_fts_content;
+         DROP TABLE IF EXISTS memory_fts_docsize;
+         DROP TABLE IF EXISTS memory_fts_config;
+         DROP TABLE memory_feedback;
+         DROP TABLE memory_relations;
+         DROP TABLE memory_evidence;
+         DROP TABLE memory_changes;
+         DROP TABLE memory_fragments;
+         DROP TABLE memory_hint_state;
+         DROP TABLE memory_state;
+         DROP TABLE memory_events;
+         DROP TABLE page_tags;
          DROP TABLE tags;
          UPDATE meta SET value = '12' WHERE key = 'format_version';
          PRAGMA user_version = 12;",
@@ -150,7 +164,7 @@ fn downgrade_tag_schema_to_v12(database: &Path) {
 }
 
 #[test]
-fn v12_store_migrates_to_v13_with_existing_pages_untagged() {
+fn v12_store_migrates_to_v14_with_existing_pages_untagged() {
     let world = TestWorld::new();
     let initialized = world.ok(&["init"]);
     let database = database_path(&initialized);
@@ -169,7 +183,7 @@ fn v12_store_migrates_to_v13_with_existing_pages_untagged() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!((version, format.as_str()), (13, "13"));
+    assert_eq!((version, format.as_str()), (14, "14"));
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM page_tags", [], |row| row
             .get::<_, i64>(0))
@@ -215,7 +229,7 @@ fn failed_v13_migration_leaves_v12_unchanged_and_can_retry() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 }
 
 #[test]
@@ -272,7 +286,7 @@ fn new_store_uses_contentless_search_fts_and_keeps_identifiers_readable() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     for table in [
         "retrieval_weights",
         "retrieval_feedback",
