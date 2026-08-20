@@ -444,6 +444,7 @@ fn codex_global_install_honors_the_official_codex_home() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn agent_install_bundles_temporal_memory_reference_byte_identically() {
     let world = World::new();
