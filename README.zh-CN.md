@@ -127,12 +127,13 @@ LWC 的幂等 AgentTarget 安装器；只有尚未注册的 Agent 才按自身�
   <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-architecture-zh.png" alt="LWC 架构图" width="100%">
 </p>
 
-持久化知识模型分为三个逻辑层：
+持久化知识模型分为四个逻辑层：
 
 | 层 | 内容 | 约束 |
 | --- | --- | --- |
 | Raw sources | 经过筛选的输入内容的不可变快照 | 通过 `source` 加入，不改写来源事实。 |
 | Wiki | Agent 维护的页面、引用、链接和溯源信息 | 通过 `page` 更新；引用来源，并分类需要长期保留的非来源知识。 |
+| 时序记忆 | 关于变化、决策、结果和未决事项的小型规范化事件 | 通过 `remember` 记录；显式关联修订，让保留策略有界淘汰普通历史。 |
 | Schema and purpose | 维护规则与项目目标 | 约束后续每一次 ingest 和修订。 |
 
 SQLite 是唯一的权威事实源。Markdown 树是供人和 Obsidian 等工具使用的可重建
@@ -585,6 +586,51 @@ lwc page show source-1
 运行 `lwc --help` 或 `lwc <command> --help`，可以查看面向 Agent 编写的前置条件、
 状态变化、副作用和下一步动作。
 
+## 时序记忆
+
+当未来工作可能需要知道发生了什么变化、为什么改变、尝试过什么、结果如何或还有
+什么未决时，只记录一个紧凑事件：
+
+```bash
+lwc remember --json '{"type":"决策","context":"部署策略","decision":["使用蓝绿发布"],"outcome":["仍可快速回滚"]}'
+lwc remember --json - < event.json
+lwc remember --json @event.json
+
+lwc memory recall "为什么修改部署方式" --limit 5
+lwc memory recall "支付重试" --since 2026-08-01 --until 2026-08-31
+lwc memory show EVENT_ID
+lwc memory feedback EVENT_ID --signal useful --reason "避免重复失败"
+```
+
+事件至少包含 `type`、`context`，以及 `observed`、`decision`、`constraints`、
+`learned`、`unresolved`、`outcome`、`changes` 中的一项有效内容。LWC 将它拆成
+规范化关系行，而不是保存不透明的对话记录。三种输入都必须是 UTF-8 且不超过
+64 MiB；`@PATH` 从当前目录解析，project scope 下规范化路径必须位于项目根目录内。
+`request_id` 只保证同一次提交重试的
+幂等性；不传或换一个 key 时，即使内容相同也会创建独立事件。LWC 不会按相似文本
+合并事件，也不会自动生成 Wiki 综合。召回默认隐藏已被显式替代的事件，只有传入
+`--include-superseded` 才会返回；也只有召回支持 `--scope all`。所有时序记忆命令
+都拒绝 `--changeset`，非召回命令必须使用一个 project 或 global 存储。
+
+时序记忆默认启用，保留上限为 365 天和 256 MiB 逻辑内容；项目配置覆盖全局配置：
+
+```bash
+lwc config show
+lwc --scope global config set --memory enabled \
+  --memory-max-age-days 365 --memory-max-bytes 268435456
+lwc config unset --memory
+lwc memory status
+lwc memory maintain
+```
+
+每次成功记录都会在同一事务中执行时间和容量淘汰。`pinned=true`、含 `unresolved`
+片段，或参与尚未被 `resolves` 关闭的显式 `contradicts` 关系的事件受到保护；若受保护
+历史占满空间，新事件会失败，而不是删掉它们。返回
+的 hint 只是数量受限、规则明确的复核候选，不会自动关联或压缩。涉及历史、先前尝试和
+时间线时先查时序记忆；查询当前稳定知识时先查 Wiki；当前结论需要历史背景时两者都查。
+生命周期 Hook 只报告有界的就绪状态与命令元数据，不会记录、召回原始事件、消费
+hint、提交反馈或执行维护。
+
 ## 原子化多命令变更
 
 单个 `source` 或 `page` 命令本身已有事务保护。当一个逻辑更新需要多条命令、又不能
@@ -637,7 +683,7 @@ checkpoint、获取正式库写锁或修改正式 Wiki 前返回 `changeset_spar
 | --- | --- | --- |
 | `project` | 最近祖先目录中的 `.lwc/wiki.db` | 默认使用，保存项目级知识 |
 | `global` | `~/.lwc/wiki.db` | 保存可跨项目复用的知识 |
-| `all` | project 与 global | 仅用于合并 `search` 和 `context` |
+| `all` | project 与 global | 仅用于合并 `search`、`context` 和 `memory recall` |
 
 示例：
 
@@ -646,6 +692,7 @@ lwc --scope global init
 lwc --scope global source add shared.md
 lwc --scope all search "shared term"
 lwc --scope all context
+lwc --scope all memory recall "之前的发布"
 ```
 
 知识写入始终是显式的。`all` 不会隐式创建不同存储之间的引用或链接；`search --record`

@@ -139,12 +139,13 @@ This project adapts those ideas into an agent-first Rust CLI backed by SQLite.
   <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-architecture-en.png" alt="LWC architecture" width="100%">
 </p>
 
-The persistent knowledge model has three logical layers:
+The persistent knowledge model has four logical layers:
 
 | Layer | Contents | Contract |
 | --- | --- | --- |
 | Raw sources | Immutable snapshots of curated input | Add through `source`; never rewrite source truth. |
 | Wiki | Agent-maintained pages, citations, links, and provenance | Update through `page`; cite sources and classify durable non-source knowledge. |
+| Temporal memory | Small normalized events about change, decisions, outcomes, and unresolved work | Record through `remember`; relate revisions explicitly and let configured retention evict ordinary history. |
 | Schema and purpose | Maintenance rules and project intent | Guide every future ingest and revision. |
 
 SQLite is canonical. The Markdown tree is a rebuildable projection for people
@@ -648,6 +649,57 @@ See [docs/agent-workflow.md](docs/agent-workflow.md) for the full operating cont
 Run `lwc --help` or `lwc <command> --help` for Agent-oriented preconditions,
 state transitions, side effects, and next actions.
 
+## Temporal Memory
+
+Record one compact event when future work may need to know what changed, why,
+what was tried, the outcome, or what remains unresolved:
+
+```bash
+lwc remember --json '{"type":"decision","context":"deployment strategy","decision":["use blue-green rollout"],"outcome":["rollback remains available"]}'
+lwc remember --json - < event.json
+lwc remember --json @event.json
+
+lwc memory recall "why did deployment change" --limit 5
+lwc memory recall "payment retry" --since 2026-08-01 --until 2026-08-31
+lwc memory show EVENT_ID
+lwc memory feedback EVENT_ID --signal useful --reason "prevented a repeated failure"
+```
+
+The capsule requires `type`, `context`, and at least one semantic entry in
+`observed`, `decision`, `constraints`, `learned`, `unresolved`, `outcome`, or
+`changes`. LWC stores normalized relational rows, not an opaque transcript.
+All three inputs are UTF-8 and limited to 64 MiB; `@PATH` is resolved from the
+current directory and must remain inside the project root for project scope.
+`request_id` only makes the same submission retry idempotent; absent or
+different keys always create distinct events. LWC never merges similar events
+or writes a Wiki synthesis automatically. Recall hides explicitly superseded
+events unless `--include-superseded` is passed. Only recall accepts
+`--scope all`; every temporal-memory command rejects `--changeset`, and all
+non-recall commands require a project or global store.
+
+Memory is enabled by default with a 365-day and 256 MiB logical retention
+limit. Project settings override global settings:
+
+```bash
+lwc config show
+lwc --scope global config set --memory enabled \
+  --memory-max-age-days 365 --memory-max-bytes 268435456
+lwc config unset --memory
+lwc memory status
+lwc memory maintain
+```
+
+Successful records enforce age and capacity retention transactionally. Events
+with `pinned=true`, an `unresolved` fragment, or an explicit `contradicts`
+relation not closed by `resolves` are protected; if protected history leaves no
+room, the new record fails instead of deleting it. Returned
+hints are bounded deterministic review candidates, never automatic linking or
+compression. Recall temporal memory first for history, prior attempts, and
+timelines; recall the Wiki first for current stable knowledge; use both when a
+current conclusion needs its history. Lifecycle Hooks only report bounded
+readiness and command metadata; they never record, recall raw events, consume
+hints, submit feedback, or run maintenance.
+
 ## Atomic Multi-command Changes
 
 A single `source` or `page` command is transactional. Use a changeset when one
@@ -706,7 +758,7 @@ single-entity transactions until their sparse inverse patches are available.
 | --- | --- | --- |
 | `project` | Nearest ancestor `.lwc/wiki.db` | Default, project-specific knowledge |
 | `global` | `~/.lwc/wiki.db` | Reusable cross-project knowledge |
-| `all` | Project and global stores | Combined `search` and `context` only |
+| `all` | Project and global stores | Combined `search`, `context`, and `memory recall` only |
 
 Examples:
 
@@ -715,6 +767,7 @@ lwc --scope global init
 lwc --scope global source add shared.md
 lwc --scope all search "shared term"
 lwc --scope all context
+lwc --scope all memory recall "prior rollout"
 ```
 
 Knowledge writes are explicit. `all` does not create implicit cross-store citations

@@ -23,6 +23,14 @@ Use `lwc` as durable external memory. The database stores evidence and compiled 
 11. A multi-command knowledge update belongs in one changeset. The draft is a
     private SQLite snapshot; live canonical state and live Markdown stay
     unchanged until commit.
+12. Temporal memory stores normalized event fields, not chat transcripts or raw
+    chain-of-thought. It supplements Sources and Wiki pages; it does not replace
+    either one.
+13. `request_id` prevents one submission retry from creating a duplicate. It is
+    not semantic deduplication: events with no key or a different key stay
+    distinct even when their text is identical.
+14. Lifecycle Hooks may report memory readiness and commands, but must not
+    record, rate, maintain, or inject raw temporal events automatically.
 
 ## Start a session
 
@@ -32,6 +40,90 @@ lwc context --limit 50
 
 This returns the purpose, schema, page index, and recent operations. Use
 `lwc --scope all context` only when shared global knowledge is relevant.
+
+## Temporal memory
+
+Use temporal memory for sparse history whose time and sequence matter. Record
+once at a meaningful boundary when future work may need to know what changed,
+why, what was tried, the outcome, or what remains unresolved. Skip routine
+progress, repeated wording, transient tool output, secrets, stable current facts
+already represented in the Wiki, and ordinary conversation turns.
+
+The fastest valid capsule has non-empty `type` and `context`, plus at least one
+entry in `observed`, `decision`, `constraints`, `learned`, `unresolved`,
+`outcome`, or `changes`:
+
+```bash
+lwc remember --json '{"type":"decision","context":"deployment strategy","decision":["use blue-green rollout"],"outcome":["rollback remains available"]}'
+lwc remember --json - < event.json
+lwc remember --json @event.json
+```
+
+All three forms accept UTF-8 up to 64 MiB. `@PATH` is resolved relative to the
+current directory; under project scope its canonical path must stay inside the
+project root. Inline, stdin, and file input otherwise share validation and
+response semantics.
+
+Optional `occurred_at`, `valid_from`, and `valid_to` fields describe time;
+`pinned` protects an event; `evidence` stores domain-neutral references and
+optional excerpts; `relations` explicitly connect existing event IDs with
+`supersedes`, `contradicts`, `resolves`, `supports`, or `related`. Never infer a
+relation merely from similar wording. Corrections append a new event and an
+explicit relation instead of rewriting the prior event.
+
+Use `request_id` only when retrying the same submission. While the event is
+retained, the same key and same canonical capsule returns the original event;
+the same key with different content fails. A missing or different key always
+creates another event.
+
+Recall temporal memory first for questions about before/after, when, why,
+changes, prior attempts, repeated failures, unresolved work, or incident
+timelines. Recall the Wiki first for current architecture, instructions, and
+stable facts. Use both when a current conclusion needs its history; inspect a
+Source when exact authoritative evidence matters.
+
+```bash
+lwc memory recall "why did deployment change" --limit 5
+lwc memory recall "payment retry" --since 2026-08-01 --until 2026-08-31
+lwc --scope all memory recall "previous rollout" --limit 10
+lwc memory show EVENT_ID
+lwc memory feedback EVENT_ID --signal useful --reason "prevented a repeated failure"
+lwc memory status
+```
+
+Recall is bounded, read-only, CJK-aware, and hides explicitly superseded events
+unless `--include-superseded` is passed. Retrieval alone never strengthens an
+event; feedback is the explicit usefulness signal. Project and global stores
+accept exact-scope reads and writes. Only recall accepts `--scope all`; it
+merges the two stores without creating cross-store relations. Every temporal
+memory command rejects `--changeset`.
+
+Memory is enabled by default with a 365-day and 256 MiB logical limit. Project
+configuration overrides global configuration; unset restores inheritance:
+
+```bash
+lwc config show
+lwc --scope global config set --memory enabled \
+  --memory-max-age-days 365 --memory-max-bytes 268435456
+lwc config unset --memory
+lwc memory maintain
+```
+
+Every successful `remember` enforces the same age and capacity policy as
+`memory maintain`. Ordinary expired history is deleted. Events with
+`pinned=true`, an `unresolved` fragment, or an explicit `contradicts` relation
+not closed by `resolves` are protected. If protected history leaves insufficient
+capacity, recording fails rather than deleting it. SQLite file reclamation
+remains the separate `maintenance compact` operation.
+
+A returned hint is only a bounded deterministic review candidate. Record a
+resolving event, pin important history, or synthesize a Wiki page only when the
+current work establishes a reusable conclusion. LWC never semantically merges
+events, judges hidden importance, or writes the Wiki for the Agent.
+
+Lifecycle Hooks expose only the resolved setting, origin, enabled/ready state,
+configured limits, and command strings. They never record, recall raw events,
+consume hints, submit feedback, or run maintenance.
 
 ## Atomic changesets
 
@@ -361,7 +453,7 @@ lwc maintenance reindex
 
 - Default: nearest project `.lwc/wiki.db`.
 - `--scope global`: `~/.lwc/wiki.db`.
-- `--scope all`: combined `search` and `context`; `search --record` appends the query operation to each selected store.
+- `--scope all`: combined `search`, `context`, and `memory recall`; `search --record` appends the query operation to each selected store.
 - Citations and wikilinks belong to one store; cross-store relations are not created implicitly.
 - Changesets exist only in one explicit `project` or `global` store. Identical
   names in different stores are unrelated, and `--scope all` cannot begin,
@@ -399,6 +491,9 @@ The command returns a durable `work` immediately. Use `lwc work status
 `work.result` reports `busy` and `after_bytes`; if `busy` is true, an active
 reader prevented full reclamation and the maintenance should be retried later.
 Compact does not run a full FTS optimization or rewrite canonical knowledge.
+Temporal age/capacity retention is enforced separately by `remember` and
+`memory maintain`; it deletes eligible event rows but does not shrink the
+SQLite file by itself.
 
 ## Mutation recovery
 
