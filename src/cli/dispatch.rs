@@ -818,6 +818,14 @@ fn run(cli: Cli) -> Result<Value> {
                 }
             }
         }
+        Command::Remember { json } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "remember")?;
+            ensure_scope_supported(cli.scope, false, "remember")?;
+            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
+            let raw = read_memory_json(&store_path, &cwd, &json)?;
+            let input = store::parse_memory_capsule(&raw)?;
+            Store::open(scope_name(store_path.scope), &store_path.path)?.remember(input)
+        }
         Command::Config { command } => {
             ensure_scope_supported(cli.scope, false, "config")?;
             if selected_changeset.is_some() {

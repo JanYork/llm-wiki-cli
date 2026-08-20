@@ -399,6 +399,7 @@ fn every_public_command_exposes_renderable_help() {
         "config show",
         "config set",
         "config unset",
+        "remember",
         "graph",
         "graph related",
         "graph explore",

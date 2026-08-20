@@ -58,6 +58,37 @@ fn read_utf8(path: &Path, allow_stdin: bool) -> Result<String> {
         .map_err(|_| AppError::new("invalid_utf8", format!("{} is not UTF-8", path.display())))
 }
 
+fn read_memory_json(store_path: &StorePath, cwd: &Path, argument: &str) -> Result<String> {
+    if argument == "-" {
+        return read_utf8(Path::new("-"), true);
+    }
+    if let Some(path) = argument.strip_prefix('@') {
+        if path.is_empty() {
+            return Err(AppError::new(
+                "invalid_input",
+                "remember --json @PATH requires a file path",
+            ));
+        }
+        let path = PathBuf::from(path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        let resolved = fs::canonicalize(&path)?;
+        if store_path.scope == Scope::Project {
+            ensure_project_path(&resolved, &project_root(store_path)?)?;
+        }
+        return read_utf8(&resolved, false);
+    }
+    ensure_input_size(
+        Path::new("<inline-json>"),
+        argument.len() as u64,
+        MAX_INPUT_BYTES,
+    )?;
+    Ok(argument.to_owned())
+}
+
 fn read_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
     ensure_input_size(path, fs::metadata(path)?.len(), max_bytes)?;
     let bytes = fs::read(path)?;

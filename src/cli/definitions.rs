@@ -284,6 +284,15 @@ enum Command {
         #[command(subcommand)]
         command: IngestCommand,
     },
+    /// Record one normalized temporal-memory event capsule.
+    #[command(
+        after_help = "Examples:\n  lwc remember --json '{\"type\":\"decision\",\"context\":\"deploy\",\"decision\":[\"use blue\"]}'\n  lwc remember --json - < event.json\n  lwc remember --json @event.json"
+    )]
+    Remember {
+        /// Inline JSON, '-' for stdin, or '@PATH' for a scoped UTF-8 file.
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
+    },
     /// Inspect and update layered graph, trans, memory, and global Office settings.
     Config {
         #[command(subcommand)]
