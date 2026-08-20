@@ -85,26 +85,6 @@ fn as_str(path: &Path) -> &str {
     path.to_str().unwrap()
 }
 
-fn drop_temporal_schema(conn: &Connection) {
-    conn.execute_batch(
-        "DROP TABLE IF EXISTS memory_fts;
-         DROP TABLE IF EXISTS memory_fts_data;
-         DROP TABLE IF EXISTS memory_fts_idx;
-         DROP TABLE IF EXISTS memory_fts_content;
-         DROP TABLE IF EXISTS memory_fts_docsize;
-         DROP TABLE IF EXISTS memory_fts_config;
-         DROP TABLE IF EXISTS memory_feedback;
-         DROP TABLE IF EXISTS memory_relations;
-         DROP TABLE IF EXISTS memory_evidence;
-         DROP TABLE IF EXISTS memory_changes;
-         DROP TABLE IF EXISTS memory_fragments;
-         DROP TABLE IF EXISTS memory_hint_state;
-         DROP TABLE IF EXISTS memory_state;
-         DROP TABLE IF EXISTS memory_events;",
-    )
-    .unwrap();
-}
-
 fn downgrade_to_v10(database: &Path) {
     let conn = Connection::open(database).unwrap();
     drop_temporal_schema(&conn);
@@ -247,6 +227,7 @@ include!("cli/changesets.rs");
 include!("cli/retrieval.rs");
 include!("cli/graph.rs");
 include!("cli/core.rs");
+include!("cli/schema.rs");
 include!("cli/source_diff.rs");
 include!("cli/source_status.rs");
 include!("cli/remaining.rs");
