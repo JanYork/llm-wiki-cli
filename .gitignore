@@ -5,3 +5,4 @@
 *.swp
 web/node_modules/
 .local-benchmarks/
+/docs/superpowers/
