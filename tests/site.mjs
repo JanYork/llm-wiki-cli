@@ -202,6 +202,16 @@ test("both pages contain the exact normative README Agent prompt", () => {
   assert.equal(embeddedPrompt(page("zh")), expected);
 });
 
+test("both locales expose temporal memory, Todo, and Plan", () => {
+  for (const [locale, names] of [
+    ["en", ["Temporal memory", "Durable Todo", "Current Plan"]],
+    ["zh", ["时序记忆", "持久 Todo", "当前 Plan"]],
+  ]) {
+    const html = page(locale);
+    for (const name of names) assert.ok(html.includes(`<h3>${name}</h3>`), `${locale}: ${name} is missing`);
+  }
+});
+
 test("assets resolve from both locale directories and controls stay accessible", () => {
   for (const locale of ["en", "zh"]) {
     const path = files[locale];
