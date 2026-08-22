@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
 const STORE_DIR: &str = ".lwc";
@@ -367,7 +369,7 @@ fn inspect_store_path(path: &Path, project_root: Option<&Path>) -> Result<bool> 
         store_sidecar(path, "-wal"),
         store_sidecar(path, "-shm"),
     ] {
-        match fs::symlink_metadata(&candidate) {
+        match symlink_metadata_with_permission_retry(&candidate) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(invalid_store_path(
                     &candidate,
@@ -388,6 +390,18 @@ fn inspect_store_path(path: &Path, project_root: Option<&Path>) -> Result<bool> 
         }
     }
     Ok(database_exists)
+}
+
+fn symlink_metadata_with_permission_retry(path: &Path) -> std::io::Result<fs::Metadata> {
+    for attempt in 0..4 {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && attempt < 3 => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final metadata attempt always returns")
 }
 
 fn store_sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -445,6 +459,8 @@ fn scope_not_supported(command: &str) -> AppError {
 mod tests {
     use super::*;
     use std::{fs, sync::Mutex};
+    #[cfg(unix)]
+    use std::{os::unix::fs::PermissionsExt, thread, time::Duration};
     use tempfile::TempDir;
 
     static HOME_LOCK: Mutex<()> = Mutex::new(());
@@ -492,6 +508,29 @@ mod tests {
 
         assert_eq!(resolved.scope, Scope::Project);
         assert_eq!(resolved.path, nested.join(STORE_DIR).join(STORE_FILE));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_inspection_survives_a_transient_sidecar_permission_error() {
+        let world = TempDir::new().unwrap();
+        let store_dir = world.path().join(STORE_DIR);
+        let database = store_dir.join(STORE_FILE);
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::write(&database, "").unwrap();
+        fs::write(store_sidecar(&database, "-wal"), "").unwrap();
+        fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let restored = store_dir.clone();
+        let restore = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            fs::set_permissions(restored, fs::Permissions::from_mode(0o700)).unwrap();
+        });
+
+        let result = inspect_store_path(&database, Some(world.path()));
+        restore.join().unwrap();
+
+        assert!(result.unwrap());
     }
 
     #[test]
