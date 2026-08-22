@@ -128,6 +128,14 @@ fn prepare_store(
         migrate_temporal_memory(conn)?;
         version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     }
+    if version == TEMPORAL_MEMORY_VERSION {
+        migrate_agent_state_v15(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
+    if version == AGENT_STATE_VERSION {
+        migrate_todo_features_v16(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
     if version != USER_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
@@ -138,6 +146,105 @@ fn prepare_store(
     }
     validate_store(conn)?;
     Ok(false)
+}
+
+fn migrate_agent_state_v15(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if current == AGENT_STATE_VERSION { tx.commit()?; return Ok(()); }
+    if current != TEMPORAL_MEMORY_VERSION {
+        return Err(AppError::new("unsupported_store_version", format!("cannot migrate wiki database version {current} to {USER_VERSION}")));
+    }
+    create_todo_schema(&tx).map_err(|error| AppError::new("store_migration_failed", format!("failed to prepare v{AGENT_STATE_VERSION} Todo schema: {error}")))?;
+    create_plan_schema(&tx).map_err(|error| AppError::new("store_migration_failed", format!("failed to prepare v{AGENT_STATE_VERSION} Plan schema: {error}")))?;
+    tx.execute("INSERT INTO meta(key,value) VALUES ('format_version',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [AGENT_STATE_VERSION.to_string()])?;
+    tx.pragma_update(None, "user_version", AGENT_STATE_VERSION)?;
+    tx.commit().map_err(|error| AppError::new("store_migration_failed", format!("failed to commit v{AGENT_STATE_VERSION} Todo and Plan migration: {error}")))
+}
+
+fn migrate_todo_features_v16(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if current == USER_VERSION {
+        tx.commit()?;
+        return Ok(());
+    }
+    if current != AGENT_STATE_VERSION {
+        return Err(AppError::new(
+            "unsupported_store_version",
+            format!("cannot migrate wiki database version {current} to {USER_VERSION}"),
+        ));
+    }
+    let has_parent: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('todo_items') WHERE name='parent_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    let has_target: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('todo_items') WHERE name='target_at')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_parent {
+        tx.execute_batch(
+            "ALTER TABLE todo_items ADD COLUMN parent_id TEXT REFERENCES todo_items(id) ON DELETE RESTRICT;",
+        )?;
+    }
+    if !has_target {
+        tx.execute_batch("ALTER TABLE todo_items ADD COLUMN target_at TEXT;")?;
+    }
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS todo_items_parent ON todo_items(parent_id,created_at,id);
+         CREATE INDEX IF NOT EXISTS todo_items_reminder ON todo_items(state,target_at,created_at,id);",
+    )?;
+    tx.execute("INSERT INTO meta(key,value) VALUES ('format_version',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [USER_VERSION.to_string()])?;
+    tx.pragma_update(None, "user_version", USER_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to commit v{USER_VERSION} Todo migration: {error}"),
+        )
+    })
+}
+
+fn create_todo_schema(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(r#"
+      CREATE TABLE IF NOT EXISTS todo_items(
+        id TEXT PRIMARY KEY CHECK(LENGTH(id)=32), request_id TEXT, fingerprint TEXT NOT NULL CHECK(LENGTH(fingerprint)=64),
+        title TEXT NOT NULL CHECK(TRIM(title)<>''), cue TEXT, detail TEXT,
+        state TEXT NOT NULL CHECK(state IN ('open','done','cancelled')), result TEXT, cancel_reason TEXT,
+        revision INTEGER NOT NULL CHECK(revision>=1), created_at TEXT NOT NULL, updated_at TEXT NOT NULL, closed_at TEXT,
+        parent_id TEXT REFERENCES todo_items(id) ON DELETE RESTRICT, target_at TEXT);
+      CREATE UNIQUE INDEX IF NOT EXISTS todo_items_request ON todo_items(request_id) WHERE request_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS todo_items_state_updated ON todo_items(state,updated_at DESC,id);
+      CREATE TABLE IF NOT EXISTS todo_tags(todo_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE, tag_name TEXT NOT NULL CHECK(TRIM(tag_name)<>''), PRIMARY KEY(todo_id,tag_name));
+      CREATE INDEX IF NOT EXISTS todo_tags_lookup ON todo_tags(tag_name,todo_id);
+      CREATE INDEX IF NOT EXISTS todo_items_parent ON todo_items(parent_id,created_at,id);
+      CREATE INDEX IF NOT EXISTS todo_items_reminder ON todo_items(state,target_at,created_at,id);
+      CREATE VIRTUAL TABLE IF NOT EXISTS todo_fts USING fts5(todo_id UNINDEXED,title_terms,tag_terms,cue_terms,detail_terms,content='',contentless_delete=1,contentless_unindexed=1);
+    "#)?;
+    Ok(())
+}
+
+fn create_plan_schema(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(&format!(r#"
+      CREATE TABLE IF NOT EXISTS plans(
+        id TEXT PRIMARY KEY CHECK(LENGTH(id)=32), request_id TEXT, fingerprint TEXT NOT NULL CHECK(LENGTH(fingerprint)=64),
+        title TEXT NOT NULL CHECK(TRIM(title)<>''), objective TEXT NOT NULL CHECK(TRIM(objective)<>''), done_when TEXT NOT NULL CHECK(TRIM(done_when)<>''),
+        state TEXT NOT NULL CHECK(state IN ('active','completed','abandoned')), result TEXT, completion_evidence TEXT,
+        done_when_checked INTEGER NOT NULL DEFAULT 0 CHECK(done_when_checked IN (0,1)), abandoned_reason TEXT,
+        revision INTEGER NOT NULL CHECK(revision>=1), created_at TEXT NOT NULL, updated_at TEXT NOT NULL, closed_at TEXT);
+      CREATE UNIQUE INDEX IF NOT EXISTS plans_request ON plans(request_id) WHERE request_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS plans_state_updated ON plans(state,updated_at DESC,id);
+      CREATE TABLE IF NOT EXISTS plan_tags(plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE, tag_name TEXT NOT NULL CHECK(TRIM(tag_name)<>''), PRIMARY KEY(plan_id,tag_name));
+      CREATE INDEX IF NOT EXISTS plan_tags_lookup ON plan_tags(tag_name,plan_id);
+      CREATE TABLE IF NOT EXISTS plan_constraints(plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, value TEXT NOT NULL CHECK(TRIM(value)<>''), PRIMARY KEY(plan_id,ordinal));
+      CREATE TABLE IF NOT EXISTS plan_steps(plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE, step_id TEXT NOT NULL CHECK(LENGTH(step_id)=32), ordinal INTEGER NOT NULL, title TEXT NOT NULL CHECK(TRIM(title)<>''), status TEXT NOT NULL CHECK(status IN ('pending','in_progress','blocked','completed','skipped')), verify TEXT, result TEXT, blocker TEXT, created_revision INTEGER NOT NULL, updated_revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(plan_id,step_id), UNIQUE(plan_id,ordinal));
+      CREATE INDEX IF NOT EXISTS plan_steps_status ON plan_steps(plan_id,status,ordinal);
+      CREATE TABLE IF NOT EXISTS plan_history(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE, revision INTEGER NOT NULL, action TEXT NOT NULL, reason TEXT, step_id TEXT, result TEXT, created_at TEXT NOT NULL DEFAULT ({TIMESTAMP_SQL}));
+      CREATE VIRTUAL TABLE IF NOT EXISTS plan_fts USING fts5(plan_id UNINDEXED,title_terms,tag_terms,objective_terms,constraint_terms,step_terms,content='',contentless_delete=1,contentless_unindexed=1);
+    "#))?;
+    Ok(())
 }
 
 fn prepare_store_read_only(conn: &Connection) -> Result<()> {

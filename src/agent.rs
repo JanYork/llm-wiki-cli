@@ -141,6 +141,15 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
     let office_status = crate::office::status()?;
     let office_enabled = office.setting == OfficeSetting::Officecli;
     let office_runtime_installed = office_status["installed"].as_bool().unwrap_or(false);
+    let todo_enabled =
+        config::resolve_todo("project", &store.path)?.setting == config::CapabilitySetting::Enabled;
+    let plan_enabled =
+        config::resolve_plan("project", &store.path)?.setting == config::CapabilitySetting::Enabled;
+    let hook_store = if wiki_initialized && (todo_enabled || plan_enabled) {
+        Some(Store::open_for_hook("project", &store.path))
+    } else {
+        None
+    };
 
     let mut value = json!({
         "wiki": {
@@ -209,6 +218,51 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
             "install": "lwc agent install",
         },
     });
+    if todo_enabled {
+        value["todo"] = match &hook_store {
+            Some(Ok(store)) => match (store.open_todo_count(), store.due_todo_reminders(3)) {
+                (Ok(open), Ok((reminders, omitted))) => {
+                    let mut state = json!({
+                        "ready": true,
+                        "open": open,
+                        "list": "lwc todo list --limit 20",
+                    });
+                    if !reminders.is_empty() {
+                        state["reminders"] = json!(reminders);
+                        state["omitted_reminders"] = json!(omitted);
+                    }
+                    state
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    json!({"ready":false,"error_code":error.code})
+                }
+            },
+            Some(Err(error)) => json!({"ready":false,"error_code":error.code}),
+            None => json!({"ready":false}),
+        };
+    }
+    if plan_enabled {
+        value["plan"] = match &hook_store {
+            Some(Ok(store)) => match (store.active_plan_count(), store.plan_tracking()) {
+                (Ok(active), Ok(tracking)) => {
+                    let mut state = json!({
+                        "ready": true,
+                        "active": active,
+                        "current": "lwc plan current --limit 20",
+                    });
+                    if let Some(tracking) = tracking {
+                        state["tracking"] = tracking;
+                    }
+                    state
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    json!({"ready":false,"error_code":error.code})
+                }
+            },
+            Some(Err(error)) => json!({"ready":false,"error_code":error.code}),
+            None => json!({"ready":false}),
+        };
+    }
     if let Some(authorization) = graph_authorization(
         document_graph_needs_consent,
         code_graph_needs_consent,

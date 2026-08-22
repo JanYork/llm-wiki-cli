@@ -211,6 +211,8 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
         "
     ))?;
     create_temporal_memory_schema(&tx)?;
+    create_todo_schema(&tx)?;
+    create_plan_schema(&tx)?;
     create_changeset_state(&tx)?;
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('schema', ?1)",
@@ -344,12 +346,14 @@ fn validate_store_read_only(conn: &Connection) -> Result<()> {
             'retrieval_feedback', 'changesets', 'search_fts', 'search_spans',
             'span_fts', 'semantic_relations', 'memory_events', 'memory_fragments',
             'memory_changes', 'memory_evidence', 'memory_relations', 'memory_feedback',
-            'memory_hint_state', 'memory_state', 'memory_fts'
+            'memory_hint_state', 'memory_state', 'memory_fts',
+            'todo_items', 'todo_tags', 'todo_fts', 'plans', 'plan_tags',
+            'plan_constraints', 'plan_steps', 'plan_history', 'plan_fts'
          )",
         [],
         |row| row.get(0),
     )?;
-    if essential_tables != 25 {
+    if essential_tables != 34 {
         return Err(AppError::new(
             "corrupt_store",
             "wiki database schema is incomplete",
@@ -433,6 +437,15 @@ fn validate_store(conn: &Connection) -> Result<()> {
         "SELECT candidate_key, hint_type, last_emitted_at, next_eligible_at FROM memory_hint_state LIMIT 0",
         "SELECT id, record_attempts, inserted_events, idempotent_replays, feedback_useful, feedback_not_useful, age_evictions, capacity_evictions, event_count, logical_bytes FROM memory_state LIMIT 0",
         "SELECT rowid, event_id, event_type, context_terms, content_terms FROM memory_fts LIMIT 0",
+        "SELECT id, request_id, fingerprint, title, cue, detail, state, result, cancel_reason, revision, created_at, updated_at, closed_at, parent_id, target_at FROM todo_items LIMIT 0",
+        "SELECT todo_id, tag_name FROM todo_tags LIMIT 0",
+        "SELECT rowid, todo_id, title_terms, tag_terms, cue_terms, detail_terms FROM todo_fts LIMIT 0",
+        "SELECT id, request_id, fingerprint, title, objective, done_when, state, result, completion_evidence, done_when_checked, abandoned_reason, revision, created_at, updated_at, closed_at FROM plans LIMIT 0",
+        "SELECT plan_id, tag_name FROM plan_tags LIMIT 0",
+        "SELECT plan_id, ordinal, value FROM plan_constraints LIMIT 0",
+        "SELECT plan_id, step_id, ordinal, title, status, verify, result, blocker, created_revision, updated_revision, created_at, updated_at FROM plan_steps LIMIT 0",
+        "SELECT id, plan_id, revision, action, reason, step_id, result, created_at FROM plan_history LIMIT 0",
+        "SELECT rowid, plan_id, title_terms, tag_terms, objective_terms, constraint_terms, step_terms FROM plan_fts LIMIT 0",
     ] {
         conn.prepare(sql).map_err(|error| {
             AppError::new(

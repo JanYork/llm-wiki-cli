@@ -967,6 +967,40 @@ UTF-8 source windows, ingest completion gates, graph precision, migrations,
 lint, and WAL compaction. See [benchmarks/README.md](benchmarks/README.md) for
 the workload contract and fair before/after comparison rules.
 
+## Durable Todo and current Plan
+
+LWC keeps deferred work and current execution state as separate durable records:
+
+```bash
+lwc config set --todo enabled --plan enabled
+lwc todo add "verify package before release" --tag release --cue "when preparing a release" --target-at 2030-01-02T09:00:00+08:00
+lwc todo add "verify signatures" --parent TODO_ID
+lwc todo list --limit 20
+lwc plan create "ship release" --objective "publish safely" --done-when "release checks pass" --step "run checks" --step "publish"
+lwc plan current --limit 20
+lwc plan brief PLAN_ID
+```
+
+Both capabilities are opt-in and independently configurable. Their commands return
+`todo_disabled` or `plan_disabled` until enabled. The lifecycle Hook omits each
+capability unless it is enabled. With Plan enabled, it also tracks the most recently
+updated active Plan using bounded progress, current-step, next-step, revision, and
+`plan brief` metadata so an Agent can resume the plan after lifecycle boundaries.
+With Todo enabled, the Hook also includes the three oldest-created open Todos whose
+RFC3339 `target_at` has arrived and an exact omitted count. Reminder entries expose only
+a bounded title, ID, direct parent ID, and target time; cue/detail text stays out.
+
+`--parent TODO_ID` creates one direct child for organization; it does not cascade state,
+create dependencies, or convert children into Plan steps. Filter direct children with
+`todo list/search --parent TODO_ID`. Reschedule with `todo update --target-at ...` or
+remove the time with `--clear-target-at`.
+
+Mutations of existing records require the revision returned by `show` or `brief` via
+`--if-revision`. Todo and Plan never convert into each other automatically. Their list
+and search commands support `--scope all`; exact reads and writes require project or
+global scope. See [the Agent workflow](docs/agent-workflow.md#todo-and-plan) and the
+`using-todo` / `using-plan` Skills.
+
 ## Limits and Non-Goals
 
 Current design constraints:

@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const CONFIG_VERSION: u32 = 5;
+pub const CONFIG_VERSION: u32 = 6;
 pub const DEFAULT_TRANS_TIMEOUT_SECONDS: u16 = 120;
 pub const MIN_TRANS_TIMEOUT_SECONDS: u16 = 1;
 pub const MAX_TRANS_TIMEOUT_SECONDS: u16 = 900;
@@ -44,6 +44,14 @@ pub enum OfficeSetting {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum MemorySetting {
+    Disabled,
+    Enabled,
+    Inherit,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapabilitySetting {
     Disabled,
     Enabled,
     Inherit,
@@ -92,6 +100,10 @@ pub struct ConfigFile {
     pub office: OfficeSetting,
     #[serde(default = "default_memory")]
     pub memory: MemorySettings,
+    #[serde(default = "inherit_capability")]
+    pub todo: CapabilitySetting,
+    #[serde(default = "inherit_capability")]
+    pub plan: CapabilitySetting,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -123,12 +135,20 @@ pub struct EffectiveMemoryConfig {
     pub max_bytes: u64,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EffectiveCapabilityConfig {
+    pub setting: CapabilitySetting,
+    pub origin: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ConfigPatch {
     pub graph: Option<GraphSetting>,
     pub trans: Option<TransSettings>,
     pub office: Option<OfficeSetting>,
     pub memory: Option<MemorySettings>,
+    pub todo: Option<CapabilitySetting>,
+    pub plan: Option<CapabilitySetting>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -161,6 +181,20 @@ struct ConfigFileV4 {
     pub office: OfficeSetting,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ConfigFileV5 {
+    pub version: u32,
+    #[serde(default = "default_graph")]
+    pub graph: GraphSettings,
+    #[serde(default = "default_trans")]
+    pub trans: TransSettings,
+    #[serde(default = "default_office")]
+    pub office: OfficeSetting,
+    #[serde(default = "default_memory")]
+    pub memory: MemorySettings,
+}
+
 fn inherit_graph() -> GraphSetting {
     GraphSetting::Inherit
 }
@@ -171,6 +205,10 @@ fn inherit_trans() -> TransSetting {
 
 fn inherit_memory() -> MemorySetting {
     MemorySetting::Inherit
+}
+
+fn inherit_capability() -> CapabilitySetting {
+    CapabilitySetting::Inherit
 }
 
 fn default_graph() -> GraphSettings {
@@ -220,6 +258,8 @@ impl Default for ConfigFile {
             trans: default_trans(),
             office: default_office(),
             memory: default_memory(),
+            todo: inherit_capability(),
+            plan: inherit_capability(),
         }
     }
 }
@@ -270,6 +310,18 @@ pub fn parse_memory_setting(value: &str) -> Result<MemorySetting> {
         _ => Err(AppError::new(
             "invalid_memory_setting",
             format!("unsupported memory setting '{value}'; use disabled, enabled, or inherit"),
+        )),
+    }
+}
+
+pub fn parse_capability_setting(name: &str, value: &str) -> Result<CapabilitySetting> {
+    match value {
+        "disabled" => Ok(CapabilitySetting::Disabled),
+        "enabled" => Ok(CapabilitySetting::Enabled),
+        "inherit" => Ok(CapabilitySetting::Inherit),
+        _ => Err(AppError::new(
+            "invalid_capability_setting",
+            format!("unsupported {name} setting '{value}'; use disabled, enabled, or inherit"),
         )),
     }
 }
@@ -365,6 +417,8 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                     trans: default_trans(),
                     office: default_office(),
                     memory: default_memory(),
+                    todo: inherit_capability(),
+                    plan: inherit_capability(),
                 });
             }
             if version == 3 {
@@ -377,6 +431,8 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                     trans: legacy.trans,
                     office: default_office(),
                     memory: default_memory(),
+                    todo: inherit_capability(),
+                    plan: inherit_capability(),
                 });
             }
             if version == 4 {
@@ -389,6 +445,22 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                     trans: legacy.trans,
                     office: legacy.office,
                     memory: default_memory(),
+                    todo: inherit_capability(),
+                    plan: inherit_capability(),
+                });
+            }
+            if version == 5 {
+                let legacy: ConfigFileV5 = serde_json::from_value(value).map_err(|error| {
+                    AppError::new("invalid_config", format!("invalid config: {error}"))
+                })?;
+                return validate_config_file(ConfigFile {
+                    version: CONFIG_VERSION,
+                    graph: legacy.graph,
+                    trans: legacy.trans,
+                    office: legacy.office,
+                    memory: legacy.memory,
+                    todo: inherit_capability(),
+                    plan: inherit_capability(),
                 });
             }
             if version != u64::from(CONFIG_VERSION) {
@@ -516,6 +588,45 @@ pub fn resolve_memory(scope: &str, database: &Path) -> Result<EffectiveMemoryCon
     Ok(effective)
 }
 
+fn resolve_capability(
+    scope: &str,
+    database: &Path,
+    select: fn(&ConfigFile) -> CapabilitySetting,
+) -> Result<EffectiveCapabilityConfig> {
+    let mut effective = EffectiveCapabilityConfig {
+        setting: CapabilitySetting::Disabled,
+        origin: "built-in".to_owned(),
+    };
+    if let Some(path) = global_config_path() {
+        let setting = select(&load_file(&path)?);
+        if setting != CapabilitySetting::Inherit {
+            effective = EffectiveCapabilityConfig {
+                setting,
+                origin: "global".to_owned(),
+            };
+        }
+    }
+    if scope == "project" {
+        let setting = select(&load_file(&config_path_for_database(database)?)?);
+        if setting != CapabilitySetting::Inherit {
+            effective = EffectiveCapabilityConfig {
+                setting,
+                origin: "project".to_owned(),
+            };
+        }
+    }
+    Ok(effective)
+}
+pub fn resolve_todo(scope: &str, database: &Path) -> Result<EffectiveCapabilityConfig> {
+    resolve_capability(scope, database, |config| config.todo)
+}
+pub fn resolve_plan(scope: &str, database: &Path) -> Result<EffectiveCapabilityConfig> {
+    resolve_capability(scope, database, |config| config.plan)
+}
+pub fn inherit_capability_setting() -> CapabilitySetting {
+    CapabilitySetting::Inherit
+}
+
 pub fn build_trans_settings(
     database: &Path,
     setting: TransSetting,
@@ -619,6 +730,12 @@ pub fn update(database: &Path, patch: ConfigPatch) -> Result<(PathBuf, ConfigFil
     if let Some(memory) = patch.memory {
         config.memory = memory;
     }
+    if let Some(todo) = patch.todo {
+        config.todo = todo;
+    }
+    if let Some(plan) = patch.plan {
+        config.plan = plan;
+    }
     validate_config_file(config.clone())?;
     let bytes = serde_json::to_vec_pretty(&config)
         .map_err(|error| AppError::new("json_error", error.to_string()))?;
@@ -721,6 +838,8 @@ pub fn response(scope: &str, database: &Path) -> Result<Value> {
     let trans = resolve_trans(scope, database)?;
     let office = resolve_office()?;
     let memory = resolve_memory(scope, database)?;
+    let todo = resolve_todo(scope, database)?;
+    let plan = resolve_plan(scope, database)?;
     Ok(json!({
         "scope": scope,
         "path": config_path_for_database(database)?,
@@ -728,5 +847,7 @@ pub fn response(scope: &str, database: &Path) -> Result<Value> {
         "trans": trans,
         "office": office,
         "memory": memory,
+        "todo":todo,
+        "plan":plan,
     }))
 }

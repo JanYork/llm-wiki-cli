@@ -467,6 +467,46 @@ fn agent_install_bundles_temporal_memory_reference_byte_identically() {
         )
         .unwrap()
     );
+    for skill in ["using-todo", "using-plan"] {
+        assert_eq!(
+            fs::read(
+                world
+                    .home
+                    .join(".agents/skills")
+                    .join(skill)
+                    .join("SKILL.md")
+            )
+            .unwrap(),
+            fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("skills")
+                    .join(skill)
+                    .join("SKILL.md")
+            )
+            .unwrap()
+        );
+    }
+    world.ok(&[
+        "agent",
+        "uninstall",
+        "--target",
+        "codex",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    assert!(
+        !world
+            .home
+            .join(".agents/skills/using-todo/SKILL.md")
+            .exists()
+    );
+    assert!(
+        !world
+            .home
+            .join(".agents/skills/using-plan/SKILL.md")
+            .exists()
+    );
 }
 
 #[cfg(unix)]

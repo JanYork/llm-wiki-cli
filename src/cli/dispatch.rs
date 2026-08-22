@@ -12,6 +12,8 @@ fn run(cli: Cli) -> Result<Value> {
             | Command::View { .. }
             | Command::Trans { .. }
             | Command::Agent { .. }
+            | Command::Todo { .. }
+            | Command::Plan { .. }
     ) {
         let paths = if cli.scope == Scope::All {
             resolve_live_read_store_paths(cli.scope, &cwd, true)?
@@ -616,6 +618,49 @@ fn run(cli: Cli) -> Result<Value> {
                 }
             }
         }
+        Command::Todo { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "todo")?;
+            if cli.scope != Scope::All {
+                let path = resolve_live_store_path(cli.scope, &cwd)?;
+                require_capability("todo", &path)?;
+            }
+            match command {
+                TodoCommand::Add { title,tags,cue,detail,parent,target_at,request_id,json } => {
+                    ensure_scope_supported(cli.scope,false,"todo add")?; let path=resolve_live_store_path(cli.scope,&cwd)?;
+                    let input=if let Some(raw)=json { let raw=read_memory_json(&path,&cwd,&raw)?; serde_json::from_str::<store::TodoCreateInput>(&raw).map_err(|e|AppError::new("invalid_input",format!("invalid Todo JSON: {e}")))? } else { store::TodoCreateInput{title:title.ok_or_else(||AppError::new("invalid_input","title is required unless --json is used"))?,tags,cue,detail,parent_id:parent,target_at,request_id} };
+                    Store::open(scope_name(path.scope),&path.path)?.todo_add(input)
+                }
+                TodoCommand::List { state,tag,parent,limit,offset } => {
+                    validate_limit(limit)?; let state=state.as_deref().or(Some("open")); let paths=resolve_live_read_store_paths(cli.scope,&cwd,true)?; let mut todos=Vec::new(); let mut enabled=false; for path in paths { if capability_enabled("todo",&path)? { enabled=true; todos.extend(Store::open_for_read(scope_name(path.scope),&path.path)?.todo_query(None,state,tag.as_deref(),parent.as_deref(),limit+offset,0)?); } } if !enabled { return Err(capability_disabled("todo")); } todos.sort_by(|a,b|b["updated_at"].as_str().cmp(&a["updated_at"].as_str()).then_with(||a["scope"].as_str().cmp(&b["scope"].as_str())).then_with(||a["id"].as_str().cmp(&b["id"].as_str()))); let todos=todos.into_iter().skip(offset).take(limit).collect::<Vec<_>>(); Ok(json!({"returned":todos.len(),"todos":todos}))
+                }
+                TodoCommand::Search { query,state,tag,parent,limit,offset } => { require_text("query",&query)?;validate_limit(limit)?;let paths=resolve_live_read_store_paths(cli.scope,&cwd,true)?;let mut todos=Vec::new();let mut enabled=false;for path in paths{if capability_enabled("todo",&path)?{enabled=true;todos.extend(Store::open_for_read(scope_name(path.scope),&path.path)?.todo_query(Some(&query),state.as_deref(),tag.as_deref(),parent.as_deref(),limit+offset,0)?)}}if !enabled{return Err(capability_disabled("todo"));}todos.sort_by(|a,b|b["updated_at"].as_str().cmp(&a["updated_at"].as_str()).then_with(||a["id"].as_str().cmp(&b["id"].as_str())));let todos=todos.into_iter().skip(offset).take(limit).collect::<Vec<_>>();Ok(json!({"returned":todos.len(),"todos":todos})) }
+                TodoCommand::Show { todo_id } => {ensure_scope_supported(cli.scope,false,"todo show")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open_for_read(scope_name(p.scope),&p.path)?.todo_show(&todo_id)}
+                TodoCommand::Update { todo_id,if_revision,title,cue,clear_cue,detail,clear_detail,target_at,clear_target_at,add_tags,remove_tags } => {ensure_scope_supported(cli.scope,false,"todo update")?;let p=resolve_live_store_path(cli.scope,&cwd)?;let input=store::TodoUpdateInput{title,cue:if clear_cue{Some(None)}else{cue.map(Some)},detail:if clear_detail{Some(None)}else{detail.map(Some)},target_at:if clear_target_at{Some(None)}else{target_at.map(Some)},add_tags,remove_tags};Store::open(scope_name(p.scope),&p.path)?.todo_update(&todo_id,if_revision,input)}
+                TodoCommand::Done { todo_id,if_revision,result } => {ensure_scope_supported(cli.scope,false,"todo done")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.todo_transition(&todo_id,if_revision,"done",Some(&result))}
+                TodoCommand::Cancel { todo_id,if_revision,reason } => {ensure_scope_supported(cli.scope,false,"todo cancel")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.todo_transition(&todo_id,if_revision,"cancelled",Some(&reason))}
+                TodoCommand::Reopen { todo_id,if_revision } => {ensure_scope_supported(cli.scope,false,"todo reopen")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.todo_transition(&todo_id,if_revision,"open",None)}
+            }
+        }
+        Command::Plan { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "plan")?;
+            if cli.scope != Scope::All {
+                let path = resolve_live_store_path(cli.scope, &cwd)?;
+                require_capability("plan", &path)?;
+            }
+            match command {
+                PlanCommand::Create { title,objective,done_when,tags,constraints,steps,request_id,json } => {ensure_scope_supported(cli.scope,false,"plan create")?;let p=resolve_live_store_path(cli.scope,&cwd)?;let input=if let Some(raw)=json{let raw=read_memory_json(&p,&cwd,&raw)?;serde_json::from_str::<store::PlanCreateInput>(&raw).map_err(|e|AppError::new("invalid_input",format!("invalid Plan JSON: {e}")))?}else{store::PlanCreateInput{title:title.ok_or_else(||AppError::new("invalid_input","title is required"))?,objective:objective.ok_or_else(||AppError::new("invalid_input","--objective is required"))?,done_when:done_when.ok_or_else(||AppError::new("invalid_input","--done-when is required"))?,tags,constraints,steps:steps.into_iter().map(|title|store::PlanStepInput{title,verify:None}).collect(),request_id}};Store::open(scope_name(p.scope),&p.path)?.plan_create(input)}
+                PlanCommand::Current { tag,limit,offset } => plan_list_response(cli.scope,&cwd,None,Some("active"),tag.as_deref(),limit,offset),
+                PlanCommand::List { state,tag,limit,offset } => plan_list_response(cli.scope,&cwd,None,state.as_deref(),tag.as_deref(),limit,offset),
+                PlanCommand::Search { query,state,tag,limit,offset } => {require_text("query",&query)?;plan_list_response(cli.scope,&cwd,Some(&query),state.as_deref(),tag.as_deref(),limit,offset)},
+                PlanCommand::Show { plan_id } => {ensure_scope_supported(cli.scope,false,"plan show")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open_for_read(scope_name(p.scope),&p.path)?.plan_show(&plan_id)}
+                PlanCommand::Brief { plan_id } => {ensure_scope_supported(cli.scope,false,"plan brief")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open_for_read(scope_name(p.scope),&p.path)?.plan_brief(&plan_id)}
+                PlanCommand::Advance { plan_id,if_revision,done,result,next } => {ensure_scope_supported(cli.scope,false,"plan advance")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.plan_advance(&plan_id,if_revision,&done,&result,next.as_deref())}
+                PlanCommand::Block { plan_id,if_revision,step,reason } => {ensure_scope_supported(cli.scope,false,"plan block")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.plan_block(&plan_id,if_revision,&step,&reason)}
+                PlanCommand::Revise { plan_id,if_revision,reason,json } => {ensure_scope_supported(cli.scope,false,"plan revise")?;let p=resolve_live_store_path(cli.scope,&cwd)?;let raw=read_memory_json(&p,&cwd,&json)?;let input=serde_json::from_str::<store::PlanReviseInput>(&raw).map_err(|e|AppError::new("invalid_input",format!("invalid Plan revision JSON: {e}")))?;Store::open(scope_name(p.scope),&p.path)?.plan_revise(&plan_id,if_revision,&reason,input)}
+                PlanCommand::Complete { plan_id,if_revision,result,evidence,done_when_checked } => {ensure_scope_supported(cli.scope,false,"plan complete")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.plan_finish(&plan_id,if_revision,true,Some(&result),Some(&evidence),done_when_checked,None)}
+                PlanCommand::Abandon { plan_id,if_revision,reason } => {ensure_scope_supported(cli.scope,false,"plan abandon")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.plan_finish(&plan_id,if_revision,false,None,None,false,Some(&reason))}
+            }
+        }
         Command::Load { command } => match command {
             LoadCommand::Tag { tag, limit } => {
                 if !(1..=100).contains(&limit) {
@@ -905,6 +950,8 @@ fn run(cli: Cli) -> Result<Value> {
                     trans,
                     office,
                     memory,
+                    todo,
+                    plan,
                     memory_max_age_days,
                     memory_max_bytes,
                     trans_timeout,
@@ -914,10 +961,12 @@ fn run(cli: Cli) -> Result<Value> {
                         && trans.is_none()
                         && office.is_none()
                         && memory.is_none()
+                        && todo.is_none()
+                        && plan.is_none()
                     {
                         return Err(AppError::new(
                             "invalid_input",
-                            "config set requires --graph, --trans, --memory, or --office",
+                            "config set requires --graph, --trans, --memory, --todo, --plan, or --office",
                         ));
                     }
                     if office.is_some() && cli.scope != Scope::Global {
@@ -967,6 +1016,8 @@ fn run(cli: Cli) -> Result<Value> {
                         )?),
                         None => None,
                     };
+                    let todo_setting=todo.as_deref().map(|value|config::parse_capability_setting("todo",value)).transpose()?;
+                    let plan_setting=plan.as_deref().map(|value|config::parse_capability_setting("plan",value)).transpose()?;
                     config::update(
                         &store_path.path,
                         config::ConfigPatch {
@@ -974,6 +1025,8 @@ fn run(cli: Cli) -> Result<Value> {
                             trans: trans_setting,
                             office: office_setting,
                             memory: memory_setting,
+                            todo:todo_setting,
+                            plan:plan_setting,
                         },
                     )?;
                     Store::open(scope_name(store_path.scope), &store_path.path)?;
@@ -998,11 +1051,13 @@ fn run(cli: Cli) -> Result<Value> {
                     graph,
                     trans,
                     memory,
+                    todo,
+                    plan,
                 } => {
-                    if !graph && !trans && !memory {
+                    if !graph && !trans && !memory && !todo && !plan {
                         return Err(AppError::new(
                             "invalid_input",
-                            "config unset requires --graph, --trans, or --memory",
+                            "config unset requires --graph, --trans, --memory, --todo, or --plan",
                         ));
                     }
                     config::update(
@@ -1012,6 +1067,8 @@ fn run(cli: Cli) -> Result<Value> {
                             trans: trans.then_some(config::inherit_trans_settings()),
                             office: None,
                             memory: memory.then_some(config::inherit_memory_settings()),
+                            todo:todo.then_some(config::inherit_capability_setting()),
+                            plan:plan.then_some(config::inherit_capability_setting()),
                         },
                     )?;
                     Store::open(scope_name(store_path.scope), &store_path.path)?;

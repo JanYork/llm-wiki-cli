@@ -1,0 +1,4 @@
+interface:
+  display_name: "LWC Todo"
+  short_description: "Durable deferred-work backlog"
+  default_prompt: "Use $using-todo to capture or resume durable deferred work with explicit revisions."

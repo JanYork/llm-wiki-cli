@@ -37,6 +37,14 @@ fn materialize_wiki_if_live(store: &mut Store, selected_changeset: Option<&str>)
     Ok(())
 }
 
+fn plan_list_response(scope:Scope,cwd:&Path,query:Option<&str>,state:Option<&str>,tag:Option<&str>,limit:usize,offset:usize)->Result<Value>{
+    validate_limit(limit)?;let paths=resolve_live_read_store_paths(scope,cwd,true)?;let mut plans=Vec::new();let mut enabled=false;for path in paths{if capability_enabled("plan",&path)?{enabled=true;plans.extend(Store::open_for_read(scope_name(path.scope),&path.path)?.plan_query(query,state,tag,limit+offset,0)?)}}if !enabled{return Err(capability_disabled("plan"))}plans.sort_by(|a,b|b["updated_at"].as_str().cmp(&a["updated_at"].as_str()).then_with(||a["scope"].as_str().cmp(&b["scope"].as_str())).then_with(||a["id"].as_str().cmp(&b["id"].as_str())));let plans=plans.into_iter().skip(offset).take(limit).collect::<Vec<_>>();Ok(json!({"returned":plans.len(),"plans":plans}))
+}
+
+fn capability_enabled(name:&str,path:&StorePath)->Result<bool>{let setting=match name{"todo"=>config::resolve_todo(scope_name(path.scope),&path.path)?.setting,"plan"=>config::resolve_plan(scope_name(path.scope),&path.path)?.setting,_=>unreachable!()};Ok(setting==config::CapabilitySetting::Enabled)}
+fn capability_disabled(name:&'static str)->AppError{AppError::new(if name=="todo"{"todo_disabled"}else{"plan_disabled"},format!("{name} capability is disabled; enable it with `lwc config set --{name} enabled`"))}
+fn require_capability(name:&'static str,path:&StorePath)->Result<()> {if capability_enabled(name,path)?{Ok(())}else{Err(capability_disabled(name))}}
+
 fn read_utf8(path: &Path, allow_stdin: bool) -> Result<String> {
     let bytes = if path == Path::new("-") {
         if !allow_stdin {

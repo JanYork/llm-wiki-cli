@@ -27,19 +27,17 @@ function files(directory) {
   return found;
 }
 
-test("canonical LWC Skill is bundled identically for every native plugin", () => {
-  const canonical = join(root, "skills/using-lwc");
-  const expected = files(canonical);
-  assert.ok(expected.includes("references/temporal-memory.md"));
-  for (const integration of ["codex-lwc", "claude-lwc", "pi-lwc"]) {
-    const copy = join(root, `integrations/${integration}/skills/using-lwc`);
-    assert.deepEqual(files(copy), expected, integration);
-    for (const file of expected) {
-      assert.deepEqual(
-        readFileSync(join(copy, file)),
-        readFileSync(join(canonical, file)),
-        `${integration}/${file}`,
-      );
+test("canonical LWC Skills are bundled identically for every native plugin", () => {
+  for (const skill of ["using-lwc", "using-todo", "using-plan"]) {
+    const canonical = join(root, `skills/${skill}`);
+    const expected = files(canonical);
+    if (skill === "using-lwc") assert.ok(expected.includes("references/temporal-memory.md"));
+    for (const integration of ["codex-lwc", "claude-lwc", "pi-lwc"]) {
+      const copy = join(root, `integrations/${integration}/skills/${skill}`);
+      assert.deepEqual(files(copy), expected, `${integration}/${skill}`);
+      for (const file of expected) {
+        assert.deepEqual(readFileSync(join(copy, file)), readFileSync(join(canonical, file)), `${integration}/${skill}/${file}`);
+      }
     }
   }
 });

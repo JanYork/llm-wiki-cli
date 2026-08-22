@@ -113,6 +113,25 @@ fn drop_temporal_schema_to_v13(database: &Path) {
     let conn = Connection::open(database).unwrap();
     conn.execute_batch(
         "PRAGMA foreign_keys = OFF;
+         DROP TABLE IF EXISTS todo_fts;
+         DROP TABLE IF EXISTS todo_fts_data;
+         DROP TABLE IF EXISTS todo_fts_idx;
+         DROP TABLE IF EXISTS todo_fts_content;
+         DROP TABLE IF EXISTS todo_fts_docsize;
+         DROP TABLE IF EXISTS todo_fts_config;
+         DROP TABLE IF EXISTS todo_tags;
+         DROP TABLE IF EXISTS todo_items;
+         DROP TABLE IF EXISTS plan_fts;
+         DROP TABLE IF EXISTS plan_fts_data;
+         DROP TABLE IF EXISTS plan_fts_idx;
+         DROP TABLE IF EXISTS plan_fts_content;
+         DROP TABLE IF EXISTS plan_fts_docsize;
+         DROP TABLE IF EXISTS plan_fts_config;
+         DROP TABLE IF EXISTS plan_history;
+         DROP TABLE IF EXISTS plan_steps;
+         DROP TABLE IF EXISTS plan_constraints;
+         DROP TABLE IF EXISTS plan_tags;
+         DROP TABLE IF EXISTS plans;
          DROP TABLE IF EXISTS memory_fts;
          DROP TABLE IF EXISTS memory_fts_data;
          DROP TABLE IF EXISTS memory_fts_idx;
@@ -220,7 +239,7 @@ fn memory_config_is_layered_validated_and_unsettable() {
 
     world.ok(&["config", "set", "--memory", "enabled"]);
     let stored: Value = serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
-    assert_eq!(stored["version"], 5);
+    assert_eq!(stored["version"], 6);
     assert_eq!(stored["memory"]["setting"], "enabled");
 }
 
@@ -271,7 +290,7 @@ fn version_13_store_migrates_temporal_tables_transactionally() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!((version, format.as_str()), (14, "14"));
+    assert_eq!((version, format.as_str()), (16, "16"));
 
     let mut statement = conn
         .prepare(

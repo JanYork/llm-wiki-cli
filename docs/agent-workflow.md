@@ -497,6 +497,40 @@ SQLite file by itself.
 
 ## Mutation recovery
 
+## Todo and Plan
+
+Use Todo for independent future/deferred work and Plan for the current coarse execution
+plan. Do not cross-write or automatically convert them.
+
+Todo and Plan are independently opt-in. Check `lwc config show` first and continue only
+when the relevant effective setting is `enabled`. Enabling one does not enable the
+other; use `lwc config set --todo enabled` or `lwc config set --plan enabled`. A Skill
+trigger is not consent to change configuration.
+
+For Todo, discover with `todo list/search`, inspect with `todo show`, then pass the
+returned revision to `update`, `done`, `cancel`, or `reopen`. For Plan, resume with the
+bounded `plan brief`, then use the returned revision for `advance`, `block`, `revise`,
+`complete`, or `abandon`. Completion requires terminal steps, a result, evidence, and
+the explicit `--done-when-checked` flag. Revision conflicts require a reload and
+reconciliation; never retry a stale write blindly.
+
+Todo may carry an RFC3339 `target_at`; set it with `todo add/update --target-at` and
+remove it with `todo update --clear-target-at`. `--parent TODO_ID` creates one direct,
+immutable parent relation. Use `todo list/search --parent TODO_ID` for direct children.
+Parentage is organization only: no recursive tree expansion, state cascade, dependency,
+reparenting, or Plan-step conversion is implied.
+
+Lifecycle Hook readiness exposes only enabled capabilities. `todo` and `plan` are
+separate top-level objects. For Plan, `plan.tracking`
+selects the most recently updated active Plan and includes bounded title, progress,
+current step, next step, revision, and an exact `plan brief` command. Treat it as a
+continuity cue, then call `brief` before mutation. It omits objective, done criteria,
+constraints, verification text, results, blockers, evidence, and Todo cue/detail text;
+the Hook never mutates task state.
+For Todo, `todo.reminders` appears only when Todo is enabled and due open items exist.
+It contains at most the three oldest-created due items and `omitted_reminders`; each
+entry is limited to ID, bounded title, direct parent ID, and normalized target time.
+
 Use a changeset for a multi-source ingest or broad replacement of existing
 pages. Its successful commit creates the pre-change checkpoint automatically.
 For a large one-command mutation or maintenance operation that cannot use a

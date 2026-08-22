@@ -118,6 +118,26 @@ const SKILL_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../skills/using-lwc/scripts/install-lwc.sh"),
     ),
 ];
+const TODO_SKILL_FILES: &[(&str, &[u8])] = &[
+    (
+        "SKILL.md",
+        include_bytes!("../../skills/using-todo/SKILL.md"),
+    ),
+    (
+        "agents/openai.yaml",
+        include_bytes!("../../skills/using-todo/agents/openai.yaml"),
+    ),
+];
+const PLAN_SKILL_FILES: &[(&str, &[u8])] = &[
+    (
+        "SKILL.md",
+        include_bytes!("../../skills/using-plan/SKILL.md"),
+    ),
+    (
+        "agents/openai.yaml",
+        include_bytes!("../../skills/using-plan/agents/openai.yaml"),
+    ),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1050,10 +1070,21 @@ pub(super) fn all_paths(paths: &TargetPaths) -> Vec<PathBuf> {
     paths_out
 }
 
-fn skill_files<'a>(root: &'a Path) -> impl Iterator<Item = (PathBuf, &'static [u8])> + 'a {
-    SKILL_FILES
-        .iter()
-        .map(move |(relative, bytes)| (root.join(relative), *bytes))
+fn skill_files(root: &Path) -> impl Iterator<Item = (PathBuf, &'static [u8])> {
+    let parent = root.parent().unwrap_or(root);
+    [
+        (root.to_owned(), SKILL_FILES),
+        (parent.join("using-todo"), TODO_SKILL_FILES),
+        (parent.join("using-plan"), PLAN_SKILL_FILES),
+    ]
+    .into_iter()
+    .flat_map(|(dir, files)| {
+        files
+            .iter()
+            .map(move |(relative, bytes)| (dir.join(relative), *bytes))
+    })
+    .collect::<Vec<_>>()
+    .into_iter()
 }
 
 fn install_skill(root: &Path) -> Result<()> {

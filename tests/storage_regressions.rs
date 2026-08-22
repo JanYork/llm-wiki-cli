@@ -70,7 +70,7 @@ fn wal_path(database: &Path) -> PathBuf {
 }
 
 #[test]
-fn new_store_has_v14_tag_schema_constraints_and_cascades() {
+fn new_store_has_v15_tag_schema_constraints_and_cascades() {
     let world = TestWorld::new();
     let initialized = world.ok(&["init"]);
     let database = database_path(&initialized);
@@ -92,7 +92,7 @@ fn new_store_has_v14_tag_schema_constraints_and_cascades() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 16);
     let indexes = {
         let mut statement = conn
             .prepare(
@@ -141,7 +141,26 @@ fn new_store_has_v14_tag_schema_constraints_and_cascades() {
 fn downgrade_tag_schema_to_v12(database: &Path) {
     let conn = Connection::open(database).unwrap();
     conn.execute_batch(
-        "DROP TABLE memory_fts;
+        "DROP TABLE todo_fts;
+         DROP TABLE IF EXISTS todo_fts_data;
+         DROP TABLE IF EXISTS todo_fts_idx;
+         DROP TABLE IF EXISTS todo_fts_content;
+         DROP TABLE IF EXISTS todo_fts_docsize;
+         DROP TABLE IF EXISTS todo_fts_config;
+         DROP TABLE todo_tags;
+         DROP TABLE todo_items;
+         DROP TABLE plan_fts;
+         DROP TABLE IF EXISTS plan_fts_data;
+         DROP TABLE IF EXISTS plan_fts_idx;
+         DROP TABLE IF EXISTS plan_fts_content;
+         DROP TABLE IF EXISTS plan_fts_docsize;
+         DROP TABLE IF EXISTS plan_fts_config;
+         DROP TABLE plan_history;
+         DROP TABLE plan_steps;
+         DROP TABLE plan_constraints;
+         DROP TABLE plan_tags;
+         DROP TABLE plans;
+         DROP TABLE memory_fts;
          DROP TABLE IF EXISTS memory_fts_data;
          DROP TABLE IF EXISTS memory_fts_idx;
          DROP TABLE IF EXISTS memory_fts_content;
@@ -164,7 +183,7 @@ fn downgrade_tag_schema_to_v12(database: &Path) {
 }
 
 #[test]
-fn v12_store_migrates_to_v14_with_existing_pages_untagged() {
+fn v12_store_migrates_to_v15_with_existing_pages_untagged() {
     let world = TestWorld::new();
     let initialized = world.ok(&["init"]);
     let database = database_path(&initialized);
@@ -183,7 +202,7 @@ fn v12_store_migrates_to_v14_with_existing_pages_untagged() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!((version, format.as_str()), (14, "14"));
+    assert_eq!((version, format.as_str()), (16, "16"));
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM page_tags", [], |row| row
             .get::<_, i64>(0))
@@ -229,7 +248,7 @@ fn failed_v13_migration_leaves_v12_unchanged_and_can_retry() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 16);
 }
 
 #[test]
@@ -286,7 +305,7 @@ fn new_store_uses_contentless_search_fts_and_keeps_identifiers_readable() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 16);
     for table in [
         "retrieval_weights",
         "retrieval_feedback",

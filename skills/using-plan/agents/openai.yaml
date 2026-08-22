@@ -1,0 +1,4 @@
+interface:
+  display_name: "LWC Plan"
+  short_description: "Durable current execution plan"
+  default_prompt: "Use $using-plan to resume and update the current plan through explicit milestones."

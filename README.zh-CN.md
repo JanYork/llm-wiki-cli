@@ -871,6 +871,37 @@ cargo test --test search_benchmark -- --ignored --nocapture
 来源窗口、ingest 完成门禁、图关系精度、迁移、lint 与 WAL compact。工作负载约定
 和公平前后对比规则见 [benchmarks/README.md](benchmarks/README.md)。
 
+## 持久 Todo 与当前 Plan
+
+LWC 将延期事项与当前执行状态保存为两类彼此独立的持久记录：
+
+```bash
+lwc config set --todo enabled --plan enabled
+lwc todo add "发布前验证包" --tag release --cue "准备发布时" --target-at 2030-01-02T09:00:00+08:00
+lwc todo add "验证签名" --parent TODO_ID
+lwc todo list --limit 20
+lwc plan create "完成发布" --objective "安全发布" --done-when "发布检查通过" --step "运行检查" --step "发布"
+lwc plan current --limit 20
+lwc plan brief PLAN_ID
+```
+
+两项能力均默认关闭，并且可以分别启用。启用前，命令会返回 `todo_disabled` 或
+`plan_disabled`；生命周期 Hook 也只会附带已启用能力的计数与发现命令。
+启用 Plan 后，Hook 还会有界追踪最近更新的 active Plan：进度、当前步骤、下一步骤、
+revision 和 `plan brief` 命令，让 Agent 在会话与上下文边界后继续意识到并遵循计划。
+启用 Todo 后，Hook 还会提醒 `target_at` 已到且仍为 open 的 Todo：按创建时间从早到晚
+最多 3 条，并返回精确省略数。提醒只含有界标题、ID、直接父 ID 与目标时间，不泄漏
+cue/detail。
+
+`--parent TODO_ID` 只建立一层直接子 Todo 关系，不级联状态、不创建依赖，也不会把子项
+转成 Plan 步骤。可用 `todo list/search --parent TODO_ID` 筛选直接子项；用
+`todo update --target-at ...` 改期，或用 `--clear-target-at` 清除时间。
+
+修改现有记录时，必须把 `show` 或 `brief` 返回的 revision 通过
+`--if-revision` 传回。Todo 与 Plan 不会自动相互转换。list/search 支持
+`--scope all`，精确读取与写入只支持 project/global。Agent 应分别遵循
+`using-todo` 与 `using-plan` Skill。
+
 ## 限制与非目标
 
 当前设计约束：

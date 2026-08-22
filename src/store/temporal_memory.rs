@@ -110,32 +110,32 @@ fn create_temporal_memory_schema(tx: &Transaction<'_>) -> Result<()> {
 fn migrate_temporal_memory(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current == USER_VERSION {
+    if current >= TEMPORAL_MEMORY_VERSION {
         tx.commit()?;
         return Ok(());
     }
     if current != TAGS_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
-            format!("cannot migrate wiki database version {current} to {USER_VERSION}"),
+            format!("cannot migrate wiki database version {current} to {TEMPORAL_MEMORY_VERSION}"),
         ));
     }
     create_temporal_memory_schema(&tx).map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to prepare v{USER_VERSION} temporal memory schema: {error}"),
+            format!("failed to prepare v{TEMPORAL_MEMORY_VERSION} temporal memory schema: {error}"),
         )
     })?;
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('format_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![USER_VERSION.to_string()],
+        params![TEMPORAL_MEMORY_VERSION.to_string()],
     )?;
-    tx.pragma_update(None, "user_version", USER_VERSION)?;
+    tx.pragma_update(None, "user_version", TEMPORAL_MEMORY_VERSION)?;
     tx.commit().map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to commit v{USER_VERSION} temporal memory migration: {error}"),
+            format!("failed to commit v{TEMPORAL_MEMORY_VERSION} temporal memory migration: {error}"),
         )
     })
 }

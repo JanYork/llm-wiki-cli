@@ -37,7 +37,7 @@ fn attached_store_identity(conn: &Connection) -> Result<StoreIdentity> {
 }
 
 fn validate_changeset_table_inventory(conn: &Connection, schema: &str) -> Result<()> {
-    const TABLES: [&str; 42] = [
+    const TABLES: [&str; 61] = [
         "changesets",
         "ingest_jobs",
         "links",
@@ -61,6 +61,17 @@ fn validate_changeset_table_inventory(conn: &Connection, schema: &str) -> Result
         "page_sources",
         "page_tags",
         "pages",
+        "plan_constraints",
+        "plan_fts",
+        "plan_fts_config",
+        "plan_fts_content",
+        "plan_fts_data",
+        "plan_fts_docsize",
+        "plan_fts_idx",
+        "plan_history",
+        "plan_steps",
+        "plan_tags",
+        "plans",
         "retrieval_feedback",
         "retrieval_weights",
         "search_fts",
@@ -80,6 +91,14 @@ fn validate_changeset_table_inventory(conn: &Connection, schema: &str) -> Result
         "span_fts_docsize",
         "span_fts_idx",
         "tags",
+        "todo_fts",
+        "todo_fts_config",
+        "todo_fts_content",
+        "todo_fts_data",
+        "todo_fts_docsize",
+        "todo_fts_idx",
+        "todo_items",
+        "todo_tags",
     ];
     let sql = format!(
         "SELECT name FROM {schema}.sqlite_schema

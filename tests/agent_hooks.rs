@@ -173,6 +173,242 @@ fn readiness(context: &str) -> Value {
 }
 
 #[test]
+fn separate_todo_and_plan_readiness_tracks_current_plan_without_sensitive_details() {
+    let world = World::new(true);
+    world.ok(&["config", "set", "--todo", "enabled", "--plan", "enabled"]);
+    world.ok(&["todo", "add", "secret todo title"]);
+    let created = world.ok(&[
+        "plan",
+        "create",
+        "tracked release plan",
+        "--objective",
+        "private objective",
+        "--done-when",
+        "verified",
+        "--step",
+        "prepare artifacts",
+        "--step",
+        "run acceptance",
+        "--step",
+        "publish release",
+    ]);
+    let plan = &created["plan"];
+    let plan_id = plan["id"].as_str().unwrap();
+    let first = plan["steps"][0]["id"].as_str().unwrap();
+    let second = plan["steps"][1]["id"].as_str().unwrap();
+    world.ok(&[
+        "plan",
+        "advance",
+        plan_id,
+        "--if-revision",
+        "1",
+        "--done",
+        first,
+        "--result",
+        "artifacts ready",
+        "--next",
+        second,
+    ]);
+    let output = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ],
+        "{}",
+    );
+    let text = context(&output);
+    let value = readiness(&text);
+    assert_eq!(value["todo"]["ready"], true);
+    assert_eq!(value["todo"]["open"], 1);
+    assert_eq!(value["todo"]["list"], "lwc todo list --limit 20");
+    assert_eq!(value["plan"]["ready"], true);
+    assert_eq!(value["plan"]["active"], 1);
+    assert_eq!(value["plan"]["current"], "lwc plan current --limit 20");
+    let tracking = &value["plan"]["tracking"];
+    assert_eq!(tracking["id"], plan_id);
+    assert_eq!(tracking["title"], "tracked release plan");
+    assert_eq!(tracking["revision"], 2);
+    assert_eq!(tracking["progress"]["completed_steps"], 1);
+    assert_eq!(tracking["progress"]["terminal_steps"], 1);
+    assert_eq!(tracking["progress"]["total_steps"], 3);
+    assert_eq!(tracking["current_step"]["title"], "run acceptance");
+    assert_eq!(tracking["current_step"]["status"], "in_progress");
+    assert_eq!(tracking["next_step"]["title"], "publish release");
+    assert_eq!(tracking["brief"], format!("lwc plan brief {plan_id}"));
+    assert!(!text.contains("secret todo title"));
+    assert!(!text.contains("private objective"));
+    assert!(!text.contains("artifacts ready"));
+}
+
+#[test]
+fn todo_and_plan_hook_prompts_only_enabled_capabilities() {
+    let world = World::new(true);
+    let disabled = context(&world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ],
+        "{}",
+    ));
+    assert!(readiness(&disabled).get("todo").is_none());
+    assert!(readiness(&disabled).get("plan").is_none());
+
+    world.ok(&["config", "set", "--todo", "enabled"]);
+    let todo_only = readiness(&context(&world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ],
+        "{}",
+    )));
+    assert_eq!(todo_only["todo"]["open"], 0);
+    assert_eq!(todo_only["todo"]["list"], "lwc todo list --limit 20");
+    assert!(todo_only.get("plan").is_none());
+
+    world.ok(&["config", "set", "--todo", "disabled", "--plan", "enabled"]);
+    let plan_only = readiness(&context(&world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ],
+        "{}",
+    )));
+    assert_eq!(plan_only["plan"]["active"], 0);
+    assert!(plan_only["plan"].get("tracking").is_none());
+    assert!(plan_only.get("todo").is_none());
+}
+
+#[test]
+fn todo_hook_reminds_three_oldest_due_open_items_and_counts_omitted() {
+    let world = World::new(true);
+    world.ok(&["config", "set", "--todo", "enabled"]);
+    let closed = world.ok(&[
+        "todo",
+        "add",
+        "closed due",
+        "--target-at",
+        "2000-01-01T00:00:00Z",
+    ]);
+    let closed_id = closed["todo"]["id"].as_str().unwrap();
+    world.ok(&[
+        "todo",
+        "done",
+        closed_id,
+        "--if-revision",
+        "1",
+        "--result",
+        "closed",
+    ]);
+    let first = world.ok(&[
+        "todo",
+        "add",
+        "due 1",
+        "--target-at",
+        "2000-01-01T00:00:00Z",
+        "--cue",
+        "private cue",
+    ]);
+    let first_id = first["todo"]["id"].as_str().unwrap();
+    for title in ["due 2", "due 3", "due 4", "due 5"] {
+        world.ok(&[
+            "todo",
+            "add",
+            title,
+            "--parent",
+            first_id,
+            "--target-at",
+            "2000-01-01T00:00:00Z",
+        ]);
+    }
+    world.ok(&[
+        "todo",
+        "add",
+        "future",
+        "--target-at",
+        "2999-01-01T00:00:00Z",
+    ]);
+
+    let text = context(&world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ],
+        "{}",
+    ));
+    let todo = &readiness(&text)["todo"];
+    assert_eq!(todo["reminders"].as_array().unwrap().len(), 3);
+    assert_eq!(todo["reminders"][0]["title"], "due 1");
+    assert_eq!(todo["reminders"][1]["title"], "due 2");
+    assert_eq!(todo["reminders"][2]["title"], "due 3");
+    assert_eq!(todo["reminders"][1]["parent_id"], first_id);
+    assert_eq!(todo["omitted_reminders"], 2);
+    assert!(!text.contains("closed due"));
+    assert!(!text.contains("future"));
+    assert!(!text.contains("private cue"));
+}
+
+#[test]
+fn plan_tracking_titles_are_bounded_at_unicode_boundaries() {
+    let world = World::new(true);
+    world.ok(&["config", "set", "--plan", "enabled"]);
+    let long_plan = "计划".repeat(300);
+    let long_step = "步骤".repeat(300);
+    world.ok(&[
+        "plan",
+        "create",
+        &long_plan,
+        "--objective",
+        "bounded tracking",
+        "--done-when",
+        "verified",
+        "--step",
+        &long_step,
+    ]);
+    let readiness = readiness(&context(&world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ],
+        "{}",
+    )));
+    let tracking = &readiness["plan"]["tracking"];
+    assert_eq!(tracking["title"].as_str().unwrap().chars().count(), 500);
+    assert_eq!(
+        tracking["current_step"]["title"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        500
+    );
+    assert!(tracking["title"].as_str().unwrap().ends_with('…'));
+}
+
+#[test]
 fn initialized_codegraph_keeps_consent_when_runtime_is_unavailable() {
     let world = World::new(true);
     let index = world.project.join(".lwc/codegraph");

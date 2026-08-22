@@ -14,4 +14,6 @@ include!("indexing.rs");
 include!("graph_search.rs");
 include!("word_graph.rs");
 include!("tags.rs");
+include!("todo.rs");
+include!("plan.rs");
 include!("tests.rs");
