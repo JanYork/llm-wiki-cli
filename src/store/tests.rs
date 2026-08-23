@@ -1822,6 +1822,69 @@ rg '^[[:space:]]*[[fenced-fake]]'
     }
 
     #[test]
+    fn sync_publish_removes_deleted_source_with_local_path_binding() {
+        let temp = tempdir().unwrap();
+        let mut source = test_store();
+        let removed = source
+            .source_add(SourceAddInput {
+                title: Some("Removed source".to_owned()),
+                origin: "docs/removed.md".to_owned(),
+                tracked_path: Some("docs/removed.md".to_owned()),
+                content: "removed evidence".to_owned(),
+            })
+            .unwrap()
+            .source;
+        let full = temp.path().join("full.db");
+        source.export_sync_state(&full).unwrap();
+
+        let mut target = test_store();
+        let local = target
+            .source_add(SourceAddInput {
+                title: Some("Local binding".to_owned()),
+                origin: "/Users/local/docs/removed.md".to_owned(),
+                tracked_path: Some("docs/removed.md".to_owned()),
+                content: "removed evidence".to_owned(),
+            })
+            .unwrap()
+            .source;
+        let expected = target.identity().unwrap();
+        target
+            .publish_sync_state(&full, &expected, "source-delete-full")
+            .unwrap();
+
+        source.source_remove(removed.id).unwrap();
+        let deleted = temp.path().join("deleted.db");
+        source.export_sync_state(&deleted).unwrap();
+        let expected = target.identity().unwrap();
+        target
+            .publish_sync_state(&deleted, &expected, "source-delete-empty")
+            .unwrap();
+
+        assert_eq!(
+            target
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sources WHERE id=?1",
+                    [local.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            target
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM source_path_revisions WHERE source_id=?1",
+                    [local.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn sync_publish_selects_relation_source_document_with_target_local_id() {
         let temp = tempdir().unwrap();
         let source = populated_sync_source();

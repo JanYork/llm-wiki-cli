@@ -2773,14 +2773,23 @@ fn read_state_with_digest(store: &StorePath, session_id: &str) -> Result<(Sessio
 
 fn read_state_consistent(stores: &[StorePath], session_id: &str) -> Result<SessionState> {
     let mut states = Vec::with_capacity(stores.len());
+    let mut failures = Vec::new();
     for store in stores {
-        states.push(read_state_with_digest(store, session_id).map_err(|error| {
-            AppError::new(
-                "sync_state_conflict",
-                "Sync session receipts are incomplete across requested scopes",
-            )
-            .with_details(json!({"cause": error.code, "scope": store.scope}))
-        })?);
+        match read_state_with_digest(store, session_id) {
+            Ok(state) => states.push(state),
+            Err(error) => failures.push((store.scope, error.code)),
+        }
+    }
+    if states.is_empty() {
+        let (scope, cause) = failures
+            .into_iter()
+            .next()
+            .expect("at least one Sync store");
+        return Err(AppError::new(
+            "sync_state_conflict",
+            "Sync session receipts are incomplete across requested scopes",
+        )
+        .with_details(json!({"cause": cause, "scope": scope})));
     }
     let newest = states
         .iter()
@@ -2803,7 +2812,7 @@ fn read_state_consistent(stores: &[StorePath], session_id: &str) -> Result<Sessi
             })));
         }
     }
-    if states.iter().any(|state| state != &newest) {
+    if !failures.is_empty() || states.iter().any(|state| state != &newest) {
         write_state_copies(stores, &newest.0)?;
     }
     Ok(newest.0)

@@ -1636,6 +1636,45 @@ fn resume_recovers_a_remote_commit_whose_response_was_lost() {
 
 #[cfg(unix)]
 #[test]
+fn resume_rejects_a_stale_remote_commit_receipt_after_remote_changes() {
+    let world = SyncWorld::new();
+    world.install_fake_ssh();
+    world.put_page(&world.local, "local-note", "Local", "local");
+    let remote = world.remote.to_str().unwrap();
+    let first = world.sync(&["sync", "peer", remote, "--mode", "merge"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    let session = first["session_id"].as_str().unwrap();
+    let state_path = world
+        .local
+        .join(".lwc/sync")
+        .join(session)
+        .join("state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    state["phase"] = Value::String("publishing".to_string());
+    state["units"][0]["published_remote"] = Value::Bool(false);
+    state["units"][0]["derived_remote"] = Value::Bool(false);
+    fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    world.put_page(&world.remote, "remote-note-after-sync", "Remote", "later");
+    let resumed = world.sync(&[
+        "sync", "peer", remote, "--mode", "merge", "--resume", session,
+    ]);
+    assert!(!resumed.status.success());
+    let error: Value = serde_json::from_slice(&resumed.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "sync_remote_failed");
+    assert_eq!(
+        error["error"]["details"]["remote"]["error"]["code"],
+        "sync_store_changed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn resume_recovers_an_existing_local_commit_whose_receipt_write_was_lost() {
     let world = SyncWorld::new();
     world.install_fake_ssh();
@@ -2134,6 +2173,52 @@ fn all_scope_resume_repairs_a_monotonic_predecessor_receipt() {
     assert!(!rejected.status.success());
     let error: Value = serde_json::from_slice(&rejected.stderr).unwrap();
     assert_eq!(error["error"]["code"], "sync_state_conflict");
+}
+
+#[cfg(unix)]
+#[test]
+fn all_scope_resume_recovers_when_one_state_copy_is_missing() {
+    let world = SyncWorld::new();
+    world.install_fake_ssh();
+    for (cwd, home) in [
+        (&world.local, &world.local_home),
+        (&world.remote, &world.remote_home),
+    ] {
+        world.ok_home(cwd, home, &["--scope", "global", "init"]);
+    }
+    let remote = world.remote.to_str().unwrap();
+    let first = world.sync(&["--scope", "all", "sync", "peer", remote, "--mode", "merge"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    let session = first["session_id"].as_str().unwrap();
+    let global_state = world
+        .local_home
+        .join(".lwc/sync")
+        .join(session)
+        .join("state.json");
+    let project_state = world
+        .local
+        .join(".lwc/sync")
+        .join(session)
+        .join("state.json");
+    fs::remove_file(&global_state).unwrap();
+
+    let resumed = world.sync(&[
+        "--scope", "all", "sync", "peer", remote, "--mode", "merge", "--resume", session,
+    ]);
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(
+        fs::read(&global_state).unwrap(),
+        fs::read(&project_state).unwrap()
+    );
 }
 
 #[cfg(unix)]

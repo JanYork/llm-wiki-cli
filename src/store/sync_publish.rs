@@ -128,7 +128,15 @@ pub(crate) fn sync_publication_receipt(
     };
     let value: Value = serde_json::from_str(&detail)
         .map_err(|error| AppError::new("sync_receipt_invalid", error.to_string()))?;
-    Ok((value["state_digest"] == state_digest).then_some(value))
+    if value["state_digest"] != state_digest {
+        return Ok(None);
+    }
+    let ending: StoreIdentity = serde_json::from_value(value["ending_identity"].clone())
+        .map_err(|error| AppError::new("sync_receipt_invalid", error.to_string()))?;
+    if store_identity(&conn)? != ending {
+        return Err(sync_store_changed());
+    }
+    Ok(Some(value))
 }
 
 impl Store {
@@ -1033,10 +1041,7 @@ fn import_sync_sources(
         .map(|(key, _)| key.to_owned())
         .collect::<BTreeSet<_>>();
     let stale = {
-        let mut statement = tx.prepare(
-            "SELECT s.id,s.content_hash FROM sources s
-             WHERE NOT EXISTS(SELECT 1 FROM source_path_revisions r WHERE r.source_id=s.id)",
-        )?;
+        let mut statement = tx.prepare("SELECT id,content_hash FROM sources")?;
         statement
             .query_map([], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -1045,6 +1050,19 @@ fn import_sync_sources(
     };
     for (id, hash) in stale {
         if !desired.contains(&hash) {
+            tx.execute(
+                "DELETE FROM source_path_revisions
+                 WHERE source_id=?1 OR tracked_path IN (
+                     SELECT head.tracked_path
+                     FROM source_path_revisions head
+                     WHERE head.source_id=?1 AND head.revision=(
+                         SELECT MAX(latest.revision)
+                         FROM source_path_revisions latest
+                         WHERE latest.tracked_path=head.tracked_path
+                     )
+                 )",
+                [id],
+            )?;
             tx.execute("DELETE FROM sources WHERE id=?1", [id])?;
         }
     }
