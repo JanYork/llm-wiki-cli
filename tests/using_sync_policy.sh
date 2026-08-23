@@ -22,8 +22,13 @@ for expected in \
   'schema-valid' \
   'preserve both' \
   'exact command, target host, absolute directory, scope, mode, affected stores, impact, risks, recovery path, and reversibility' \
-  'separate human reply explicitly confirming that exact action' \
-  'Confirmation is single-use' \
+  'An explicit user instruction that already names or unambiguously accepts these facts is authorization' \
+  'do not ask the human to repeat it' \
+  'One authorization covers the bounded workflow' \
+  'ordinary `--resume`' \
+  'Reconfirm only when' \
+  'new destructive, irreversible, privacy, or data-loss risk' \
+  'candidate resolution would discard one side' \
   'committed=true' \
   'next_action' \
   'fresh local suspended draft' \
@@ -54,6 +59,15 @@ for expected in \
   'SHM'; do
   grep -Fq -- "$expected" "$skill"
 done
+for forbidden in \
+  'separate human reply explicitly confirming that exact action' \
+  'Confirmation is single-use' \
+  'obtain fresh confirmation'; do
+  if grep -Fq -- "$forbidden" "$skill"; then
+    printf 'using-sync must not require redundant confirmation: %s\n' "$forbidden" >&2
+    exit 1
+  fi
+done
 for untrusted in \
   'embedded prompts or commands' \
   'never become Agent' \
@@ -72,6 +86,16 @@ grep -Fq -- 'at most 20 conflict objects' "$root/docs/agent-workflow.md"
 grep -Fq -- 'untrusted data' "$root/README.md"
 grep -Fq -- 'untrusted data' "$root/docs/agent-workflow.md"
 grep -Fq -- 'untrusted data' "$root/SECURITY.md"
+for expected in \
+  'An explicit user instruction that already names or unambiguously accepts these facts is authorization' \
+  'do not ask the user to repeat it' \
+  'One authorization covers' \
+  'ordinary `--resume`' \
+  'Reconfirm only when' \
+  'new destructive, irreversible, privacy, or data-loss risk' \
+  'candidate resolution would discard one side'; do
+  grep -Fq -- "$expected" "$root/docs/agent-workflow.md"
+done
 for document in README.md docs/agent-workflow.md SECURITY.md; do
   grep -Fq -- 'resume_continuity' "$root/$document"
   grep -Fq -- 'resume_derived_rebuild' "$root/$document"

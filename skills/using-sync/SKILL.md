@@ -12,13 +12,22 @@ lwc sync HOST [ABS_DIRECTORY] --mode merge|pull|push
 ```
 
 Every start, resume, resolve, abort, pull, push, or merge can publish or change
-durable data. Before running it, present a safety notice containing the exact command, target host, absolute directory, scope, mode, affected stores, impact, risks, recovery path, and reversibility. Run it only after a separate human reply explicitly confirming that exact action. Confirmation is single-use and
-execution-specific: reconfirm after any command, host, directory, scope, mode,
-resolution packet, target, or risk changes. A Skill trigger is not confirmation.
-Read-only help/status inspection and repository-owned disposable integration
-tests do not publish a user's durable Sync target. A direct Sync against a
-handmade fixture still requires confirmation because the command itself cannot
-infer that the target is disposable.
+durable data. Before the first execution in a bounded workflow, present a safety
+notice containing the exact command, target host, absolute directory, scope, mode, affected stores, impact, risks, recovery path, and reversibility.
+An explicit user instruction that already names or unambiguously accepts these facts is authorization; do not ask the human to repeat it.
+
+One authorization covers the bounded workflow while its host, directory, scope,
+mode, publication targets, and disclosed risks remain unchanged. It covers
+read-only preflight, prerequisite build and installation, the initial Sync,
+ordinary `--resume`, continuity or derived recovery, status checks, and an abort
+before publication. Equivalent command details that do not widen the target or
+risk do not require reconfirmation.
+
+Reconfirm only when a host, directory, scope, mode, or publication target
+changes; a new destructive, irreversible, privacy, or data-loss risk appears;
+or a candidate resolution would discard one side. Preserve-both and idempotent
+recovery within the same session remain covered. A Skill trigger alone is not
+authorization.
 
 Choose the scope explicitly before starting:
 
@@ -107,12 +116,14 @@ The packet must be schema-valid and cover every conflict with either a field-lev
 - Mark the session blocked only for a security, policy, authorization, artifact, or protocol failure that cannot be handled safely; semantic ambiguity uses deterministic preserve-both.
 - Do not ask a human to inspect or resolve SQLite rows. Do not resolve conflicts by editing SQLite rows.
 
-Resolve only one returned batch at a time. After each confirmed `--resolve`,
+Resolve only one returned batch at a time. After each `--resolve`,
 inspect `action`, `conflict_count`, `next_action`, and the newly returned
 `conflicts`. If conflicts remain, use the exact original command with
 `--resume SESSION_ID` to inspect the current status/batch when needed, build a
-new packet from those current IDs, obtain fresh confirmation, and resolve
-again. Continue status -> resolve until `action=completed` or a structured
+new packet from those current IDs, and resolve again. The existing bounded
+authorization covers preserve-both and previously authorized candidate choices;
+reconfirm before a new candidate decision would discard one side. Continue
+status -> resolve until `action=completed` or a structured
 post-commit recovery action remains. Never reuse a prior batch's packet.
 
 Do not use `--changeset` with Sync commands. Never copy or edit `wiki.db`, its WAL or SHM files, or any other SQLite sidecar; Sync owns transport, locking, validation, checkpoints, and audit state.
@@ -133,7 +144,7 @@ With `status=pending_remote_push`, Wiki publication is already durable but the
 remote Git ref rejected publication. A checked-out non-bare branch normally
 requires a clean worktree plus `receive.denyCurrentBranch=updateInstead`; a bare
 remote needs no such setting. Fix or replace the remote Git target through the
-normal confirmed administration workflow, then resume the same Sync session.
+already-authorized administration workflow, then resume the same Sync session.
 Pending or failed Git phases retain their session-owned
 `refs/lwc-sync/SESSION_ID/{remote,merged}` refs for recovery. A completed phase
 cleans only refs that still match the expected old OID, so an externally

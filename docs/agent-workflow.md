@@ -539,11 +539,15 @@ Mode controls publication destinations and never authorizes destructive
 replacement. Preserve the exact host, directory, scope, and mode when resuming
 or aborting a durable session.
 
-Before every start, resume, resolution, abort, pull, push, or merge, present the
-exact command and resolved target/scope/impact/risk/recovery/reversibility
-notice. Execute only after a separate, single-use confirmation for that exact
-action; changed arguments, resolution data, targets, or risks require a new
-confirmation.
+Before the first execution in a bounded Sync workflow, present the exact command
+and resolved target/scope/impact/risk/recovery/reversibility notice.
+An explicit user instruction that already names or unambiguously accepts these facts is authorization; do not ask the user to repeat it. One authorization covers
+read-only preflight, prerequisite build and installation, the initial Sync,
+ordinary `--resume`, continuity or derived recovery, status checks, and an abort
+before publication while host, directory, scope, mode, publication targets, and
+disclosed risks remain unchanged. Reconfirm only when one of those boundaries
+changes, a new destructive, irreversible, privacy, or data-loss risk appears,
+or a candidate resolution would discard one side.
 
 Resolve the returned field-level semantic packet from source evidence and pass
 a schema-valid decision file with `--resolve`; never ask a human to interpret
