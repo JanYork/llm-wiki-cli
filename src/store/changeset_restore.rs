@@ -36,6 +36,10 @@ fn validate_sparse_operation_actions<'a>(actions: impl IntoIterator<Item = &'a s
                 | "tag_delete"
                 | "tag_autoload"
                 | "search"
+                | "changeset_sync_replay_start"
+                | "changeset_sync_replay_complete"
+                | "changeset_sync_replay_item_start"
+                | "changeset_sync_replay_item"
         ) {
             return Err(AppError::new(
                 "changeset_sparse_unsupported",
@@ -200,7 +204,7 @@ fn merge_sparse_sources(
         )?;
         if created {
             tx.execute(
-            "INSERT INTO ingest_jobs(
+                "INSERT INTO ingest_jobs(
                 source_id, status, attempts, analysis, last_error,
                 no_derived_pages_reason, updated_at
              ) SELECT ?2, status, attempts, analysis, last_error,
@@ -211,7 +215,7 @@ fn merge_sparse_sources(
                 analysis = excluded.analysis, last_error = excluded.last_error,
                 no_derived_pages_reason = excluded.no_derived_pages_reason,
                 updated_at = excluded.updated_at",
-            params![source_id, resolved_id],
+                params![source_id, resolved_id],
             )?;
             index_source(
                 tx,
@@ -281,12 +285,8 @@ fn merge_sparse_sources(
             .iter()
             .find(|entry| entry.draft_id == draft_source_id)
             .is_none_or(|entry| entry.created);
-        let (revision, advanced) = record_source_path_revision_at(
-            tx,
-            &tracked_path,
-            source_id,
-            Some(&observed_at),
-        )?;
+        let (revision, advanced) =
+            record_source_path_revision_at(tx, &tracked_path, source_id, Some(&observed_at))?;
         value["path_revision"] = json!(revision);
         value["path_advanced"] = json!(advanced);
         value["source_id"] = json!(source_id);
@@ -369,7 +369,10 @@ fn merge_sparse_page(
             "INSERT INTO page_sources(page_slug, source_id) VALUES (?1, ?2)",
             params![
                 slug,
-                source_id_remap.get(&source_id).copied().unwrap_or(source_id)
+                source_id_remap
+                    .get(&source_id)
+                    .copied()
+                    .unwrap_or(source_id)
             ],
         )?;
     }
@@ -609,12 +612,7 @@ fn rollback_sparse_changeset(
     for tag in &inverse.payload.tags {
         tx.execute("DELETE FROM tags WHERE name = ?1", [&tag.name])?;
         restore_tag_snapshot(&tx, &tag.before)?;
-        record_operation(
-            &tx,
-            "tag_restore",
-            &tag.name,
-            &json!({"rollback": true}),
-        )?;
+        record_operation(&tx, "tag_restore", &tag.name, &json!({"rollback": true}))?;
     }
     for entry in &inverse.payload.meta {
         tx.execute(
@@ -1061,9 +1059,7 @@ fn rollback_attached_changeset(
     })
 }
 
-fn changed_source_path_head_documents(
-    tx: &Transaction<'_>,
-) -> Result<BTreeSet<(String, String)>> {
+fn changed_source_path_head_documents(tx: &Transaction<'_>) -> Result<BTreeSet<(String, String)>> {
     let mut statement = tx.prepare(
         "SELECT tracked_path FROM source_path_revisions
          UNION SELECT tracked_path FROM candidate.source_path_revisions

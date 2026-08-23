@@ -722,7 +722,7 @@ pub struct OperationRecord {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StoreIdentity {
     pub store_id: String,
     pub revision: String,
@@ -744,6 +744,132 @@ pub struct ChangesetDraftState {
     pub operations: Vec<OperationRecord>,
     pub created_at: String,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct DetachedChangesetIntent {
+    pub(crate) version: u32,
+    pub(crate) origin_changeset_id: String,
+    pub(crate) name: String,
+    pub(crate) actions: Vec<DetachedChangesetAction>,
+    pub(crate) sources: Vec<DetachedSourceIntent>,
+    pub(crate) pages: Vec<DetachedPageIntent>,
+    pub(crate) tags: Vec<DetachedTagIntent>,
+    pub(crate) meta: Vec<DetachedMetaIntent>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum DetachedChangesetAction {
+    SourceAdd {
+        content_hash: String,
+    },
+    Ingest {
+        action: String,
+        content_hash: String,
+    },
+    PagePut {
+        slug: String,
+    },
+    PageRemove {
+        slug: String,
+    },
+    Tag {
+        action: String,
+        name: String,
+    },
+    MetaSet {
+        key: String,
+    },
+    Search,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct DetachedSourceIntent {
+    pub(crate) content_hash: String,
+    pub(crate) title: Option<String>,
+    pub(crate) origin: Option<String>,
+    pub(crate) structural_navigation: bool,
+    pub(crate) base_fingerprint: String,
+    pub(crate) content_required: bool,
+    #[serde(default)]
+    pub(crate) ingest: DetachedIngestIntent,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct DetachedIngestIntent {
+    pub(crate) status: String,
+    pub(crate) attempts: i64,
+    pub(crate) analysis: Option<String>,
+    pub(crate) no_derived_pages_reason: Option<String>,
+}
+
+impl Default for DetachedIngestIntent {
+    fn default() -> Self {
+        Self {
+            status: "pending".into(),
+            attempts: 0,
+            analysis: None,
+            no_derived_pages_reason: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct DetachedPageIntent {
+    pub(crate) slug: String,
+    pub(crate) base_fingerprint: String,
+    pub(crate) after: Option<DetachedPageAfterImage>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct DetachedPageAfterImage {
+    pub(crate) title: String,
+    pub(crate) kind: Option<String>,
+    pub(crate) summary: Option<String>,
+    pub(crate) body: String,
+    pub(crate) source_hashes: Vec<String>,
+    pub(crate) provenance: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct DetachedTagIntent {
+    pub(crate) name: String,
+    pub(crate) base_fingerprint: String,
+    pub(crate) after: Option<DetachedTagAfterImage>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct DetachedTagAfterImage {
+    pub(crate) autoload: bool,
+    pub(crate) autoload_priority: i32,
+    pub(crate) autoload_limit: i64,
+    pub(crate) autoload_max_chars: i64,
+    pub(crate) reason: String,
+    pub(crate) memberships: Vec<DetachedTagMembership>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct DetachedTagMembership {
+    pub(crate) page_slug: String,
+    pub(crate) priority: i32,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct DetachedMetaIntent {
+    pub(crate) key: String,
+    pub(crate) base_fingerprint: String,
+    pub(crate) value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChangesetSyncReplayState {
+    pub(crate) complete: bool,
+    pub(crate) items: BTreeMap<String, String>,
+}
+
+pub(crate) type DetachedChangesetStoreExport =
+    (DetachedChangesetIntent, Vec<(i64, String, u64)>);
 
 #[derive(Debug, Clone)]
 pub struct ChangesetPublishInput {

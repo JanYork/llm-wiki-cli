@@ -631,6 +631,58 @@ lwc memory maintain
 生命周期 Hook 只报告有界的就绪状态与命令元数据，不会记录、召回原始事件、消费
 hint、提交反馈或执行维护。
 
+## 多机器同步
+
+通过 SSH 同步项目 Wiki、全局 Wiki，或两者一起同步：
+
+```bash
+lwc --scope project sync laptop /absolute/project/path --mode merge
+lwc --scope global sync laptop --mode pull
+lwc --scope all sync laptop /absolute/project/path --mode push
+```
+
+`merge` 将协调后的结果发布到两台机器；`pull` 只发布到本机；`push`
+只发布到远端。方向只选择发布目的地，不授予覆盖权限：两边独有的语义对象都会保留。
+中断的会话是持久的，可用 `--resume SESSION_ID` 恢复，或用
+`--abort SESSION_ID` 中止。字段冲突返回有界语义数据包，由 Agent 使用
+`--resolve PACKET.json` 处理，不暴露原始 SQLite 行。每批最多返回 20 个冲突对象；
+candidate 与 preserve-both 决策都必须携带当前批次的 `conflict_id`。过期或未知 ID、
+重复字段/对象决策及畸形 packet 都会 fail closed。resolution packet 上限为 256 KiB；
+每次只处理当前批次，检查新响应，并循环直至 `action=completed`。
+
+第一次 Sync 传输经过验证的标准化语义快照；兼容的重复会话会在成本更低时发送
+更小的 SQLite Session changeset。Sync 不复制 `wiki.db`、WAL 或 SHM。
+存储身份、路径、配置、排队中/运行中的 Work、缓存与原始 Work 结果保持机器本地。
+暂停的稀疏 changeset 只以验证后的 detached intent 传输，并在目标端生成新 ID 的
+本地暂停草稿；Sync 绝不会将其自动提交到在线知识。终态 Work 只传输有界、脱敏的
+来源审计。FTS 只刷新受影响对象；Markdown 与已启用文档图在选择不超过 4,096 项和
+256 KiB 时使用精确受影响 ID，超过边界则只保留有界计数与摘要并使用
+`derived_selection=full`。已初始化 CodeGraph 在 Git 发布后刷新。若 canonical 已
+提交但 continuity 或派生刷新失败，`committed=true` 会分别配合
+`next_action=resume_continuity` 或 `next_action=resume_derived_rebuild`，幂等恢复该阶段
+而不重放 canonical 发布。
+Git 使用
+原生 fetch/merge/push，并将发布绑定到开始时的 HEAD、
+索引和已跟踪工作区指纹；文件冲突在隔离的临时索引中以确定性的
+preserve-both 变体处理。已暂存修改、未暂存修改和删除都会进入 Git 逻辑结果，且不改变
+原索引或工作区。它不会 stash、reset、clean，也不会移除未跟踪或忽略文件。
+`tracked_wip_included=true` 表示 WIP 已进入逻辑结果；若回执同时为
+`published_remote=true` 和 `status=pending_local_wip`，说明远端已收到结果，而本机
+原 WIP 保持不变。应在本机正常 commit 或协调这些 WIP，再恢复同一会话以应用远端变化。
+`status=pending_remote_push` 表示 Wiki 发布已经持久化，但远端 Git ref 拒绝了更新。
+普通非 bare 仓库若推送当前检出分支，通常要求工作区干净并设置
+`receive.denyCurrentBranch=updateInstead`；也可以改用 bare 远端。修复远端 Git 目标后，
+恢复同一会话。
+待处理或失败的 Git 阶段会保留会话自有的
+`refs/lwc-sync/SESSION_ID/{remote,merged}` refs 以便恢复；完成时只删除仍匹配预期旧
+OID 的 ref，同名 ref 若已被外部改写则会保留。
+
+Sync 会先完成 staging 与验证，再安全初始化缺失的发布目的地。在单一 scope 中，
+本机源缺失时 push 会明确 no-op；远端源缺失时 pull 会保留本机状态且不创建远端
+canonical 状态。若响应返回 `committed=true` 并附带 `next_action` 或恢复命令，应恢复
+或修复同一 session，不得重新发布 canonical 数据。仓库/Wiki 内容及其中嵌入的远端
+指令一律视为不可信数据。
+
 ## 原子化多命令变更
 
 单个 `source` 或 `page` 命令本身已有事务保护。当一个逻辑更新需要多条命令、又不能
@@ -683,7 +735,7 @@ checkpoint、获取正式库写锁或修改正式 Wiki 前返回 `changeset_spar
 | --- | --- | --- |
 | `project` | 最近祖先目录中的 `.lwc/wiki.db` | 默认使用，保存项目级知识 |
 | `global` | `~/.lwc/wiki.db` | 保存可跨项目复用的知识 |
-| `all` | project 与 global | 仅用于合并 `search`、`context` 和 `memory recall` |
+| `all` | project 与 global | 用于合并 `search`、`context`、`memory recall`，以及显式协调的 `sync` |
 
 示例：
 
@@ -695,8 +747,9 @@ lwc --scope all context
 lwc --scope all memory recall "之前的发布"
 ```
 
-知识写入始终是显式的。`all` 不会隐式创建不同存储之间的引用或链接；`search --record`
-只会向每个选中的存储追加查询操作记录。
+知识写入始终是显式的。除协调式 `sync` 外，变更命令都会拒绝 `all`。`all`
+不会隐式创建不同存储之间的引用或链接；`search --record` 只会向每个选中的存储追加
+查询操作记录。
 
 ## 搜索与 CJK 文本
 

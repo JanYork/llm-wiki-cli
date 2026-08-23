@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    fs,
     io::{self, Read},
     path::Path,
 };
@@ -19,6 +20,7 @@ pub(crate) use install::{AgentLocation, install, refresh, status, uninstall};
 
 const MAX_INPUT_BYTES: u64 = 64 * 1024;
 const MAX_CONTEXT_CHARS: usize = 100_000;
+const MAX_SYNC_STATE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AgentKind {
@@ -218,6 +220,9 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
             "install": "lwc agent install",
         },
     });
+    if let Some(sync) = sync_readiness(&store.path) {
+        value["sync"] = sync;
+    }
     if todo_enabled {
         value["todo"] = match &hook_store {
             Some(Ok(store)) => match (store.open_todo_count(), store.due_todo_reminders(3)) {
@@ -271,6 +276,155 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
         value["authorization"] = authorization;
     }
     Ok(value)
+}
+
+fn sync_readiness(store_path: &Path) -> Option<Value> {
+    let root = store_path.parent()?.join("sync");
+    let entries = fs::read_dir(root).ok()?;
+    let mut pending = 0_u64;
+    let mut latest: Option<(u64, String, Value)> = None;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(session_id) = file_name.to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !valid_sync_session_id(&session_id) {
+            continue;
+        }
+        let directory = match fs::symlink_metadata(entry.path()) {
+            Ok(directory) => directory,
+            Err(_) => continue,
+        };
+        if directory.file_type().is_symlink() || !directory.is_dir() {
+            continue;
+        }
+        let state_path = entry.path().join("state.json");
+        match fs::symlink_metadata(&state_path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() <= MAX_SYNC_STATE_BYTES => {}
+            _ => continue,
+        }
+        let state: Value = match fs::read(&state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        {
+            Some(state) => state,
+            None => continue,
+        };
+        let object = match state.as_object() {
+            Some(object) => object,
+            None => continue,
+        };
+        let protocol = object.get("protocol").and_then(Value::as_u64);
+        let saved_id = object.get("session_id").and_then(Value::as_str);
+        let mode = object.get("mode").and_then(Value::as_str);
+        let scope = object.get("scope").and_then(Value::as_str);
+        let host_valid = object
+            .get("host")
+            .and_then(Value::as_str)
+            .is_some_and(|host| !host.is_empty());
+        let phase = object.get("phase").and_then(Value::as_str);
+        let created = object.get("created_at_unix_ms").and_then(Value::as_u64);
+        let updated = object.get("updated_at_unix_ms").and_then(Value::as_u64);
+        let peers_valid = object.get("peer_stores").is_some_and(Value::is_array);
+        if protocol != Some(1)
+            || saved_id != Some(session_id.as_str())
+            || !matches!(mode, Some("merge" | "pull" | "push"))
+            || !matches!(scope, Some("project" | "global" | "all"))
+            || !host_valid
+            || created.is_none()
+            || updated.is_none()
+            || !peers_valid
+        {
+            continue;
+        }
+        let Some(phase) = phase.filter(|phase| valid_sync_phase(phase)) else {
+            continue;
+        };
+        if matches!(phase, "completed" | "aborted" | "failed") {
+            continue;
+        }
+
+        pending = pending.saturating_add(1);
+        let directory = if scope == Some("global") {
+            ""
+        } else {
+            " ABS_DIRECTORY"
+        };
+        let mut summary = json!({
+            "session_id": session_id,
+            "phase": phase,
+            "resume": format!(
+                "lwc --scope {} sync HOST{} --mode {} --resume {}",
+                scope.unwrap(),
+                directory,
+                mode.unwrap(),
+                saved_id.unwrap()
+            ),
+        });
+        let conflict_count = object.get("conflict_count").and_then(Value::as_u64);
+        let mut conflict_kinds = object
+            .get("conflict_kinds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|kind| valid_conflict_kind(kind))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        conflict_kinds.sort();
+        conflict_kinds.dedup();
+        conflict_kinds.truncate(3);
+        let mut conflicts = json!({});
+        if let Some(count) = conflict_count {
+            conflicts["count"] = json!(count);
+        }
+        if !conflict_kinds.is_empty() {
+            conflicts["kinds"] = json!(conflict_kinds);
+        }
+        if conflicts
+            .as_object()
+            .is_some_and(|fields| !fields.is_empty())
+        {
+            summary["conflicts"] = conflicts;
+        }
+        let updated = updated.unwrap();
+        let newer = match latest.as_ref() {
+            Some((latest_updated, latest_id, _)) => {
+                (updated, saved_id.unwrap()) > (*latest_updated, latest_id.as_str())
+            }
+            None => true,
+        };
+        if newer {
+            latest = Some((updated, saved_id.unwrap().to_owned(), summary));
+        }
+    }
+    latest.map(|(_, _, latest)| json!({"pending": pending, "latest": latest}))
+}
+
+fn valid_sync_session_id(session_id: &str) -> bool {
+    session_id.len() == 32
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_sync_phase(phase: &str) -> bool {
+    !phase.is_empty()
+        && phase.len() <= 64
+        && phase
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn valid_conflict_kind(kind: &str) -> bool {
+    !kind.is_empty()
+        && kind.len() <= 64
+        && kind
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn graph_authorization(

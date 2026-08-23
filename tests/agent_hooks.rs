@@ -872,6 +872,169 @@ fn temporal_memory_readiness_is_bounded_and_hook_is_read_only() {
 }
 
 #[test]
+fn sync_readiness_reports_only_valid_pending_bounded_metadata_and_is_read_only() {
+    let world = World::new(true);
+    let sync = world.project.join(".lwc/sync");
+    let older = "0123456789abcdef0123456789abcdef";
+    let latest = "fedcba9876543210fedcba9876543210";
+    let terminal = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let invalid = "not-a-session";
+    for session in [older, latest, terminal, invalid] {
+        fs::create_dir_all(sync.join(session)).unwrap();
+    }
+    fs::write(
+        sync.join(older).join("state.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "protocol": 1,
+            "session_id": older,
+            "mode": "pull",
+            "scope": "project",
+            "host": "sensitive-old-host",
+            "remote_directory": "/sensitive/old/path",
+            "phase": "handshake_complete",
+            "created_at_unix_ms": 1,
+            "updated_at_unix_ms": 2,
+            "peer_digest": null,
+            "peer_stores": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        sync.join(latest).join("state.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "protocol": 1,
+            "session_id": latest,
+            "mode": "merge",
+            "scope": "all",
+            "host": "sensitive-latest-host",
+            "remote_directory": "/sensitive/latest/path",
+            "phase": "conflicts",
+            "conflict_count": 5,
+            "conflict_kinds": ["source", "page", "todo", "plan", "page"],
+            "payload": {"secret": "object body must stay private"},
+            "created_at_unix_ms": 3,
+            "updated_at_unix_ms": 4,
+            "peer_digest": null,
+            "peer_stores": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        sync.join(terminal).join("state.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "protocol": 1,
+            "session_id": terminal,
+            "mode": "push",
+            "scope": "global",
+            "host": "terminal-host",
+            "phase": "completed",
+            "created_at_unix_ms": 5,
+            "updated_at_unix_ms": 6,
+            "peer_digest": null,
+            "peer_stores": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        sync.join(invalid).join("state.json"),
+        br#"{"phase":"conflicts"}"#,
+    )
+    .unwrap();
+
+    let before = fs::read(sync.join(latest).join("state.json")).unwrap();
+    let input = serde_json::json!({"source": "startup", "cwd": world.project}).to_string();
+    let output = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ],
+        &input,
+    );
+    let sync_readiness = readiness(&context(&output))["sync"].clone();
+    assert_eq!(
+        sync_readiness,
+        serde_json::json!({
+            "pending": 2,
+            "latest": {
+                "session_id": latest,
+                "phase": "conflicts",
+                "conflicts": {"count": 5, "kinds": ["page", "plan", "source"]},
+                "resume": format!("lwc --scope all sync HOST ABS_DIRECTORY --mode merge --resume {latest}")
+            }
+        })
+    );
+    let rendered = serde_json::to_string(&sync_readiness).unwrap();
+    for secret in [
+        "sensitive-old-host",
+        "sensitive-latest-host",
+        "/sensitive/old/path",
+        "/sensitive/latest/path",
+        "object body must stay private",
+        "terminal-host",
+    ] {
+        assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+    }
+    assert_eq!(
+        fs::read(sync.join(latest).join("state.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn sync_readiness_omits_invalid_terminal_and_broken_sessions_without_breaking_hook() {
+    let world = World::new(true);
+    let sync = world.project.join(".lwc/sync");
+    fs::create_dir_all(sync.join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")).unwrap();
+    fs::write(
+        sync.join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .join("state.json"),
+        b"not json",
+    )
+    .unwrap();
+    fs::create_dir_all(sync.join("cccccccccccccccccccccccccccccccc")).unwrap();
+    fs::write(
+        sync.join("cccccccccccccccccccccccccccccccc")
+            .join("state.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "protocol": 1,
+            "session_id": "cccccccccccccccccccccccccccccccc",
+            "mode": "merge",
+            "scope": "project",
+            "host": "private-host",
+            "phase": "failed",
+            "created_at_unix_ms": 1,
+            "updated_at_unix_ms": 2,
+            "peer_digest": null,
+            "peer_stores": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let input = serde_json::json!({"source": "startup", "cwd": world.project}).to_string();
+    let output = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ],
+        &input,
+    );
+    let value = readiness(&context(&output));
+    assert!(value.get("sync").is_none());
+    assert!(value.get("wiki").is_some());
+}
+
+#[test]
 fn boundary_hook_omits_authorization_when_both_graphs_are_configured() {
     let world = World::new(true);
     fs::write(

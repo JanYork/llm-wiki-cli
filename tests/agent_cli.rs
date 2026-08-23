@@ -467,7 +467,7 @@ fn agent_install_bundles_temporal_memory_reference_byte_identically() {
         )
         .unwrap()
     );
-    for skill in ["using-todo", "using-plan"] {
+    for skill in ["using-todo", "using-plan", "using-sync"] {
         assert_eq!(
             fs::read(
                 world
@@ -505,6 +505,12 @@ fn agent_install_bundles_temporal_memory_reference_byte_identically() {
         !world
             .home
             .join(".agents/skills/using-plan/SKILL.md")
+            .exists()
+    );
+    assert!(
+        !world
+            .home
+            .join(".agents/skills/using-sync/SKILL.md")
             .exists()
     );
 }

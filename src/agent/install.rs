@@ -138,6 +138,16 @@ const PLAN_SKILL_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../skills/using-plan/agents/openai.yaml"),
     ),
 ];
+const SYNC_SKILL_FILES: &[(&str, &[u8])] = &[
+    (
+        "SKILL.md",
+        include_bytes!("../../skills/using-sync/SKILL.md"),
+    ),
+    (
+        "agents/openai.yaml",
+        include_bytes!("../../skills/using-sync/agents/openai.yaml"),
+    ),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1076,6 +1086,7 @@ fn skill_files(root: &Path) -> impl Iterator<Item = (PathBuf, &'static [u8])> {
         (root.to_owned(), SKILL_FILES),
         (parent.join("using-todo"), TODO_SKILL_FILES),
         (parent.join("using-plan"), PLAN_SKILL_FILES),
+        (parent.join("using-sync"), SYNC_SKILL_FILES),
     ]
     .into_iter()
     .flat_map(|(dir, files)| {

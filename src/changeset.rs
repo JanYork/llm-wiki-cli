@@ -1,15 +1,23 @@
 use crate::{
     error::{AppError, Result},
     scope::{Scope, StorePath},
-    store::{ChangesetDraftState, ChangesetPublishInput, ChangesetRollbackInput, Store},
+    store::{
+        ChangesetDraftState, ChangesetPublishInput, ChangesetRollbackInput,
+        ChangesetSyncReplayItemState, DetachedChangesetIntent, Store,
+    },
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
     time::Instant,
 };
+
+#[cfg(test)]
+#[path = "sync_continuity_tests.rs"]
+mod sync_continuity_tests;
 
 #[derive(Debug, Serialize)]
 pub struct ChangesetBeginResponse {
@@ -97,6 +105,29 @@ pub struct ChangesetRollbackResponse {
     pub materialization_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_work: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DetachedBlobLocator {
+    pub(crate) draft_database: PathBuf,
+    pub(crate) source_id: i64,
+    pub(crate) content_hash: String,
+    pub(crate) bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DetachedChangesetExport {
+    pub(crate) intent: DetachedChangesetIntent,
+    pub(crate) blobs: Vec<DetachedBlobLocator>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct DetachedChangesetReplay {
+    pub(crate) name: String,
+    pub(crate) changeset_id: String,
+    pub(crate) status: &'static str,
+    pub(crate) created: bool,
+    pub(crate) completed_items: usize,
 }
 
 pub fn begin(live: &StorePath, name: &str) -> Result<ChangesetBeginResponse> {
@@ -227,6 +258,707 @@ pub fn list(live: &StorePath, limit: usize) -> Result<ChangesetListResponse> {
         database: live.path.clone(),
         changesets,
     })
+}
+
+pub(crate) fn export_detached_intents(live: &StorePath) -> Result<Vec<DetachedChangesetExport>> {
+    const MAX_DRAFTS: usize = 32;
+    let directory = changeset_directory(live, false)?;
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut drafts = Vec::new();
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(invalid_path(&path));
+        }
+        if !metadata.is_file() || path.extension().and_then(|value| value.to_str()) != Some("db") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| invalid_path(&path))?;
+        validate_name(name)?;
+        drafts.push((name.to_string(), path));
+    }
+    drafts.sort_by(|left, right| left.0.cmp(&right.0));
+    if drafts.len() > MAX_DRAFTS {
+        return Err(AppError::new(
+            "changeset_sync_limit",
+            "too many draft changesets to export safely",
+        ));
+    }
+    let mut exports = Vec::new();
+    for (name, path) in drafts {
+        validate_draft_binding(live, &name, &path, 0)?;
+        let draft = Store::open_for_read(scope_name(live.scope), &path)?;
+        draft.begin_read_snapshot()?;
+        let _ = draft.identity()?;
+        let Some((intent, blobs)) = draft.detached_changeset_intent()? else {
+            continue;
+        };
+        exports.push(DetachedChangesetExport {
+            intent,
+            blobs: blobs
+                .into_iter()
+                .map(|(source_id, content_hash, bytes)| DetachedBlobLocator {
+                    draft_database: path.clone(),
+                    source_id,
+                    content_hash,
+                    bytes,
+                })
+                .collect(),
+        });
+    }
+    Ok(exports)
+}
+
+pub(crate) fn replay_detached_intent<F>(
+    live: &StorePath,
+    origin_store_id: &str,
+    intent: &DetachedChangesetIntent,
+    mut resolve_content: F,
+) -> Result<DetachedChangesetReplay>
+where
+    F: FnMut(&str) -> Result<PathBuf>,
+{
+    validate_replay_intent(live, origin_store_id, intent)?;
+    let name = format!(
+        "sync-{}-{}",
+        &origin_store_id[..12],
+        &intent.origin_changeset_id[..12]
+    );
+    let path = draft_path(live, &name, true)?;
+    let created = !path.exists();
+    if created {
+        begin(live, &name)?;
+    } else {
+        require_regular_file(&path)?;
+        validate_draft_binding(live, &name, &path, 0)?;
+    }
+    let mut draft = Store::open(scope_name(live.scope), &path)?;
+    let state = draft.changeset_sync_replay_state(origin_store_id, &intent.origin_changeset_id)?;
+    if created {
+        if state.is_some() {
+            return Err(replay_conflict(
+                "fresh replay draft already contains replay state",
+            ));
+        }
+        draft.changeset_sync_replay_marker(origin_store_id, &intent.origin_changeset_id, false)?;
+    } else if state.is_none() {
+        return Err(replay_conflict(
+            "deterministic replay draft name is owned by the user",
+        ));
+    }
+    let state = draft
+        .changeset_sync_replay_state(origin_store_id, &intent.origin_changeset_id)?
+        .expect("replay start marker was written");
+    if state.complete {
+        let changeset_id = draft.changeset_draft(&name, 0)?.id;
+        return Ok(DetachedChangesetReplay {
+            name,
+            changeset_id,
+            status: "complete",
+            created: false,
+            completed_items: state.items.len(),
+        });
+    }
+    drop(draft);
+
+    for source in intent
+        .sources
+        .iter()
+        .filter(|source| !source.content_required)
+    {
+        Store::open(scope_name(live.scope), &path)?
+            .changeset_replay_prepare_existing_source(&live.path, source)?;
+    }
+
+    let mut remaining_blob_bytes = 8_u64 * 1024 * 1024 * 1024;
+    for source in &intent.sources {
+        if !source.content_required {
+            continue;
+        }
+        let key = format!("source\0{}", source.content_hash);
+        let digest = replay_item_digest(source)?;
+        if replay_item_begin(
+            live,
+            &name,
+            origin_store_id,
+            intent,
+            &key,
+            &digest,
+            |draft| draft.changeset_replay_source_matches(source),
+        )? {
+            continue;
+        }
+        let normalized = resolve_content(&source.content_hash)?;
+        let mut draft = Store::open(scope_name(live.scope), &path)?;
+        let (_, copied_bytes) = draft.changeset_replay_source_from_normalized(
+            &normalized,
+            source,
+            remaining_blob_bytes,
+        )?;
+        remaining_blob_bytes = remaining_blob_bytes
+            .checked_sub(copied_bytes)
+            .ok_or_else(|| {
+                AppError::new(
+                    "changeset_sync_limit",
+                    "resolved source blob bytes overflowed",
+                )
+            })?;
+        draft.changeset_sync_replay_mark_item(
+            origin_store_id,
+            &intent.origin_changeset_id,
+            &key,
+            &digest,
+        )?;
+    }
+
+    for page in &intent.pages {
+        let key = format!("page\0{}", page.slug);
+        let digest = replay_item_digest(page)?;
+        if replay_item_begin(
+            live,
+            &name,
+            origin_store_id,
+            intent,
+            &key,
+            &digest,
+            |draft| draft.changeset_replay_page_matches(page),
+        )? {
+            continue;
+        }
+        let mut source_ids = Vec::new();
+        if let Some(after) = &page.after {
+            let draft = Store::open_for_read(scope_name(live.scope), &path)?;
+            let live_store = Store::open_for_read(scope_name(live.scope), &live.path)?;
+            for hash in &after.source_hashes {
+                source_ids.push(
+                    draft
+                        .source_id_by_content_hash(hash)?
+                        .or(live_store.source_id_by_content_hash(hash)?)
+                        .ok_or_else(|| {
+                            AppError::new(
+                                "changeset_replay_invalid",
+                                "page cites a source absent from the synchronized target",
+                            )
+                        })?,
+                );
+            }
+        }
+        prepare_page_touch(live, &name, &page.slug, &source_ids)?;
+        let mut draft = Store::open(scope_name(live.scope), &path)?;
+        if let Some(after) = &page.after {
+            draft.page_put(crate::store::PagePutInput {
+                slug: page.slug.clone(),
+                title: after.title.clone(),
+                kind: after.kind.clone(),
+                summary: after.summary.clone(),
+                body: after.body.clone(),
+                source_ids,
+                provenance: after.provenance.clone(),
+            })?;
+        } else {
+            draft.page_remove(&page.slug)?;
+        }
+        draft.changeset_sync_replay_mark_item(
+            origin_store_id,
+            &intent.origin_changeset_id,
+            &key,
+            &digest,
+        )?;
+    }
+
+    for meta in &intent.meta {
+        let key = format!("meta\0{}", meta.key);
+        let digest = replay_item_digest(meta)?;
+        if replay_item_begin(
+            live,
+            &name,
+            origin_store_id,
+            intent,
+            &key,
+            &digest,
+            |draft| draft.changeset_replay_meta_matches(meta),
+        )? {
+            continue;
+        }
+        let mut draft = Store::open(scope_name(live.scope), &path)?;
+        match meta.key.as_str() {
+            "schema" => {
+                draft.schema_set(&meta.value)?;
+            }
+            "purpose" => {
+                draft.purpose_set(&meta.value)?;
+            }
+            _ => {
+                return Err(AppError::new(
+                    "changeset_replay_invalid",
+                    "unsupported meta key",
+                ));
+            }
+        }
+        draft.changeset_sync_replay_mark_item(
+            origin_store_id,
+            &intent.origin_changeset_id,
+            &key,
+            &digest,
+        )?;
+    }
+
+    for tag in &intent.tags {
+        let key = format!("tag\0{}", tag.name);
+        let digest = replay_item_digest(tag)?;
+        if replay_item_begin(
+            live,
+            &name,
+            origin_store_id,
+            intent,
+            &key,
+            &digest,
+            |draft| draft.changeset_replay_tag_matches(tag),
+        )? {
+            continue;
+        }
+        if let Some(after) = &tag.after {
+            for member in &after.memberships {
+                prepare_tag_touch(live, &name, &tag.name, Some(&member.page_slug), false)?;
+            }
+        } else {
+            prepare_tag_touch(live, &name, &tag.name, None, false)?;
+        }
+        let mut draft = Store::open(scope_name(live.scope), &path)?;
+        if let Some(after) = &tag.after {
+            let existed = draft.tag_exists_for_replay(&tag.name)?;
+            if !existed && after.memberships.is_empty() {
+                return Err(AppError::new(
+                    "changeset_replay_invalid",
+                    "detached intent cannot create an empty tag through typed APIs",
+                ));
+            }
+            for member in &after.memberships {
+                draft.tag_set(
+                    &tag.name,
+                    &member.page_slug,
+                    member.priority,
+                    &member.reason,
+                )?;
+            }
+            let desired = after
+                .memberships
+                .iter()
+                .map(|member| member.page_slug.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            for member in draft.tag_page_identities(&tag.name, 10_001)? {
+                if !desired.contains(member.page_slug.as_str()) {
+                    draft.tag_remove(&tag.name, &member.page_slug)?;
+                }
+            }
+            draft.tag_autoload(
+                &tag.name,
+                after.autoload,
+                after.autoload_priority,
+                usize::try_from(after.autoload_limit).map_err(|_| {
+                    AppError::new("changeset_replay_invalid", "invalid tag autoload limit")
+                })?,
+                usize::try_from(after.autoload_max_chars).map_err(|_| {
+                    AppError::new("changeset_replay_invalid", "invalid tag autoload max chars")
+                })?,
+                &after.reason,
+            )?;
+        } else if draft.tag_exists_for_replay(&tag.name)? {
+            draft.tag_delete(&tag.name)?;
+        }
+        draft.changeset_sync_replay_mark_item(
+            origin_store_id,
+            &intent.origin_changeset_id,
+            &key,
+            &digest,
+        )?;
+    }
+
+    for source in &intent.sources {
+        let key = format!("ingest\0{}", source.content_hash);
+        let digest = replay_item_digest(&source.ingest)?;
+        if replay_item_begin(
+            live,
+            &name,
+            origin_store_id,
+            intent,
+            &key,
+            &digest,
+            |draft| draft.changeset_replay_ingest_matches(&source.content_hash, &source.ingest),
+        )? {
+            continue;
+        }
+        let mut draft = Store::open(scope_name(live.scope), &path)?;
+        let source_id = draft
+            .source_id_by_content_hash(&source.content_hash)?
+            .ok_or_else(|| {
+                AppError::new("changeset_replay_invalid", "replayed source is missing")
+            })?;
+        replay_ingest_after_image(&mut draft, source_id, &source.ingest)?;
+        draft.changeset_sync_replay_mark_item(
+            origin_store_id,
+            &intent.origin_changeset_id,
+            &key,
+            &digest,
+        )?;
+    }
+
+    let mut draft = Store::open(scope_name(live.scope), &path)?;
+    draft.changeset_sync_replay_marker(origin_store_id, &intent.origin_changeset_id, true)?;
+    let final_state = draft
+        .changeset_sync_replay_state(origin_store_id, &intent.origin_changeset_id)?
+        .expect("completed replay retains start marker");
+    let changeset_id = draft.changeset_draft(&name, 0)?.id;
+    Ok(DetachedChangesetReplay {
+        name,
+        changeset_id,
+        status: "complete",
+        created,
+        completed_items: final_state.items.len(),
+    })
+}
+
+fn replay_item_begin<F>(
+    live: &StorePath,
+    name: &str,
+    origin_store_id: &str,
+    intent: &DetachedChangesetIntent,
+    key: &str,
+    digest: &str,
+    matches_after_image: F,
+) -> Result<bool>
+where
+    F: FnOnce(&Store) -> Result<bool>,
+{
+    let path = draft_path(live, name, false)?;
+    let mut draft = Store::open(scope_name(live.scope), path)?;
+    match draft.changeset_sync_replay_start_item(
+        origin_store_id,
+        &intent.origin_changeset_id,
+        key,
+        digest,
+    )? {
+        ChangesetSyncReplayItemState::Complete => Ok(true),
+        ChangesetSyncReplayItemState::Ready | ChangesetSyncReplayItemState::PendingClean => {
+            Ok(false)
+        }
+        ChangesetSyncReplayItemState::PendingMutated
+            if draft.changeset_sync_replay_pending_mutations_match(
+                origin_store_id,
+                &intent.origin_changeset_id,
+                key,
+            )? && matches_after_image(&draft)? =>
+        {
+            draft.changeset_sync_replay_mark_item(
+                origin_store_id,
+                &intent.origin_changeset_id,
+                key,
+                digest,
+            )?;
+            Ok(true)
+        }
+        ChangesetSyncReplayItemState::PendingMutated => Err(replay_conflict(
+            "pending replay item differs from its declared after-image",
+        )),
+    }
+}
+
+fn validate_replay_intent(
+    live: &StorePath,
+    origin_store_id: &str,
+    intent: &DetachedChangesetIntent,
+) -> Result<()> {
+    for value in [origin_store_id, intent.origin_changeset_id.as_str()] {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(AppError::new(
+                "changeset_replay_invalid",
+                "replay identity must use 64 lowercase hexadecimal characters",
+            ));
+        }
+    }
+    if intent.version != 1 {
+        return Err(AppError::new(
+            "changeset_replay_invalid",
+            "unsupported detached intent version",
+        ));
+    }
+    if Store::open_for_read(scope_name(live.scope), &live.path)?
+        .identity()?
+        .store_id
+        == origin_store_id
+    {
+        return Err(AppError::new(
+            "changeset_replay_origin_local",
+            "a store cannot replay its own detached changeset intent",
+        ));
+    }
+    let encoded = serde_json::to_vec(intent)
+        .map_err(|error| AppError::new("changeset_replay_invalid", error.to_string()))?;
+    if encoded.len() > 8 * 1024 * 1024
+        || intent.sources.len() + intent.pages.len() + intent.tags.len() + intent.meta.len() > 1_024
+        || intent.actions.len() > 2_048
+    {
+        return Err(AppError::new(
+            "changeset_sync_limit",
+            "detached replay intent exceeds fixed limits",
+        ));
+    }
+    let mut hashes = std::collections::BTreeSet::new();
+    for source in &intent.sources {
+        if (source.content_required && source.base_fingerprint != "absent")
+            || (!source.content_required && !replay_fingerprint_is_valid(&source.base_fingerprint))
+            || source.content_hash.len() != 64
+            || !source
+                .content_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !hashes.insert(&source.content_hash)
+            || source
+                .origin
+                .as_ref()
+                .is_some_and(|origin| !replay_origin_is_portable(origin))
+            || source.ingest.attempts < 0
+            || source.ingest.attempts > 100
+            || !matches!(
+                source.ingest.status.as_str(),
+                "pending" | "analyzing" | "generating" | "completed" | "failed"
+            )
+        {
+            return Err(AppError::new(
+                "changeset_replay_invalid",
+                "malformed detached source intent",
+            ));
+        }
+    }
+    let mut pages = std::collections::BTreeSet::new();
+    for page in &intent.pages {
+        if !pages.insert(&page.slug) || !replay_fingerprint_is_valid(&page.base_fingerprint) {
+            return Err(AppError::new(
+                "changeset_replay_invalid",
+                "malformed detached page intent",
+            ));
+        }
+    }
+    let mut tags = std::collections::BTreeSet::new();
+    for tag in &intent.tags {
+        if !tags.insert(&tag.name) || !replay_fingerprint_is_valid(&tag.base_fingerprint) {
+            return Err(AppError::new(
+                "changeset_replay_invalid",
+                "malformed detached tag intent",
+            ));
+        }
+    }
+    let mut meta = std::collections::BTreeSet::new();
+    for item in &intent.meta {
+        if !matches!(item.key.as_str(), "schema" | "purpose")
+            || !meta.insert(&item.key)
+            || !replay_fingerprint_is_valid(&item.base_fingerprint)
+        {
+            return Err(AppError::new(
+                "changeset_replay_invalid",
+                "malformed detached meta intent",
+            ));
+        }
+    }
+    let mut action_sources = std::collections::BTreeSet::new();
+    let mut action_ingests = std::collections::BTreeSet::new();
+    let mut action_pages = std::collections::BTreeSet::new();
+    let mut action_tags = std::collections::BTreeSet::new();
+    let mut action_meta = std::collections::BTreeSet::new();
+    for action in &intent.actions {
+        match action {
+            crate::store::DetachedChangesetAction::SourceAdd { content_hash } => {
+                if !replay_fingerprint_is_valid(content_hash) {
+                    return Err(AppError::new(
+                        "changeset_replay_invalid",
+                        "invalid source action hash",
+                    ));
+                }
+                action_sources.insert(content_hash.as_str());
+            }
+            crate::store::DetachedChangesetAction::Ingest {
+                action,
+                content_hash,
+            } => {
+                if !matches!(
+                    action.as_str(),
+                    "ingest_claim"
+                        | "ingest_analyze"
+                        | "ingest_complete"
+                        | "ingest_fail"
+                        | "ingest_retry"
+                ) || !replay_fingerprint_is_valid(content_hash)
+                {
+                    return Err(AppError::new(
+                        "changeset_replay_invalid",
+                        "invalid ingest action",
+                    ));
+                }
+                action_ingests.insert(content_hash.as_str());
+            }
+            crate::store::DetachedChangesetAction::PagePut { slug } => {
+                if !intent
+                    .pages
+                    .iter()
+                    .any(|page| page.slug == *slug && page.after.is_some())
+                {
+                    return Err(AppError::new(
+                        "changeset_replay_invalid",
+                        "page_put lacks matching after-image",
+                    ));
+                }
+                action_pages.insert(slug.as_str());
+            }
+            crate::store::DetachedChangesetAction::PageRemove { slug } => {
+                if !intent
+                    .pages
+                    .iter()
+                    .any(|page| page.slug == *slug && page.after.is_none())
+                {
+                    return Err(AppError::new(
+                        "changeset_replay_invalid",
+                        "page_remove lacks matching after-image",
+                    ));
+                }
+                action_pages.insert(slug.as_str());
+            }
+            crate::store::DetachedChangesetAction::Tag { action, name } => {
+                if !matches!(
+                    action.as_str(),
+                    "tag_set" | "tag_remove" | "tag_delete" | "tag_autoload"
+                ) || !tags.contains(name)
+                {
+                    return Err(AppError::new(
+                        "changeset_replay_invalid",
+                        "tag action lacks matching after-image",
+                    ));
+                }
+                action_tags.insert(name.as_str());
+            }
+            crate::store::DetachedChangesetAction::MetaSet { key } => {
+                if !meta.contains(key) {
+                    return Err(AppError::new(
+                        "changeset_replay_invalid",
+                        "meta action lacks matching after-image",
+                    ));
+                }
+                action_meta.insert(key.as_str());
+            }
+            crate::store::DetachedChangesetAction::Search => {}
+        }
+    }
+    if intent.sources.iter().any(|source| {
+        (source.content_required && !action_sources.contains(source.content_hash.as_str()))
+            || (!source.content_required && !action_ingests.contains(source.content_hash.as_str()))
+    }) || pages
+        .iter()
+        .any(|page| !action_pages.contains(page.as_str()))
+        || tags.iter().any(|tag| !action_tags.contains(tag.as_str()))
+        || meta.iter().any(|key| !action_meta.contains(key.as_str()))
+    {
+        return Err(AppError::new(
+            "changeset_replay_invalid",
+            "detached after-images do not match the typed action list",
+        ));
+    }
+    Ok(())
+}
+
+fn replay_fingerprint_is_valid(value: &str) -> bool {
+    value == "absent"
+        || (value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+}
+
+fn replay_origin_is_portable(origin: &str) -> bool {
+    let bytes = origin.as_bytes();
+    let windows_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    !Path::new(origin).is_absolute() && !origin.starts_with(['/', '\\']) && !windows_absolute
+}
+
+fn replay_item_digest<T: Serialize>(item: &T) -> Result<String> {
+    let encoded = serde_json::to_vec(item)
+        .map_err(|error| AppError::new("changeset_replay_invalid", error.to_string()))?;
+    Ok(replay_sha256(&encoded))
+}
+
+fn replay_ingest_after_image(
+    draft: &mut Store,
+    source_id: i64,
+    ingest: &crate::store::DetachedIngestIntent,
+) -> Result<()> {
+    if ingest.attempts < 0 || ingest.attempts > 100 {
+        return Err(AppError::new(
+            "changeset_replay_invalid",
+            "detached ingest attempt count is out of range",
+        ));
+    }
+    let terminal_attempt = !matches!(ingest.status.as_str(), "pending") as i64;
+    if ingest.attempts < terminal_attempt {
+        return Err(AppError::new(
+            "changeset_replay_invalid",
+            "detached ingest status is inconsistent with its attempt count",
+        ));
+    }
+    let retry_cycles = ingest.attempts - terminal_attempt;
+    for _ in 0..retry_cycles {
+        draft.ingest_claim(source_id, 1, None)?;
+        draft.ingest_retry(source_id)?;
+    }
+    match ingest.status.as_str() {
+        "pending" => {}
+        "analyzing" => {
+            draft.ingest_claim(source_id, 1, None)?;
+        }
+        "generating" | "completed" => {
+            draft.ingest_claim(source_id, 1, None)?;
+            draft.ingest_analyze(source_id, ingest.analysis.as_deref().unwrap_or(""))?;
+            if ingest.status == "completed" {
+                draft.ingest_complete(source_id, ingest.no_derived_pages_reason.as_deref())?;
+            }
+        }
+        "failed" => {
+            draft.ingest_claim(source_id, 1, None)?;
+            if let Some(analysis) = ingest.analysis.as_deref() {
+                draft.ingest_analyze(source_id, analysis)?;
+            }
+            draft.ingest_fail(source_id, "detached origin ingest failure")?;
+        }
+        _ => {
+            return Err(AppError::new(
+                "changeset_replay_invalid",
+                "unsupported detached ingest status",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn replay_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn replay_conflict(message: &str) -> AppError {
+    AppError::new("changeset_replay_conflict", message).with_details(json!({"mutated": false}))
 }
 
 pub fn discard(live: &StorePath, name: &str) -> Result<ChangesetDiscardResponse> {

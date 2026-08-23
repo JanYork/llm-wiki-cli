@@ -142,6 +142,159 @@ impl Store {
         Ok(written)
     }
 
+    pub(crate) fn materialize_sync_selection(
+        &mut self,
+        publication: &Value,
+    ) -> Result<MaterializeResponse> {
+        match publication
+            .get("derived_selection")
+            .and_then(Value::as_str)
+        {
+            Some("full") => return self.materialize(),
+            Some("exact") => {}
+            _ => {
+                return Err(AppError::new(
+                    "sync_receipt_invalid",
+                    "Sync publication has no valid derived selection",
+                ));
+            }
+        }
+
+        let affected = publication
+            .get("affected")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                AppError::new(
+                    "sync_receipt_invalid",
+                    "exact Sync publication has no affected-object map",
+                )
+            })?;
+        let values = |kind: &str| -> Result<Vec<String>> {
+            let Some(values) = affected.get(kind) else {
+                return Ok(Vec::new());
+            };
+            values
+                .as_array()
+                .ok_or_else(|| {
+                    AppError::new(
+                        "sync_receipt_invalid",
+                        format!("Sync {kind} selection is not an array"),
+                    )
+                })?
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        AppError::new(
+                            "sync_receipt_invalid",
+                            format!("Sync {kind} selection contains a non-text identifier"),
+                        )
+                    })
+                })
+                .collect()
+        };
+        let graph_documents = publication
+            .get("affected_graph_documents")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                AppError::new(
+                    "sync_receipt_invalid",
+                    "exact Sync publication has no graph-document selection",
+                )
+            })?;
+        let mut source_ids = BTreeSet::new();
+        for document in graph_documents {
+            let pair = document.as_array().filter(|pair| pair.len() == 2).ok_or_else(|| {
+                AppError::new(
+                    "sync_receipt_invalid",
+                    "Sync graph-document selection is malformed",
+                )
+            })?;
+            if pair[0].as_str() == Some("source") {
+                let id = pair[1].as_str().ok_or_else(|| {
+                    AppError::new(
+                        "sync_receipt_invalid",
+                        "Sync source projection identifier is not text",
+                    )
+                })?;
+                if id.parse::<i64>().is_err() {
+                    return Err(AppError::new(
+                        "sync_receipt_invalid",
+                        "Sync source projection identifier is not numeric",
+                    ));
+                }
+                source_ids.insert(id.to_owned());
+            }
+        }
+
+        // Advance the normal operation log/cursor first. The explicit Sync
+        // receipt remains sufficient to retry the selected files if a later
+        // projection write fails after that cursor update.
+        let mut written = self.materialize_incremental(true)?;
+        let root = self
+            .database
+            .parent()
+            .ok_or_else(|| AppError::new("invalid_store_path", "database has no parent"))?;
+        let _projection_lock = artifacts::lock_projection(root)
+            .map_err(|error| AppError::new("artifact_busy", error.to_string()))?;
+
+        for slug in values("page")? {
+            if let Some(page) = self.load_artifact_page(&slug)? {
+                written.extend(artifacts::materialize_page(root, &page).map_err(|error| {
+                    AppError::new("artifact_write_failed", error.to_string())
+                })?);
+            } else {
+                written.extend(artifacts::remove_page(root, &slug).map_err(|error| {
+                    AppError::new("artifact_write_failed", error.to_string())
+                })?);
+            }
+        }
+        for id in source_ids {
+            let id_number = id.parse::<i64>().map_err(|_| {
+                AppError::new(
+                    "sync_receipt_invalid",
+                    "Sync source projection identifier is not numeric",
+                )
+            })?;
+            if let Some(source) = self.load_artifact_source(id_number)? {
+                written.extend(artifacts::materialize_source(root, &source).map_err(|error| {
+                    AppError::new("artifact_write_failed", error.to_string())
+                })?);
+            } else {
+                written.extend(artifacts::remove_source(root, &id).map_err(|error| {
+                    AppError::new("artifact_write_failed", error.to_string())
+                })?);
+            }
+        }
+        for key in values("meta")? {
+            let (path, content) = match key.as_str() {
+                "schema" => (
+                    "schema.md",
+                    self.schema_text()?.unwrap_or_else(|| DEFAULT_SCHEMA.to_string()),
+                ),
+                "purpose" => (
+                    "purpose.md",
+                    self.purpose_text()?.unwrap_or_else(|| DEFAULT_PURPOSE.to_string()),
+                ),
+                _ => {
+                    return Err(AppError::new(
+                        "sync_receipt_invalid",
+                        "Sync meta selection contains an unsupported key",
+                    ));
+                }
+            };
+            artifacts::materialize_text(root, path, &content)
+                .map_err(|error| AppError::new("artifact_write_failed", error.to_string()))?;
+            written.push(path.to_owned());
+        }
+        written.sort();
+        written.dedup();
+        Ok(MaterializeResponse {
+            scope: self.scope.clone(),
+            database: self.database_string(),
+            files: written,
+        })
+    }
+
     fn load_artifact_page(&self, slug: &str) -> Result<Option<artifacts::Page>> {
         let page = self
             .conn

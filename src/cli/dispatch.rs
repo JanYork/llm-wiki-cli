@@ -14,6 +14,8 @@ fn run(cli: Cli) -> Result<Value> {
             | Command::Agent { .. }
             | Command::Todo { .. }
             | Command::Plan { .. }
+            | Command::Sync { .. }
+            | Command::SyncPeer
     ) {
         let paths = if cli.scope == Scope::All {
             resolve_live_read_store_paths(cli.scope, &cwd, true)?
@@ -660,6 +662,23 @@ fn run(cli: Cli) -> Result<Value> {
                 PlanCommand::Complete { plan_id,if_revision,result,evidence,done_when_checked } => {ensure_scope_supported(cli.scope,false,"plan complete")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.plan_finish(&plan_id,if_revision,true,Some(&result),Some(&evidence),done_when_checked,None)}
                 PlanCommand::Abandon { plan_id,if_revision,reason } => {ensure_scope_supported(cli.scope,false,"plan abandon")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.plan_finish(&plan_id,if_revision,false,None,None,false,Some(&reason))}
             }
+        }
+        Command::Sync { host, directory, mode, resume, resolve, abort } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "sync")?;
+            crate::sync::run(
+                &cwd,
+                cli.scope,
+                &host,
+                directory.as_deref(),
+                mode,
+                resume.as_deref(),
+                resolve.as_deref(),
+                abort.as_deref(),
+            )
+        }
+        Command::SyncPeer => {
+            changeset::reject_selector(selected_changeset.as_deref(), "sync peer")?;
+            crate::sync::peer()
         }
         Command::Load { command } => match command {
             LoadCommand::Tag { tag, limit } => {

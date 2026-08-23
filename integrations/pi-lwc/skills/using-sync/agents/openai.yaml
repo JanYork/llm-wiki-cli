@@ -1,0 +1,4 @@
+interface:
+  display_name: "LWC Sync"
+  short_description: "Safe resumable Wiki synchronization"
+  default_prompt: "Use $using-sync to synchronize LWC stores and resolve conflicts through audited packets."

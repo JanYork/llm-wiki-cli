@@ -1,3 +1,52 @@
+fn portable_detached_origin(origin: String) -> Option<String> {
+    let bytes = origin.as_bytes();
+    let windows_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    (!Path::new(&origin).is_absolute() && !origin.starts_with(['/', '\\']) && !windows_absolute)
+        .then_some(origin)
+}
+
+fn changeset_sync_replay_target(origin_store_id: &str, origin_changeset_id: &str) -> String {
+    hash_content(&format!("{origin_store_id}\0{origin_changeset_id}"))
+}
+
+fn changeset_sync_replay_expected_key(target: &str) -> String {
+    format!("changeset_sync_replay_expected:{target}")
+}
+
+fn validate_changeset_sync_replay_item(item_key: &str, item_digest: &str) -> Result<()> {
+    let valid_key = (1..=512).contains(&item_key.len())
+        && item_key.matches('\0').count() == 1
+        && matches!(
+            item_key.split_once('\0').map(|value| value.0),
+            Some("source" | "page" | "meta" | "tag" | "ingest")
+        )
+        && !item_key
+            .chars()
+            .any(|character| character.is_control() && character != '\0');
+    let valid_digest = item_digest.len() == 64
+        && item_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !valid_key || !valid_digest {
+        return Err(AppError::new(
+            "changeset_replay_invalid",
+            "replay item marker is malformed",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChangesetSyncReplayItemState {
+    Ready,
+    PendingClean,
+    PendingMutated,
+    Complete,
+}
+
 impl Store {
     pub fn initialize(
         scope: impl Into<String>,
@@ -261,6 +310,1076 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    pub(crate) fn changeset_sync_replay_marker(
+        &mut self,
+        origin_store_id: &str,
+        origin_changeset_id: &str,
+        complete: bool,
+    ) -> Result<bool> {
+        for (label, value) in [
+            ("origin store ID", origin_store_id),
+            ("origin changeset ID", origin_changeset_id),
+        ] {
+            if value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(AppError::new(
+                    "changeset_replay_invalid",
+                    format!("{label} must be 64 hexadecimal characters"),
+                ));
+            }
+        }
+        let target = changeset_sync_replay_target(origin_store_id, origin_changeset_id);
+        if let Some(state) =
+            self.changeset_sync_replay_state(origin_store_id, origin_changeset_id)?
+        {
+            if !complete || state.complete {
+                return Ok(false);
+            }
+        } else if complete {
+            return Err(AppError::new(
+                "changeset_replay_not_started",
+                "changeset replay cannot complete before its start marker",
+            ));
+        }
+        let action = if complete {
+            "changeset_sync_replay_complete"
+        } else {
+            "changeset_sync_replay_start"
+        };
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let revision = record_operation(
+            &tx,
+            action,
+            &target,
+            &json!({
+                "origin_store_id": origin_store_id,
+                "origin_changeset_id": origin_changeset_id,
+            }),
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![changeset_sync_replay_expected_key(&target), revision],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn changeset_sync_replay_state(
+        &self,
+        origin_store_id: &str,
+        origin_changeset_id: &str,
+    ) -> Result<Option<ChangesetSyncReplayState>> {
+        let target = changeset_sync_replay_target(origin_store_id, origin_changeset_id);
+        let started: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations
+             WHERE action = 'changeset_sync_replay_start' AND target = ?1)",
+            [&target],
+            |row| row.get(0),
+        )?;
+        if !started {
+            return Ok(None);
+        }
+        let expected: String = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [changeset_sync_replay_expected_key(&target)],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                AppError::new(
+                    "changeset_replay_conflict",
+                    "replay draft lost its revision guard",
+                )
+            })?;
+        let revision_changed = self.identity()?.revision != expected;
+        let pending_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM operations started
+             WHERE started.action = 'changeset_sync_replay_item_start'
+               AND started.target = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM operations completed
+                   WHERE completed.action = 'changeset_sync_replay_item'
+                     AND completed.target = started.target
+                     AND json_extract(completed.detail_json, '$.item_key') =
+                         json_extract(started.detail_json, '$.item_key')
+               )",
+            [&target],
+            |row| row.get(0),
+        )?;
+        if pending_count > 1 {
+            return Err(AppError::new(
+                "changeset_corrupt",
+                "replay draft contains multiple pending items",
+            ));
+        }
+        if revision_changed && pending_count == 0 {
+            return Err(AppError::new(
+                "changeset_replay_conflict",
+                "replay draft was changed outside its replay helper",
+            )
+            .with_details(json!({"mutated": false, "reason": "draft_revision_changed"})));
+        }
+        let complete: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations
+             WHERE action = 'changeset_sync_replay_complete' AND target = ?1)",
+            [&target],
+            |row| row.get(0),
+        )?;
+        let mut statement = self.conn.prepare(
+            "SELECT detail_json FROM operations
+             WHERE action = 'changeset_sync_replay_item' AND target = ?1 ORDER BY id",
+        )?;
+        let mut items = BTreeMap::new();
+        for detail in statement.query_map([&target], |row| row.get::<_, String>(0))? {
+            let detail: Value = serde_json::from_str(&detail?)
+                .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?;
+            let key = detail
+                .get("item_key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AppError::new("changeset_corrupt", "replay item marker lacks item_key")
+                })?;
+            let digest = detail
+                .get("item_digest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AppError::new("changeset_corrupt", "replay item marker lacks item_digest")
+                })?;
+            if items.insert(key.to_string(), digest.to_string()).is_some() {
+                return Err(AppError::new(
+                    "changeset_corrupt",
+                    "duplicate replay item marker",
+                ));
+            }
+        }
+        Ok(Some(ChangesetSyncReplayState { complete, items }))
+    }
+
+    pub(crate) fn changeset_sync_replay_start_item(
+        &mut self,
+        origin_store_id: &str,
+        origin_changeset_id: &str,
+        item_key: &str,
+        item_digest: &str,
+    ) -> Result<ChangesetSyncReplayItemState> {
+        validate_changeset_sync_replay_item(item_key, item_digest)?;
+        let target = changeset_sync_replay_target(origin_store_id, origin_changeset_id);
+        let state = self
+            .changeset_sync_replay_state(origin_store_id, origin_changeset_id)?
+            .ok_or_else(|| {
+                AppError::new("changeset_replay_not_started", "replay has not started")
+            })?;
+        if state.complete {
+            return Ok(ChangesetSyncReplayItemState::Complete);
+        }
+        if let Some(existing) = state.items.get(item_key) {
+            return if existing == item_digest {
+                Ok(ChangesetSyncReplayItemState::Complete)
+            } else {
+                Err(AppError::new(
+                    "changeset_replay_conflict",
+                    "replay item digest changed",
+                ))
+            };
+        }
+        let pending: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT json_extract(detail_json, '$.item_digest'), id
+             FROM operations
+             WHERE action = 'changeset_sync_replay_item_start' AND target = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM operations completed
+                   WHERE completed.action = 'changeset_sync_replay_item'
+                     AND completed.target = operations.target
+                     AND json_extract(completed.detail_json, '$.item_key') =
+                         json_extract(operations.detail_json, '$.item_key')
+               )
+             ORDER BY id DESC LIMIT 1",
+                [&target],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((pending_digest, _)) = pending {
+            let pending_key: String = self.conn.query_row(
+                "SELECT json_extract(detail_json, '$.item_key') FROM operations
+                 WHERE action = 'changeset_sync_replay_item_start' AND target = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM operations completed
+                       WHERE completed.action = 'changeset_sync_replay_item'
+                         AND completed.target = operations.target
+                         AND json_extract(completed.detail_json, '$.item_key') =
+                             json_extract(operations.detail_json, '$.item_key')
+                   ) ORDER BY id DESC LIMIT 1",
+                [&target],
+                |row| row.get(0),
+            )?;
+            if pending_key != item_key || pending_digest != item_digest {
+                return Err(AppError::new(
+                    "changeset_replay_conflict",
+                    "another replay item is pending",
+                ));
+            }
+            let expected: String = self.conn.query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [changeset_sync_replay_expected_key(&target)],
+                |row| row.get(0),
+            )?;
+            return Ok(if self.identity()?.revision == expected {
+                ChangesetSyncReplayItemState::PendingClean
+            } else {
+                ChangesetSyncReplayItemState::PendingMutated
+            });
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let revision = record_operation(
+            &tx,
+            "changeset_sync_replay_item_start",
+            &target,
+            &json!({"item_key": item_key, "item_digest": item_digest}),
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![changeset_sync_replay_expected_key(&target), revision],
+        )?;
+        tx.commit()?;
+        Ok(ChangesetSyncReplayItemState::Ready)
+    }
+
+    pub(crate) fn changeset_sync_replay_mark_item(
+        &mut self,
+        origin_store_id: &str,
+        origin_changeset_id: &str,
+        item_key: &str,
+        item_digest: &str,
+    ) -> Result<bool> {
+        validate_changeset_sync_replay_item(item_key, item_digest)?;
+        let target = changeset_sync_replay_target(origin_store_id, origin_changeset_id);
+        let started: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations
+             WHERE action = 'changeset_sync_replay_start' AND target = ?1)",
+            [&target],
+            |row| row.get(0),
+        )?;
+        if !started {
+            return Err(AppError::new(
+                "changeset_replay_not_started",
+                "replay has not started",
+            ));
+        }
+        let complete: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations
+             WHERE action = 'changeset_sync_replay_complete' AND target = ?1)",
+            [&target],
+            |row| row.get(0),
+        )?;
+        if complete {
+            return Err(AppError::new(
+                "changeset_replay_conflict",
+                "completed replay cannot accept items",
+            ));
+        }
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT json_extract(detail_json, '$.item_digest') FROM operations
+             WHERE action = 'changeset_sync_replay_item' AND target = ?1
+               AND json_extract(detail_json, '$.item_key') = ?2",
+                params![&target, item_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing == item_digest {
+                return Ok(false);
+            }
+            return Err(AppError::new(
+                "changeset_replay_conflict",
+                "replay item digest changed",
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let revision = record_operation(
+            &tx,
+            "changeset_sync_replay_item",
+            &target,
+            &json!({"item_key": item_key, "item_digest": item_digest}),
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![changeset_sync_replay_expected_key(&target), revision],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn changeset_sync_replay_pending_mutations_match(
+        &self,
+        origin_store_id: &str,
+        origin_changeset_id: &str,
+        item_key: &str,
+    ) -> Result<bool> {
+        let target = changeset_sync_replay_target(origin_store_id, origin_changeset_id);
+        let start_id: i64 = self.conn.query_row(
+            "SELECT id FROM operations
+             WHERE action = 'changeset_sync_replay_item_start' AND target = ?1
+               AND json_extract(detail_json, '$.item_key') = ?2
+             ORDER BY id DESC LIMIT 1",
+            params![&target, item_key],
+            |row| row.get(0),
+        )?;
+        let mut statement = self.conn.prepare(
+            "SELECT action,target,detail_json FROM operations
+             WHERE id > ?1 AND action NOT LIKE 'changeset_sync_replay_%' ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([start_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.is_empty() {
+            return Ok(false);
+        }
+        let (kind, identifier) = item_key.split_once('\0').unwrap_or(("", ""));
+        for (action, operation_target, detail_json) in rows {
+            let valid = match kind {
+                "source" => {
+                    if action != "source_add" {
+                        false
+                    } else {
+                        let detail: Value =
+                            serde_json::from_str(&detail_json).map_err(|error| {
+                                AppError::new("changeset_corrupt", error.to_string())
+                            })?;
+                        let source_id = detail.get("source_id").and_then(Value::as_i64);
+                        source_id.is_some_and(|source_id| {
+                            self.conn
+                                .query_row(
+                                    "SELECT content_hash = ?2 FROM sources WHERE id = ?1",
+                                    params![source_id, identifier],
+                                    |row| row.get::<_, bool>(0),
+                                )
+                                .unwrap_or(false)
+                        })
+                    }
+                }
+                "page" => {
+                    matches!(action.as_str(), "page_put" | "page_remove")
+                        && operation_target == identifier
+                }
+                "meta" => match identifier {
+                    "schema" => action == "schema_set" && operation_target == "schema",
+                    "purpose" => action == "purpose_set" && operation_target == "purpose",
+                    _ => false,
+                },
+                "tag" => {
+                    matches!(action.as_str(), "tag_set" | "tag_remove")
+                        && operation_target.starts_with(&format!("{identifier}/"))
+                        || matches!(action.as_str(), "tag_delete" | "tag_autoload")
+                            && operation_target == identifier
+                }
+                "ingest" => {
+                    let source_id = self.source_id_by_content_hash(identifier)?;
+                    matches!(
+                        action.as_str(),
+                        "ingest_claim"
+                            | "ingest_analyze"
+                            | "ingest_complete"
+                            | "ingest_fail"
+                            | "ingest_retry"
+                    ) && source_id.is_some_and(|id| operation_target == id.to_string())
+                }
+                _ => false,
+            };
+            if !valid {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn source_id_by_content_hash(&self, content_hash: &str) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM sources WHERE content_hash = ?1",
+                [content_hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn changeset_replay_source_from_normalized(
+        &mut self,
+        normalized: &Path,
+        source: &DetachedSourceIntent,
+        remaining_bytes: u64,
+    ) -> Result<(i64, u64)> {
+        if let Some(source_id) = self.source_id_by_content_hash(&source.content_hash)? {
+            if self.changeset_replay_source_matches(source)? {
+                return Ok((source_id, 0));
+            }
+            return Err(AppError::new(
+                "changeset_replay_conflict",
+                "existing replay source metadata differs from its after-image",
+            ));
+        }
+        let artifact = validate_sync_state_file(normalized)?;
+        let row: Option<(i64, i64)> = artifact
+            .query_row(
+                "SELECT rowid, length(content) FROM sync_blobs WHERE content_hash = ?1",
+                [&source.content_hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (rowid, byte_len) = row.ok_or_else(|| {
+            AppError::new(
+                "changeset_replay_hash_mismatch",
+                "normalized Sync state lacks the declared source blob",
+            )
+        })?;
+        if byte_len < 0 || u64::try_from(byte_len).unwrap_or(u64::MAX) > remaining_bytes {
+            return Err(AppError::new(
+                "changeset_sync_limit",
+                "resolved source blob exceeds the Sync transfer byte limit",
+            ));
+        }
+        let mut state_hasher = Sha256::new();
+        let actual_hash = hash_and_validate_sync_blob(&artifact, rowid, &mut state_hasher)?;
+        if actual_hash != source.content_hash {
+            return Err(AppError::new(
+                "changeset_replay_hash_mismatch",
+                "resolved source content does not match its declared hash",
+            ));
+        }
+        drop(artifact);
+
+        let origin = source
+            .origin
+            .clone()
+            .unwrap_or_else(|| format!("sync:sha256:{}", source.content_hash));
+        let title = source.title.as_deref().unwrap_or(&origin).to_string();
+        self.conn.execute(
+            "ATTACH DATABASE ?1 AS replay_blob",
+            [normalized.to_string_lossy().as_ref()],
+        )?;
+        let result = (|| -> Result<i64> {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                &format!(
+                    "INSERT INTO sources(content_hash,title,origin,content,structural_navigation,created_at)
+                     SELECT ?1,?2,?3,CAST(content AS TEXT),?4,{TIMESTAMP_SQL}
+                     FROM replay_blob.sync_blobs WHERE content_hash = ?1"
+                ),
+                params![&source.content_hash, &title, &origin, source.structural_navigation],
+            )?;
+            let source_id = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO search_fts(
+                    doc_type,identifier,title_terms,path_terms,summary_terms,body_terms
+                 ) SELECT 'source',?1,?2,?3,'',CAST(content AS TEXT)
+                   FROM replay_blob.sync_blobs WHERE content_hash = ?4",
+                params![
+                    source_id.to_string(),
+                    source_title_terms(&title, &origin),
+                    joined_terms(source_parent(&origin)),
+                    &source.content_hash,
+                ],
+            )?;
+            tx.execute(
+                &format!(
+                    "INSERT INTO ingest_jobs(source_id,status,updated_at)
+                     VALUES(?1,'pending',{TIMESTAMP_SQL})"
+                ),
+                [source_id],
+            )?;
+            record_operation(
+                &tx,
+                "source_add",
+                &origin,
+                &json!({"source_id": source_id, "created": true,
+                         "tracked_path": Value::Null, "path_revision": Value::Null,
+                         "path_advanced": Value::Null}),
+            )?;
+            tx.commit()?;
+            Ok(source_id)
+        })();
+        let _ = self.conn.execute("DETACH DATABASE replay_blob", []);
+        result.map(|source_id| (source_id, u64::try_from(byte_len).unwrap_or(0)))
+    }
+
+    pub(crate) fn changeset_replay_prepare_existing_source(
+        &mut self,
+        live_path: &Path,
+        source: &DetachedSourceIntent,
+    ) -> Result<i64> {
+        if let Some(source_id) = self.source_id_by_content_hash(&source.content_hash)? {
+            return Ok(source_id);
+        }
+        self.conn.execute(
+            "ATTACH DATABASE ?1 AS replay_live",
+            [live_path.to_string_lossy().as_ref()],
+        )?;
+        let result = (|| -> Result<i64> {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let inserted = tx.execute(
+                "INSERT INTO sources(id,content_hash,title,origin,content,structural_navigation,created_at)
+                 SELECT id,content_hash,title,origin,'',structural_navigation,created_at
+                 FROM replay_live.sources WHERE content_hash = ?1",
+                [&source.content_hash],
+            )?;
+            if inserted != 1 {
+                return Err(AppError::new(
+                    "changeset_replay_invalid",
+                    "existing replay source is absent from the synchronized target",
+                ));
+            }
+            let source_id: i64 = tx.query_row(
+                "SELECT id FROM sources WHERE content_hash = ?1",
+                [&source.content_hash],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                &format!(
+                    "INSERT INTO ingest_jobs(source_id,status,updated_at)
+                     VALUES(?1,'pending',{TIMESTAMP_SQL})"
+                ),
+                [source_id],
+            )?;
+            tx.commit()?;
+            Ok(source_id)
+        })();
+        let _ = self.conn.execute("DETACH DATABASE replay_live", []);
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn changeset_replay_blob_max_buffered_bytes() -> u64 {
+        SYNC_BLOB_MAX_BUFFERED_BYTES.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn tag_exists_for_replay(&self, tag: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tags WHERE name = ?1)",
+            [tag],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn changeset_replay_source_matches(
+        &self,
+        source: &DetachedSourceIntent,
+    ) -> Result<bool> {
+        let fallback_origin;
+        let expected_origin = if let Some(origin) = source.origin.as_deref() {
+            origin
+        } else {
+            fallback_origin = format!("sync:sha256:{}", source.content_hash);
+            &fallback_origin
+        };
+        let expected_title = source.title.as_deref().unwrap_or(expected_origin);
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sources
+             WHERE content_hash = ?1 AND title = ?2 AND origin = ?3
+               AND structural_navigation = ?4)",
+            params![
+                &source.content_hash,
+                expected_title,
+                expected_origin,
+                source.structural_navigation
+            ],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn changeset_replay_page_matches(&self, page: &DetachedPageIntent) -> Result<bool> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pages WHERE slug = ?1)",
+            [&page.slug],
+            |row| row.get(0),
+        )?;
+        let Some(after) = &page.after else {
+            return Ok(!exists);
+        };
+        if !exists {
+            return Ok(false);
+        }
+        let actual = self.load_page(&page.slug)?;
+        let mut hashes = actual
+            .source_ids
+            .iter()
+            .map(|id| {
+                self.conn
+                    .query_row(
+                        "SELECT content_hash FROM sources WHERE id = ?1",
+                        [id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        hashes.sort();
+        let mut expected_hashes = after.source_hashes.clone();
+        expected_hashes.sort();
+        Ok(actual.title == after.title
+            && actual.kind == after.kind
+            && actual.summary == after.summary
+            && actual.body == after.body
+            && actual.provenance == after.provenance
+            && hashes == expected_hashes)
+    }
+
+    pub(crate) fn changeset_replay_meta_matches(&self, meta: &DetachedMetaIntent) -> Result<bool> {
+        let actual = match meta.key.as_str() {
+            "schema" => self.schema_text()?,
+            "purpose" => self.purpose_text()?,
+            _ => return Ok(false),
+        };
+        Ok(actual.as_deref() == Some(meta.value.as_str()))
+    }
+
+    pub(crate) fn changeset_replay_tag_matches(&self, tag: &DetachedTagIntent) -> Result<bool> {
+        let snapshot = load_tag_snapshot(&self.conn, "main", &tag.name)?;
+        let Some(after) = &tag.after else {
+            return Ok(snapshot.policy.is_none());
+        };
+        let Some(policy) = snapshot.policy else {
+            return Ok(false);
+        };
+        let actual_memberships = snapshot
+            .memberships
+            .into_iter()
+            .map(|member| DetachedTagMembership {
+                page_slug: member.page_slug,
+                priority: member.priority,
+                reason: member.reason,
+            })
+            .collect::<Vec<_>>();
+        Ok(policy.autoload == after.autoload
+            && policy.autoload_priority == after.autoload_priority
+            && policy.autoload_limit == after.autoload_limit
+            && policy.autoload_max_chars == after.autoload_max_chars
+            && policy.reason == after.reason
+            && actual_memberships == after.memberships)
+    }
+
+    pub(crate) fn changeset_replay_ingest_matches(
+        &self,
+        content_hash: &str,
+        ingest: &DetachedIngestIntent,
+    ) -> Result<bool> {
+        let actual = self
+            .conn
+            .query_row(
+                "SELECT j.status, j.attempts, j.analysis, j.no_derived_pages_reason
+             FROM ingest_jobs j JOIN sources s ON s.id = j.source_id
+             WHERE s.content_hash = ?1",
+                [content_hash],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(actual.is_some_and(|actual| {
+            actual
+                == (
+                    ingest.status.clone(),
+                    ingest.attempts,
+                    ingest.analysis.clone(),
+                    ingest.no_derived_pages_reason.clone(),
+                )
+        }))
+    }
+
+    pub(crate) fn detached_changeset_intent(&self) -> Result<Option<DetachedChangesetStoreExport>> {
+        const MAX_ACTIONS: usize = 2_048;
+        const MAX_ITEMS: usize = 1_024;
+        const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
+        const MAX_TOTAL_BLOB_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+        self.validate_changeset_integrity()?;
+        if self.changeset_storage_kind()?.as_deref() != Some("sparse-v1") {
+            return Err(AppError::new(
+                "changeset_sync_unsupported",
+                "only sparse changesets can be exported as detached intent",
+            ));
+        }
+        let state = self.changeset_draft(
+            self.conn
+                .query_row(
+                    "SELECT name FROM changesets WHERE status = 'draft' LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )?
+                .as_str(),
+            MAX_ACTIONS + 1,
+        )?;
+        if state.staged_operation_count > MAX_ACTIONS {
+            return Err(AppError::new(
+                "changeset_sync_limit",
+                "detached changeset has too many actions",
+            ));
+        }
+        if state.operations.iter().any(|operation| {
+            matches!(
+                operation.action.as_str(),
+                "changeset_sync_replay_start" | "changeset_sync_replay_complete"
+            )
+        }) {
+            return Ok(None);
+        }
+
+        let created_source_ids = changeset_created_source_ids(&self.conn)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut source_ids = created_source_ids.clone();
+        for operation in &state.operations {
+            if operation.action.starts_with("ingest_") {
+                source_ids.insert(operation.target.parse::<i64>().map_err(|_| {
+                    AppError::new(
+                        "changeset_corrupt",
+                        "ingest action has an invalid source ID",
+                    )
+                })?);
+            }
+        }
+        let mut sources = Vec::with_capacity(source_ids.len());
+        let mut blobs = Vec::with_capacity(source_ids.len());
+        let mut source_hashes = BTreeMap::new();
+        let mut total_blob_bytes = 0_u64;
+        for source_id in source_ids {
+            let content_required = created_source_ids.contains(&source_id);
+            let source = self
+                .conn
+                .query_row(
+                    "SELECT s.content_hash, s.title, s.origin, s.structural_navigation,
+                        LENGTH(CAST(s.content AS BLOB)), j.status, j.attempts,
+                        j.analysis, j.no_derived_pages_reason
+                 FROM sources s JOIN ingest_jobs j ON j.source_id = s.id
+                 WHERE s.id = ?1",
+                    [source_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, bool>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                            row.get::<_, Option<String>>(8)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    AppError::new("changeset_corrupt", "staged source after-image is missing")
+                })?;
+            if source.0.len() != 64
+                || !source
+                    .0
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(AppError::new(
+                    "changeset_corrupt",
+                    "invalid source content hash",
+                ));
+            }
+            let blob_bytes = u64::try_from(source.4).map_err(|_| {
+                AppError::new("changeset_corrupt", "invalid staged source byte count")
+            })?;
+            if content_required {
+                total_blob_bytes = total_blob_bytes.checked_add(blob_bytes).ok_or_else(|| {
+                    AppError::new(
+                        "changeset_sync_limit",
+                        "detached source byte count overflowed",
+                    )
+                })?;
+                if total_blob_bytes > MAX_TOTAL_BLOB_BYTES {
+                    return Err(AppError::new(
+                        "changeset_sync_limit",
+                        "detached source blobs exceed the Sync transfer byte limit",
+                    ));
+                }
+            }
+            source_hashes.insert(source_id, source.0.clone());
+            if content_required {
+                blobs.push((source_id, source.0.clone(), blob_bytes));
+            }
+            let base_fingerprint = if content_required {
+                "absent".into()
+            } else {
+                source.0.clone()
+            };
+            sources.push(DetachedSourceIntent {
+                content_hash: source.0,
+                title: source.1,
+                origin: portable_detached_origin(source.2),
+                structural_navigation: source.3,
+                base_fingerprint,
+                content_required,
+                ingest: DetachedIngestIntent {
+                    status: source.5,
+                    attempts: source.6,
+                    analysis: source.7,
+                    no_derived_pages_reason: source.8,
+                },
+            });
+        }
+
+        let mut pages = Vec::new();
+        for (slug, base_fingerprint) in self.changeset_touched_pages()? {
+            let after = load_sparse_page_snapshot(&self.conn, &slug)?
+                .map(|page| -> Result<DetachedPageAfterImage> {
+                    let hashes = page
+                        .source_ids
+                        .iter()
+                        .map(|id| {
+                            source_hashes
+                                .get(id)
+                                .cloned()
+                                .or_else(|| {
+                                    self.conn
+                                        .query_row(
+                                            "SELECT content_hash FROM sources WHERE id = ?1",
+                                            [id],
+                                            |row| row.get(0),
+                                        )
+                                        .optional()
+                                        .ok()
+                                        .flatten()
+                                })
+                                .ok_or_else(|| {
+                                    AppError::new(
+                                        "changeset_corrupt",
+                                        "page cites a missing source",
+                                    )
+                                })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(DetachedPageAfterImage {
+                        title: page.title,
+                        kind: page.kind,
+                        summary: page.summary,
+                        body: page.body,
+                        source_hashes: hashes,
+                        provenance: page.provenance,
+                    })
+                })
+                .transpose()?;
+            pages.push(DetachedPageIntent {
+                slug,
+                base_fingerprint,
+                after,
+            });
+        }
+
+        let mut tags = Vec::new();
+        for (name, base_fingerprint) in self.changeset_touched_tags()? {
+            let snapshot = load_tag_snapshot(&self.conn, "main", &name)?;
+            let after = snapshot.policy.map(|policy| DetachedTagAfterImage {
+                autoload: policy.autoload,
+                autoload_priority: policy.autoload_priority,
+                autoload_limit: policy.autoload_limit,
+                autoload_max_chars: policy.autoload_max_chars,
+                reason: policy.reason,
+                memberships: snapshot
+                    .memberships
+                    .into_iter()
+                    .map(|member| DetachedTagMembership {
+                        page_slug: member.page_slug,
+                        priority: member.priority,
+                        reason: member.reason,
+                    })
+                    .collect(),
+            });
+            tags.push(DetachedTagIntent {
+                name,
+                base_fingerprint,
+                after,
+            });
+        }
+
+        let mut meta = Vec::new();
+        for (key, base_fingerprint) in self.changeset_touched_meta()? {
+            if !matches!(key.as_str(), "schema" | "purpose") {
+                return Err(AppError::new(
+                    "changeset_corrupt",
+                    "unsupported detached meta key",
+                ));
+            }
+            let value =
+                self.conn
+                    .query_row("SELECT value FROM meta WHERE key = ?1", [&key], |row| {
+                        row.get(0)
+                    })?;
+            meta.push(DetachedMetaIntent {
+                key,
+                base_fingerprint,
+                value,
+            });
+        }
+
+        if sources.len() + pages.len() + tags.len() + meta.len() > MAX_ITEMS {
+            return Err(AppError::new(
+                "changeset_sync_limit",
+                "detached changeset has too many typed items",
+            ));
+        }
+        let mut actions = Vec::with_capacity(state.operations.len());
+        for operation in state.operations.iter().rev() {
+            let detail = operation.detail.as_object().ok_or_else(|| {
+                AppError::new(
+                    "changeset_corrupt",
+                    "changeset operation detail is not an object",
+                )
+            })?;
+            let action = match operation.action.as_str() {
+                "source_add" => {
+                    let id = detail
+                        .get("source_id")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| {
+                            AppError::new("changeset_corrupt", "source_add lacks source_id")
+                        })?;
+                    DetachedChangesetAction::SourceAdd {
+                        content_hash: source_hashes
+                            .get(&id)
+                            .cloned()
+                            .or_else(|| {
+                                self.conn
+                                    .query_row(
+                                        "SELECT content_hash FROM sources WHERE id = ?1",
+                                        [id],
+                                        |row| row.get(0),
+                                    )
+                                    .optional()
+                                    .ok()
+                                    .flatten()
+                            })
+                            .ok_or_else(|| {
+                                AppError::new(
+                                    "changeset_corrupt",
+                                    "source_add references a missing source",
+                                )
+                            })?,
+                    }
+                }
+                action @ ("ingest_claim" | "ingest_analyze" | "ingest_complete" | "ingest_fail"
+                | "ingest_retry") => {
+                    let id = operation.target.parse::<i64>().map_err(|_| {
+                        AppError::new(
+                            "changeset_corrupt",
+                            "ingest action has an invalid source ID",
+                        )
+                    })?;
+                    DetachedChangesetAction::Ingest {
+                        action: action.to_string(),
+                        content_hash: source_hashes
+                            .get(&id)
+                            .cloned()
+                            .or_else(|| {
+                                self.conn
+                                    .query_row(
+                                        "SELECT content_hash FROM sources WHERE id = ?1",
+                                        [id],
+                                        |row| row.get(0),
+                                    )
+                                    .optional()
+                                    .ok()
+                                    .flatten()
+                            })
+                            .ok_or_else(|| {
+                                AppError::new(
+                                    "changeset_corrupt",
+                                    "ingest action references a missing source",
+                                )
+                            })?,
+                    }
+                }
+                "page_put" => DetachedChangesetAction::PagePut {
+                    slug: operation.target.clone(),
+                },
+                "page_remove" => DetachedChangesetAction::PageRemove {
+                    slug: operation.target.clone(),
+                },
+                action @ ("tag_set" | "tag_remove" | "tag_delete" | "tag_autoload") => {
+                    DetachedChangesetAction::Tag {
+                        action: action.to_string(),
+                        name: detail
+                            .get("tag")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                AppError::new("changeset_corrupt", "tag action lacks tag")
+                            })?
+                            .to_string(),
+                    }
+                }
+                "schema_set" => DetachedChangesetAction::MetaSet {
+                    key: "schema".into(),
+                },
+                "purpose_set" => DetachedChangesetAction::MetaSet {
+                    key: "purpose".into(),
+                },
+                "search" => DetachedChangesetAction::Search,
+                _ => {
+                    return Err(AppError::new(
+                        "changeset_corrupt",
+                        "unsupported detached changeset action",
+                    ));
+                }
+            };
+            actions.push(action);
+        }
+        let intent = DetachedChangesetIntent {
+            version: 1,
+            origin_changeset_id: state.id,
+            name: state.name,
+            actions,
+            sources,
+            pages,
+            tags,
+            meta,
+        };
+        let bytes = serde_json::to_vec(&intent)
+            .map_err(|error| AppError::new("changeset_corrupt", error.to_string()))?;
+        if bytes.len() > MAX_METADATA_BYTES {
+            return Err(AppError::new(
+                "changeset_sync_limit",
+                "detached changeset metadata exceeds the byte limit",
+            ));
+        }
+        Ok(Some((intent, blobs)))
     }
 
     pub fn changeset_touched_pages(&self) -> Result<Vec<(String, String)>> {

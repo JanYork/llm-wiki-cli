@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use crate::{changeset, codegraph, config, source_diff, store, trans, view, work};
+use crate::{changeset, codegraph, config, source_diff, store, sync, trans, view, work};
 use crate::error::{AppError, Result};
 use crate::import::collect_documents;
 use crate::scope::{
@@ -154,7 +154,7 @@ all      Read project and global stores together; valid only for search and cont
 Run `lwc <COMMAND> --help` for command-specific examples and side effects."
 )]
 struct Cli {
-    /// Wiki scope. Mutating commands accept project or global; all is for search/context.
+    /// Wiki scope. Each command validates the scopes it supports; Sync accepts all three.
     #[arg(long, value_enum, default_value = "project", global = true)]
     scope: Scope,
 
@@ -268,6 +268,32 @@ enum Command {
     Todo { #[command(subcommand)] command: TodoCommand },
     /// Manage an independent durable current execution plan.
     Plan { #[command(subcommand)] command: PlanCommand },
+    /// Synchronize Git-tracked files and LWC semantic state with another machine over SSH.
+    #[command(
+        long_about = "Synchronize without replacing an existing Wiki database. Project files use Git; LWC semantic state is staged, merged, validated, and published separately.",
+        after_help = "Examples:\n  lwc sync laptop /Users/me/project\n  lwc sync laptop /Users/me/project --mode pull\n  lwc --scope global sync laptop --mode push\n  lwc sync laptop /Users/me/project --resume SESSION_ID"
+    )]
+    Sync {
+        /// SSH host or configured SSH alias.
+        host: String,
+        /// Absolute project directory on the remote machine; omitted for global-only sync.
+        directory: Option<PathBuf>,
+        /// Merge both sides, pull remote changes, or push local changes.
+        #[arg(long, value_enum, default_value = "merge")]
+        mode: sync::SyncMode,
+        /// Resume an existing local Sync session.
+        #[arg(long, conflicts_with = "abort")]
+        resume: Option<String>,
+        /// Apply an Agent-produced resolution packet while resuming.
+        #[arg(long, requires = "resume")]
+        resolve: Option<PathBuf>,
+        /// Mark an existing Sync session aborted without deleting its audit state.
+        #[arg(long, conflicts_with_all = ["resume", "resolve"])]
+        abort: Option<String>,
+    },
+    /// Internal SSH peer endpoint. Reads one bounded JSON request from stdin.
+    #[command(name = "__sync-peer", hide = true)]
+    SyncPeer,
     /// Load deterministic Wiki context without search.
     Load {
         #[command(subcommand)]

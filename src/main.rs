@@ -15,6 +15,8 @@ mod secret_scan;
 pub mod segment;
 mod source_diff;
 mod store;
+mod sync;
+mod sync_git;
 pub mod tokenize;
 mod trans;
 mod view;

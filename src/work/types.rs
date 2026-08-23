@@ -104,3 +104,20 @@ impl WorkState {
         self.updated_at_unix_ms = now_ms();
     }
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct TerminalSyncAudit {
+    pub(crate) audit_key: String,
+    pub(crate) digest: String,
+    pub(crate) origin_store_id: String,
+    pub(crate) origin_work_id: String,
+    pub(crate) kind: String,
+    pub(crate) state: String,
+    pub(crate) completed: u64,
+    pub(crate) total: Option<u64>,
+    pub(crate) updated_at_unix_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) result_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error_code: Option<String>,
+}
