@@ -40,6 +40,14 @@ fn subject(cwd: &Path, home: &Path) -> String {
         .to_owned()
 }
 
+fn named_subject(cwd: &Path, home: &Path, name: &str, request_id: &str) -> String {
+    let input = serde_json::json!({"name":name,"request_id":request_id}).to_string();
+    ok(cwd, home, &["subject", "create", "--json", &input])["result"]["subject"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
 #[test]
 fn visible_turn_input_is_durable_before_reply_and_commit_is_idempotent() {
     let temp = tempfile::tempdir().unwrap();
@@ -266,4 +274,202 @@ fn soul_is_fully_materialized_versioned_bounded_and_sensitive_changes_need_appro
         )["error"]["code"],
         "soul_too_large"
     );
+}
+
+#[test]
+fn learner_facts_preserve_scope_evidence_precedence_and_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let algebra = named_subject(&cwd, &home, "线性代数", "subject-fact-algebra");
+    let english = named_subject(&cwd, &home, "英语", "subject-fact-english");
+
+    let provisional_input = serde_json::json!({
+        "scope": "subject",
+        "subject_id": algebra,
+        "claim": "学生在抽象定义后看到具体反例时理解更快",
+        "confidence": 0.55,
+        "evidence_refs": ["turn-algebra-01"],
+        "origin": "agent",
+        "request_id": "fact-algebra-example"
+    })
+    .to_string();
+    let provisional = ok(
+        &cwd,
+        &home,
+        &["learner", "fact", "record", "--json", &provisional_input],
+    );
+    let fact_id = provisional["result"]["fact"]["id"].as_str().unwrap();
+    assert_eq!(provisional["result"]["fact"]["status"], "provisional");
+    assert_eq!(provisional["result"]["fact"]["scope"], "subject");
+    assert_eq!(provisional["result"]["fact"]["subject_id"], algebra);
+    assert!(
+        provisional["result"]["fact"]
+            .get("learning_style")
+            .is_none()
+    );
+
+    let corroborate = serde_json::json!({
+        "action": "corroborate",
+        "evidence_refs": ["turn-algebra-02"],
+        "confidence": 0.82,
+        "request_id": "fact-algebra-corroborate"
+    })
+    .to_string();
+    let confirmed = ok(
+        &cwd,
+        &home,
+        &[
+            "learner",
+            "fact",
+            "revise",
+            fact_id,
+            "--if-revision",
+            "1",
+            "--json",
+            &corroborate,
+        ],
+    );
+    assert_eq!(confirmed["result"]["fact"]["status"], "confirmed");
+    assert_eq!(confirmed["result"]["fact"]["revision"], 2);
+    assert_eq!(
+        confirmed["result"]["fact"]["evidence_refs"],
+        serde_json::json!(["turn-algebra-01", "turn-algebra-02"])
+    );
+
+    let other_subject = serde_json::json!({
+        "scope": "subject",
+        "subject_id": english,
+        "claim": "学生在抽象定义后看到具体反例时理解更快",
+        "confidence": 0.6,
+        "evidence_refs": ["turn-english-01"],
+        "origin": "agent",
+        "request_id": "fact-english-example"
+    })
+    .to_string();
+    let english_fact = ok(
+        &cwd,
+        &home,
+        &["learner", "fact", "record", "--json", &other_subject],
+    );
+    assert_ne!(english_fact["result"]["fact"]["id"], fact_id);
+
+    let correction = serde_json::json!({
+        "action": "correct",
+        "claim": "只有在先给出定义用途后，具体反例才会帮助我理解",
+        "evidence_refs": ["learner-correction-01"],
+        "confidence": 1.0,
+        "origin": "learner",
+        "request_id": "fact-algebra-correct"
+    })
+    .to_string();
+    let corrected = ok(
+        &cwd,
+        &home,
+        &[
+            "learner",
+            "fact",
+            "revise",
+            fact_id,
+            "--if-revision",
+            "2",
+            "--json",
+            &correction,
+        ],
+    );
+    assert_eq!(corrected["result"]["previous"]["status"], "superseded");
+    assert_eq!(corrected["result"]["fact"]["status"], "confirmed");
+    assert_eq!(corrected["result"]["fact"]["origin"], "learner");
+    assert_eq!(corrected["result"]["fact"]["supersedes_id"], fact_id);
+    assert_eq!(
+        ok(&cwd, &home, &["learner", "fact", "show", fact_id])["result"]["fact"]["status"],
+        "superseded"
+    );
+}
+
+#[test]
+fn global_promotion_requires_cross_subject_evidence_and_private_wiki_stays_private() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let accounting = named_subject(&cwd, &home, "会计学", "subject-fact-accounting");
+    let english = named_subject(&cwd, &home, "英语", "subject-fact-english-promotion");
+    let input = serde_json::json!({
+        "scope": "subject",
+        "subject_id": accounting,
+        "claim": "学生更愿意在工作日早晨完成短练习",
+        "confidence": 0.8,
+        "evidence_refs": ["turn-accounting-01"],
+        "origin": "agent",
+        "request_id": "fact-morning"
+    })
+    .to_string();
+    let fact = ok(
+        &cwd,
+        &home,
+        &["learner", "fact", "record", "--json", &input],
+    );
+    let fact_id = fact["result"]["fact"]["id"].as_str().unwrap();
+
+    let insufficient = serde_json::json!({
+        "action": "promote",
+        "evidence_refs": ["turn-accounting-02"],
+        "corroborating_subject_ids": [accounting],
+        "confidence": 0.9,
+        "request_id": "fact-morning-promote-one"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "learner",
+                "fact",
+                "revise",
+                fact_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &insufficient,
+            ],
+        )["error"]["code"],
+        "cross_subject_evidence_required"
+    );
+
+    let promote = serde_json::json!({
+        "action": "promote",
+        "evidence_refs": ["turn-accounting-02", "turn-english-03"],
+        "corroborating_subject_ids": [accounting, english],
+        "confidence": 0.9,
+        "request_id": "fact-morning-promote"
+    })
+    .to_string();
+    let promoted = ok(
+        &cwd,
+        &home,
+        &[
+            "learner",
+            "fact",
+            "revise",
+            fact_id,
+            "--if-revision",
+            "1",
+            "--json",
+            &promote,
+        ],
+    );
+    assert_eq!(promoted["result"]["fact"]["scope"], "global");
+    assert!(promoted["result"]["fact"]["subject_id"].is_null());
+    assert_eq!(promoted["result"]["fact"]["status"], "confirmed");
+
+    let private_page = home.join(format!(".lwc/plugins/tutor/wiki/subjects/{accounting}.md"));
+    let page = fs::read_to_string(private_page).unwrap();
+    assert!(page.contains("学生更愿意在工作日早晨完成短练习"));
+    assert!(page.contains("superseded"));
+    assert!(!home.join(".lwc/wiki.db").exists());
 }
