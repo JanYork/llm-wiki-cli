@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::atomic::Ordering,
 };
@@ -246,8 +246,12 @@ fn run(cli: BookCli) -> Result<Value> {
             if_revision,
             json,
         } => prepare(&mut store, &id, if_revision, read_json(&json)?),
-        BookCommand::Search { id, query, limit } => search(&store.connection, &id, &query, limit),
-        BookCommand::Peek { id, start, count } => peek(&store.connection, &id, start, count),
+        BookCommand::Search { id, query, limit } => {
+            search(&store.connection, &store.root, &id, &query, limit)
+        }
+        BookCommand::Peek { id, start, count } => {
+            peek(&store.connection, &store.root, &id, start, count)
+        }
         BookCommand::Read { command } => match command {
             ReadCommand::Next {
                 id,
@@ -336,7 +340,6 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
            subordinal INTEGER NOT NULL CHECK(subordinal>=0),
            byte_start INTEGER NOT NULL CHECK(byte_start>=0),
            byte_end INTEGER NOT NULL CHECK(byte_end>byte_start),
-           text TEXT NOT NULL,
            text_hash TEXT NOT NULL,
            heading_path_json TEXT NOT NULL,
            UNIQUE(book_id,ordinal),
@@ -356,7 +359,7 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
          CREATE INDEX IF NOT EXISTS book_anomalies_book
            ON book_anomalies(book_id,status,id);
          CREATE VIRTUAL TABLE IF NOT EXISTS book_blocks_fts USING fts5(
-           block_id UNINDEXED,book_id UNINDEXED,text,tokenize='trigram'
+           text,content='',tokenize='trigram'
          );
          CREATE TABLE IF NOT EXISTS book_cursors(
            book_id TEXT PRIMARY KEY REFERENCES books(id),
@@ -455,6 +458,7 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
          );",
     )?;
     validate_book_schema(connection)?;
+    rebuild_book_fts(connection, root)?;
     let mut statement = connection.prepare(
         "SELECT b.id,MAX(s.revision) FROM books b JOIN book_syntheses s ON s.book_id=b.id
          WHERE b.state='synthesized' GROUP BY b.id ORDER BY b.id",
@@ -511,7 +515,6 @@ fn validate_book_schema(connection: &Connection) -> Result<()> {
                 "subordinal",
                 "byte_start",
                 "byte_end",
-                "text",
                 "text_hash",
                 "heading_path_json",
             ][..],
@@ -622,7 +625,7 @@ fn validate_book_schema(connection: &Connection) -> Result<()> {
                 "source_hashes_json",
             ][..],
         ),
-        ("book_blocks_fts", &["block_id", "book_id", "text"]),
+        ("book_blocks_fts", &["text"]),
     ] {
         let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
         let actual = statement
@@ -678,6 +681,65 @@ fn validate_book_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn rebuild_book_fts(connection: &Connection, root: &Path) -> Result<()> {
+    let block_count = connection.query_row("SELECT COUNT(*) FROM book_blocks", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    let indexed_count =
+        connection.query_row("SELECT COUNT(*) FROM book_blocks_fts", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+    if block_count == indexed_count {
+        return Ok(());
+    }
+    let mut statement = connection.prepare(
+        "SELECT b.rowid,b.book_id,b.byte_start,b.byte_end,b.text_hash,k.normalized_sha256
+         FROM book_blocks b JOIN books k ON k.id=b.book_id
+         ORDER BY k.normalized_sha256,b.byte_start,b.rowid",
+    )?;
+    let records = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let tx = connection.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO book_blocks_fts(book_blocks_fts) VALUES('delete-all')",
+        [],
+    )?;
+    let mut open_hash = String::new();
+    let mut open_blob: Option<fs::File> = None;
+    for (rowid, book_id, start, end, text_hash, normalized_hash) in records {
+        let normalized_hash = normalized_hash.ok_or_else(|| {
+            Error::new(
+                "corrupt_store",
+                format!("book {book_id} has blocks without a normalized blob"),
+            )
+        })?;
+        if normalized_hash != open_hash {
+            let path = blob_path(root, &normalized_hash)?;
+            reject_symlink(&path)?;
+            open_blob = Some(fs::File::open(path)?);
+            open_hash = normalized_hash;
+        }
+        let text = read_block_from_file(open_blob.as_mut().unwrap(), start, end, &text_hash)?;
+        tx.execute(
+            "INSERT INTO book_blocks_fts(rowid,text) VALUES(?1,?2)",
+            params![rowid, text],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn import(store: &mut Store, input: BookImport) -> Result<Value> {
     validate_request_id(&input.request_id)?;
     validate_id(&input.subject_id)?;
@@ -715,19 +777,13 @@ fn import(store: &mut Store, input: BookImport) -> Result<Value> {
         )
         .optional()?
     {
-        discard_staged(&staged.path);
+        publish_blob(&store.root, &staged)?;
         let value = envelope(
             Plugin::Book,
             "import",
             json!({"book": book(&tx, &id)?, "deduplicated": true}),
         );
-        let value = finalize_mutation(
-            &tx,
-            Plugin::Book,
-            &input.request_id,
-            &fingerprint,
-            value,
-        )?;
+        let value = finalize_mutation(&tx, Plugin::Book, &input.request_id, &fingerprint, value)?;
         tx.commit()?;
         return Ok(value);
     }
@@ -761,13 +817,7 @@ fn import(store: &mut Store, input: BookImport) -> Result<Value> {
         "import",
         json!({"book": book(&tx, &id)?, "deduplicated": false}),
     );
-    let value = finalize_mutation(
-        &tx,
-        Plugin::Book,
-        &input.request_id,
-        &fingerprint,
-        value,
-    )?;
+    let value = finalize_mutation(&tx, Plugin::Book, &input.request_id, &fingerprint, value)?;
     tx.commit()?;
     Ok(value)
 }
@@ -795,7 +845,7 @@ fn prepare(store: &mut Store, id: &str, if_revision: i64, input: BookPrepare) ->
         "input": &input,
         "source_sha256": current["original_sha256"],
     }))?;
-    let source = blob_path(&store.root, current["original_sha256"].as_str().unwrap());
+    let source = blob_path(&store.root, current["original_sha256"].as_str().unwrap())?;
     let converter = if matches!(current["format"].as_str(), Some("txt" | "markdown")) {
         None
     } else {
@@ -862,9 +912,9 @@ fn prepare(store: &mut Store, id: &str, if_revision: i64, input: BookPrepare) ->
         let block_id = block_id(id, block);
         tx.execute(
             "INSERT INTO book_blocks(
-               id,book_id,ordinal,logical_block_id,subordinal,byte_start,byte_end,text,
+               id,book_id,ordinal,logical_block_id,subordinal,byte_start,byte_end,
                text_hash,heading_path_json
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 block_id,
                 id,
@@ -873,15 +923,15 @@ fn prepare(store: &mut Store, id: &str, if_revision: i64, input: BookPrepare) ->
                 block.subordinal,
                 block.byte_start,
                 block.byte_end,
-                block.text,
                 block.text_hash,
                 serde_json::to_string(&block.heading_path)
                     .map_err(|error| Error::new("json_error", error.to_string()))?,
             ],
         )?;
+        let rowid = tx.last_insert_rowid();
         tx.execute(
-            "INSERT INTO book_blocks_fts(block_id,book_id,text) VALUES(?1,?2,?3)",
-            params![block_id, id, block.text],
+            "INSERT INTO book_blocks_fts(rowid,text) VALUES(?1,?2)",
+            params![rowid, block.text],
         )?;
     }
     let timestamp = now(&tx)?;
@@ -902,13 +952,7 @@ fn prepare(store: &mut Store, id: &str, if_revision: i64, input: BookPrepare) ->
         ],
     )?;
     let value = envelope(Plugin::Book, "prepare", json!({"book": book(&tx, id)?}));
-    let value = finalize_mutation(
-        &tx,
-        Plugin::Book,
-        &input.request_id,
-        &fingerprint,
-        value,
-    )?;
+    let value = finalize_mutation(&tx, Plugin::Book, &input.request_id, &fingerprint, value)?;
     tx.commit()?;
     Ok(value)
 }
@@ -947,7 +991,7 @@ fn read_next(store: &mut Store, id: &str, if_revision: i64, input: ReadNext) -> 
         )
         .optional()?
     {
-        let lease = lease(&tx, &lease_id)?;
+        let lease = lease(&tx, &store.root, &lease_id)?;
         if lease["owner"] != input.owner {
             return Err(Error::new(
                 "stale_owner",
@@ -955,13 +999,6 @@ fn read_next(store: &mut Store, id: &str, if_revision: i64, input: ReadNext) -> 
             ));
         }
         let value = envelope(Plugin::Book, "read.next", json!({"lease":lease}));
-        let value = finalize_mutation(
-            &tx,
-            Plugin::Book,
-            &input.request_id,
-            &fingerprint,
-            value,
-        )?;
         tx.commit()?;
         return Ok(value);
     }
@@ -979,9 +1016,10 @@ fn read_next(store: &mut Store, id: &str, if_revision: i64, input: ReadNext) -> 
         },
     )?;
     let mut statement = tx.prepare(
-        "SELECT id,ordinal,text,text_hash FROM book_blocks
+        "SELECT id,ordinal,byte_start,byte_end,text_hash FROM book_blocks
          WHERE book_id=?1 AND ordinal>=?2 ORDER BY ordinal",
     )?;
+    let normalized_hash = current["normalized_sha256"].as_str().unwrap();
     let mut rows = statement.query(params![id, next])?;
     let mut selected = Vec::new();
     let mut used_bytes = 0_i64;
@@ -989,8 +1027,16 @@ fn read_next(store: &mut Store, id: &str, if_revision: i64, input: ReadNext) -> 
     while let Some(row) = rows.next()? {
         let block_id = row.get::<_, String>(0)?;
         let ordinal = row.get::<_, i64>(1)?;
-        let text = row.get::<_, String>(2)?;
-        let text_hash = row.get::<_, String>(3)?;
+        let byte_start = row.get::<_, i64>(2)?;
+        let byte_end = row.get::<_, i64>(3)?;
+        let text_hash = row.get::<_, String>(4)?;
+        let text = read_block_text(
+            &store.root,
+            normalized_hash,
+            byte_start,
+            byte_end,
+            &text_hash,
+        )?;
         let bytes = text.len() as i64;
         let chars = text.chars().count() as i64;
         let used = if count_chars { used_chars } else { used_bytes };
@@ -1056,15 +1102,9 @@ fn read_next(store: &mut Store, id: &str, if_revision: i64, input: ReadNext) -> 
     let value = envelope(
         Plugin::Book,
         "read.next",
-        json!({"lease":lease(&tx,&lease_id)?}),
+        json!({"lease":lease(&tx,&store.root,&lease_id)?}),
     );
-    let value = finalize_mutation(
-        &tx,
-        Plugin::Book,
-        &input.request_id,
-        &fingerprint,
-        value,
-    )?;
+    let value = finalize_mutation(&tx, Plugin::Book, &input.request_id, &fingerprint, value)?;
     tx.commit()?;
     Ok(value)
 }
@@ -1090,7 +1130,7 @@ fn read_commit(
     if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
         return Ok(value);
     }
-    let current = lease(&tx, lease_id)?;
+    let current = lease(&tx, &store.root, lease_id)?;
     if current["state"] == "expired" {
         return Err(Error::new(
             "lease_expired",
@@ -1192,15 +1232,9 @@ fn read_commit(
     let value = envelope(
         Plugin::Book,
         "read.commit",
-        json!({"lease":lease(&tx,lease_id)?,"coverage":coverage(&tx,book_id)?}),
+        json!({"lease":lease(&tx,&store.root,lease_id)?,"coverage":coverage(&tx,book_id)?}),
     );
-    let value = finalize_mutation(
-        &tx,
-        Plugin::Book,
-        &input.request_id,
-        &fingerprint,
-        value,
-    )?;
+    let value = finalize_mutation(&tx, Plugin::Book, &input.request_id, &fingerprint, value)?;
     tx.commit()?;
     Ok(value)
 }
@@ -1224,7 +1258,7 @@ fn read_renew(
     if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
         return Ok(value);
     }
-    let current = lease(&tx, lease_id)?;
+    let current = lease(&tx, &store.root, lease_id)?;
     if current["state"] == "expired" {
         return Err(Error::new(
             "lease_expired",
@@ -1256,15 +1290,9 @@ fn read_renew(
     let value = envelope(
         Plugin::Book,
         "read.renew",
-        json!({"lease":lease(&tx,lease_id)?}),
+        json!({"lease":lease(&tx,&store.root,lease_id)?}),
     );
-    let value = finalize_mutation(
-        &tx,
-        Plugin::Book,
-        &input.request_id,
-        &fingerprint,
-        value,
-    )?;
+    let value = finalize_mutation(&tx, Plugin::Book, &input.request_id, &fingerprint, value)?;
     tx.commit()?;
     Ok(value)
 }
@@ -1303,7 +1331,7 @@ fn read_takeover(store: &mut Store, input: ReadTakeover) -> Result<Value> {
         ],
     )?;
     if changed != 1 {
-        let current = lease(&tx, &input.entity_id)?;
+        let current = lease(&tx, &store.root, &input.entity_id)?;
         if current["owner"] != input.old_owner {
             return Err(Error::new("stale_owner", "book lease owner changed"));
         }
@@ -1328,15 +1356,9 @@ fn read_takeover(store: &mut Store, input: ReadTakeover) -> Result<Value> {
     let value = envelope(
         Plugin::Book,
         "read.takeover",
-        json!({"lease":lease(&tx,&input.entity_id)?}),
+        json!({"lease":lease(&tx,&store.root,&input.entity_id)?}),
     );
-    let value = finalize_mutation(
-        &tx,
-        Plugin::Book,
-        &input.request_id,
-        &fingerprint,
-        value,
-    )?;
+    let value = finalize_mutation(&tx, Plugin::Book, &input.request_id, &fingerprint, value)?;
     tx.commit()?;
     Ok(value)
 }
@@ -1426,19 +1448,24 @@ fn publish_synthesis(
         ));
     }
     let total = current["block_count"].as_i64().unwrap();
+    let required_headings = required_heading_summaries(&tx, book_id)?;
     if !input.summaries.iter().any(|summary| {
         summary.level == "book" && summary.start_ordinal == 0 && summary.end_ordinal == total - 1
-    }) || !input
-        .summaries
-        .iter()
-        .any(|summary| summary.level == "chapter")
-    {
+    }) || required_headings.iter().any(|required| {
+        required.level == "chapter"
+            && !input.summaries.iter().any(|summary| {
+                summary.level == required.level
+                    && summary.title == required.title
+                    && summary.start_ordinal == required.start
+                    && summary.end_ordinal == required.end
+            })
+    }) {
         return Err(Error::new(
             "incomplete_synthesis",
             "synthesis requires complete chapter and book summaries",
         ));
     }
-    for required in required_heading_summaries(&tx, book_id)? {
+    for required in required_headings {
         if !input.summaries.iter().any(|summary| {
             summary.level == required.level
                 && summary.title == required.title
@@ -1480,6 +1507,22 @@ fn publish_synthesis(
             node.end_ordinal,
             &node.source_hashes,
         )?;
+    }
+    let mut next_mainline_ordinal = 0;
+    for node in &input.mainline {
+        if node.start_ordinal != next_mainline_ordinal {
+            return Err(Error::new(
+                "incomplete_synthesis",
+                "mainline must cover the whole book once in source order",
+            ));
+        }
+        next_mainline_ordinal = node.end_ordinal + 1;
+    }
+    if next_mainline_ordinal != total {
+        return Err(Error::new(
+            "incomplete_synthesis",
+            "mainline must cover the whole book once in source order",
+        ));
     }
     for relation in &input.relations {
         validate_text("relation from", &relation.from, 64 * 1024)?;
@@ -1584,15 +1627,23 @@ fn publish_synthesis(
             "supersedes_revision":input.supersedes_revision,
         }),
     );
-    let value = finalize_mutation(
-        &tx,
-        Plugin::Book,
-        &input.request_id,
-        &fingerprint,
-        value,
-    )?;
+    let value = finalize_mutation(&tx, Plugin::Book, &input.request_id, &fingerprint, value)?;
     tx.commit()?;
-    materialize_book_wiki(&store.connection, &store.root, book_id, synthesis_revision)?;
+    if let Err(error) =
+        materialize_book_wiki(&store.connection, &store.root, book_id, synthesis_revision)
+    {
+        return Err(Error::new(
+            "book_materialization_pending",
+            "synthesis committed but its private Wiki projection still needs materialization",
+        )
+        .details(json!({
+            "committed": true,
+            "retryable": true,
+            "book_id": book_id,
+            "synthesis_revision": synthesis_revision,
+            "cause": error.code(),
+        })));
+    }
     Ok(value)
 }
 
@@ -1623,8 +1674,16 @@ fn required_heading_summaries(
                 .map_err(|error| Error::new("corrupt_store", error.to_string()))
         })
         .collect::<Result<Vec<_>>>()?;
+    let max_depth = rows.iter().map(|(_, path)| path.len()).max().unwrap_or(0);
     let mut required: Vec<RequiredSummary> = Vec::new();
-    for (depth, level) in [(1, "chapter"), (2, "section")] {
+    for depth in 1..=max_depth {
+        let level = match (max_depth, depth) {
+            (1 | 2, 1) => "chapter",
+            (2, 2) => "section",
+            (_, 1) => "part",
+            (_, 2) => "chapter",
+            _ => "section",
+        };
         for (ordinal, path) in &rows {
             if path.len() < depth {
                 continue;
@@ -1773,20 +1832,41 @@ fn materialize_book_wiki(
         })?;
     }
     let destination = books.join(format!("{book_id}.md"));
-    reject_symlink(&destination)?;
     let temporary = books.join(format!(
         ".book-wiki-{}-{}.tmp",
         std::process::id(),
         ID_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::write(&temporary, body.as_bytes())?;
+    publish_wiki_file(&temporary, &destination, body.as_bytes())?;
+    Ok(())
+}
+
+fn publish_wiki_file(temporary: &Path, destination: &Path, body: &[u8]) -> Result<()> {
+    reject_symlink(temporary)?;
+    reject_symlink(destination)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(temporary)?;
+    output.write_all(body)?;
+    output.sync_all()?;
     fs::rename(temporary, destination)?;
     Ok(())
 }
 
-fn search(connection: &Connection, id: &str, query: &str, limit: usize) -> Result<Value> {
+fn search(
+    connection: &Connection,
+    root: &Path,
+    id: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Value> {
     validate_id(id)?;
-    book(connection, id)?;
+    let normalized_hash = normalized_book_hash(connection, id)?;
     validate_text("query", query, 4096)?;
     if !(1..=100).contains(&limit) {
         return Err(Error::new("invalid_input", "limit must be within 1..=100"));
@@ -1794,45 +1874,24 @@ fn search(connection: &Connection, id: &str, query: &str, limit: usize) -> Resul
     let phrase = format!("\"{}\"", query.replace('"', "\"\""));
     let mut statement = connection.prepare(
         "SELECT b.id,b.ordinal,b.logical_block_id,b.subordinal,b.byte_start,b.byte_end,
-                b.text,b.text_hash,b.heading_path_json
-         FROM book_blocks_fts f JOIN book_blocks b ON b.id=f.block_id
-         WHERE book_blocks_fts MATCH ?1 AND f.book_id=?2
+                b.text_hash,b.heading_path_json
+         FROM book_blocks_fts f JOIN book_blocks b ON b.rowid=f.rowid
+         WHERE book_blocks_fts MATCH ?1 AND b.book_id=?2
          ORDER BY bm25(book_blocks_fts),b.ordinal LIMIT ?3",
     )?;
-    let rows = statement.query_map(params![phrase, id, limit as i64], |row| {
-        let headings: String = row.get(8)?;
-        let headings = serde_json::from_str::<Value>(&headings).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                8,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?;
-        Ok(json!({
-            "block_id": row.get::<_, String>(0)?,
-            "book_id": id,
-            "ordinal": row.get::<_, i64>(1)?,
-            "locator": {
-                "book_id": id,
-                "logical_block_id": row.get::<_, String>(2)?,
-                "subordinal": row.get::<_, i64>(3)?,
-                "byte_start": row.get::<_, i64>(4)?,
-                "byte_end": row.get::<_, i64>(5)?,
-                "heading_path": headings,
-                "source_hash": row.get::<_, String>(7)?,
-            },
-            "text": row.get::<_, String>(6)?,
-            "text_hash": row.get::<_, String>(7)?,
-            "query_only": true,
-        }))
-    })?;
-    let hits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let records = statement
+        .query_map(params![phrase, id, limit as i64], stored_block_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let hits = records
+        .iter()
+        .map(|record| block_value(root, &normalized_hash, id, record, true))
+        .collect::<Result<Vec<_>>>()?;
     Ok(envelope(Plugin::Book, "search", json!({"hits": hits})))
 }
 
-fn peek(connection: &Connection, id: &str, start: i64, count: usize) -> Result<Value> {
+fn peek(connection: &Connection, root: &Path, id: &str, start: i64, count: usize) -> Result<Value> {
     validate_id(id)?;
-    book(connection, id)?;
+    let normalized_hash = normalized_book_hash(connection, id)?;
     if start < 0 || !(1..=100).contains(&count) {
         return Err(Error::new(
             "invalid_input",
@@ -1840,40 +1899,17 @@ fn peek(connection: &Connection, id: &str, start: i64, count: usize) -> Result<V
         ));
     }
     let mut statement = connection.prepare(
-        "SELECT id,ordinal,logical_block_id,subordinal,byte_start,byte_end,text,text_hash,
+        "SELECT id,ordinal,logical_block_id,subordinal,byte_start,byte_end,text_hash,
                 heading_path_json
          FROM book_blocks WHERE book_id=?1 AND ordinal>=?2 ORDER BY ordinal LIMIT ?3",
     )?;
-    let rows = statement.query_map(params![id, start, count as i64], |row| {
-        let headings: String = row.get(8)?;
-        let headings = serde_json::from_str::<Value>(&headings).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                8,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?;
-        Ok(json!({
-            "id":row.get::<_,String>(0)?,
-            "book_id":id,
-            "ordinal":row.get::<_,i64>(1)?,
-            "byte_start":row.get::<_,i64>(4)?,
-            "byte_end":row.get::<_,i64>(5)?,
-            "text":row.get::<_,String>(6)?,
-            "text_hash":row.get::<_,String>(7)?,
-            "heading_path":headings,
-            "locator":{
-                "book_id":id,
-                "logical_block_id":row.get::<_,String>(2)?,
-                "subordinal":row.get::<_,i64>(3)?,
-                "byte_start":row.get::<_,i64>(4)?,
-                "byte_end":row.get::<_,i64>(5)?,
-                "source_hash":row.get::<_,String>(7)?,
-            },
-            "query_only":true,
-        }))
-    })?;
-    let blocks = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let records = statement
+        .query_map(params![id, start, count as i64], stored_block_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let blocks = records
+        .iter()
+        .map(|record| block_value(root, &normalized_hash, id, record, false))
+        .collect::<Result<Vec<_>>>()?;
     Ok(envelope(Plugin::Book, "peek", json!({"blocks":blocks})))
 }
 
@@ -1942,7 +1978,7 @@ fn expire_lease(connection: &mut Connection, lease_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn lease(connection: &Connection, id: &str) -> Result<Value> {
+fn lease(connection: &Connection, root: &Path, id: &str) -> Result<Value> {
     validate_id(id)?;
     let mut value = connection
         .query_row(
@@ -1991,41 +2027,21 @@ fn lease(connection: &Connection, id: &str) -> Result<Value> {
         .optional()?
         .ok_or_else(|| Error::new("book_lease_not_found", format!("lease {id} was not found")))?;
     let book_id = value["book_id"].as_str().unwrap().to_owned();
+    let normalized_hash = normalized_book_hash(connection, &book_id)?;
     let start = value["start_ordinal"].as_i64().unwrap();
     let end = value["end_ordinal"].as_i64().unwrap();
     let mut statement = connection.prepare(
-        "SELECT id,ordinal,logical_block_id,subordinal,byte_start,byte_end,text,text_hash,
+        "SELECT id,ordinal,logical_block_id,subordinal,byte_start,byte_end,text_hash,
                 heading_path_json
          FROM book_blocks WHERE book_id=?1 AND ordinal BETWEEN ?2 AND ?3 ORDER BY ordinal",
     )?;
-    let rows = statement.query_map(params![book_id, start, end], |row| {
-        let headings: String = row.get(8)?;
-        let headings = serde_json::from_str::<Value>(&headings).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                8,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?;
-        Ok(json!({
-            "id":row.get::<_,String>(0)?,
-            "ordinal":row.get::<_,i64>(1)?,
-            "byte_start":row.get::<_,i64>(4)?,
-            "byte_end":row.get::<_,i64>(5)?,
-            "text":row.get::<_,String>(6)?,
-            "text_hash":row.get::<_,String>(7)?,
-            "heading_path":headings,
-            "locator":{
-                "book_id":book_id,
-                "logical_block_id":row.get::<_,String>(2)?,
-                "subordinal":row.get::<_,i64>(3)?,
-                "byte_start":row.get::<_,i64>(4)?,
-                "byte_end":row.get::<_,i64>(5)?,
-                "source_hash":row.get::<_,String>(7)?,
-            },
-        }))
-    })?;
-    let blocks = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let records = statement
+        .query_map(params![book_id, start, end], stored_block_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let blocks = records
+        .iter()
+        .map(|record| block_value(root, &normalized_hash, &book_id, record, false))
+        .collect::<Result<Vec<_>>>()?;
     let text = blocks
         .iter()
         .map(|block| block["text"].as_str().unwrap())
@@ -2128,11 +2144,167 @@ fn record_anomaly(
     Ok(())
 }
 
-fn blob_path(root: &Path, hash: &str) -> PathBuf {
-    root.join("blobs")
+fn blob_path(root: &Path, hash: &str) -> Result<PathBuf> {
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::new(
+            "corrupt_store",
+            "book blob hash is not a lowercase SHA-256 digest",
+        ));
+    }
+    Ok(root
+        .join("blobs")
         .join("sha256")
         .join(&hash[..2])
-        .join(hash)
+        .join(hash))
+}
+
+struct StoredBlock {
+    id: String,
+    ordinal: i64,
+    logical_block_id: String,
+    subordinal: i64,
+    byte_start: i64,
+    byte_end: i64,
+    text_hash: String,
+    heading_path_json: String,
+}
+
+fn stored_block_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBlock> {
+    Ok(StoredBlock {
+        id: row.get(0)?,
+        ordinal: row.get(1)?,
+        logical_block_id: row.get(2)?,
+        subordinal: row.get(3)?,
+        byte_start: row.get(4)?,
+        byte_end: row.get(5)?,
+        text_hash: row.get(6)?,
+        heading_path_json: row.get(7)?,
+    })
+}
+
+fn normalized_book_hash(connection: &Connection, id: &str) -> Result<String> {
+    validate_id(id)?;
+    connection
+        .query_row(
+            "SELECT normalized_sha256 FROM books WHERE id=?1",
+            [id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .ok_or_else(|| {
+            Error::new(
+                "book_not_prepared",
+                format!("book {id} has no normalized source blob"),
+            )
+        })
+}
+
+fn read_block_text(
+    root: &Path,
+    normalized_hash: &str,
+    byte_start: i64,
+    byte_end: i64,
+    expected_hash: &str,
+) -> Result<String> {
+    let path = blob_path(root, normalized_hash)?;
+    reject_symlink(&path)?;
+    let mut file = fs::File::open(&path)?;
+    read_block_from_file(&mut file, byte_start, byte_end, expected_hash)
+}
+
+fn read_block_from_file(
+    file: &mut fs::File,
+    byte_start: i64,
+    byte_end: i64,
+    expected_hash: &str,
+) -> Result<String> {
+    if byte_start < 0 || byte_end <= byte_start || byte_end as u64 > MAX_BOOK_BYTES {
+        return Err(Error::new(
+            "corrupt_store",
+            "book block has invalid byte offsets",
+        ));
+    }
+    let length = (byte_end - byte_start) as usize;
+    if file.metadata()?.len() < byte_end as u64 {
+        return Err(Error::new(
+            "corrupt_blob",
+            "normalized book blob is shorter than its block metadata",
+        ));
+    }
+    file.seek(SeekFrom::Start(byte_start as u64))?;
+    let mut bytes = vec![0; length];
+    file.read_exact(&mut bytes)?;
+    if hash_bytes(&bytes) != expected_hash {
+        return Err(Error::new(
+            "corrupt_blob",
+            "normalized book block hash does not match its metadata",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| Error::new("corrupt_blob", "normalized book block is not UTF-8"))
+}
+
+fn block_value(
+    root: &Path,
+    normalized_hash: &str,
+    book_id: &str,
+    block: &StoredBlock,
+    search_style: bool,
+) -> Result<Value> {
+    let heading_path: Value = serde_json::from_str(&block.heading_path_json)
+        .map_err(|error| Error::new("corrupt_store", error.to_string()))?;
+    let text = read_block_text(
+        root,
+        normalized_hash,
+        block.byte_start,
+        block.byte_end,
+        &block.text_hash,
+    )?;
+    let locator = json!({
+        "book_id": book_id,
+        "logical_block_id": block.logical_block_id,
+        "subordinal": block.subordinal,
+        "byte_start": block.byte_start,
+        "byte_end": block.byte_end,
+        "source_hash": block.text_hash,
+    });
+    if search_style {
+        Ok(json!({
+            "block_id": block.id,
+            "book_id": book_id,
+            "ordinal": block.ordinal,
+            "locator": {
+                "book_id": book_id,
+                "logical_block_id": block.logical_block_id,
+                "subordinal": block.subordinal,
+                "byte_start": block.byte_start,
+                "byte_end": block.byte_end,
+                "heading_path": heading_path,
+                "source_hash": block.text_hash,
+            },
+            "text": text,
+            "text_hash": block.text_hash,
+            "query_only": true,
+        }))
+    } else {
+        Ok(json!({
+            "id": block.id,
+            "book_id": book_id,
+            "ordinal": block.ordinal,
+            "byte_start": block.byte_start,
+            "byte_end": block.byte_end,
+            "text": text,
+            "text_hash": block.text_hash,
+            "heading_path": heading_path,
+            "locator": locator,
+            "query_only": true,
+        }))
+    }
 }
 
 fn book_converter_config() -> Result<crate::trans_adapter::Config> {
@@ -2550,10 +2722,11 @@ fn publish_blob(root: &Path, staged: &StagedBlob) -> Result<()> {
     let destination = prefix.join(&staged.sha256);
     reject_symlink(&destination)?;
     if destination.is_file() {
-        if fs::metadata(&destination)?.len() != staged.bytes {
+        let (actual_hash, actual_bytes) = file_hash(&destination)?;
+        if actual_bytes != staged.bytes || actual_hash != staged.sha256 {
             return Err(Error::new(
                 "corrupt_blob",
-                "existing book blob has the wrong size",
+                "existing book blob does not match its content address",
             ));
         }
         discard_staged(&staged.path);
@@ -2561,6 +2734,42 @@ fn publish_blob(root: &Path, staged: &StagedBlob) -> Result<()> {
         fs::rename(&staged.path, destination)?;
     }
     Ok(())
+}
+
+fn file_hash(path: &Path) -> Result<(String, u64)> {
+    reject_symlink(path)?;
+    let mut file = fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::new(
+            "corrupt_blob",
+            "book blob is not a regular file",
+        ));
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 1024 * 1024];
+    let mut bytes = 0_u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes += read as u64;
+        if bytes > MAX_BOOK_BYTES {
+            return Err(Error::new(
+                "corrupt_blob",
+                "book blob exceeds the size limit",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        bytes,
+    ))
 }
 
 fn discard_staged(path: &Path) {
@@ -2678,5 +2887,33 @@ fn validate_text(field: &str, value: &str, max_bytes: usize) -> Result<()> {
         ))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn wiki_publish_rejects_a_preexisting_temporary_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let temporary = directory.path().join("temporary");
+        let destination = directory.path().join("destination");
+        fs::write(&target, b"untouched").unwrap();
+        symlink(&target, &temporary).unwrap();
+        let error = publish_wiki_file(&temporary, &destination, b"replacement").unwrap_err();
+        assert_eq!(error.code(), "unsafe_store_path");
+        assert_eq!(fs::read(&target).unwrap(), b"untouched");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn malformed_blob_hash_is_an_error_not_a_path_slice_panic() {
+        let error = blob_path(Path::new("/tmp"), "a").unwrap_err();
+        assert_eq!(error.code(), "corrupt_store");
     }
 }
