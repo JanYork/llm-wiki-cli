@@ -3160,7 +3160,7 @@ fn terminate_child_tree(child: &mut Child) -> io::Result<()> {
     }
     match child.kill() {
         Ok(()) => Ok(()),
-        Err(error) if child.try_wait()?.is_some() => Ok(()),
+        Err(_error) if child.try_wait()?.is_some() => Ok(()),
         Err(error) => Err(error),
     }
 }

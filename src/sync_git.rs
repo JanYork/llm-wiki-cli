@@ -299,6 +299,7 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     }
 }
 
+#[cfg_attr(not(unix), allow(unused_mut))]
 fn create_private_directory(path: &Path) -> std::io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]

@@ -674,6 +674,7 @@ fn validate_args(
     Ok((args, path))
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn sensitive_system_root(path: &Path) -> bool {
     #[cfg(unix)]
     {

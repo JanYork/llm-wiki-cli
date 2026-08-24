@@ -164,6 +164,7 @@ fn ensure_work_directory(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn set_directory_mode(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {

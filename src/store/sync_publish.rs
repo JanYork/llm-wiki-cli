@@ -594,6 +594,7 @@ struct CreatedSyncFile {
 }
 
 impl CreatedSyncFile {
+    #[cfg_attr(not(unix), allow(unused_variables))]
     fn new(path: &Path, metadata: &fs::Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
