@@ -1115,12 +1115,25 @@ fn prepare_real_books(world: &World) -> Vec<RealBook> {
             .expect("LWC_REAL_BOOK_FIXTURE_DIR must point at the three real Markdown books"),
     );
     let specifications = [
-        ("jobs.md", ["现实扭曲力场", "皮克斯", "Macintosh"]),
-        ("sapiens.md", ["认知革命", "农业革命", "科学革命"]),
-        ("netty.md", ["EventLoop", "ChannelPipeline", "ByteBuf"]),
+        (
+            "jobs.md",
+            "jobs.md",
+            ["现实扭曲力场", "皮克斯", "Macintosh"],
+        ),
+        (
+            "sapiens.md",
+            "sapiens.md",
+            ["认知革命", "农业革命", "科学革命"],
+        ),
+        (
+            "netty.md",
+            "netty.md",
+            ["EventLoop", "ChannelPipeline", "ByteBuf"],
+        ),
+        ("fenix.md", "凤凰架构", ["凤凰架构", "容错性设计", "DAPR"]),
     ];
     let mut books = Vec::new();
-    for (name, canaries) in specifications {
+    for (name, title, canaries) in specifications {
         let source = fixture.join(name);
         assert!(
             source.is_file(),
@@ -1135,7 +1148,7 @@ fn prepare_real_books(world: &World) -> Vec<RealBook> {
             &[
                 "import",
                 "--json",
-                &json!({"subject_id":SUBJECT_ID,"path":name,"title":name,"request_id":format!("real-{name}-import")}).to_string(),
+                &json!({"subject_id":SUBJECT_ID,"path":name,"title":title,"request_id":format!("real-{name}-import")}).to_string(),
             ],
         );
         let id = imported["result"]["book"]["id"]
