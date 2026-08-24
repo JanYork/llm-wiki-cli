@@ -1,4 +1,5 @@
 use crate::learning::*;
+use crate::tutor_plan::PlanCommand;
 use clap::{Parser, Subcommand};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,10 @@ enum TutorCommand {
     Goal {
         #[command(subcommand)]
         command: GoalCommand,
+    },
+    Plan {
+        #[command(subcommand)]
+        command: PlanCommand,
     },
     Status,
 }
@@ -351,6 +356,7 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
             params![INITIAL_SOUL, sha256(INITIAL_SOUL.as_bytes()), timestamp],
         )?;
     }
+    crate::tutor_plan::initialize(connection)?;
     materialize_soul(connection, root)?;
     materialize_fact_wiki(connection, root)
 }
@@ -365,6 +371,7 @@ fn run(cli: TutorCli) -> Result<Value> {
         TutorCommand::Learner { command } => run_learner(&mut store, command),
         TutorCommand::Soul { command } => run_soul(&mut store, command),
         TutorCommand::Goal { command } => run_goal(&mut store, command),
+        TutorCommand::Plan { command } => crate::tutor_plan::run(&mut store, command),
         TutorCommand::Status => {
             let sessions = store.connection.query_row(
                 "SELECT COUNT(*) FROM tutor_sessions WHERE state='active'",
