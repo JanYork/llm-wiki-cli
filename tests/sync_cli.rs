@@ -2816,6 +2816,120 @@ fn sync_materializes_preserved_book_when_its_runtime_becomes_ready() {
 
 #[cfg(unix)]
 #[test]
+fn sync_fast_forward_records_the_current_receipt_on_the_unchanged_source_side() {
+    let world = SyncWorld::new();
+    world.install_fake_ssh();
+    for (cwd, home) in [
+        (&world.local, &world.local_home),
+        (&world.remote, &world.remote_home),
+    ] {
+        install_learning_runtime(home, "book", Path::new(env!("CARGO_BIN_EXE_lwc-book")));
+        world.ok_home(cwd, home, &["--scope", "global", "init"]);
+        world.ok_home(
+            cwd,
+            home,
+            &["--scope", "global", "config", "set", "--book", "enabled"],
+        );
+    }
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+            .env("HOME", &world.local_home)
+            .arg("status")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let baseline = serde_json::json!({
+        "name": "Receipt baseline",
+        "request_id": "sync-receipt-baseline",
+    })
+    .to_string();
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+            .env("HOME", &world.local_home)
+            .args(["subject", "create", "--json", &baseline])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let remote = world.remote.to_str().unwrap();
+    assert!(
+        world
+            .sync(&["sync", "peer", remote, "--mode", "merge"])
+            .status
+            .success()
+    );
+    assert!(
+        world
+            .sync(&["sync", "peer", remote, "--mode", "merge"])
+            .status
+            .success()
+    );
+
+    let mutation = serde_json::json!({
+        "name": "Receipt source mutation",
+        "request_id": "sync-receipt-source-mutation",
+    })
+    .to_string();
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+            .env("HOME", &world.local_home)
+            .args(["subject", "create", "--json", &mutation])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let fast_forward = world.sync(&["sync", "peer", remote, "--mode", "merge"]);
+    assert!(
+        fast_forward.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&fast_forward.stdout),
+        String::from_utf8_lossy(&fast_forward.stderr)
+    );
+    let result: Value = serde_json::from_slice(&fast_forward.stdout).unwrap();
+    let session_id = result["session_id"].as_str().unwrap();
+    let book = result["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|plugin| plugin["plugin"] == "book")
+        .unwrap();
+    assert_eq!(book["publication"]["local"], false);
+    assert_eq!(book["rebuild"]["local"], false);
+    assert_eq!(book["receipt"]["local"], true);
+    for home in [&world.local_home, &world.remote_home] {
+        let connection = Connection::open(home.join(".lwc/plugins/book/data.sqlite3")).unwrap();
+        let pointer: String = connection
+            .query_row(
+                "SELECT value FROM plugin_meta WHERE key='latest_sync_receipt_session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointer, session_id);
+        let current_revision: String = connection
+            .query_row(
+                "SELECT value FROM plugin_meta WHERE key='revision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt_revision: i64 = connection
+            .query_row(
+                "SELECT resolved_revision FROM sync_receipts WHERE session_id=?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt_revision.to_string(), current_revision);
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn sync_three_way_merges_disjoint_book_rows_from_a_common_baseline() {
     let world = SyncWorld::new();
     world.install_fake_ssh();

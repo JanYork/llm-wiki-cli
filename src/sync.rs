@@ -2133,6 +2133,12 @@ fn reconcile_fixed_plugins(
             .find(|plugin| plugin.plugin_id == plugin_id)
             .ok_or_else(|| AppError::new("sync_protocol_invalid", "remote plugin unit missing"))?;
         let mut resolved_export = None;
+        let mut local_published = false;
+        let mut remote_published = false;
+        let mut local_rebuilt = false;
+        let mut remote_rebuilt = false;
+        let mut local_receipt = false;
+        let mut remote_receipt = false;
         let status = match (&local.export, &remote.export) {
             (Some(left), Some(right)) if !same_plugin_state(left, right) => {
                 let baseline = common_plugin_baseline(local, remote);
@@ -2168,9 +2174,19 @@ fn reconcile_fixed_plugins(
                             plugin_id,
                             &resolved,
                         )?;
+                        local_published = true;
+                        local_rebuilt = local.runtime_ready;
+                        local_receipt = local.runtime_ready;
                     } else if local.runtime_ready {
-                        materialize_existing_plugin(session_id, plugin_id, &resolved)?;
+                        local_rebuilt =
+                            materialize_existing_plugin(session_id, plugin_id, &resolved)?;
+                        local_published = local_rebuilt;
+                        local_receipt = true;
                     }
+                } else if mode != SyncMode::Push && local.runtime_ready {
+                    local_rebuilt = materialize_existing_plugin(session_id, plugin_id, &resolved)?;
+                    local_published = local_rebuilt;
+                    local_receipt = true;
                 }
                 if mode != SyncMode::Pull && !same_plugin_state(right, &resolved) {
                     publish_plugin_to_peer(
@@ -2181,6 +2197,20 @@ fn reconcile_fixed_plugins(
                         plugin_id,
                         &resolved,
                     )?;
+                    remote_published = true;
+                    remote_rebuilt = remote.runtime_ready;
+                    remote_receipt = remote.runtime_ready;
+                } else if mode != SyncMode::Pull && remote.runtime_ready {
+                    remote_rebuilt = materialize_plugin_on_peer(
+                        host,
+                        scope,
+                        remote_directory,
+                        session_id,
+                        plugin_id,
+                        &resolved,
+                    )?;
+                    remote_published = remote_rebuilt;
+                    remote_receipt = true;
                 }
                 retain_plugin_history(session_id, plugin_id, &resolved)?;
                 resolved_export = Some(resolved);
@@ -2193,10 +2223,12 @@ fn reconcile_fixed_plugins(
             (Some(export), Some(_)) => {
                 resolved_export = Some(export.clone());
                 if local.runtime_ready && mode != SyncMode::Push {
-                    materialize_existing_plugin(session_id, plugin_id, export)?;
+                    local_rebuilt = materialize_existing_plugin(session_id, plugin_id, export)?;
+                    local_published = local_rebuilt;
+                    local_receipt = true;
                 }
                 if remote.runtime_ready && mode != SyncMode::Pull {
-                    materialize_plugin_on_peer(
+                    remote_rebuilt = materialize_plugin_on_peer(
                         host,
                         scope,
                         remote_directory,
@@ -2204,6 +2236,8 @@ fn reconcile_fixed_plugins(
                         plugin_id,
                         export,
                     )?;
+                    remote_published = remote_rebuilt;
+                    remote_receipt = true;
                 }
                 if local.runtime_ready && remote.runtime_ready {
                     "ready"
@@ -2221,6 +2255,9 @@ fn reconcile_fixed_plugins(
                     plugin_id,
                     export,
                 )?;
+                remote_published = true;
+                remote_rebuilt = remote.runtime_ready;
+                remote_receipt = remote.runtime_ready;
                 "preserved_not_ready"
             }
             (None, Some(export)) if mode != SyncMode::Push => {
@@ -2233,6 +2270,9 @@ fn reconcile_fixed_plugins(
                     plugin_id,
                     export,
                 )?;
+                local_published = true;
+                local_rebuilt = local.runtime_ready;
+                local_receipt = local.runtime_ready;
                 "preserved_not_ready"
             }
             (None, None) => "absent",
@@ -2256,12 +2296,16 @@ fn reconcile_fixed_plugins(
             "record_counts": readback["record_counts"],
             "blob_hashes": readback["blob_hashes"],
             "publication": {
-                "local": mode != SyncMode::Push && resolved_export.is_some(),
-                "remote": mode != SyncMode::Pull && resolved_export.is_some(),
+                "local": local_published,
+                "remote": remote_published,
             },
             "rebuild": {
-                "local": local.runtime_ready,
-                "remote": remote.runtime_ready,
+                "local": local_rebuilt,
+                "remote": remote_rebuilt,
+            },
+            "receipt": {
+                "local": local_receipt,
+                "remote": remote_receipt,
             },
         });
         checkpoint(&result)?;
@@ -2628,7 +2672,7 @@ fn materialize_plugin_on_peer(
     session_id: &str,
     plugin_id: &str,
     export: &PluginExportInventory,
-) -> Result<()> {
+) -> Result<bool> {
     let request = PeerRequest {
         protocol: PROTOCOL_VERSION,
         action: "plugin-materialize".to_owned(),
@@ -2654,20 +2698,21 @@ fn materialize_plugin_on_peer(
         || response["action"] != "plugin-materialized"
         || response["session_id"] != session_id
         || response["plugin"] != plugin_id
+        || !response["rebuilt"].is_boolean()
     {
         return Err(AppError::new(
             "sync_protocol_invalid",
             "remote plugin materialization response does not match the request",
         ));
     }
-    Ok(())
+    Ok(response["rebuilt"] == true)
 }
 
 fn materialize_existing_plugin(
     session_id: &str,
     plugin_id: &str,
     export: &PluginExportInventory,
-) -> Result<()> {
+) -> Result<bool> {
     let root = plugin_export_path(session_id, plugin_id, export)?;
     materialize_plugin_export(session_id, plugin_id, export, &root)
 }
@@ -2928,7 +2973,7 @@ fn materialize_plugin_export(
     plugin_id: &str,
     export: &PluginExportInventory,
     source: &Path,
-) -> Result<()> {
+) -> Result<bool> {
     if validate_plugin_export(plugin_id, source)? != *export {
         return Err(AppError::new(
             "sync_plugin_changed",
@@ -2987,7 +3032,7 @@ fn materialize_plugin_export(
         if current_hash == export.logical_hash {
             record_ready_plugin_receipt(&mut connection, plugin_id, session_id, export)?;
             discard_stale_live_export(&home, session_id, plugin_id, source)?;
-            return Ok(());
+            return Ok(false);
         }
         if canonical_count != 0 {
             return Err(AppError::new(
@@ -3039,7 +3084,8 @@ fn materialize_plugin_export(
     tx.commit()?;
     run_plugin_status(plugin_id)?;
     record_ready_plugin_receipt(&mut connection, plugin_id, session_id, export)?;
-    discard_stale_live_export(&home, session_id, plugin_id, source)
+    discard_stale_live_export(&home, session_id, plugin_id, source)?;
+    Ok(true)
 }
 
 fn discard_stale_live_export(
@@ -3406,12 +3452,17 @@ pub(crate) fn peer() -> Result<Value> {
                 ));
             }
             if request.action == "plugin-materialize" {
-                materialize_existing_plugin(&request.session_id, &plugin.plugin_id, &inventory)?;
+                let rebuilt = materialize_existing_plugin(
+                    &request.session_id,
+                    &plugin.plugin_id,
+                    &inventory,
+                )?;
                 return Ok(json!({
                     "protocol": PROTOCOL_VERSION,
                     "action": "plugin-materialized",
                     "session_id": request.session_id,
                     "plugin": plugin.plugin_id,
+                    "rebuilt": rebuilt,
                 }));
             }
             let artifact =
