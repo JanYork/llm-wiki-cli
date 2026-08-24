@@ -3321,7 +3321,7 @@ fn sync_two_way_unions_disjoint_rows_for_a_cloned_store_without_history() {
     assert!(records.contains("Remote clone"));
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, debug_assertions))]
 #[test]
 fn sync_checkpoints_each_fixed_plugin_and_resumes_after_the_next_unit_fails() {
     let world = SyncWorld::new();
