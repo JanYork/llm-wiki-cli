@@ -483,7 +483,7 @@ fn turn(connection: &Connection, id: &str) -> Result<Value> {
         )
         .optional()?
         .ok_or_else(|| Error::new("turn_not_found", format!("turn {id} was not found")))?;
-    let checkpoint = row
+    let checkpoint: Option<Value> = row
         .5
         .map(|value| {
             serde_json::from_str(&value)
