@@ -58,6 +58,13 @@ enum SessionCommand {
     Show {
         id: String,
     },
+    Diagnosis {
+        id: String,
+        #[arg(long)]
+        if_revision: i64,
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -170,6 +177,15 @@ enum GoalCommand {
 struct SessionCreate {
     subject_id: String,
     mode: String,
+    request_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DiagnosisRecord {
+    outcome: String,
+    reason: String,
+    evidence_refs: Vec<String>,
     request_id: String,
 }
 
@@ -315,6 +331,16 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
            updated_at TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS tutor_sessions_subject ON tutor_sessions(subject_id,state,id);
+         CREATE TABLE IF NOT EXISTS tutor_diagnoses(
+           id TEXT PRIMARY KEY,
+           session_id TEXT NOT NULL REFERENCES tutor_sessions(id),
+           outcome TEXT NOT NULL CHECK(outcome IN ('completed','shortened','skipped')),
+           reason TEXT NOT NULL CHECK(trim(reason)<>''),
+           evidence_refs_json TEXT NOT NULL,
+           created_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS tutor_diagnoses_session
+           ON tutor_diagnoses(session_id,created_at,id);
          CREATE TABLE IF NOT EXISTS tutor_turns(
            id TEXT PRIMARY KEY,
            session_id TEXT NOT NULL REFERENCES tutor_sessions(id),
@@ -512,6 +538,81 @@ fn run_session(store: &mut Store, command: SessionCommand) -> Result<Value> {
             "session.show",
             json!({"session": session(&store.connection, &id)?}),
         )),
+        SessionCommand::Diagnosis {
+            id,
+            if_revision,
+            json,
+        } => {
+            validate_id(&id)?;
+            if if_revision < 1 {
+                return Err(Error::new("invalid_input", "if_revision must be positive"));
+            }
+            let input: DiagnosisRecord = read_json(&json)?;
+            validate_request_id(&input.request_id)?;
+            validate_text("reason", &input.reason, 16 * 1024)?;
+            if !matches!(
+                input.outcome.as_str(),
+                "completed" | "shortened" | "skipped"
+            ) {
+                return Err(Error::new(
+                    "invalid_input",
+                    "diagnosis outcome must be completed, shortened, or skipped",
+                ));
+            }
+            let evidence = normalized_refs(input.evidence_refs.clone())?;
+            let fingerprint = fingerprint(&json!({
+                "session_id": id,
+                "if_revision": if_revision,
+                "diagnosis": &input,
+            }))?;
+            let tx = store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
+                return Ok(value);
+            }
+            let current = session(&tx, &id)?;
+            if current["revision"] != if_revision {
+                return Err(Error::new("revision_conflict", "session revision is stale")
+                    .details(json!({"expected": if_revision, "current": current["revision"]})));
+            }
+            let diagnosis_id = new_id(Plugin::Tutor, &input.request_id);
+            let timestamp = now(&tx)?;
+            tx.execute(
+                "INSERT INTO tutor_diagnoses(
+                   id,session_id,outcome,reason,evidence_refs_json,created_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    diagnosis_id,
+                    id,
+                    input.outcome,
+                    input.reason,
+                    serde_json::to_string(&evidence)
+                        .map_err(|error| Error::new("json_error", error.to_string()))?,
+                    timestamp,
+                ],
+            )?;
+            tx.execute(
+                "UPDATE tutor_sessions SET revision=revision+1,updated_at=?2 WHERE id=?1",
+                params![id, timestamp],
+            )?;
+            let diagnosis = json!({
+                "id": diagnosis_id,
+                "session_id": id,
+                "outcome": input.outcome,
+                "reason": input.reason,
+                "evidence_refs": evidence,
+                "created_at": timestamp,
+            });
+            let value = envelope(
+                Plugin::Tutor,
+                "session.diagnosis",
+                json!({"diagnosis": diagnosis, "session": session(&tx, &id)?}),
+            );
+            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            tx.commit()?;
+            Ok(value)
+        }
     }
 }
 
