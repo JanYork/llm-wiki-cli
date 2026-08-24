@@ -59,11 +59,11 @@ choices that later tests and code must share.
   64 KiB UTF-8-byte fallback. Every lease reports the requested unit/value, applied
   source limit, exact used bytes/chars, and block range. No model-name guessing occurs.
 
-The Pro capacity probe wrote a 256 MiB deterministic corpus both ways. External copy
-took 3 ms, while incremental SQLite BLOB commit took 752 ms and produced a
-270,292,632-byte WAL. The external content-addressed representation therefore keeps
-large canonical book bytes out of SQLite/WAL while SQLite retains transactional
-metadata.
+The Pro capacity probe wrote a 256 MiB deterministic corpus both ways. APFS copied the
+external file in 3 ms (clone timing is not portable); incremental SQLite BLOB commit
+took 752 ms and produced a 270,292,632-byte WAL. The decisive result is the extra
+full-size SQLite/WAL surface, so content-addressed files carry large bytes while
+SQLite retains transactional metadata.
 
 ## Practice scheduling
 
