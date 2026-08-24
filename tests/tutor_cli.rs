@@ -373,10 +373,18 @@ fn soul_is_fully_materialized_versioned_bounded_and_sensitive_changes_need_appro
         "request_id": "soul-expanded"
     })
     .to_string();
+    fs::write(cwd.join("soul-expanded.json"), &expanded).unwrap();
     let expanded = ok(
         &cwd,
         &home,
-        &["soul", "publish", "--if-revision", "2", "--json", &expanded],
+        &[
+            "soul",
+            "publish",
+            "--if-revision",
+            "2",
+            "--json",
+            "@soul-expanded.json",
+        ],
     );
     assert_eq!(expanded["result"]["soul"]["body_bytes"], 210_000);
     assert_eq!(expanded["result"]["soul"]["max_bytes"], 220_000);
@@ -389,6 +397,7 @@ fn soul_is_fully_materialized_versioned_bounded_and_sensitive_changes_need_appro
         "request_id": "soul-oversized"
     })
     .to_string();
+    fs::write(cwd.join("soul-oversized.json"), &oversized).unwrap();
     assert_eq!(
         err(
             &cwd,
@@ -399,7 +408,7 @@ fn soul_is_fully_materialized_versioned_bounded_and_sensitive_changes_need_appro
                 "--if-revision",
                 "3",
                 "--json",
-                &oversized
+                "@soul-oversized.json"
             ]
         )["error"]["code"],
         "soul_too_large"
