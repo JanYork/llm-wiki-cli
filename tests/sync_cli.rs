@@ -2503,6 +2503,22 @@ const TEST_PLUGIN_STORE_ID: &str =
     "1111111111111111111111111111111111111111111111111111111111111111";
 
 fn write_preserved_plugin_export(home: &Path, plugin: &str, records: &[u8]) -> PathBuf {
+    let label = String::from_utf8(records.to_vec()).unwrap();
+    let mut normalized = serde_json::to_vec(&serde_json::json!({
+        "table": "subjects",
+        "key": [TEST_PLUGIN_STORE_ID],
+        "values": {
+            "id": TEST_PLUGIN_STORE_ID,
+            "name": label,
+            "parent_id": null,
+            "tags_json": "[]",
+            "revision": 1,
+            "created_at": "2026-08-24T00:00:00.000Z",
+            "updated_at": "2026-08-24T00:00:00.000Z"
+        }
+    }))
+    .unwrap();
+    normalized.push(b'\n');
     let blob_hash = Sha256::digest(b"blob")
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -2519,11 +2535,11 @@ fn write_preserved_plugin_export(home: &Path, plugin: &str, records: &[u8]) -> P
             "plugin": plugin,
             "store_id": TEST_PLUGIN_STORE_ID,
             "revision": 1,
-            "records_sha256": Sha256::digest(records)
+            "records_sha256": Sha256::digest(&normalized)
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>(),
-            "logical_hash": Sha256::digest(records)
+            "logical_hash": Sha256::digest(&normalized)
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>(),
@@ -2532,7 +2548,7 @@ fn write_preserved_plugin_export(home: &Path, plugin: &str, records: &[u8]) -> P
         .unwrap(),
     )
     .unwrap();
-    fs::write(root.join("records.ndjson"), records).unwrap();
+    fs::write(root.join("records.ndjson"), normalized).unwrap();
     fs::write(
         root.join(format!("blobs/sha256/{}/{}", &blob_hash[..2], blob_hash)),
         b"blob",
@@ -2887,6 +2903,80 @@ fn sync_three_way_merges_disjoint_book_rows_from_a_common_baseline() {
             );
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_two_way_unions_disjoint_rows_for_a_cloned_store_without_history() {
+    let world = SyncWorld::new();
+    world.install_fake_ssh();
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+            .env("HOME", &world.local_home)
+            .arg("status")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let base = serde_json::json!({"name":"Base","request_id":"clone-base"}).to_string();
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+            .env("HOME", &world.local_home)
+            .args(["subject", "create", "--json", &base])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    fs::create_dir_all(world.remote_home.join(".lwc/plugins")).unwrap();
+    assert!(
+        Command::new("cp")
+            .args(["-R"])
+            .arg(world.local_home.join(".lwc/plugins/book"))
+            .arg(world.remote_home.join(".lwc/plugins/book"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    for (home, name, request_id) in [
+        (&world.local_home, "Local clone", "clone-local"),
+        (&world.remote_home, "Remote clone", "clone-remote"),
+    ] {
+        let input = serde_json::json!({"name":name,"request_id":request_id}).to_string();
+        assert!(
+            Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+                .env("HOME", home)
+                .args(["subject", "create", "--json", &input])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let merged = world.sync(&[
+        "sync",
+        "peer",
+        world.remote.to_str().unwrap(),
+        "--mode",
+        "merge",
+    ]);
+    assert!(
+        merged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    let history = world.local_home.join(".lwc/plugins/book/sync-history");
+    let store = fs::read_dir(history)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let resolved = store.join("3/records.ndjson");
+    let records = fs::read_to_string(resolved).unwrap();
+    assert!(records.contains("Local clone"));
+    assert!(records.contains("Remote clone"));
 }
 
 #[cfg(unix)]

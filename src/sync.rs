@@ -1415,7 +1415,7 @@ fn plugin_inventory(home: &Path, session_id: &str, plugin: &str) -> Result<PeerP
                 if let Some(existing) = exports.iter().find(|existing| {
                     existing.store_id == export.store_id && existing.revision == export.revision
                 }) {
-                    if existing != &export {
+                    if !same_plugin_state(existing, &export) {
                         return Err(AppError::new(
                             "sync_plugin_diverged",
                             format!("{plugin} archive revision has different canonical content"),
@@ -1433,7 +1433,7 @@ fn plugin_inventory(home: &Path, session_id: &str, plugin: &str) -> Result<PeerP
             .iter()
             .find(|export| export.store_id == live.store_id && export.revision == live.revision)
         {
-            if existing != &live {
+            if !same_plugin_state(existing, &live) {
                 return Err(AppError::new(
                     "sync_plugin_changed",
                     format!("{plugin} canonical content changed without a revision bump"),
@@ -1553,6 +1553,12 @@ fn valid_plugin_store_id(value: &str) -> bool {
     valid_sha256(value)
 }
 
+fn same_plugin_state(left: &PluginExportInventory, right: &PluginExportInventory) -> bool {
+    left.store_id == right.store_id
+        && left.revision == right.revision
+        && left.logical_hash == right.logical_hash
+}
+
 fn plugin_runtime_ready(plugin: &str) -> Result<bool> {
     use crate::config::CapabilitySetting;
     let enabled = crate::config::resolve_learning(plugin)?.setting == CapabilitySetting::Enabled;
@@ -1614,12 +1620,34 @@ fn ensure_live_plugin_export(
             || export.revision != revision
             || export.logical_hash != logical_hash
         {
-            return Err(AppError::new(
-                "sync_plugin_changed",
-                format!("{plugin} canonical content changed during the Sync session"),
-            ));
+            let materialized_by_session = connection
+                .query_row(
+                    "SELECT 1 FROM sync_receipts
+                     WHERE session_id=?1 AND store_id=?2 AND resolved_revision=?3
+                       AND logical_hash=?4 AND runtime_state='ready' AND state='completed'",
+                    params![
+                        session_id,
+                        store_id,
+                        i64::try_from(revision).map_err(|_| AppError::new(
+                            "sync_plugin_invalid",
+                            "plugin revision exceeds SQLite limits",
+                        ))?,
+                        logical_hash
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !materialized_by_session {
+                return Err(AppError::new(
+                    "sync_plugin_changed",
+                    format!("{plugin} canonical content changed during the Sync session"),
+                ));
+            }
+            fs::remove_dir_all(&destination)?;
+        } else {
+            return Ok(export);
         }
-        return Ok(export);
     }
     let staging = destination
         .parent()
@@ -2104,17 +2132,19 @@ fn reconcile_fixed_plugins(
             .iter()
             .find(|plugin| plugin.plugin_id == plugin_id)
             .ok_or_else(|| AppError::new("sync_protocol_invalid", "remote plugin unit missing"))?;
+        let mut resolved_export = None;
         let status = match (&local.export, &remote.export) {
-            (Some(left), Some(right)) if left != right => {
-                let baseline = common_plugin_baseline(local, remote).ok_or_else(|| {
-                    AppError::new(
-                        "sync_plugin_diverged",
-                        format!("{plugin_id} has no common normalized baseline"),
-                    )
-                })?;
-                let resolved = if left == &baseline {
+            (Some(left), Some(right)) if !same_plugin_state(left, right) => {
+                let baseline = common_plugin_baseline(local, remote);
+                let resolved = if baseline
+                    .as_ref()
+                    .is_some_and(|baseline| same_plugin_state(baseline, left))
+                {
                     right.clone()
-                } else if right == &baseline {
+                } else if baseline
+                    .as_ref()
+                    .is_some_and(|baseline| same_plugin_state(baseline, right))
+                {
                     left.clone()
                 } else {
                     merge_plugin_exports(
@@ -2123,13 +2153,13 @@ fn reconcile_fixed_plugins(
                         remote_directory,
                         session_id,
                         plugin_id,
-                        &baseline,
+                        baseline.as_ref(),
                         left,
                         right,
                     )?
                 };
-                if mode != SyncMode::Push && left != &resolved {
-                    if &resolved == right {
+                if mode != SyncMode::Push && !same_plugin_state(left, &resolved) {
+                    if same_plugin_state(&resolved, right) {
                         fetch_plugin_from_peer(
                             host,
                             scope,
@@ -2142,7 +2172,7 @@ fn reconcile_fixed_plugins(
                         materialize_existing_plugin(session_id, plugin_id, &resolved)?;
                     }
                 }
-                if mode != SyncMode::Pull && right != &resolved {
+                if mode != SyncMode::Pull && !same_plugin_state(right, &resolved) {
                     publish_plugin_to_peer(
                         host,
                         scope,
@@ -2153,6 +2183,7 @@ fn reconcile_fixed_plugins(
                     )?;
                 }
                 retain_plugin_history(session_id, plugin_id, &resolved)?;
+                resolved_export = Some(resolved);
                 if local.runtime_ready && remote.runtime_ready {
                     "ready"
                 } else {
@@ -2160,6 +2191,7 @@ fn reconcile_fixed_plugins(
                 }
             }
             (Some(export), Some(_)) => {
+                resolved_export = Some(export.clone());
                 if local.runtime_ready && mode != SyncMode::Push {
                     materialize_existing_plugin(session_id, plugin_id, export)?;
                 }
@@ -2180,6 +2212,7 @@ fn reconcile_fixed_plugins(
                 }
             }
             (Some(export), None) if mode != SyncMode::Pull => {
+                resolved_export = Some(export.clone());
                 publish_plugin_to_peer(
                     host,
                     scope,
@@ -2191,6 +2224,7 @@ fn reconcile_fixed_plugins(
                 "preserved_not_ready"
             }
             (None, Some(export)) if mode != SyncMode::Push => {
+                resolved_export = Some(export.clone());
                 fetch_plugin_from_peer(
                     host,
                     scope,
@@ -2204,9 +2238,14 @@ fn reconcile_fixed_plugins(
             (None, None) => "absent",
             _ => "retained_source_only",
         };
-        if let Some(export) = local.export.as_ref().or(remote.export.as_ref()) {
+        if let Some(export) = resolved_export.as_ref() {
             retain_plugin_history(session_id, plugin_id, export)?;
         }
+        let readback = resolved_export
+            .as_ref()
+            .map(|export| plugin_readback(session_id, plugin_id, export))
+            .transpose()?
+            .unwrap_or_else(|| json!({"record_counts": {}, "blob_hashes": []}));
         let result = json!({
             "plugin": plugin_id,
             "status": status,
@@ -2214,11 +2253,49 @@ fn reconcile_fixed_plugins(
             "remote_runtime_ready": remote.runtime_ready,
             "local": local.export,
             "remote": remote.export,
+            "record_counts": readback["record_counts"],
+            "blob_hashes": readback["blob_hashes"],
+            "publication": {
+                "local": mode != SyncMode::Push && resolved_export.is_some(),
+                "remote": mode != SyncMode::Pull && resolved_export.is_some(),
+            },
+            "rebuild": {
+                "local": local.runtime_ready,
+                "remote": remote.runtime_ready,
+            },
         });
         checkpoint(&result)?;
         results.push(result);
     }
     Ok(results)
+}
+
+fn plugin_readback(
+    session_id: &str,
+    plugin_id: &str,
+    export: &PluginExportInventory,
+) -> Result<Value> {
+    let root = plugin_export_path(session_id, plugin_id, export)?;
+    let records = read_normalized_plugin_records(plugin_id, &root)?;
+    let mut counts = serde_json::Map::new();
+    for table in learning_schema::canonical_tables(plugin_id).expect("fixed plugin") {
+        counts.insert(
+            (*table).to_owned(),
+            json!(
+                records
+                    .iter()
+                    .filter(|record| record.table == *table)
+                    .count()
+            ),
+        );
+    }
+    let manifest: PluginManifest =
+        serde_json::from_slice(&fs::read(root.join("manifest.json"))?)
+            .map_err(|error| AppError::new("sync_plugin_invalid", error.to_string()))?;
+    Ok(json!({
+        "record_counts": counts,
+        "blob_hashes": manifest.blobs.into_iter().map(|blob| blob.sha256).collect::<Vec<_>>(),
+    }))
 }
 
 fn validate_fixed_plugin_preflight(
@@ -2236,15 +2313,19 @@ fn validate_fixed_plugin_preflight(
             .find(|plugin| plugin.plugin_id == plugin_id)
             .ok_or_else(|| AppError::new("sync_protocol_invalid", "remote plugin unit missing"))?;
         if let (Some(left), Some(right)) = (&local.export, &remote.export)
-            && left != right
+            && !same_plugin_state(left, right)
         {
             let baseline = common_plugin_baseline(local, remote);
-            let valid_descendant = baseline.as_ref().is_some_and(|baseline| {
-                left.store_id == baseline.store_id
-                    && right.store_id == baseline.store_id
-                    && (left == baseline || left.revision > baseline.revision)
-                    && (right == baseline || right.revision > baseline.revision)
-            });
+            let valid_descendant = baseline.as_ref().map_or_else(
+                || left.store_id == right.store_id && left.revision == right.revision,
+                |baseline| {
+                    left.store_id == baseline.store_id
+                        && right.store_id == baseline.store_id
+                        && (same_plugin_state(left, baseline) || left.revision > baseline.revision)
+                        && (same_plugin_state(right, baseline)
+                            || right.revision > baseline.revision)
+                },
+            );
             if !valid_descendant {
                 let code = if left.store_id == right.store_id && left.revision == right.revision {
                     "sync_plugin_changed"
@@ -2277,17 +2358,21 @@ fn merge_plugin_exports(
     remote_directory: Option<&Path>,
     session_id: &str,
     plugin_id: &str,
-    baseline: &PluginExportInventory,
+    baseline: Option<&PluginExportInventory>,
     local: &PluginExportInventory,
     remote: &PluginExportInventory,
 ) -> Result<PluginExportInventory> {
-    if local.store_id != baseline.store_id || remote.store_id != baseline.store_id {
+    if local.store_id != remote.store_id
+        || baseline.is_some_and(|baseline| baseline.store_id != local.store_id)
+    {
         return Err(AppError::new(
             "sync_plugin_diverged",
             format!("{plugin_id} StoreIdentity changed after the common baseline"),
         ));
     }
-    let baseline_root = plugin_export_path(session_id, plugin_id, baseline)?;
+    let baseline_root = baseline
+        .map(|baseline| plugin_export_path(session_id, plugin_id, baseline))
+        .transpose()?;
     let local_root = plugin_export_path(session_id, plugin_id, local)?;
     let remote_artifact = plugin_artifact_path(session_id, plugin_id, "merge-remote")?;
     download_plugin_export(
@@ -2308,7 +2393,10 @@ fn merge_plugin_exports(
         .join(format!("{plugin_id}-merge-remote"));
     extract_plugin_artifact(plugin_id, remote, &remote_artifact, &remote_root)?;
 
-    let base = normalized_record_map(read_normalized_plugin_records(plugin_id, &baseline_root)?)?;
+    let base = baseline_root.as_ref().map_or_else(
+        || Ok(std::collections::BTreeMap::new()),
+        |root| normalized_record_map(read_normalized_plugin_records(plugin_id, root)?),
+    )?;
     let left = normalized_record_map(read_normalized_plugin_records(plugin_id, &local_root)?)?;
     let right = normalized_record_map(read_normalized_plugin_records(plugin_id, &remote_root)?)?;
     let keys = base
@@ -2367,11 +2455,11 @@ fn merge_plugin_exports(
         }
         records.sync_all()?;
         let records_sha256 = file_digest(&destination.join("records.ndjson"))?;
-        let blobs = merge_plugin_blobs(
-            plugin_id,
-            [&baseline_root, &local_root, &remote_root],
-            &destination,
-        )?;
+        let mut blob_roots = vec![local_root.as_path(), remote_root.as_path()];
+        if let Some(root) = baseline_root.as_deref() {
+            blob_roots.push(root);
+        }
+        let blobs = merge_plugin_blobs(plugin_id, &blob_roots, &destination)?;
         let revision = local
             .revision
             .max(remote.revision)
@@ -2381,7 +2469,7 @@ fn merge_plugin_exports(
         let manifest = json!({
             "format": 1,
             "plugin": plugin_id,
-            "store_id": baseline.store_id,
+            "store_id": local.store_id,
             "revision": revision,
             "records_sha256": records_sha256,
             "logical_hash": logical_hash,
@@ -2446,11 +2534,7 @@ fn preview_plugin_logical_hash<'a>(
         .map_err(|message| AppError::new("sync_plugin_invalid", message))
 }
 
-fn merge_plugin_blobs(
-    plugin_id: &str,
-    roots: [&Path; 3],
-    destination: &Path,
-) -> Result<Vec<Value>> {
+fn merge_plugin_blobs(plugin_id: &str, roots: &[&Path], destination: &Path) -> Result<Vec<Value>> {
     if plugin_id != "book" {
         return Ok(Vec::new());
     }
@@ -2493,7 +2577,12 @@ fn common_plugin_baseline(
     local
         .history
         .iter()
-        .filter(|left| remote.history.iter().any(|right| right == *left))
+        .filter(|left| {
+            remote
+                .history
+                .iter()
+                .any(|right| same_plugin_state(right, left))
+        })
         .max_by_key(|export| export.revision)
         .cloned()
 }
@@ -2896,13 +2985,25 @@ fn materialize_plugin_export(
         let current_hash = learning_schema::canonical_logical_hash(plugin_id, &connection)
             .map_err(|message| AppError::new("sync_plugin_invalid", message))?;
         if current_hash == export.logical_hash {
-            return record_ready_plugin_receipt(&mut connection, plugin_id, session_id, export);
+            record_ready_plugin_receipt(&mut connection, plugin_id, session_id, export)?;
+            discard_stale_live_export(&home, session_id, plugin_id, source)?;
+            return Ok(());
         }
         if canonical_count != 0 {
             return Err(AppError::new(
                 "sync_plugin_changed",
-                "runtime canonical content changed without a revision bump",
-            ));
+                format!(
+                    "{plugin_id} canonical content changed without a revision bump at {current_revision}: current {current_hash}, expected {}",
+                    export.logical_hash
+                ),
+            )
+            .with_details(json!({
+                "plugin": plugin_id,
+                "session_id": session_id,
+                "revision": current_revision,
+                "current_hash": current_hash,
+                "expected_hash": export.logical_hash,
+            })));
         }
     }
 
@@ -2937,7 +3038,21 @@ fn materialize_plugin_export(
     }
     tx.commit()?;
     run_plugin_status(plugin_id)?;
-    record_ready_plugin_receipt(&mut connection, plugin_id, session_id, export)
+    record_ready_plugin_receipt(&mut connection, plugin_id, session_id, export)?;
+    discard_stale_live_export(&home, session_id, plugin_id, source)
+}
+
+fn discard_stale_live_export(
+    home: &Path,
+    session_id: &str,
+    plugin_id: &str,
+    materialized_source: &Path,
+) -> Result<()> {
+    let live = plugin_live_export_path(home, session_id, plugin_id);
+    if live != materialized_source && live.is_dir() {
+        fs::remove_dir_all(live)?;
+    }
+    Ok(())
 }
 
 fn canonical_record_count(plugin_id: &str, connection: &Connection) -> Result<u64> {
@@ -3272,15 +3387,17 @@ pub(crate) fn peer() -> Result<Value> {
                 .find(|inventory| {
                     inventory.store_id == plugin.store_id
                         && inventory.revision == plugin.revision
-                        && inventory.records_sha256 == plugin.records_sha256
                         && inventory.logical_hash == plugin.logical_hash
+                        && (request.action == "plugin-materialize"
+                            || inventory.records_sha256 == plugin.records_sha256)
                 })
                 .ok_or_else(|| {
                     AppError::new("sync_plugin_changed", "remote plugin export changed")
                 })?;
             if inventory.store_id != plugin.store_id
                 || inventory.revision != plugin.revision
-                || inventory.records_sha256 != plugin.records_sha256
+                || (request.action != "plugin-materialize"
+                    && inventory.records_sha256 != plugin.records_sha256)
                 || inventory.logical_hash != plugin.logical_hash
             {
                 return Err(AppError::new(
