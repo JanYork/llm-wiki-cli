@@ -202,10 +202,10 @@ test("both pages contain the exact normative README Agent prompt", () => {
   assert.equal(embeddedPrompt(page("zh")), expected);
 });
 
-test("both locales expose temporal memory, Todo, and Plan", () => {
+test("both locales expose continuity and Learning Suite capabilities", () => {
   for (const [locale, names] of [
-    ["en", ["Temporal memory", "Durable Todo", "Current Plan"]],
-    ["zh", ["时序记忆", "持久 Todo", "当前 Plan"]],
+    ["en", ["Temporal memory", "Durable Todo", "Current Plan", "Tutor", "Book", "Practice"]],
+    ["zh", ["时序记忆", "持久 Todo", "当前 Plan", "Tutor 教学", "Book 整书阅读", "Practice 练习"]],
   ]) {
     const html = page(locale);
     for (const name of names) assert.ok(html.includes(`<h3>${name}</h3>`), `${locale}: ${name} is missing`);
