@@ -7,7 +7,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fs, path::Path, sync::atomic::Ordering};
 
-const SOUL_MAX_BYTES: usize = 64 * 1024;
+const SOUL_DEFAULT_MAX_BYTES: usize = 64 * 1024;
+const SOUL_HARD_MAX_BYTES: usize = 256 * 1024;
 const INITIAL_SOUL: &str = "# 老师的灵魂\n\n保持客观、科学、诚实，禁止谄媚。先识别学生的具体阻塞，再逐级提供提示；评价必须引用可观察证据。\n";
 
 #[derive(Parser)]
@@ -119,6 +120,12 @@ enum FactCommand {
 enum SoulCommand {
     Show,
     History,
+    Configure {
+        #[arg(long)]
+        if_revision: i64,
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
+    },
     Propose {
         #[arg(long)]
         if_revision: i64,
@@ -201,6 +208,7 @@ struct TurnBegin {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TurnCommit {
+    owner: String,
     reply: String,
     checkpoint: Value,
     request_id: String,
@@ -230,6 +238,13 @@ struct SoulPublish {
     sensitivity: String,
     #[serde(default)]
     approved: bool,
+    request_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SoulConfigure {
+    max_bytes: usize,
     request_id: String,
 }
 
@@ -369,6 +384,17 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
            approved INTEGER NOT NULL,
            created_at TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS soul_settings(
+           singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+           max_bytes INTEGER NOT NULL CHECK(max_bytes>=65536 AND max_bytes<=262144),
+           revision INTEGER NOT NULL CHECK(revision>=1),
+           updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS soul_settings_history(
+           revision INTEGER PRIMARY KEY,
+           max_bytes INTEGER NOT NULL,
+           changed_at TEXT NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS soul_proposals(
            id TEXT PRIMARY KEY,
            base_revision INTEGER NOT NULL REFERENCES soul_versions(revision),
@@ -459,6 +485,25 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
                revision,body,body_hash,fact_refs_json,reason,sensitivity,approved,created_at
              ) VALUES(1,?1,?2,'[]','initial teacher contract','ordinary',1,?3)",
             params![INITIAL_SOUL, sha256(INITIAL_SOUL.as_bytes()), timestamp],
+        )?;
+    }
+    if connection
+        .query_row("SELECT 1 FROM soul_settings WHERE singleton=1", [], |_| {
+            Ok(())
+        })
+        .optional()?
+        .is_none()
+    {
+        let timestamp = now(connection)?;
+        connection.execute(
+            "INSERT INTO soul_settings(singleton,max_bytes,revision,updated_at)
+             VALUES(1,?1,1,?2)",
+            params![SOUL_DEFAULT_MAX_BYTES as i64, timestamp],
+        )?;
+        connection.execute(
+            "INSERT INTO soul_settings_history(revision,max_bytes,changed_at)
+             VALUES(1,?1,?2)",
+            params![SOUL_DEFAULT_MAX_BYTES as i64, timestamp],
         )?;
     }
     crate::tutor_plan::initialize(connection)?;
@@ -660,6 +705,7 @@ fn run_turn(store: &mut Store, command: TurnCommand) -> Result<Value> {
             validate_id(&id)?;
             let input: TurnCommit = read_json(&json)?;
             validate_request_id(&input.request_id)?;
+            validate_text("owner", &input.owner, 256)?;
             validate_text("reply", &input.reply, 1024 * 1024)?;
             if !input.checkpoint.is_object() {
                 return Err(Error::new("invalid_input", "checkpoint must be an object"));
@@ -679,6 +725,12 @@ fn run_turn(store: &mut Store, command: TurnCommand) -> Result<Value> {
             if current["state"] != "pending" || current["revision"] != if_revision {
                 return Err(Error::new("revision_conflict", "turn revision is stale")
                     .details(json!({"expected": if_revision, "current": current["revision"]})));
+            }
+            if current["owner"] != input.owner {
+                return Err(Error::new(
+                    "stale_owner",
+                    "only the current turn owner may commit",
+                ));
             }
             let teaching = validate_teaching_checkpoint(&tx, &current, &input.checkpoint)?;
             let checkpoint = serde_json::to_string(&input.checkpoint)
@@ -1574,10 +1626,68 @@ fn run_soul(store: &mut Store, command: SoulCommand) -> Result<Value> {
             "soul.history",
             soul_history(&store.connection)?,
         )),
+        SoulCommand::Configure { if_revision, json } => {
+            let input: SoulConfigure = read_json(&json)?;
+            validate_request_id(&input.request_id)?;
+            if !(SOUL_DEFAULT_MAX_BYTES..=SOUL_HARD_MAX_BYTES).contains(&input.max_bytes) {
+                return Err(Error::new(
+                    "invalid_input",
+                    format!(
+                        "Soul max_bytes must be within {SOUL_DEFAULT_MAX_BYTES}..={SOUL_HARD_MAX_BYTES}"
+                    ),
+                ));
+            }
+            let fingerprint = fingerprint(&json!({
+                "if_revision": if_revision,
+                "configure": &input,
+            }))?;
+            let tx = store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
+                return Ok(value);
+            }
+            let current = soul_settings(&tx)?;
+            if current["revision"] != if_revision {
+                return Err(
+                    Error::new("revision_conflict", "Soul settings revision is stale")
+                        .details(json!({"expected": if_revision, "current": current["revision"]})),
+                );
+            }
+            let body_bytes = soul(&tx)?["body_bytes"].as_u64().unwrap() as usize;
+            if input.max_bytes < body_bytes {
+                return Err(Error::new(
+                    "soul_budget_below_current",
+                    "Soul max_bytes cannot be smaller than the current body",
+                ));
+            }
+            let revision = if_revision + 1;
+            let max_bytes = input.max_bytes as i64;
+            let timestamp = now(&tx)?;
+            tx.execute(
+                "UPDATE soul_settings SET max_bytes=?1,revision=?2,updated_at=?3
+                 WHERE singleton=1",
+                params![max_bytes, revision, timestamp],
+            )?;
+            tx.execute(
+                "INSERT INTO soul_settings_history(revision,max_bytes,changed_at)
+                 VALUES(?1,?2,?3)",
+                params![revision, max_bytes, timestamp],
+            )?;
+            let value = envelope(
+                Plugin::Tutor,
+                "soul.configure",
+                json!({"settings": soul_settings(&tx)?}),
+            );
+            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            tx.commit()?;
+            Ok(value)
+        }
         SoulCommand::Propose { if_revision, json } => {
             let input: SoulProposalCreate = read_json(&json)?;
             validate_request_id(&input.request_id)?;
             validate_soul_content(
+                &store.connection,
                 &input.body,
                 &input.fact_refs,
                 &input.reason,
@@ -1743,6 +1853,7 @@ fn run_soul(store: &mut Store, command: SoulCommand) -> Result<Value> {
             let input: SoulPublish = read_json(&json)?;
             validate_request_id(&input.request_id)?;
             validate_soul_content(
+                &store.connection,
                 &input.body,
                 &input.fact_refs,
                 &input.reason,
@@ -1798,6 +1909,7 @@ fn run_soul(store: &mut Store, command: SoulCommand) -> Result<Value> {
 }
 
 fn validate_soul_content(
+    connection: &Connection,
     body: &str,
     fact_refs: &[String],
     reason: &str,
@@ -1806,10 +1918,11 @@ fn validate_soul_content(
     if body.trim().is_empty() {
         return Err(Error::new("invalid_input", "Soul body must not be empty"));
     }
-    if body.len() > SOUL_MAX_BYTES {
+    let max_bytes = soul_limit(connection)?;
+    if body.len() > max_bytes {
         return Err(Error::new(
             "soul_too_large",
-            format!("Soul body exceeds {SOUL_MAX_BYTES} UTF-8 bytes"),
+            format!("Soul body exceeds {max_bytes} UTF-8 bytes"),
         ));
     }
     validate_text("reason", reason, 4096)?;
@@ -1932,13 +2045,40 @@ fn soul(connection: &Connection) -> Result<Value> {
         "body": row.1,
         "body_sha256": row.2,
         "body_bytes": row.1.len(),
-        "max_bytes": SOUL_MAX_BYTES,
+        "max_bytes": soul_limit(connection)?,
         "fact_refs": fact_refs,
         "reason": row.4,
         "sensitivity": row.5,
         "approved": row.6,
         "created_at": row.7,
     }))
+}
+
+fn soul_limit(connection: &Connection) -> Result<usize> {
+    connection
+        .query_row(
+            "SELECT max_bytes FROM soul_settings WHERE singleton=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value as usize)
+        .map_err(Into::into)
+}
+
+fn soul_settings(connection: &Connection) -> Result<Value> {
+    connection
+        .query_row(
+            "SELECT max_bytes,revision,updated_at FROM soul_settings WHERE singleton=1",
+            [],
+            |row| {
+                Ok(json!({
+                    "max_bytes": row.get::<_, i64>(0)?,
+                    "revision": row.get::<_, i64>(1)?,
+                    "updated_at": row.get::<_, String>(2)?,
+                }))
+            },
+        )
+        .map_err(Into::into)
 }
 
 fn soul_proposal(connection: &Connection, id: &str) -> Result<Value> {

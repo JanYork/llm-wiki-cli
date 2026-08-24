@@ -29,6 +29,43 @@ pub(crate) enum PlanCommand {
         #[arg(long, value_name = "JSON|-|@PATH")]
         json: String,
     },
+    Step {
+        #[command(subcommand)]
+        command: PlanStepCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum PlanStepCommand {
+    Update {
+        plan_id: String,
+        step_id: String,
+        #[arg(long)]
+        if_revision: i64,
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PlanStepCreate {
+    title: String,
+    estimated_minutes: i64,
+    #[serde(default)]
+    practice_target_kind: Option<String>,
+    #[serde(default)]
+    practice_target_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PlanStepUpdate {
+    status: String,
+    actor: String,
+    reason: String,
+    evidence_refs: Vec<String>,
+    request_id: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -44,6 +81,8 @@ struct PlanCreate {
     pace: String,
     method: String,
     exercise_ratio: f64,
+    #[serde(default)]
+    steps: Vec<PlanStepCreate>,
     request_id: String,
 }
 
@@ -114,6 +153,34 @@ pub(crate) fn initialize(connection: &Connection) -> Result<()> {
            rolled_back_to INTEGER,
            created_at TEXT NOT NULL,
            PRIMARY KEY(plan_id,revision)
+         );
+         CREATE TABLE IF NOT EXISTS tutor_plan_steps(
+           id TEXT PRIMARY KEY,
+           plan_id TEXT NOT NULL REFERENCES tutor_plans(id),
+           ordinal INTEGER NOT NULL,
+           title TEXT NOT NULL CHECK(trim(title)<>''),
+           estimated_minutes INTEGER NOT NULL CHECK(estimated_minutes>0),
+           status TEXT NOT NULL CHECK(status IN
+             ('planned','in_progress','completed','missed','deferred','skipped')),
+           practice_target_kind TEXT CHECK(practice_target_kind IN ('bank','set','paper')),
+           practice_target_id TEXT,
+           revision INTEGER NOT NULL CHECK(revision>=1),
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           UNIQUE(plan_id,ordinal),
+           CHECK((practice_target_kind IS NULL)=(practice_target_id IS NULL))
+         );
+         CREATE INDEX IF NOT EXISTS tutor_plan_steps_plan
+           ON tutor_plan_steps(plan_id,ordinal);
+         CREATE TABLE IF NOT EXISTS tutor_plan_step_history(
+           step_id TEXT NOT NULL REFERENCES tutor_plan_steps(id),
+           revision INTEGER NOT NULL,
+           status TEXT NOT NULL,
+           actor TEXT NOT NULL CHECK(actor IN ('learner','agent')),
+           reason TEXT NOT NULL,
+           evidence_refs_json TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           PRIMARY KEY(step_id,revision)
          );",
     )?;
     Ok(())
@@ -138,6 +205,14 @@ pub(crate) fn run(store: &mut Store, command: PlanCommand) -> Result<Value> {
             to_revision,
             json,
         } => rollback(store, &id, if_revision, to_revision, read_json(&json)?),
+        PlanCommand::Step { command } => match command {
+            PlanStepCommand::Update {
+                plan_id,
+                step_id,
+                if_revision,
+                json,
+            } => update_step(store, &plan_id, &step_id, if_revision, read_json(&json)?),
+        },
     }
 }
 
@@ -154,6 +229,7 @@ fn create(store: &mut Store, input: PlanCreate) -> Result<Value> {
         &input.method,
         input.exercise_ratio,
     )?;
+    validate_steps(&input.steps, input.weekly_minutes)?;
     require_subject_goal(&store.connection, &input.subject_id, &input.goal_id)?;
     let fingerprint = fingerprint(&input)?;
     let tx = store
@@ -189,8 +265,117 @@ fn create(store: &mut Store, input: PlanCreate) -> Result<Value> {
         None,
         &timestamp,
     )?;
+    for (ordinal, step) in input.steps.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO tutor_plan_steps(
+               id,plan_id,ordinal,title,estimated_minutes,status,practice_target_kind,
+               practice_target_id,revision,created_at,updated_at
+             ) VALUES(?1,?2,?3,?4,?5,'planned',?6,?7,1,?8,?8)",
+            params![
+                new_id(
+                    Plugin::Tutor,
+                    &format!("{}:step:{ordinal}", input.request_id)
+                ),
+                id,
+                ordinal as i64,
+                step.title.trim(),
+                step.estimated_minutes,
+                step.practice_target_kind,
+                step.practice_target_id,
+                timestamp,
+            ],
+        )?;
+    }
     let plan = current_plan(&tx, &id)?;
     let value = envelope(Plugin::Tutor, "plan.create", json!({"plan": plan}));
+    remember(&tx, &input.request_id, &fingerprint, &value)?;
+    tx.commit()?;
+    Ok(value)
+}
+
+fn update_step(
+    store: &mut Store,
+    plan_id: &str,
+    step_id: &str,
+    if_revision: i64,
+    input: PlanStepUpdate,
+) -> Result<Value> {
+    validate_id(plan_id)?;
+    validate_id(step_id)?;
+    validate_revision(if_revision)?;
+    validate_step_status(&input.status)?;
+    validate_change_metadata(
+        &input.actor,
+        "step_update",
+        &input.reason,
+        &input.evidence_refs,
+        &input.request_id,
+    )?;
+    let fingerprint = fingerprint(&json!({
+        "plan_id": plan_id,
+        "step_id": step_id,
+        "if_revision": if_revision,
+        "input": &input,
+    }))?;
+    let tx = store
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
+        return Ok(value);
+    }
+    let current = plan_step(&tx, plan_id, step_id)?;
+    let revision = current["revision"].as_i64().unwrap();
+    if revision != if_revision {
+        return Err(
+            Error::new("revision_conflict", "plan step revision is stale")
+                .details(json!({"expected": if_revision, "current": revision})),
+        );
+    }
+    let current_status = current["status"].as_str().unwrap();
+    if matches!(
+        current_status,
+        "completed" | "missed" | "deferred" | "skipped"
+    ) {
+        return Err(Error::new(
+            "plan_step_terminal",
+            "terminal plan steps cannot be rewritten",
+        ));
+    }
+    if !allowed_step_transition(current_status, &input.status) {
+        return Err(Error::new(
+            "invalid_step_transition",
+            format!(
+                "cannot change plan step from {current_status} to {}",
+                input.status
+            ),
+        ));
+    }
+    let evidence = normalized_evidence(&input.evidence_refs)?;
+    let next_revision = revision + 1;
+    let timestamp = now(&tx)?;
+    tx.execute(
+        "UPDATE tutor_plan_steps
+         SET status=?3,revision=?4,updated_at=?5
+         WHERE id=?1 AND plan_id=?2",
+        params![step_id, plan_id, input.status, next_revision, timestamp],
+    )?;
+    tx.execute(
+        "INSERT INTO tutor_plan_step_history(
+           step_id,revision,status,actor,reason,evidence_refs_json,created_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            step_id,
+            next_revision,
+            input.status,
+            input.actor,
+            input.reason,
+            serde_json::to_string(&evidence)
+                .map_err(|error| Error::new("json_error", error.to_string()))?,
+            timestamp,
+        ],
+    )?;
+    let step = plan_step(&tx, plan_id, step_id)?;
+    let value = envelope(Plugin::Tutor, "plan.step.update", json!({"step": step}));
     remember(&tx, &input.request_id, &fingerprint, &value)?;
     tx.commit()?;
     Ok(value)
@@ -229,6 +414,7 @@ fn revise(store: &mut Store, id: &str, if_revision: i64, input: PlanRevise) -> R
     authorize_changes(&current, &input.actor, &input.trigger, &changes)?;
     let next = apply_changes(&current, &input)?;
     validate_snapshot_value(&tx, &next)?;
+    validate_plan_time_cap(&tx, id, next["weekly_minutes"].as_i64().unwrap())?;
     if let Some(goal_id) = input.goal_id.as_deref() {
         require_subject_goal(&tx, current["subject_id"].as_str().unwrap(), goal_id)?;
     }
@@ -352,6 +538,103 @@ fn validate_mode(mode: &str) -> Result<()> {
             "invalid_input",
             "mode must be fixed, adaptive, or agent-led",
         ))
+    }
+}
+
+fn validate_steps(steps: &[PlanStepCreate], weekly_minutes: i64) -> Result<()> {
+    if steps.len() > 1024 {
+        return Err(Error::new(
+            "invalid_input",
+            "a plan accepts at most 1024 steps",
+        ));
+    }
+    let mut total = 0_i64;
+    for step in steps {
+        validate_string("step title", &step.title)?;
+        if step.estimated_minutes <= 0 {
+            return Err(Error::new(
+                "invalid_input",
+                "step estimated_minutes must be positive",
+            ));
+        }
+        total = total
+            .checked_add(step.estimated_minutes)
+            .ok_or_else(|| Error::new("invalid_input", "step time total overflowed"))?;
+        match (
+            step.practice_target_kind.as_deref(),
+            step.practice_target_id.as_deref(),
+        ) {
+            (None, None) => {}
+            (Some(kind), Some(id)) => {
+                if !matches!(kind, "bank" | "set" | "paper") {
+                    return Err(Error::new(
+                        "invalid_input",
+                        "practice_target_kind must be bank, set, or paper",
+                    ));
+                }
+                validate_id(id)?;
+            }
+            _ => {
+                return Err(Error::new(
+                    "invalid_input",
+                    "practice target kind and ID must be supplied together",
+                ));
+            }
+        }
+    }
+    if total > weekly_minutes {
+        return Err(Error::new(
+            "plan_time_cap_exceeded",
+            "plan steps exceed the learner-owned weekly time ceiling",
+        )
+        .details(json!({"weekly_minutes": weekly_minutes, "step_minutes": total})));
+    }
+    Ok(())
+}
+
+fn validate_plan_time_cap(
+    connection: &Connection,
+    plan_id: &str,
+    weekly_minutes: i64,
+) -> Result<()> {
+    let total = connection.query_row(
+        "SELECT COALESCE(SUM(estimated_minutes),0) FROM tutor_plan_steps WHERE plan_id=?1",
+        [plan_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if total <= weekly_minutes {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "plan_time_cap_exceeded",
+            "plan steps exceed the learner-owned weekly time ceiling",
+        )
+        .details(json!({"weekly_minutes": weekly_minutes, "step_minutes": total})))
+    }
+}
+
+fn validate_step_status(status: &str) -> Result<()> {
+    if matches!(
+        status,
+        "in_progress" | "completed" | "missed" | "deferred" | "skipped"
+    ) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "invalid_input",
+            "step status must be in_progress, completed, missed, deferred, or skipped",
+        ))
+    }
+}
+
+fn allowed_step_transition(current: &str, next: &str) -> bool {
+    match current {
+        "planned" => matches!(
+            next,
+            "in_progress" | "completed" | "missed" | "deferred" | "skipped"
+        ),
+        "in_progress" => matches!(next, "completed" | "missed" | "deferred" | "skipped"),
+        _ => false,
     }
 }
 
@@ -738,7 +1021,64 @@ fn current_plan(connection: &Connection, id: &str) -> Result<Value> {
     object.insert("status".to_owned(), json!(base.2));
     object.insert("created_at".to_owned(), json!(base.4));
     object.insert("updated_at".to_owned(), json!(base.5));
+    object.insert("steps".to_owned(), plan_steps(connection, id)?);
     Ok(plan)
+}
+
+fn plan_steps(connection: &Connection, plan_id: &str) -> Result<Value> {
+    let mut statement = connection.prepare(
+        "SELECT id,ordinal,title,estimated_minutes,status,practice_target_kind,
+                practice_target_id,revision,created_at,updated_at
+         FROM tutor_plan_steps WHERE plan_id=?1 ORDER BY ordinal",
+    )?;
+    let rows = statement.query_map([plan_id], |row| {
+        Ok(json!({
+            "id": row.get::<_, String>(0)?,
+            "ordinal": row.get::<_, i64>(1)?,
+            "title": row.get::<_, String>(2)?,
+            "estimated_minutes": row.get::<_, i64>(3)?,
+            "status": row.get::<_, String>(4)?,
+            "practice_target_kind": row.get::<_, Option<String>>(5)?,
+            "practice_target_id": row.get::<_, Option<String>>(6)?,
+            "revision": row.get::<_, i64>(7)?,
+            "created_at": row.get::<_, String>(8)?,
+            "updated_at": row.get::<_, String>(9)?,
+        }))
+    })?;
+    let steps = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(json!(steps))
+}
+
+fn plan_step(connection: &Connection, plan_id: &str, step_id: &str) -> Result<Value> {
+    connection
+        .query_row(
+            "SELECT ordinal,title,estimated_minutes,status,practice_target_kind,
+                    practice_target_id,revision,created_at,updated_at
+             FROM tutor_plan_steps WHERE id=?1 AND plan_id=?2",
+            params![step_id, plan_id],
+            |row| {
+                Ok(json!({
+                    "id": step_id,
+                    "plan_id": plan_id,
+                    "ordinal": row.get::<_, i64>(0)?,
+                    "title": row.get::<_, String>(1)?,
+                    "estimated_minutes": row.get::<_, i64>(2)?,
+                    "status": row.get::<_, String>(3)?,
+                    "practice_target_kind": row.get::<_, Option<String>>(4)?,
+                    "practice_target_id": row.get::<_, Option<String>>(5)?,
+                    "revision": row.get::<_, i64>(6)?,
+                    "created_at": row.get::<_, String>(7)?,
+                    "updated_at": row.get::<_, String>(8)?,
+                }))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            Error::new(
+                "plan_step_not_found",
+                format!("step {step_id} was not found in plan {plan_id}"),
+            )
+        })
 }
 
 fn plan_at(connection: &Connection, id: &str, revision: i64) -> Result<Value> {

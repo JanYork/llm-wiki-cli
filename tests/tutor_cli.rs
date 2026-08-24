@@ -110,6 +110,7 @@ fn visible_turn_input_is_durable_before_reply_and_commit_is_idempotent() {
     assert!(!pending.to_string().contains("chain_of_thought"));
 
     let commit_input = serde_json::json!({
+        "owner": "agent-local",
         "reply": "关键在于：若同一向量有两种表示，相减就得到一组非零系数的零向量组合。",
         "checkpoint": {
             "kind": "diagnosis",
@@ -119,6 +120,33 @@ fn visible_turn_input_is_durable_before_reply_and_commit_is_idempotent() {
         "request_id": "turn-linear-1-commit"
     })
     .to_string();
+    let stale_owner = serde_json::json!({
+        "owner": "agent-other-machine",
+        "reply": "不应写入",
+        "checkpoint": {
+            "kind": "diagnosis",
+            "blocked_by": "不应写入",
+            "hint_level": 1
+        },
+        "request_id": "turn-linear-stale-owner"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "turn",
+                "commit",
+                turn_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &stale_owner,
+            ],
+        )["error"]["code"],
+        "stale_owner"
+    );
     let args = [
         "turn",
         "commit",
@@ -251,10 +279,47 @@ fn soul_is_fully_materialized_versioned_bounded_and_sensitive_changes_need_appro
         body
     );
 
-    let oversized = serde_json::json!({
+    assert_eq!(initial["result"]["soul"]["max_bytes"], 65_536);
+    let configure = serde_json::json!({
+        "max_bytes": 220_000,
+        "request_id": "soul-budget-220k"
+    })
+    .to_string();
+    let configured = ok(
+        &cwd,
+        &home,
+        &[
+            "soul",
+            "configure",
+            "--if-revision",
+            "1",
+            "--json",
+            &configure,
+        ],
+    );
+    assert_eq!(configured["result"]["settings"]["max_bytes"], 220_000);
+    assert_eq!(configured["result"]["settings"]["revision"], 2);
+
+    let expanded = serde_json::json!({
         "body": "甲".repeat(70_000),
         "fact_refs": [],
-        "reason": "容量边界",
+        "reason": "在配置后的完整读取预算内扩展",
+        "sensitivity": "ordinary",
+        "request_id": "soul-expanded"
+    })
+    .to_string();
+    let expanded = ok(
+        &cwd,
+        &home,
+        &["soul", "publish", "--if-revision", "2", "--json", &expanded],
+    );
+    assert_eq!(expanded["result"]["soul"]["body_bytes"], 210_000);
+    assert_eq!(expanded["result"]["soul"]["max_bytes"], 220_000);
+
+    let oversized = serde_json::json!({
+        "body": "甲".repeat(90_000),
+        "fact_refs": [],
+        "reason": "超过配置上限",
         "sensitivity": "ordinary",
         "request_id": "soul-oversized"
     })
@@ -267,7 +332,7 @@ fn soul_is_fully_materialized_versioned_bounded_and_sensitive_changes_need_appro
                 "soul",
                 "publish",
                 "--if-revision",
-                "2",
+                "3",
                 "--json",
                 &oversized
             ]
@@ -900,6 +965,7 @@ fn teaching_checkpoint_enforces_blockage_progressive_hints_answer_timing_and_exa
     );
 
     let premature_answer = serde_json::json!({
+        "owner": "agent-local",
         "reply": "完整答案",
         "checkpoint": {
             "kind": "teaching",
@@ -931,6 +997,7 @@ fn teaching_checkpoint_enforces_blockage_progressive_hints_answer_timing_and_exa
     );
 
     let first_hint = serde_json::json!({
+        "owner": "agent-local",
         "reply": "先把两种表示相减，会得到什么？",
         "checkpoint": {
             "kind": "teaching",
@@ -960,6 +1027,7 @@ fn teaching_checkpoint_enforces_blockage_progressive_hints_answer_timing_and_exa
 
     let second = begin_turn(&cwd, &home, &learning, "我还是卡住了", "turn-teaching-2");
     let skipped_hint = serde_json::json!({
+        "owner": "agent-local",
         "reply": "三级提示",
         "checkpoint": {
             "kind": "teaching",
@@ -991,6 +1059,7 @@ fn teaching_checkpoint_enforces_blockage_progressive_hints_answer_timing_and_exa
     );
 
     let answer_after_attempt = serde_json::json!({
+        "owner": "agent-local",
         "reply": "现在给出完整推导。",
         "checkpoint": {
             "kind": "teaching",
@@ -1021,6 +1090,7 @@ fn teaching_checkpoint_enforces_blockage_progressive_hints_answer_timing_and_exa
     let exam = session(&cwd, &home, &subject_id, "exam", "session-exam-no-hints");
     let exam_turn = begin_turn(&cwd, &home, &exam, "给一点提示", "turn-exam-hint");
     let exam_hint = serde_json::json!({
+        "owner": "agent-local",
         "reply": "提示",
         "checkpoint": {
             "kind": "teaching",
@@ -1232,4 +1302,172 @@ fn skipped_diagnosis_is_audited_without_changing_goal_or_plan() {
         ok(&cwd, &home, &["plan", "show", plan_id])["result"]["plan"]["revision"],
         1
     );
+}
+
+#[test]
+fn plan_steps_keep_exact_practice_targets_and_never_rewrite_missed_or_deferred_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let subject_id = named_subject(&cwd, &home, "英语", "subject-step-english");
+    let goal_id = goal(&cwd, &home, &subject_id, "goal-step-english");
+    let overflow = serde_json::json!({
+        "subject_id": subject_id,
+        "goal_id": goal_id,
+        "mode": "adaptive",
+        "deadline": "2026-12-31T23:59:59+08:00",
+        "weekly_minutes": 240,
+        "core_content": ["听力"],
+        "order": ["听力"],
+        "pace": "每周一次",
+        "method": "精听",
+        "exercise_ratio": 1.0,
+        "steps": [{"title": "超出本周上限", "estimated_minutes": 241}],
+        "request_id": "plan-step-overflow"
+    })
+    .to_string();
+    assert_eq!(
+        err(&cwd, &home, &["plan", "create", "--json", &overflow])["error"]["code"],
+        "plan_time_cap_exceeded"
+    );
+    let input = serde_json::json!({
+        "subject_id": subject_id,
+        "goal_id": goal_id,
+        "mode": "adaptive",
+        "deadline": "2026-12-31T23:59:59+08:00",
+        "weekly_minutes": 240,
+        "core_content": ["听力", "阅读"],
+        "order": ["听力", "阅读"],
+        "pace": "每周四次",
+        "method": "精听与分级阅读",
+        "exercise_ratio": 0.5,
+        "steps": [
+            {
+                "title": "完成第一组听力训练",
+                "estimated_minutes": 120,
+                "practice_target_kind": "bank",
+                "practice_target_id": "1234567890abcdef"
+            },
+            {
+                "title": "完成第一篇分级阅读",
+                "estimated_minutes": 120
+            }
+        ],
+        "request_id": "plan-step-english"
+    })
+    .to_string();
+    let created = ok(&cwd, &home, &["plan", "create", "--json", &input]);
+    let plan = &created["result"]["plan"];
+    let plan_id = plan["id"].as_str().unwrap();
+    let first = plan["steps"][0]["id"].as_str().unwrap();
+    let second = plan["steps"][1]["id"].as_str().unwrap();
+    assert_eq!(plan["steps"][0]["practice_target_kind"], "bank");
+    assert_eq!(plan["steps"][0]["practice_target_id"], "1234567890abcdef");
+    let lower_cap = serde_json::json!({
+        "actor": "learner",
+        "trigger": "schedule_change",
+        "reason": "本周只能安排更少时间",
+        "evidence_refs": ["learner-schedule-limit-01"],
+        "weekly_minutes": 200,
+        "request_id": "plan-step-lower-cap"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "plan",
+                "revise",
+                plan_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &lower_cap,
+            ],
+        )["error"]["code"],
+        "plan_time_cap_exceeded"
+    );
+
+    let missed = serde_json::json!({
+        "status": "missed",
+        "actor": "agent",
+        "reason": "学习者本周明确未完成该安排",
+        "evidence_refs": ["turn-week-review-01"],
+        "request_id": "plan-step-missed"
+    })
+    .to_string();
+    let missed = ok(
+        &cwd,
+        &home,
+        &[
+            "plan",
+            "step",
+            "update",
+            plan_id,
+            first,
+            "--if-revision",
+            "1",
+            "--json",
+            &missed,
+        ],
+    );
+    assert_eq!(missed["result"]["step"]["status"], "missed");
+    assert_eq!(missed["result"]["step"]["revision"], 2);
+
+    let falsified = serde_json::json!({
+        "status": "completed",
+        "actor": "agent",
+        "reason": "错误地补记完成",
+        "evidence_refs": ["turn-week-review-02"],
+        "request_id": "plan-step-false-complete"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "plan",
+                "step",
+                "update",
+                plan_id,
+                first,
+                "--if-revision",
+                "2",
+                "--json",
+                &falsified,
+            ],
+        )["error"]["code"],
+        "plan_step_terminal"
+    );
+
+    let deferred = serde_json::json!({
+        "status": "deferred",
+        "actor": "learner",
+        "reason": "本周工作冲突，明确延期",
+        "evidence_refs": ["learner-schedule-change-01"],
+        "request_id": "plan-step-deferred"
+    })
+    .to_string();
+    ok(
+        &cwd,
+        &home,
+        &[
+            "plan",
+            "step",
+            "update",
+            plan_id,
+            second,
+            "--if-revision",
+            "1",
+            "--json",
+            &deferred,
+        ],
+    );
+    let shown = ok(&cwd, &home, &["plan", "show", plan_id]);
+    assert_eq!(shown["result"]["plan"]["steps"][0]["status"], "missed");
+    assert_eq!(shown["result"]["plan"]["steps"][1]["status"], "deferred");
 }
