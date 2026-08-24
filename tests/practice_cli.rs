@@ -290,6 +290,126 @@ fn exact_sources_verification_and_bank_membership_are_versioned() {
 }
 
 #[test]
+fn book_default_and_subject_banks_allow_exact_mixed_sources() {
+    let world = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let subject_id = subject(world.path(), home.path());
+
+    let book_bank = bank(
+        world.path(),
+        home.path(),
+        &subject_id,
+        &format!("book:{BOOK_ID}"),
+        "bank-book-default",
+    );
+    assert_eq!(book_bank["source"]["kind"], "book");
+
+    let stale_input = json_arg(json!({
+        "subject_id": subject_id,
+        "key": "subject:stale",
+        "title": "过期科目题库",
+        "source": {
+            "kind": "subject",
+            "id": subject_id,
+            "revision_or_hash": "2",
+            "subject_id": subject_id
+        },
+        "request_id": "bank-subject-stale"
+    }));
+    assert_eq!(
+        err(
+            world.path(),
+            home.path(),
+            &["bank", "create", "--json", &stale_input],
+        )["error"]["code"],
+        "source_truth_mismatch"
+    );
+    let practice =
+        rusqlite::Connection::open(home.path().join(".lwc/plugins/practice/data.sqlite3")).unwrap();
+    assert_eq!(
+        practice
+            .query_row("SELECT COUNT(*) FROM practice_banks", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+    drop(practice);
+
+    let mixed_input = json_arg(json!({
+        "subject_id": subject_id,
+        "key": format!("subject:{subject_id}"),
+        "title": "科目混合题库",
+        "source": {
+            "kind": "subject",
+            "id": subject_id,
+            "revision_or_hash": "1",
+            "subject_id": subject_id
+        },
+        "request_id": "bank-subject-mixed"
+    }));
+    let mixed = ok(
+        world.path(),
+        home.path(),
+        &["bank", "create", "--json", &mixed_input],
+    )["result"]["bank"]
+        .clone();
+    assert_eq!(mixed["key"], format!("subject:{subject_id}"));
+
+    let book_input = item_input(&subject_id, "mixed-book-item", "Book evidence?", json!("A"));
+    let book_draft = create_item(world.path(), home.path(), &book_input);
+    let book_item = verify_item(
+        world.path(),
+        home.path(),
+        &book_draft,
+        &book_input,
+        "mixed-book-verify",
+    );
+    let mixed = add_to_bank(
+        world.path(),
+        home.path(),
+        &mixed,
+        &book_item,
+        "mixed-add-book",
+    );
+
+    let tutor_input = json!({
+        "subject_id": subject_id,
+        "item_type": "choice",
+        "grading_kind": "objective",
+        "prompt": "Tutor evidence?",
+        "answer": "B",
+        "rubric": null,
+        "max_points": 2.0,
+        "estimated_minutes": 3,
+        "difficulty": 0.5,
+        "source": {
+            "kind": "tutor_turn",
+            "id": TUTOR_TURN_ID,
+            "revision_or_hash": "1",
+            "subject_id": subject_id
+        },
+        "request_id": "mixed-tutor-item"
+    });
+    let tutor_draft = create_item(world.path(), home.path(), &tutor_input);
+    let tutor_item = verify_item(
+        world.path(),
+        home.path(),
+        &tutor_draft,
+        &tutor_input,
+        "mixed-tutor-verify",
+    );
+    let mixed = add_to_bank(
+        world.path(),
+        home.path(),
+        &mixed,
+        &tutor_item,
+        "mixed-add-tutor",
+    );
+    assert_eq!(mixed["item_count"], 2);
+}
+
+#[test]
 fn missing_stale_wrong_kind_and_cross_subject_sources_write_nothing() {
     let world = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

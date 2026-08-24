@@ -1085,14 +1085,23 @@ fn validate_source_base(source: &SourceRef) -> Result<()> {
 
 fn validate_bank_source(source: &SourceRef, subject_id: &str) -> Result<()> {
     validate_source_base(source)?;
-    if source.subject_id.as_deref() != Some(subject_id)
-        || source.kind != "book"
-        || !valid_exact_hash(&source.revision_or_hash)
-        || source.locator.is_some()
-    {
+    let valid = source.subject_id.as_deref() == Some(subject_id)
+        && source.locator.is_none()
+        && match source.kind.as_str() {
+            "book" => valid_exact_hash(&source.revision_or_hash),
+            "subject" => {
+                source.id == subject_id
+                    && source
+                        .revision_or_hash
+                        .parse::<i64>()
+                        .is_ok_and(|revision| revision > 0)
+            }
+            _ => false,
+        };
+    if !valid {
         return Err(Error::new(
             "invalid_source_ref",
-            "bank source must be an exact same-subject Book id and content hash",
+            "bank source must be an exact same-subject Book hash or subject revision",
         ));
     }
     Ok(())
@@ -1138,13 +1147,14 @@ fn create_bank(store: &mut Store, input: BankCreate) -> Result<Value> {
             "bank key and title are required",
         ));
     }
-    if input.source.kind == "book"
+    if (input.source.kind == "book"
         && input.key != format!("book:{}", input.source.id)
-        && !input.key.starts_with("subject:")
+        && !input.key.starts_with("subject:"))
+        || (input.source.kind == "subject" && !input.key.starts_with("subject:"))
     {
         return Err(Error::new(
             "invalid_bank_key",
-            "book default bank key must be book:<book_id>",
+            "bank key must be book:<book_id> or use the subject: prefix",
         ));
     }
     let fingerprint = fingerprint(&input)?;
@@ -1154,8 +1164,8 @@ fn create_bank(store: &mut Store, input: BankCreate) -> Result<Value> {
     if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
         return Ok(value);
     }
-    validate_bank_source_truth(&store.root, &input.source, &input.subject_id)?;
     require_subject(&tx, &input.subject_id)?;
+    validate_bank_source_truth(&tx, &store.root, &input.source, &input.subject_id)?;
     let id = new_id(Plugin::Practice, &input.request_id);
     let at = now(&tx)?;
     tx.execute("INSERT INTO practice_banks(id,subject_id,bank_key,title,source_json,revision,created_at) VALUES(?1,?2,?3,?4,?5,1,?6)",params![id,input.subject_id,input.key,input.title,serde_json::to_string(&input.source).unwrap(),at])?;
@@ -1331,10 +1341,28 @@ fn source_connection(practice_root: &Path, plugin: &str) -> Result<Connection> {
 }
 
 fn validate_bank_source_truth(
+    practice: &Connection,
     practice_root: &Path,
     source: &SourceRef,
     subject_id: &str,
 ) -> Result<()> {
+    if source.kind == "subject" {
+        let revision = practice
+            .query_row(
+                "SELECT revision FROM subjects WHERE id=?1",
+                [subject_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::new("subject_not_found", "subject was not found"))?;
+        if source.id != subject_id || source.revision_or_hash != revision.to_string() {
+            return Err(Error::new(
+                "source_truth_mismatch",
+                "current subject id or revision does not match",
+            ));
+        }
+        return Ok(());
+    }
     let connection = source_connection(practice_root, "book")?;
     let exists = connection
         .query_row(
