@@ -1,5 +1,5 @@
 use crate::{
-    config::{self, CapabilitySetting},
+    config::{self, CapabilitySetting, TransSetting},
     error::{AppError, Result},
     scope::global_lwc_root,
 };
@@ -117,12 +117,32 @@ pub(crate) fn run(plugin: Plugin, cwd: &Path, args: &[OsString]) -> Result<Value
             "recovery": format!("retry `lwc {} ...` to install the fixed runtime", plugin.id()),
         }))
     })?;
-    let status = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .args(args)
         .current_dir(cwd)
         .env("LWC_PLUGIN_SKIP_UPDATE", "1")
-        .env("LWC_PLUGIN_NO_BACKGROUND", "1")
-        .status()?;
+        .env("LWC_PLUGIN_NO_BACKGROUND", "1");
+    if matches!(plugin, Plugin::Book) {
+        let root = global_lwc_root()?;
+        let trans = config::resolve_trans("global", &root.join("wiki.db"))?;
+        let (engine, args) = match trans.setting {
+            TransSetting::Anydoc => ("anydoc", trans.anydoc_args),
+            TransSetting::Markitdown => ("markitdown", trans.markitdown_args),
+            TransSetting::Disabled | TransSetting::Inherit => ("disabled", Vec::new()),
+        };
+        let config = crate::trans_adapter::Config {
+            engine: engine.to_owned(),
+            args,
+            timeout_seconds: trans.timeout_seconds,
+        };
+        command.env(
+            "LWC_BOOK_TRANS_CONFIG",
+            serde_json::to_string(&config)
+                .map_err(|error| AppError::new("json_error", error.to_string()))?,
+        );
+    }
+    let status = command.status()?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }

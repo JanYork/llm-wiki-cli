@@ -20,6 +20,7 @@ mod sync;
 mod sync_git;
 pub mod tokenize;
 mod trans;
+mod trans_adapter;
 mod view;
 mod work;
 

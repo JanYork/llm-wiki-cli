@@ -90,6 +90,17 @@ enum ReadCommand {
         #[arg(long, value_name = "JSON|-|@PATH")]
         json: String,
     },
+    Renew {
+        id: String,
+        #[arg(long)]
+        if_revision: i64,
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
+    },
+    Takeover {
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
+    },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -117,6 +128,27 @@ struct ReadNext {
     owner: String,
     #[serde(default)]
     budget: Option<ReadBudget>,
+    #[serde(default = "default_lease_seconds")]
+    lease_seconds: i64,
+    request_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReadRenew {
+    owner: String,
+    lease_seconds: i64,
+    request_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReadTakeover {
+    entity_id: String,
+    old_owner: String,
+    new_owner: String,
+    if_revision: i64,
+    sync_session_id: String,
     request_id: String,
 }
 
@@ -152,10 +184,21 @@ struct ReportPoint {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SynthesisPublish {
+    #[serde(default)]
+    supersedes_revision: Option<i64>,
+    #[serde(default)]
+    anomaly_dispositions: Vec<AnomalyDisposition>,
     summaries: Vec<SynthesisSummary>,
     mainline: Vec<SynthesisMainline>,
     relations: Vec<SynthesisRelation>,
     request_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AnomalyDisposition {
+    id: String,
+    status: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -216,6 +259,12 @@ fn run(cli: BookCli) -> Result<Value> {
                 if_revision,
                 json,
             } => read_commit(&mut store, &id, if_revision, read_json(&json)?),
+            ReadCommand::Renew {
+                id,
+                if_revision,
+                json,
+            } => read_renew(&mut store, &id, if_revision, read_json(&json)?),
+            ReadCommand::Takeover { json } => read_takeover(&mut store, read_json(&json)?),
         },
         BookCommand::Synthesis { command } => match command {
             SynthesisCommand::Publish {
@@ -233,12 +282,28 @@ fn run(cli: BookCli) -> Result<Value> {
             let books = store
                 .connection
                 .query_row("SELECT COUNT(*) FROM books", [], |row| row.get::<_, i64>(0))?;
-            Ok(envelope(Plugin::Book, "status", json!({"books": books})))
+            let identity = store.identity(Plugin::Book)?;
+            Ok(envelope(
+                Plugin::Book,
+                "status",
+                json!({"books":books,"store":identity}),
+            ))
         }
     }
 }
 
 fn initialize(connection: &Connection, root: &Path) -> Result<()> {
+    let existing = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='books'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if existing {
+        validate_book_schema(connection)?;
+    }
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS books(
            id TEXT PRIMARY KEY,
@@ -250,6 +315,8 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
            original_bytes INTEGER NOT NULL CHECK(original_bytes>0),
            normalized_sha256 TEXT,
            normalized_bytes INTEGER,
+           converter TEXT,
+           converter_args_json TEXT,
            edition_of TEXT REFERENCES books(id),
            state TEXT NOT NULL CHECK(state IN
              ('imported','normalized','structured','indexed','ready','reading','covered','synthesized')),
@@ -265,12 +332,15 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
            id TEXT PRIMARY KEY,
            book_id TEXT NOT NULL REFERENCES books(id),
            ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+           logical_block_id TEXT NOT NULL,
+           subordinal INTEGER NOT NULL CHECK(subordinal>=0),
            byte_start INTEGER NOT NULL CHECK(byte_start>=0),
            byte_end INTEGER NOT NULL CHECK(byte_end>byte_start),
            text TEXT NOT NULL,
            text_hash TEXT NOT NULL,
            heading_path_json TEXT NOT NULL,
            UNIQUE(book_id,ordinal),
+           UNIQUE(book_id,logical_block_id,subordinal),
            UNIQUE(book_id,byte_start,byte_end)
          );
          CREATE INDEX IF NOT EXISTS book_blocks_order ON book_blocks(book_id,ordinal);
@@ -313,6 +383,7 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
            revision INTEGER NOT NULL CHECK(revision>=1),
            created_at TEXT NOT NULL,
            updated_at TEXT NOT NULL,
+           expires_at TEXT NOT NULL,
            committed_at TEXT
          );
          CREATE INDEX IF NOT EXISTS book_leases_book
@@ -329,9 +400,21 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
            anomalies_json TEXT NOT NULL,
            created_at TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS book_lease_owner_history(
+           lease_id TEXT NOT NULL REFERENCES book_leases(id),
+           revision INTEGER NOT NULL CHECK(revision>=2),
+           old_owner TEXT NOT NULL,
+           new_owner TEXT NOT NULL,
+           sync_session_id TEXT NOT NULL,
+           changed_at TEXT NOT NULL,
+           PRIMARY KEY(lease_id,revision)
+         );
+         CREATE INDEX IF NOT EXISTS book_lease_owner_history_session
+           ON book_lease_owner_history(sync_session_id,lease_id,revision);
          CREATE TABLE IF NOT EXISTS book_syntheses(
            book_id TEXT NOT NULL REFERENCES books(id),
            revision INTEGER NOT NULL,
+           supersedes_revision INTEGER,
            created_at TEXT NOT NULL,
            PRIMARY KEY(book_id,revision)
          );
@@ -371,6 +454,7 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
            FOREIGN KEY(book_id,synthesis_revision) REFERENCES book_syntheses(book_id,revision)
          );",
     )?;
+    validate_book_schema(connection)?;
     let mut statement = connection.prepare(
         "SELECT b.id,MAX(s.revision) FROM books b JOIN book_syntheses s ON s.book_id=b.id
          WHERE b.state='synthesized' GROUP BY b.id ORDER BY b.id",
@@ -390,6 +474,206 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
         if !page.is_file() {
             materialize_book_wiki(connection, root, &book_id, revision)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_book_schema(connection: &Connection) -> Result<()> {
+    for (table, expected) in [
+        (
+            "books",
+            &[
+                "id",
+                "subject_id",
+                "title",
+                "author",
+                "format",
+                "original_sha256",
+                "original_bytes",
+                "normalized_sha256",
+                "normalized_bytes",
+                "converter",
+                "converter_args_json",
+                "edition_of",
+                "state",
+                "revision",
+                "created_at",
+                "updated_at",
+            ][..],
+        ),
+        (
+            "book_blocks",
+            &[
+                "id",
+                "book_id",
+                "ordinal",
+                "logical_block_id",
+                "subordinal",
+                "byte_start",
+                "byte_end",
+                "text",
+                "text_hash",
+                "heading_path_json",
+            ][..],
+        ),
+        (
+            "book_anomalies",
+            &["id", "book_id", "kind", "details", "status", "created_at"],
+        ),
+        (
+            "book_cursors",
+            &[
+                "book_id",
+                "next_ordinal",
+                "committed_blocks",
+                "revision",
+                "updated_at",
+            ],
+        ),
+        (
+            "book_leases",
+            &[
+                "id",
+                "book_id",
+                "owner",
+                "start_ordinal",
+                "end_ordinal",
+                "range_hash",
+                "requested_unit",
+                "requested_value",
+                "source_limit",
+                "used_bytes",
+                "used_chars",
+                "coverage_committed_before",
+                "coverage_total",
+                "state",
+                "revision",
+                "created_at",
+                "updated_at",
+                "expires_at",
+                "committed_at",
+            ][..],
+        ),
+        (
+            "book_window_reports",
+            &[
+                "lease_id",
+                "summary",
+                "key_points_json",
+                "new_concepts_json",
+                "prior_links_json",
+                "open_threads_json",
+                "anomalies_json",
+                "created_at",
+            ][..],
+        ),
+        (
+            "book_lease_owner_history",
+            &[
+                "lease_id",
+                "revision",
+                "old_owner",
+                "new_owner",
+                "sync_session_id",
+                "changed_at",
+            ],
+        ),
+        (
+            "book_syntheses",
+            &["book_id", "revision", "supersedes_revision", "created_at"],
+        ),
+        (
+            "book_summaries",
+            &[
+                "id",
+                "book_id",
+                "synthesis_revision",
+                "level",
+                "title",
+                "summary",
+                "start_ordinal",
+                "end_ordinal",
+                "source_hashes_json",
+            ][..],
+        ),
+        (
+            "book_mainline",
+            &[
+                "id",
+                "book_id",
+                "synthesis_revision",
+                "ordinal",
+                "text",
+                "start_ordinal",
+                "end_ordinal",
+                "source_hashes_json",
+            ][..],
+        ),
+        (
+            "book_relations",
+            &[
+                "id",
+                "book_id",
+                "synthesis_revision",
+                "from_text",
+                "to_text",
+                "kind",
+                "confidence",
+                "source_hashes_json",
+            ][..],
+        ),
+        ("book_blocks_fts", &["block_id", "book_id", "text"]),
+    ] {
+        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+        let actual = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if actual != expected {
+            return Err(Error::new(
+                "corrupt_store",
+                format!("Book table {table} has an invalid schema"),
+            ));
+        }
+    }
+    for index in [
+        "books_subject",
+        "books_edition",
+        "book_blocks_order",
+        "book_anomalies_book",
+        "book_leases_book",
+        "book_one_active_lease",
+        "book_lease_owner_history_session",
+    ] {
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?1",
+                [index],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(Error::new(
+                "corrupt_store",
+                format!("Book index {index} is missing"),
+            ));
+        }
+    }
+    let invalid_states = connection.query_row(
+        "SELECT
+           (SELECT COUNT(*) FROM books WHERE state NOT IN
+             ('imported','normalized','structured','indexed','ready','reading','covered','synthesized')) +
+           (SELECT COUNT(*) FROM book_anomalies WHERE status NOT IN ('open','accepted','resolved')) +
+           (SELECT COUNT(*) FROM book_leases WHERE state NOT IN
+             ('active','committed','expired','superseded'))",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_states != 0 {
+        return Err(Error::new(
+            "corrupt_store",
+            "Book store contains an unsupported future state",
+        ));
     }
     Ok(())
 }
@@ -437,7 +721,13 @@ fn import(store: &mut Store, input: BookImport) -> Result<Value> {
             "import",
             json!({"book": book(&tx, &id)?, "deduplicated": true}),
         );
-        remember(&tx, &input.request_id, &fingerprint, &value)?;
+        let value = finalize_mutation(
+            &tx,
+            Plugin::Book,
+            &input.request_id,
+            &fingerprint,
+            value,
+        )?;
         tx.commit()?;
         return Ok(value);
     }
@@ -471,7 +761,13 @@ fn import(store: &mut Store, input: BookImport) -> Result<Value> {
         "import",
         json!({"book": book(&tx, &id)?, "deduplicated": false}),
     );
-    remember(&tx, &input.request_id, &fingerprint, &value)?;
+    let value = finalize_mutation(
+        &tx,
+        Plugin::Book,
+        &input.request_id,
+        &fingerprint,
+        value,
+    )?;
     tx.commit()?;
     Ok(value)
 }
@@ -493,12 +789,6 @@ fn prepare(store: &mut Store, id: &str, if_revision: i64, input: BookPrepare) ->
             "only imported books can be prepared",
         ));
     }
-    if !matches!(current["format"].as_str(), Some("txt" | "markdown")) {
-        return Err(Error::new(
-            "book_converter_required",
-            "EPUB and text PDF preparation require the configured converter adapter",
-        ));
-    }
     let fingerprint = fingerprint(&json!({
         "id": id,
         "if_revision": if_revision,
@@ -506,7 +796,16 @@ fn prepare(store: &mut Store, id: &str, if_revision: i64, input: BookPrepare) ->
         "source_sha256": current["original_sha256"],
     }))?;
     let source = blob_path(&store.root, current["original_sha256"].as_str().unwrap());
-    let normalized = match normalize_direct(&store.root, &source) {
+    let converter = if matches!(current["format"].as_str(), Some("txt" | "markdown")) {
+        None
+    } else {
+        Some(book_converter_config()?)
+    };
+    let normalized = match converter.as_ref() {
+        Some(config) => normalize_converted(&store.root, &source, config),
+        None => normalize_direct(&store.root, &source),
+    };
+    let normalized = match normalized {
         Ok(normalized) => normalized,
         Err(error) if error.code() == "invalid_book_text" => {
             record_anomaly(
@@ -515,6 +814,10 @@ fn prepare(store: &mut Store, id: &str, if_revision: i64, input: BookPrepare) ->
                 "invalid_utf8",
                 "normalized direct text is not valid UTF-8",
             )?;
+            return Err(error);
+        }
+        Err(error) if converter.is_some() => {
+            record_anomaly(&mut store.connection, id, "converter_error", error.code())?;
             return Err(error);
         }
         Err(error) => return Err(error),
@@ -559,12 +862,15 @@ fn prepare(store: &mut Store, id: &str, if_revision: i64, input: BookPrepare) ->
         let block_id = block_id(id, block);
         tx.execute(
             "INSERT INTO book_blocks(
-               id,book_id,ordinal,byte_start,byte_end,text,text_hash,heading_path_json
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+               id,book_id,ordinal,logical_block_id,subordinal,byte_start,byte_end,text,
+               text_hash,heading_path_json
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 block_id,
                 id,
                 block.ordinal,
+                logical_block_id(id, block),
+                block.subordinal,
                 block.byte_start,
                 block.byte_end,
                 block.text,
@@ -580,18 +886,29 @@ fn prepare(store: &mut Store, id: &str, if_revision: i64, input: BookPrepare) ->
     }
     let timestamp = now(&tx)?;
     tx.execute(
-        "UPDATE books SET normalized_sha256=?2,normalized_bytes=?3,state='ready',
-           revision=?4,updated_at=?5 WHERE id=?1",
+        "UPDATE books SET normalized_sha256=?2,normalized_bytes=?3,converter=?4,
+           converter_args_json=?5,state='ready',revision=?6,updated_at=?7 WHERE id=?1",
         params![
             id,
             normalized.sha256,
             normalized.bytes as i64,
+            converter.as_ref().map(|config| config.engine.as_str()),
+            converter
+                .as_ref()
+                .map(|config| json_string(&config.args))
+                .transpose()?,
             if_revision + 1,
             timestamp,
         ],
     )?;
     let value = envelope(Plugin::Book, "prepare", json!({"book": book(&tx, id)?}));
-    remember(&tx, &input.request_id, &fingerprint, &value)?;
+    let value = finalize_mutation(
+        &tx,
+        Plugin::Book,
+        &input.request_id,
+        &fingerprint,
+        value,
+    )?;
     tx.commit()?;
     Ok(value)
 }
@@ -600,6 +917,7 @@ fn read_next(store: &mut Store, id: &str, if_revision: i64, input: ReadNext) -> 
     validate_id(id)?;
     validate_request_id(&input.request_id)?;
     validate_text("owner", &input.owner, 256)?;
+    validate_lease_seconds(input.lease_seconds)?;
     let (requested_unit, requested_value, source_limit, count_chars) =
         read_budget(input.budget.as_ref())?;
     let fingerprint = fingerprint(&json!({"book_id":id,"if_revision":if_revision,"input":&input}))?;
@@ -620,6 +938,7 @@ fn read_next(store: &mut Store, id: &str, if_revision: i64, input: ReadNext) -> 
             "book must be ready or reading before issuing a lease",
         ));
     }
+    expire_active_leases(&tx, id)?;
     if let Some(lease_id) = tx
         .query_row(
             "SELECT id FROM book_leases WHERE book_id=?1 AND state='active'",
@@ -636,7 +955,13 @@ fn read_next(store: &mut Store, id: &str, if_revision: i64, input: ReadNext) -> 
             ));
         }
         let value = envelope(Plugin::Book, "read.next", json!({"lease":lease}));
-        remember(&tx, &input.request_id, &fingerprint, &value)?;
+        let value = finalize_mutation(
+            &tx,
+            Plugin::Book,
+            &input.request_id,
+            &fingerprint,
+            value,
+        )?;
         tx.commit()?;
         return Ok(value);
     }
@@ -703,8 +1028,9 @@ fn read_next(store: &mut Store, id: &str, if_revision: i64, input: ReadNext) -> 
            id,book_id,owner,start_ordinal,end_ordinal,range_hash,requested_unit,
            requested_value,source_limit,used_bytes,used_chars,coverage_committed_before,
            coverage_total,state,revision,
-           created_at,updated_at,committed_at
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'active',1,?14,?14,NULL)",
+           created_at,updated_at,expires_at,committed_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'active',1,
+                  ?14,?14,strftime('%Y-%m-%dT%H:%M:%fZ','now',?15),NULL)",
         params![
             lease_id,
             id,
@@ -720,6 +1046,7 @@ fn read_next(store: &mut Store, id: &str, if_revision: i64, input: ReadNext) -> 
             committed_before,
             total_before,
             timestamp,
+            format!("+{} seconds", input.lease_seconds),
         ],
     )?;
     tx.execute(
@@ -731,7 +1058,13 @@ fn read_next(store: &mut Store, id: &str, if_revision: i64, input: ReadNext) -> 
         "read.next",
         json!({"lease":lease(&tx,&lease_id)?}),
     );
-    remember(&tx, &input.request_id, &fingerprint, &value)?;
+    let value = finalize_mutation(
+        &tx,
+        Plugin::Book,
+        &input.request_id,
+        &fingerprint,
+        value,
+    )?;
     tx.commit()?;
     Ok(value)
 }
@@ -750,6 +1083,7 @@ fn read_commit(
     validate_report(&input)?;
     let fingerprint =
         fingerprint(&json!({"lease_id":lease_id,"if_revision":if_revision,"input":&input}))?;
+    expire_lease(&mut store.connection, lease_id)?;
     let tx = store
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -757,6 +1091,12 @@ fn read_commit(
         return Ok(value);
     }
     let current = lease(&tx, lease_id)?;
+    if current["state"] == "expired" {
+        return Err(Error::new(
+            "lease_expired",
+            "expired book leases cannot advance coverage",
+        ));
+    }
     if current["revision"] != if_revision || current["state"] != "active" {
         return Err(Error::new(
             "revision_conflict",
@@ -841,7 +1181,149 @@ fn read_commit(
         "read.commit",
         json!({"lease":lease(&tx,lease_id)?,"coverage":coverage(&tx,book_id)?}),
     );
-    remember(&tx, &input.request_id, &fingerprint, &value)?;
+    let value = finalize_mutation(
+        &tx,
+        Plugin::Book,
+        &input.request_id,
+        &fingerprint,
+        value,
+    )?;
+    tx.commit()?;
+    Ok(value)
+}
+
+fn read_renew(
+    store: &mut Store,
+    lease_id: &str,
+    if_revision: i64,
+    input: ReadRenew,
+) -> Result<Value> {
+    validate_id(lease_id)?;
+    validate_request_id(&input.request_id)?;
+    validate_text("owner", &input.owner, 256)?;
+    validate_lease_seconds(input.lease_seconds)?;
+    let fingerprint =
+        fingerprint(&json!({"lease_id":lease_id,"if_revision":if_revision,"input":&input}))?;
+    expire_lease(&mut store.connection, lease_id)?;
+    let tx = store
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
+        return Ok(value);
+    }
+    let current = lease(&tx, lease_id)?;
+    if current["state"] == "expired" {
+        return Err(Error::new(
+            "lease_expired",
+            "expired book leases cannot be renewed",
+        ));
+    }
+    if current["state"] != "active" || current["revision"] != if_revision {
+        return Err(Error::new(
+            "revision_conflict",
+            "book lease revision is stale",
+        ));
+    }
+    if current["owner"] != input.owner {
+        return Err(Error::new(
+            "stale_owner",
+            "only the current lease owner may renew",
+        ));
+    }
+    let timestamp = now(&tx)?;
+    tx.execute(
+        "UPDATE book_leases SET revision=revision+1,updated_at=?2,
+         expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now',?3) WHERE id=?1",
+        params![
+            lease_id,
+            timestamp,
+            format!("+{} seconds", input.lease_seconds),
+        ],
+    )?;
+    let value = envelope(
+        Plugin::Book,
+        "read.renew",
+        json!({"lease":lease(&tx,lease_id)?}),
+    );
+    let value = finalize_mutation(
+        &tx,
+        Plugin::Book,
+        &input.request_id,
+        &fingerprint,
+        value,
+    )?;
+    tx.commit()?;
+    Ok(value)
+}
+
+fn read_takeover(store: &mut Store, input: ReadTakeover) -> Result<Value> {
+    validate_id(&input.entity_id)?;
+    validate_text("old_owner", &input.old_owner, 256)?;
+    validate_text("new_owner", &input.new_owner, 256)?;
+    validate_request_id(&input.sync_session_id)?;
+    validate_request_id(&input.request_id)?;
+    if input.if_revision < 1 || input.old_owner == input.new_owner {
+        return Err(Error::new(
+            "invalid_takeover",
+            "takeover requires a positive revision and a different new owner",
+        ));
+    }
+    let fingerprint = fingerprint(&input)?;
+    let tx = store
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
+        return Ok(value);
+    }
+    require_latest_sync_receipt(&tx, Plugin::Book, &input.sync_session_id)?;
+    let timestamp = now(&tx)?;
+    let changed = tx.execute(
+        "UPDATE book_leases SET owner=?2,state='active',revision=revision+1,updated_at=?3,
+           expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+900 seconds')
+         WHERE id=?1 AND owner=?4 AND revision=?5 AND state IN ('active','expired')",
+        params![
+            input.entity_id,
+            input.new_owner,
+            timestamp,
+            input.old_owner,
+            input.if_revision,
+        ],
+    )?;
+    if changed != 1 {
+        let current = lease(&tx, &input.entity_id)?;
+        if current["owner"] != input.old_owner {
+            return Err(Error::new("stale_owner", "book lease owner changed"));
+        }
+        return Err(Error::new(
+            "revision_conflict",
+            "book lease revision or state changed",
+        ));
+    }
+    tx.execute(
+        "INSERT INTO book_lease_owner_history(
+           lease_id,revision,old_owner,new_owner,sync_session_id,changed_at
+         ) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            input.entity_id,
+            input.if_revision + 1,
+            input.old_owner,
+            input.new_owner,
+            input.sync_session_id,
+            timestamp,
+        ],
+    )?;
+    let value = envelope(
+        Plugin::Book,
+        "read.takeover",
+        json!({"lease":lease(&tx,&input.entity_id)?}),
+    );
+    let value = finalize_mutation(
+        &tx,
+        Plugin::Book,
+        &input.request_id,
+        &fingerprint,
+        value,
+    )?;
     tx.commit()?;
     Ok(value)
 }
@@ -866,17 +1348,58 @@ fn publish_synthesis(
     if current["revision"] != if_revision {
         return Err(Error::new("revision_conflict", "book revision is stale"));
     }
-    if current["state"] != "covered" {
+    let latest_synthesis = tx.query_row(
+        "SELECT MAX(revision) FROM book_syntheses WHERE book_id=?1",
+        [book_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    let correction = current["state"] == "synthesized";
+    if current["state"] != "covered" && !correction {
         return Err(Error::new(
             "book_not_covered",
             "book must have 100% committed ordered coverage before synthesis",
         ));
+    }
+    match (correction, input.supersedes_revision, latest_synthesis) {
+        (false, None, None) => {}
+        (true, Some(supersedes), Some(latest)) if supersedes == latest => {}
+        (true, _, _) => {
+            return Err(Error::new(
+                "revision_conflict",
+                "synthesis correction must supersede the latest synthesis revision",
+            ));
+        }
+        _ => {
+            return Err(Error::new(
+                "invalid_synthesis",
+                "initial synthesis cannot supersede another revision",
+            ));
+        }
     }
     if input.summaries.is_empty() || input.mainline.is_empty() || input.relations.is_empty() {
         return Err(Error::new(
             "incomplete_synthesis",
             "synthesis requires summaries, mainline, and relations",
         ));
+    }
+    for disposition in &input.anomaly_dispositions {
+        validate_id(&disposition.id)?;
+        if !matches!(disposition.status.as_str(), "accepted" | "resolved") {
+            return Err(Error::new(
+                "invalid_anomaly_disposition",
+                "anomaly disposition must be accepted or resolved",
+            ));
+        }
+        if tx.execute(
+            "UPDATE book_anomalies SET status=?3 WHERE id=?1 AND book_id=?2 AND status='open'",
+            params![disposition.id, book_id, disposition.status],
+        )? != 1
+        {
+            return Err(Error::new(
+                "invalid_anomaly_disposition",
+                "anomaly is not an open anomaly for this book",
+            ));
+        }
     }
     let open_anomalies = tx.query_row(
         "SELECT COUNT(*) FROM book_anomalies WHERE book_id=?1 AND status='open'",
@@ -901,6 +1424,22 @@ fn publish_synthesis(
             "incomplete_synthesis",
             "synthesis requires complete chapter and book summaries",
         ));
+    }
+    for required in required_heading_summaries(&tx, book_id)? {
+        if !input.summaries.iter().any(|summary| {
+            summary.level == required.level
+                && summary.title == required.title
+                && summary.start_ordinal == required.start
+                && summary.end_ordinal == required.end
+        }) {
+            return Err(Error::new(
+                "incomplete_synthesis",
+                format!(
+                    "missing {} summary for {} at {}..={}",
+                    required.level, required.title, required.start, required.end
+                ),
+            ));
+        }
     }
     for summary in &input.summaries {
         if !matches!(
@@ -947,8 +1486,14 @@ fn publish_synthesis(
     )?;
     let timestamp = now(&tx)?;
     tx.execute(
-        "INSERT INTO book_syntheses(book_id,revision,created_at) VALUES(?1,?2,?3)",
-        params![book_id, synthesis_revision, timestamp],
+        "INSERT INTO book_syntheses(book_id,revision,supersedes_revision,created_at)
+         VALUES(?1,?2,?3,?4)",
+        params![
+            book_id,
+            synthesis_revision,
+            input.supersedes_revision,
+            timestamp
+        ],
     )?;
     for (ordinal, summary) in input.summaries.iter().enumerate() {
         tx.execute(
@@ -1020,12 +1565,73 @@ fn publish_synthesis(
     let value = envelope(
         Plugin::Book,
         "synthesis.publish",
-        json!({"book":book(&tx,book_id)?,"synthesis_revision":synthesis_revision}),
+        json!({
+            "book":book(&tx,book_id)?,
+            "synthesis_revision":synthesis_revision,
+            "supersedes_revision":input.supersedes_revision,
+        }),
     );
-    remember(&tx, &input.request_id, &fingerprint, &value)?;
+    let value = finalize_mutation(
+        &tx,
+        Plugin::Book,
+        &input.request_id,
+        &fingerprint,
+        value,
+    )?;
     tx.commit()?;
     materialize_book_wiki(&store.connection, &store.root, book_id, synthesis_revision)?;
     Ok(value)
+}
+
+struct RequiredSummary {
+    level: &'static str,
+    title: String,
+    start: i64,
+    end: i64,
+}
+
+fn required_heading_summaries(
+    connection: &Connection,
+    book_id: &str,
+) -> Result<Vec<RequiredSummary>> {
+    let mut statement = connection.prepare(
+        "SELECT ordinal,heading_path_json FROM book_blocks WHERE book_id=?1 ORDER BY ordinal",
+    )?;
+    let rows = statement
+        .query_map([book_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = rows
+        .into_iter()
+        .map(|(ordinal, raw)| {
+            serde_json::from_str::<Vec<String>>(&raw)
+                .map(|path| (ordinal, path))
+                .map_err(|error| Error::new("corrupt_store", error.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut required: Vec<RequiredSummary> = Vec::new();
+    for (depth, level) in [(1, "chapter"), (2, "section")] {
+        for (ordinal, path) in &rows {
+            if path.len() < depth {
+                continue;
+            }
+            let key = path[..depth].join(" / ");
+            if let Some(last) = required.last_mut() {
+                if last.level == level && last.title == key && last.end + 1 == *ordinal {
+                    last.end = *ordinal;
+                    continue;
+                }
+            }
+            required.push(RequiredSummary {
+                level,
+                title: key,
+                start: *ordinal,
+                end: *ordinal,
+            });
+        }
+    }
+    Ok(required)
 }
 
 fn validate_span_sources(
@@ -1174,16 +1780,17 @@ fn search(connection: &Connection, id: &str, query: &str, limit: usize) -> Resul
     }
     let phrase = format!("\"{}\"", query.replace('"', "\"\""));
     let mut statement = connection.prepare(
-        "SELECT b.id,b.ordinal,b.byte_start,b.byte_end,b.text,b.text_hash,b.heading_path_json
+        "SELECT b.id,b.ordinal,b.logical_block_id,b.subordinal,b.byte_start,b.byte_end,
+                b.text,b.text_hash,b.heading_path_json
          FROM book_blocks_fts f JOIN book_blocks b ON b.id=f.block_id
          WHERE book_blocks_fts MATCH ?1 AND f.book_id=?2
          ORDER BY bm25(book_blocks_fts),b.ordinal LIMIT ?3",
     )?;
     let rows = statement.query_map(params![phrase, id, limit as i64], |row| {
-        let headings: String = row.get(6)?;
+        let headings: String = row.get(8)?;
         let headings = serde_json::from_str::<Value>(&headings).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                6,
+                8,
                 rusqlite::types::Type::Text,
                 Box::new(error),
             )
@@ -1193,12 +1800,16 @@ fn search(connection: &Connection, id: &str, query: &str, limit: usize) -> Resul
             "book_id": id,
             "ordinal": row.get::<_, i64>(1)?,
             "locator": {
-                "byte_start": row.get::<_, i64>(2)?,
-                "byte_end": row.get::<_, i64>(3)?,
+                "book_id": id,
+                "logical_block_id": row.get::<_, String>(2)?,
+                "subordinal": row.get::<_, i64>(3)?,
+                "byte_start": row.get::<_, i64>(4)?,
+                "byte_end": row.get::<_, i64>(5)?,
                 "heading_path": headings,
-                "source_hash": row.get::<_, String>(5)?,
+                "source_hash": row.get::<_, String>(7)?,
             },
-            "text": row.get::<_, String>(4)?,
+            "text": row.get::<_, String>(6)?,
+            "text_hash": row.get::<_, String>(7)?,
             "query_only": true,
         }))
     })?;
@@ -1216,14 +1827,15 @@ fn peek(connection: &Connection, id: &str, start: i64, count: usize) -> Result<V
         ));
     }
     let mut statement = connection.prepare(
-        "SELECT id,ordinal,byte_start,byte_end,text,text_hash,heading_path_json
+        "SELECT id,ordinal,logical_block_id,subordinal,byte_start,byte_end,text,text_hash,
+                heading_path_json
          FROM book_blocks WHERE book_id=?1 AND ordinal>=?2 ORDER BY ordinal LIMIT ?3",
     )?;
     let rows = statement.query_map(params![id, start, count as i64], |row| {
-        let headings: String = row.get(6)?;
+        let headings: String = row.get(8)?;
         let headings = serde_json::from_str::<Value>(&headings).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                6,
+                8,
                 rusqlite::types::Type::Text,
                 Box::new(error),
             )
@@ -1232,11 +1844,19 @@ fn peek(connection: &Connection, id: &str, start: i64, count: usize) -> Result<V
             "id":row.get::<_,String>(0)?,
             "book_id":id,
             "ordinal":row.get::<_,i64>(1)?,
-            "byte_start":row.get::<_,i64>(2)?,
-            "byte_end":row.get::<_,i64>(3)?,
-            "text":row.get::<_,String>(4)?,
-            "text_hash":row.get::<_,String>(5)?,
+            "byte_start":row.get::<_,i64>(4)?,
+            "byte_end":row.get::<_,i64>(5)?,
+            "text":row.get::<_,String>(6)?,
+            "text_hash":row.get::<_,String>(7)?,
             "heading_path":headings,
+            "locator":{
+                "book_id":id,
+                "logical_block_id":row.get::<_,String>(2)?,
+                "subordinal":row.get::<_,i64>(3)?,
+                "byte_start":row.get::<_,i64>(4)?,
+                "byte_end":row.get::<_,i64>(5)?,
+                "source_hash":row.get::<_,String>(7)?,
+            },
             "query_only":true,
         }))
     })?;
@@ -1267,6 +1887,48 @@ fn read_budget(budget: Option<&ReadBudget>) -> Result<(String, i64, i64, bool)> 
     }
 }
 
+fn default_lease_seconds() -> i64 {
+    15 * 60
+}
+
+fn validate_lease_seconds(seconds: i64) -> Result<()> {
+    if (30..=24 * 60 * 60).contains(&seconds) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "invalid_lease_expiry",
+            "lease_seconds must be within 30..=86400",
+        ))
+    }
+}
+
+fn expire_active_leases(connection: &Connection, book_id: &str) -> Result<()> {
+    connection.execute(
+        "UPDATE book_leases SET state='expired',revision=revision+1,
+         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE book_id=?1 AND state='active'
+           AND expires_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        [book_id],
+    )?;
+    Ok(())
+}
+
+fn expire_lease(connection: &mut Connection, lease_id: &str) -> Result<()> {
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        "UPDATE book_leases SET state='expired',revision=revision+1,
+         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id=?1 AND state='active'
+           AND expires_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        [lease_id],
+    )?;
+    if changed != 0 {
+        bump_store_revision(&tx)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn lease(connection: &Connection, id: &str) -> Result<Value> {
     validate_id(id)?;
     let mut value = connection
@@ -1274,7 +1936,7 @@ fn lease(connection: &Connection, id: &str) -> Result<Value> {
             "SELECT book_id,owner,start_ordinal,end_ordinal,range_hash,requested_unit,
                     requested_value,source_limit,used_bytes,used_chars,
                     coverage_committed_before,coverage_total,state,revision,
-                    created_at,updated_at,committed_at
+                    created_at,updated_at,expires_at,committed_at
              FROM book_leases WHERE id=?1",
             [id],
             |row| {
@@ -1308,7 +1970,8 @@ fn lease(connection: &Connection, id: &str) -> Result<Value> {
                     "revision":row.get::<_,i64>(13)?,
                     "created_at":row.get::<_,String>(14)?,
                     "updated_at":row.get::<_,String>(15)?,
-                    "committed_at":row.get::<_,Option<String>>(16)?,
+                    "expires_at":row.get::<_,String>(16)?,
+                    "committed_at":row.get::<_,Option<String>>(17)?,
                 }))
             },
         )
@@ -1318,14 +1981,15 @@ fn lease(connection: &Connection, id: &str) -> Result<Value> {
     let start = value["start_ordinal"].as_i64().unwrap();
     let end = value["end_ordinal"].as_i64().unwrap();
     let mut statement = connection.prepare(
-        "SELECT id,ordinal,byte_start,byte_end,text,text_hash,heading_path_json
+        "SELECT id,ordinal,logical_block_id,subordinal,byte_start,byte_end,text,text_hash,
+                heading_path_json
          FROM book_blocks WHERE book_id=?1 AND ordinal BETWEEN ?2 AND ?3 ORDER BY ordinal",
     )?;
     let rows = statement.query_map(params![book_id, start, end], |row| {
-        let headings: String = row.get(6)?;
+        let headings: String = row.get(8)?;
         let headings = serde_json::from_str::<Value>(&headings).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                6,
+                8,
                 rusqlite::types::Type::Text,
                 Box::new(error),
             )
@@ -1333,11 +1997,19 @@ fn lease(connection: &Connection, id: &str) -> Result<Value> {
         Ok(json!({
             "id":row.get::<_,String>(0)?,
             "ordinal":row.get::<_,i64>(1)?,
-            "byte_start":row.get::<_,i64>(2)?,
-            "byte_end":row.get::<_,i64>(3)?,
-            "text":row.get::<_,String>(4)?,
-            "text_hash":row.get::<_,String>(5)?,
+            "byte_start":row.get::<_,i64>(4)?,
+            "byte_end":row.get::<_,i64>(5)?,
+            "text":row.get::<_,String>(6)?,
+            "text_hash":row.get::<_,String>(7)?,
             "heading_path":headings,
+            "locator":{
+                "book_id":book_id,
+                "logical_block_id":row.get::<_,String>(2)?,
+                "subordinal":row.get::<_,i64>(3)?,
+                "byte_start":row.get::<_,i64>(4)?,
+                "byte_end":row.get::<_,i64>(5)?,
+                "source_hash":row.get::<_,String>(7)?,
+            },
         }))
     })?;
     let blocks = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1425,7 +2097,7 @@ fn record_anomaly(
 ) -> Result<()> {
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let timestamp = now(&tx)?;
-    tx.execute(
+    let changed = tx.execute(
         "INSERT OR IGNORE INTO book_anomalies(id,book_id,kind,details,status,created_at)
          VALUES(?1,?2,?3,?4,'open',?5)",
         params![
@@ -1436,6 +2108,9 @@ fn record_anomaly(
             timestamp,
         ],
     )?;
+    if changed != 0 {
+        bump_store_revision(&tx)?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -1445,6 +2120,91 @@ fn blob_path(root: &Path, hash: &str) -> PathBuf {
         .join("sha256")
         .join(&hash[..2])
         .join(hash)
+}
+
+fn book_converter_config() -> Result<crate::trans_adapter::Config> {
+    let raw = std::env::var("LWC_BOOK_TRANS_CONFIG").map_err(|_| {
+        Error::new(
+            "book_converter_required",
+            "EPUB and text PDF preparation require a configured converter adapter",
+        )
+    })?;
+    if raw.len() > 64 * 1024 {
+        return Err(Error::new(
+            "invalid_converter_config",
+            "Book converter configuration exceeds 64 KiB",
+        ));
+    }
+    serde_json::from_str(&raw)
+        .map_err(|error| Error::new("invalid_converter_config", error.to_string()))
+}
+
+fn normalize_converted(
+    root: &Path,
+    source: &Path,
+    config: &crate::trans_adapter::Config,
+) -> Result<StagedBlob> {
+    let path = root.join(format!(
+        ".normalized-{}-{}.tmp",
+        std::process::id(),
+        ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    reject_symlink(&path)?;
+    if let Err(error) = crate::trans_adapter::run(config, source, &path) {
+        discard_staged(&path);
+        return Err(Error::new(error.code, error.message).details(error.details));
+    }
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        discard_staged(&path);
+        return Err(Error::new(
+            "trans_unsafe_output",
+            "converter output is not a regular file",
+        ));
+    }
+    if metadata.len() == 0 {
+        discard_staged(&path);
+        return Err(Error::new(
+            "trans_empty_output",
+            "converter output is empty",
+        ));
+    }
+    if metadata.len() > MAX_BOOK_BYTES {
+        discard_staged(&path);
+        return Err(Error::new(
+            "trans_output_too_large",
+            "converter output exceeds the Book size limit",
+        ));
+    }
+    let mut file = fs::File::open(&path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if std::str::from_utf8(&buffer[..read]).is_err() {
+            let bytes = fs::read(&path)?;
+            if std::str::from_utf8(&bytes).is_err() {
+                discard_staged(&path);
+                return Err(Error::new(
+                    "trans_invalid_utf8",
+                    "converter output is not valid UTF-8",
+                ));
+            }
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(StagedBlob {
+        path,
+        sha256: hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        bytes: metadata.len(),
+    })
 }
 
 fn normalize_direct(root: &Path, source: &Path) -> Result<StagedBlob> {
@@ -1539,6 +2299,9 @@ fn normalize_direct(root: &Path, source: &Path) -> Result<StagedBlob> {
 
 struct Block {
     ordinal: i64,
+    logical_ordinal: i64,
+    subordinal: i64,
+    logical_hash: String,
     byte_start: i64,
     byte_end: i64,
     text: String,
@@ -1551,8 +2314,8 @@ fn blocks(path: &Path) -> Result<Vec<Block>> {
     let mut reader = BufReader::new(fs::File::open(path)?);
     let mut line = String::new();
     let mut heading_path = Vec::new();
-    let mut block_heading = Vec::new();
-    let mut current = String::new();
+    let mut logical_heading = Vec::new();
+    let mut logical = String::new();
     let mut result = Vec::new();
     let mut start = 0_i64;
     let mut has_visible_text = false;
@@ -1564,30 +2327,40 @@ fn blocks(path: &Path) -> Result<Vec<Block>> {
         }
         has_visible_text |= !line.trim().is_empty();
         if let Some((level, title)) = markdown_heading(&line) {
+            push_logical_block(
+                &mut result,
+                &mut logical,
+                &logical_heading,
+                &mut start,
+                TARGET_BYTES,
+            );
             heading_path.truncate(level.saturating_sub(1));
             heading_path.push(title.to_owned());
+            logical_heading = heading_path.clone();
+            logical.push_str(&line);
+            continue;
         }
-        let mut remaining = line.as_str();
-        while !remaining.is_empty() {
-            if current.is_empty() {
-                block_heading = heading_path.clone();
-            }
-            let capacity = TARGET_BYTES - current.len();
-            let take = utf8_prefix(remaining, capacity);
-            if take == 0 {
-                push_block(&mut result, &mut current, &block_heading, &mut start);
-                continue;
-            }
-            current.push_str(&remaining[..take]);
-            remaining = &remaining[take..];
-            if current.len() == TARGET_BYTES {
-                push_block(&mut result, &mut current, &block_heading, &mut start);
-            }
+        if logical.is_empty() {
+            logical_heading = heading_path.clone();
+        }
+        logical.push_str(&line);
+        if line.trim().is_empty() {
+            push_logical_block(
+                &mut result,
+                &mut logical,
+                &logical_heading,
+                &mut start,
+                TARGET_BYTES,
+            );
         }
     }
-    if !current.is_empty() {
-        push_block(&mut result, &mut current, &block_heading, &mut start);
-    }
+    push_logical_block(
+        &mut result,
+        &mut logical,
+        &logical_heading,
+        &mut start,
+        TARGET_BYTES,
+    );
     if has_visible_text {
         Ok(result)
     } else {
@@ -1617,30 +2390,62 @@ fn utf8_prefix(text: &str, max: usize) -> usize {
     end
 }
 
-fn push_block(
+fn push_logical_block(
     result: &mut Vec<Block>,
-    current: &mut String,
+    logical: &mut String,
     heading_path: &[String],
     start: &mut i64,
+    target_bytes: usize,
 ) {
-    let text = std::mem::take(current);
-    let end = *start + text.len() as i64;
-    result.push(Block {
-        ordinal: result.len() as i64,
-        byte_start: *start,
-        byte_end: end,
-        text_hash: hash_bytes(text.as_bytes()),
-        text,
-        heading_path: heading_path.to_vec(),
-    });
-    *start = end;
+    if logical.is_empty() {
+        return;
+    }
+    let text = std::mem::take(logical);
+    let logical_ordinal = result.last().map_or(0, |block| block.logical_ordinal + 1);
+    let logical_hash = hash_bytes(text.as_bytes());
+    let mut remaining = text.as_str();
+    let mut subordinal = 0;
+    while !remaining.is_empty() {
+        let take = utf8_prefix(remaining, target_bytes);
+        let part = remaining[..take].to_owned();
+        let end = *start + part.len() as i64;
+        result.push(Block {
+            ordinal: result.len() as i64,
+            logical_ordinal,
+            subordinal,
+            logical_hash: logical_hash.clone(),
+            byte_start: *start,
+            byte_end: end,
+            text_hash: hash_bytes(part.as_bytes()),
+            text: part,
+            heading_path: heading_path.to_vec(),
+        });
+        *start = end;
+        subordinal += 1;
+        remaining = &remaining[take..];
+    }
+}
+
+fn logical_block_id(book_id: &str, block: &Block) -> String {
+    hash_bytes(
+        format!(
+            "{book_id}:logical:{}:{}",
+            block.logical_ordinal, block.logical_hash
+        )
+        .as_bytes(),
+    )[..32]
+        .to_owned()
 }
 
 fn block_id(book_id: &str, block: &Block) -> String {
     hash_bytes(
         format!(
-            "{book_id}:{}:{}:{}:{}",
-            block.ordinal, block.byte_start, block.byte_end, block.text_hash
+            "{}:{}:{}:{}:{}",
+            logical_block_id(book_id, block),
+            block.subordinal,
+            block.byte_start,
+            block.byte_end,
+            block.text_hash
         )
         .as_bytes(),
     )[..32]
@@ -1803,7 +2608,8 @@ fn book(connection: &Connection, id: &str) -> Result<Value> {
     let mut value = connection
         .query_row(
             "SELECT subject_id,title,author,format,original_sha256,original_bytes,
-                    normalized_sha256,normalized_bytes,edition_of,state,revision,created_at,updated_at
+                    normalized_sha256,normalized_bytes,edition_of,state,revision,created_at,updated_at,
+                    converter,converter_args_json
              FROM books WHERE id=?1",
             [id],
             |row| {
@@ -1822,6 +2628,13 @@ fn book(connection: &Connection, id: &str) -> Result<Value> {
                     "revision": row.get::<_, i64>(10)?,
                     "created_at": row.get::<_, String>(11)?,
                     "updated_at": row.get::<_, String>(12)?,
+                    "converter": row.get::<_, Option<String>>(13)?,
+                    "converter_args": row.get::<_, Option<String>>(14)?
+                        .map(|value| serde_json::from_str::<Value>(&value))
+                        .transpose()
+                        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+                            14,rusqlite::types::Type::Text,Box::new(error)
+                        ))?,
                 }))
             },
         )

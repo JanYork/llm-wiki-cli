@@ -2,9 +2,23 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path, process::Command};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 fn run(cwd: &Path, home: &Path, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lwc-book"));
     command.current_dir(cwd).env("HOME", home).args(args);
+    let trans_config = home.join("book-trans-config.json");
+    if trans_config.is_file() {
+        command.env(
+            "LWC_BOOK_TRANS_CONFIG",
+            fs::read_to_string(trans_config).unwrap(),
+        );
+        command.env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", home.join("bin").display()),
+        );
+    }
     command.output().unwrap()
 }
 
@@ -150,6 +164,43 @@ fn unsupported_formats_fail_before_book_or_blob_creation() {
 }
 
 #[test]
+fn existing_book_schema_corruption_fails_closed_instead_of_being_repaired() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    ok(&cwd, &home, &["status"]);
+    let connection =
+        rusqlite::Connection::open(home.join(".lwc/plugins/book/data.sqlite3")).unwrap();
+    connection
+        .execute("DROP INDEX book_blocks_order", [])
+        .unwrap();
+    drop(connection);
+
+    let error = err(&cwd, &home, &["status"]);
+    assert_eq!(error["error"]["code"], "corrupt_store");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("book_blocks_order")
+    );
+    let connection =
+        rusqlite::Connection::open(home.join(".lwc/plugins/book/data.sqlite3")).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='book_blocks_order'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn prepare_normalizes_indexes_and_proves_gap_free_order_without_advancing_coverage() {
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().join("cwd");
@@ -246,6 +297,53 @@ fn prepare_normalizes_indexes_and_proves_gap_free_order_without_advancing_covera
 }
 
 #[test]
+fn oversized_paragraph_keeps_one_logical_block_with_stable_sublocators() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let subject_id = subject(&cwd, &home);
+    let paragraph = "连续段落。".repeat(12_000);
+    fs::write(cwd.join("oversized.md"), format!("# 大章\n\n{paragraph}\n")).unwrap();
+    let imported = import_book(
+        &cwd,
+        &home,
+        &subject_id,
+        "oversized.md",
+        "book-oversized-import",
+    );
+    let book_id = imported["result"]["book"]["id"].as_str().unwrap();
+    let prepare = serde_json::json!({"request_id":"book-oversized-prepare"}).to_string();
+    ok(
+        &cwd,
+        &home,
+        &["prepare", book_id, "--if-revision", "1", "--json", &prepare],
+    );
+
+    let peeked = ok(
+        &cwd,
+        &home,
+        &["peek", book_id, "--start", "0", "--count", "10"],
+    );
+    let blocks = peeked["result"]["blocks"].as_array().unwrap();
+    let paragraph_parts = blocks
+        .iter()
+        .filter(|block| block["text"].as_str().unwrap().contains("连续段落"))
+        .collect::<Vec<_>>();
+    assert!(paragraph_parts.len() >= 2);
+    let logical_id = paragraph_parts[0]["locator"]["logical_block_id"]
+        .as_str()
+        .unwrap();
+    for (subordinal, block) in paragraph_parts.iter().enumerate() {
+        assert_eq!(block["locator"]["book_id"], book_id);
+        assert_eq!(block["locator"]["logical_block_id"], logical_id);
+        assert_eq!(block["locator"]["subordinal"], subordinal as i64);
+        assert_eq!(block["locator"]["source_hash"], block["text_hash"]);
+    }
+}
+
+#[test]
 fn invalid_utf8_preparation_records_anomaly_and_never_becomes_ready() {
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().join("cwd");
@@ -268,6 +366,246 @@ fn invalid_utf8_preparation_records_anomaly_and_never_becomes_ready() {
     let shown = ok(&cwd, &home, &["show", book_id]);
     assert_eq!(shown["result"]["book"]["state"], "imported");
     assert_eq!(shown["result"]["book"]["anomaly_count"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn epub_and_text_pdf_use_the_shared_configured_converter_without_nested_lwc() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    let bin = home.join("bin");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let adapter = bin.join("markitdown");
+    fs::write(
+        &adapter,
+        "#!/bin/sh\nwhile [ \"$1\" != \"-o\" ]; do shift; done\nprintf '# Converted\\n\\nOrdered text from adapter.\\n' > \"$2\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&adapter).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&adapter, permissions).unwrap();
+    fs::write(
+        home.join("book-trans-config.json"),
+        serde_json::json!({
+            "engine":"markitdown", "args":[], "timeout_seconds":5
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let subject_id = subject(&cwd, &home);
+
+    for (name, original, request) in [
+        (
+            "book.epub",
+            &[0x50, 0x4b, 0x03, 0x04, b'e', b'p', b'u', b'b'][..],
+            "epub",
+        ),
+        ("book.pdf", b"%PDF-1.7 synthetic text pdf".as_slice(), "pdf"),
+    ] {
+        fs::write(cwd.join(name), original).unwrap();
+        let imported = import_book(
+            &cwd,
+            &home,
+            &subject_id,
+            name,
+            &format!("converter-{request}-import"),
+        );
+        let book_id = imported["result"]["book"]["id"].as_str().unwrap();
+        let prepare = serde_json::json!({
+            "request_id":format!("converter-{request}-prepare")
+        })
+        .to_string();
+        let prepared = ok(
+            &cwd,
+            &home,
+            &["prepare", book_id, "--if-revision", "1", "--json", &prepare],
+        );
+        assert_eq!(prepared["result"]["book"]["state"], "ready");
+        assert_eq!(prepared["result"]["book"]["converter"], "markitdown");
+        assert_eq!(prepared["result"]["book"]["original_bytes"], original.len());
+        assert_eq!(
+            ok(&cwd, &home, &["peek", book_id, "--start", "0"])["result"]["blocks"][0]["text"],
+            "# Converted\n\n"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn converter_failures_are_bounded_fail_closed_and_leave_no_stderr_artifact() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    let bin = home.join("bin");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let subject_id = subject(&cwd, &home);
+    fs::write(cwd.join("broken.pdf"), b"%PDF-1.7 synthetic").unwrap();
+    let imported = import_book(
+        &cwd,
+        &home,
+        &subject_id,
+        "broken.pdf",
+        "converter-failure-import",
+    );
+    let book_id = imported["result"]["book"]["id"].as_str().unwrap();
+
+    let prepare = |request: &str| serde_json::json!({"request_id":request}).to_string();
+    fs::write(
+        home.join("book-trans-config.json"),
+        r#"{"engine":"disabled","args":[],"timeout_seconds":1}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "prepare",
+                book_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &prepare("converter-disabled"),
+            ],
+        )["error"]["code"],
+        "trans_disabled"
+    );
+
+    fs::write(
+        home.join("book-trans-config.json"),
+        r#"{"engine":"markitdown","args":["--output","escape"],"timeout_seconds":1}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "prepare",
+                book_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &prepare("converter-malicious-args"),
+            ],
+        )["error"]["code"],
+        "trans_unsafe_args"
+    );
+    assert!(!cwd.join("escape").exists());
+
+    fs::write(
+        home.join("book-trans-config.json"),
+        r#"{"engine":"markitdown","args":[],"timeout_seconds":1}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "prepare",
+                book_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &prepare("converter-missing"),
+            ],
+        )["error"]["code"],
+        "trans_executable_missing"
+    );
+    let revision_after_first_missing = ok(&cwd, &home, &["status"])["result"]["store"]
+        ["revision"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "prepare",
+                book_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &prepare("converter-missing-repeat"),
+            ],
+        )["error"]["code"],
+        "trans_executable_missing"
+    );
+    assert_eq!(
+        ok(&cwd, &home, &["status"])["result"]["store"]["revision"],
+        revision_after_first_missing
+    );
+    let connection =
+        rusqlite::Connection::open(home.join(".lwc/plugins/book/data.sqlite3")).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM book_anomalies
+                 WHERE book_id=?1 AND kind='converter_error' AND details='trans_executable_missing'",
+                [book_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    assert_eq!(
+        fs::read_dir(home.join(".lwc/plugins/book"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("stderr"))
+            .count(),
+        0
+    );
+
+    let adapter = bin.join("markitdown");
+    fs::write(&adapter, "#!/bin/sh\nsleep 5\n").unwrap();
+    let mut permissions = fs::metadata(&adapter).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&adapter, permissions).unwrap();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "prepare",
+                book_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &prepare("converter-timeout"),
+            ],
+        )["error"]["code"],
+        "trans_timeout"
+    );
+
+    fs::write(
+        &adapter,
+        "#!/bin/sh\nwhile [ \"$1\" != \"-o\" ]; do shift; done\n: > \"$2\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "prepare",
+                book_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &prepare("converter-empty"),
+            ],
+        )["error"]["code"],
+        "trans_empty_output"
+    );
+    let shown = ok(&cwd, &home, &["show", book_id]);
+    assert_eq!(shown["result"]["book"]["state"], "imported");
+    assert!(shown["result"]["book"]["anomaly_count"].as_i64().unwrap() >= 5);
 }
 
 #[test]
@@ -504,6 +842,165 @@ fn read_leases_repeat_exactly_and_only_valid_ordered_commits_advance_coverage() 
 }
 
 #[test]
+fn lease_expiry_and_renewal_never_advance_or_change_the_source_range() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let subject_id = subject(&cwd, &home);
+    fs::write(
+        cwd.join("lease.md"),
+        "# Lease\n\nExpiry never advances coverage.\n",
+    )
+    .unwrap();
+    let imported = import_book(&cwd, &home, &subject_id, "lease.md", "lease-import");
+    let book_id = imported["result"]["book"]["id"].as_str().unwrap();
+    let prepare = serde_json::json!({"request_id":"lease-prepare"}).to_string();
+    ok(
+        &cwd,
+        &home,
+        &["prepare", book_id, "--if-revision", "1", "--json", &prepare],
+    );
+    let next = serde_json::json!({
+        "owner":"agent-a", "lease_seconds":60, "request_id":"lease-next"
+    })
+    .to_string();
+    let lease = ok(
+        &cwd,
+        &home,
+        &[
+            "read",
+            "next",
+            book_id,
+            "--if-revision",
+            "2",
+            "--json",
+            &next,
+        ],
+    )["result"]["lease"]
+        .clone();
+    assert!(lease["expires_at"].is_string());
+
+    let renew = serde_json::json!({
+        "owner":"agent-a", "lease_seconds":120, "request_id":"lease-renew"
+    })
+    .to_string();
+    let renewed = ok(
+        &cwd,
+        &home,
+        &[
+            "read",
+            "renew",
+            lease["id"].as_str().unwrap(),
+            "--if-revision",
+            "1",
+            "--json",
+            &renew,
+        ],
+    )["result"]["lease"]
+        .clone();
+    assert_eq!(renewed["revision"], 2);
+    assert_eq!(renewed["range_hash"], lease["range_hash"]);
+    assert_eq!(renewed["blocks"], lease["blocks"]);
+
+    let connection =
+        rusqlite::Connection::open(home.join(".lwc/plugins/book/data.sqlite3")).unwrap();
+    connection
+        .execute(
+            "UPDATE book_leases SET expires_at='2000-01-01T00:00:00.000Z' WHERE id=?1",
+            [lease["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE plugin_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'",
+            [],
+        )
+        .unwrap();
+    let report = serde_json::json!({
+        "owner":"agent-a", "range_hash":lease["range_hash"], "summary":"expired",
+        "key_points":[{"text":"expired","block_id":lease["blocks"][0]["id"],
+          "source_hash":lease["blocks"][0]["text_hash"]}],
+        "new_concepts":[], "prior_links":[], "open_threads":[], "anomalies":[],
+        "request_id":"lease-expired-commit"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "read",
+                "commit",
+                lease["id"].as_str().unwrap(),
+                "--if-revision",
+                "2",
+                "--json",
+                &report,
+            ],
+        )["error"]["code"],
+        "lease_expired"
+    );
+    let shown = ok(&cwd, &home, &["show", book_id]);
+    assert_eq!(shown["result"]["book"]["coverage"]["committed_blocks"], 0);
+}
+
+#[test]
+fn lease_takeover_requires_a_latest_sync_receipt_and_rejects_the_stale_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let subject_id = subject(&cwd, &home);
+    fs::write(cwd.join("takeover.md"), "# Takeover\n\nOne exact range.\n").unwrap();
+    let imported = import_book(
+        &cwd,
+        &home,
+        &subject_id,
+        "takeover.md",
+        "takeover-import",
+    );
+    let book_id = imported["result"]["book"]["id"].as_str().unwrap();
+    let prepare = serde_json::json!({"request_id":"takeover-prepare"}).to_string();
+    ok(
+        &cwd,
+        &home,
+        &["prepare", book_id, "--if-revision", "1", "--json", &prepare],
+    );
+    let next = serde_json::json!({
+        "owner":"agent-old", "request_id":"takeover-next"
+    })
+    .to_string();
+    let lease = ok(
+        &cwd,
+        &home,
+        &[
+            "read",
+            "next",
+            book_id,
+            "--if-revision",
+            "2",
+            "--json",
+            &next,
+        ],
+    )["result"]["lease"]
+        .clone();
+
+    let takeover = serde_json::json!({
+        "entity_id":lease["id"], "old_owner":"agent-old", "new_owner":"agent-new",
+        "if_revision":1, "sync_session_id":"sync-book-takeover",
+        "request_id":"takeover-owner-change"
+    })
+    .to_string();
+    assert_eq!(
+        err(&cwd, &home, &["read", "takeover", "--json", &takeover])["error"]["code"],
+        "sync_receipt_missing"
+    );
+}
+
+#[test]
 fn synthesis_requires_full_coverage_complete_source_links_and_builds_only_private_wiki() {
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().join("cwd");
@@ -582,8 +1079,26 @@ fn synthesis_requires_full_coverage_complete_source_links_and_builds_only_privat
         ],
     );
     assert_eq!(committed["result"]["coverage"]["percent"], 100.0);
+    let anomaly_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let connection =
+        rusqlite::Connection::open(home.join(".lwc/plugins/book/data.sqlite3")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO book_anomalies(id,book_id,kind,details,status,created_at)
+             VALUES(?1,?2,'hierarchy_gap','fixture','open','2026-08-24T00:00:00.000Z')",
+            [anomaly_id, book_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE plugin_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
     let source_hash = lease["blocks"][0]["text_hash"].clone();
     let complete = serde_json::json!({
+        "anomaly_dispositions":[{"id":anomaly_id,"status":"accepted"}],
         "summaries":[
           {"level":"chapter","title":"核心章","summary":"提交日志保证恢复。",
            "start_ordinal":0,"end_ordinal":0,"source_hashes":[source_hash.clone()]},
@@ -611,8 +1126,21 @@ fn synthesis_requires_full_coverage_complete_source_links_and_builds_only_privat
         ],
     );
     assert_eq!(synthesized["result"]["book"]["state"], "synthesized");
+    let connection =
+        rusqlite::Connection::open(home.join(".lwc/plugins/book/data.sqlite3")).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status FROM book_anomalies WHERE id=?1",
+                [anomaly_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "accepted"
+    );
+    drop(connection);
     let private = home.join(format!(".lwc/plugins/book/wiki/books/{book_id}.md"));
-    let wiki = fs::read_to_string(private).unwrap();
+    let wiki = fs::read_to_string(&private).unwrap();
     assert!(wiki.contains("全书围绕可靠恢复展开"));
     assert!(!home.join(".lwc/wiki.db").exists());
     fs::remove_file(home.join(format!(".lwc/plugins/book/wiki/books/{book_id}.md"))).unwrap();
@@ -620,5 +1148,141 @@ fn synthesis_requires_full_coverage_complete_source_links_and_builds_only_privat
     assert!(
         home.join(format!(".lwc/plugins/book/wiki/books/{book_id}.md"))
             .is_file()
+    );
+
+    let correction = serde_json::json!({
+        "supersedes_revision":1,
+        "summaries":[
+          {"level":"chapter","title":"核心章","summary":"修正后的章节摘要。",
+           "start_ordinal":0,"end_ordinal":0,"source_hashes":[source_hash.clone()]},
+          {"level":"book","title":"全书总结","summary":"修正后的全书摘要。",
+           "start_ordinal":0,"end_ordinal":0,"source_hashes":[source_hash.clone()]}
+        ],
+        "mainline":[{"text":"提交日志 -> 可恢复状态","start_ordinal":0,"end_ordinal":0,
+          "source_hashes":[source_hash.clone()]}],
+        "relations":[{"from":"提交日志","to":"可恢复状态","kind":"explicit",
+          "confidence":1.0,"source_hashes":[source_hash]}],
+        "request_id":"synth-correction"
+    })
+    .to_string();
+    let corrected = ok(
+        &cwd,
+        &home,
+        &[
+            "synthesis",
+            "publish",
+            book_id,
+            "--if-revision",
+            "5",
+            "--json",
+            &correction,
+        ],
+    );
+    assert_eq!(corrected["result"]["synthesis_revision"], 2);
+    assert_eq!(corrected["result"]["supersedes_revision"], 1);
+    let connection =
+        rusqlite::Connection::open(home.join(".lwc/plugins/book/data.sqlite3")).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(DISTINCT synthesis_revision) FROM book_relations WHERE book_id=?1",
+                [book_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        2
+    );
+    assert!(fs::read_to_string(private)
+        .unwrap()
+        .contains("修正后的全书摘要"));
+}
+
+#[test]
+fn synthesis_requires_every_detected_chapter_span() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let subject_id = subject(&cwd, &home);
+    fs::write(
+        cwd.join("chapters.md"),
+        "# 第一章\n\n甲。\n\n# 第二章\n\n乙。\n",
+    )
+    .unwrap();
+    let imported = import_book(&cwd, &home, &subject_id, "chapters.md", "chapters-import");
+    let book_id = imported["result"]["book"]["id"].as_str().unwrap();
+    let prepare = serde_json::json!({"request_id":"chapters-prepare"}).to_string();
+    ok(
+        &cwd,
+        &home,
+        &["prepare", book_id, "--if-revision", "1", "--json", &prepare],
+    );
+    let next = serde_json::json!({"owner":"agent","request_id":"chapters-next"}).to_string();
+    let lease = ok(
+        &cwd,
+        &home,
+        &["read", "next", book_id, "--if-revision", "2", "--json", &next],
+    )["result"]["lease"]
+        .clone();
+    let blocks = lease["blocks"].as_array().unwrap();
+    let report = serde_json::json!({
+        "owner":"agent","range_hash":lease["range_hash"],"summary":"全书窗口",
+        "key_points":[{"text":"甲乙","block_id":blocks[0]["id"],
+          "source_hash":blocks[0]["text_hash"]}],
+        "new_concepts":[],"prior_links":[],"open_threads":[],"anomalies":[],
+        "request_id":"chapters-commit"
+    })
+    .to_string();
+    ok(
+        &cwd,
+        &home,
+        &[
+            "read",
+            "commit",
+            lease["id"].as_str().unwrap(),
+            "--if-revision",
+            "1",
+            "--json",
+            &report,
+        ],
+    );
+    let hashes = blocks
+        .iter()
+        .map(|block| block["text_hash"].clone())
+        .collect::<Vec<_>>();
+    let first_end = blocks
+        .iter()
+        .rposition(|block| block["heading_path"][0] == "第一章")
+        .unwrap();
+    let incomplete = serde_json::json!({
+        "summaries":[
+          {"level":"chapter","title":"第一章","summary":"甲。","start_ordinal":0,
+           "end_ordinal":first_end,"source_hashes":hashes[..=first_end]},
+          {"level":"book","title":"全书","summary":"甲乙。","start_ordinal":0,
+           "end_ordinal":blocks.len()-1,"source_hashes":hashes}
+        ],
+        "mainline":[{"text":"甲到乙","start_ordinal":0,"end_ordinal":blocks.len()-1,
+          "source_hashes":hashes}],
+        "relations":[{"from":"甲","to":"乙","kind":"explicit","confidence":1.0,
+          "source_hashes":[hashes[0].clone()]}],
+        "request_id":"chapters-incomplete"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "synthesis",
+                "publish",
+                book_id,
+                "--if-revision",
+                "4",
+                "--json",
+                &incomplete,
+            ],
+        )["error"]["code"],
+        "incomplete_synthesis"
     );
 }
