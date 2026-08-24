@@ -269,6 +269,45 @@ commands may still create an explicitly requested derived output (`--out` or
 See [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
+## Optional Learning Suite
+
+Tutor, Book, and Practice are three fixed first-party plugins. Each is globally and
+independently disabled by default:
+
+```bash
+lwc --scope global config set --tutor enabled
+lwc --scope global config set --book enabled
+lwc --scope global config set --practice enabled
+```
+
+The first runtime-backed `lwc tutor`, `lwc book`, or `lwc practice` operation lazily
+downloads the same-version, checksum-verified binary for the current target into
+`~/.lwc/runtime/<plugin>/<version>/<target>/`. LWC does not discover plugins on
+`PATH` and exposes no generic plugin ABI. Canonical stores remain separate under
+`~/.lwc/plugins/{tutor,book,practice}/`; disabling or replacing a runtime preserves
+them. Sync inventories each store independently and can preserve validated canonical
+data when a destination lacks that runtime.
+
+- **Tutor** keeps durable teaching turns, learner evidence, goals, plans, and its
+  private Soul/Wiki.
+- **Book** accepts EPUB, TXT, Markdown, and text PDFs. HTML, scanned/OCR PDFs, MOBI,
+  and AZW3 are unsupported; convert them outside Book first.
+- **Practice** keeps versioned banks/items, immutable papers, attempts, immediate
+  responses, grading, and FSRS review state.
+
+The matching `using-tutor`, `using-book`, and `using-practice` Skills recover pending
+work and carry exact IDs across plugins. Explicit learning intent starts the enabled
+workflow; ambiguous intent causes one direct question. Ordinary factual Q&A stays
+outside Tutor and is not recorded. If a required plugin is disabled, the Agent asks
+once before enabling it unless the user explicitly requested enablement.
+
+Plugin roots are private user data. They are not projected into the ordinary LWC Wiki,
+and v1 provides no forget/clear/purge command. Disable, runtime replacement, archive,
+correction, and Sync preserve canonical history; any future destructive purge requires
+a separate, explicit design and authorization. See
+[the Learning Suite contracts](docs/learning-suite-contracts.md) and
+[the Agent workflow](docs/agent-workflow.md#optional-learning-suite).
+
 Grafeo and embedded SurrealDB use disposable sidecars under `.lwc/`. Each
 `graph-project` Work commits one current Source/Page and its owned links,
 citations, and explicit relations before starting the next document. Updates

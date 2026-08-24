@@ -244,6 +244,42 @@ lwc --scope global config set --office disabled
 [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) 与
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
+## 可选 Learning Suite
+
+Tutor、Book、Practice 是三项固定的一方插件，彼此独立，且全局默认关闭：
+
+```bash
+lwc --scope global config set --tutor enabled
+lwc --scope global config set --book enabled
+lwc --scope global config set --practice enabled
+```
+
+首次执行需要 runtime 的 `lwc tutor`、`lwc book` 或 `lwc practice` 操作时，LWC
+才会把与当前 LWC
+同版本、适配当前 target 且通过校验和验证的 binary 下载到
+`~/.lwc/runtime/<plugin>/<version>/<target>/`。LWC 不从 `PATH` 发现插件，也不提供
+通用插件 ABI。三套 canonical store 分别位于
+`~/.lwc/plugins/{tutor,book,practice}/`；关闭能力或替换 runtime 都会保留数据。
+Sync 分别盘点三套 store，即使目标端缺少对应 runtime，也能保留验证通过的 canonical
+数据。
+
+- **Tutor** 保存持久教学 turn、学习者证据、目标、计划及其私有 Soul/Wiki。
+- **Book** 支持 EPUB、TXT、Markdown 与文本型 PDF；不支持 HTML、扫描件/OCR PDF、
+  MOBI、AZW3，须先在 Book 外部转换。
+- **Practice** 保存版本化题库/题目、不可变试卷、作答、即时 response、评分与 FSRS
+  复习状态。
+
+配套 `using-tutor`、`using-book`、`using-practice` Skills 会恢复 pending 工作，并在
+插件间传递精确 ID。明确学习意图会直接进入已启用的工作流；意图含糊时只直接询问
+一次；普通事实问答不进入 Tutor，也不记录。需要的插件尚未启用时，Agent 会先询问
+一次；若用户已明确要求启用，则无需重复确认。
+
+插件根目录属于用户私有数据，不会投影到普通 LWC Wiki。v1 不提供
+forget/clear/purge 命令；关闭、替换 runtime、归档、纠正和 Sync 都会保留 canonical
+历史。未来任何破坏性 purge 都必须另行设计并获得明确授权。详见
+[Learning Suite 契约](docs/learning-suite-contracts.md) 与
+[Agent 工作流](docs/agent-workflow.md#optional-learning-suite)。
+
 Grafeo 与嵌入式 SurrealDB 使用 `.lwc/` 下可重建的 sidecar。每个
 `graph-project` Work 会先完整提交一篇当前 Source/Page 及其自有链接、引用和显式关系，
 确认可用后才开始下一篇。更新和删除只排入实际触及的文档；重建和恢复也使用相同的

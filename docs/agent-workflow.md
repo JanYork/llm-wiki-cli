@@ -32,6 +32,46 @@ Use `lwc` as durable external memory. The database stores evidence and compiled 
 14. Lifecycle Hooks may report memory readiness and commands, but must not
     record, rate, maintain, or inject raw temporal events automatically.
 
+## Optional Learning Suite
+
+Tutor, Book, and Practice are independent global capabilities and are disabled by
+default. Enable only the required fixed plugin:
+
+```bash
+lwc --scope global config set --tutor enabled
+lwc --scope global config set --book enabled
+lwc --scope global config set --practice enabled
+lwc tutor status
+lwc book status
+lwc practice status
+```
+
+The first domain command lazily installs the same-version target asset under
+`~/.lwc/runtime/<plugin>/<version>/<target>/`; never substitute a `PATH` binary or a
+generic plugin. Before new work, invoke the matching `using-tutor`, `using-book`, or
+`using-practice` Skill and query exact status. Recover a pending Tutor turn, Book
+lease, or Practice attempt before starting another one.
+
+Intent routing is deliberately small:
+
+- explicit learning/practice/book intent enters the matching enabled workflow;
+- when the need is real but the plugin is disabled, ask once before enabling unless
+  the user explicitly requested enablement;
+- ambiguous learning intent gets one direct start/enable question;
+- ordinary factual Q&A stays outside Tutor and creates no learning record.
+
+Use exact IDs and revisions/hashes when a Skill crosses plugin boundaries. Do not
+infer identity from titles or tags, copy hidden reasoning into a store, or project
+Tutor/Book private Wikis into the ordinary LWC Wiki. Book accepts EPUB, TXT, Markdown,
+and text PDF only; HTML, scanned/OCR PDF, MOBI, and AZW3 require external conversion.
+
+Canonical data lives independently in `~/.lwc/plugins/{tutor,book,practice}/`. Sync
+inventories each store separately, excludes derived projections, and may preserve a
+validated canonical store as not ready when its runtime is absent. Disable and runtime
+replacement preserve data. V1 has no forget/clear/purge command: do not delete plugin
+roots or blobs manually, and treat any future destructive purge as a separately
+designed and explicitly authorized workflow.
+
 ## Start a session
 
 ```bash

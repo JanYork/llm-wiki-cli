@@ -114,7 +114,7 @@ jobs:
         run: cargo test --locked --release --target ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }} --bins
 
       - name: Smoke test Unix binary
         if: matrix.archive == 'tar'
@@ -150,6 +150,17 @@ jobs:
           tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
           cd dist
           shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
+          cd ..
+          for plugin in tutor book practice; do
+            archive="lwc-${plugin}-${version}-${{ matrix.target }}"
+            mkdir -p "dist/${archive}"
+            cp "target/${{ matrix.target }}/release/lwc-${plugin}" "dist/${archive}/"
+            tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
+            (
+              cd dist
+              shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
+            )
+          done
 
       - name: Package Windows archive
         if: matrix.archive == 'zip'
@@ -164,6 +175,15 @@ jobs:
           Compress-Archive -Path $stage -DestinationPath "dist\$archive.zip"
           $hash = (Get-FileHash "dist\$archive.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $archive.zip" | Set-Content "dist\$archive.zip.sha256" -Encoding ascii
+          foreach ($plugin in @("tutor", "book", "practice")) {
+            $archive = "lwc-$plugin-$version-${{ matrix.target }}"
+            $stage = Join-Path dist $archive
+            New-Item -ItemType Directory -Force -Path $stage | Out-Null
+            Copy-Item "target\${{ matrix.target }}\release\lwc-$plugin.exe" $stage
+            Compress-Archive -Path $stage -DestinationPath "dist\$archive.zip"
+            $hash = (Get-FileHash "dist\$archive.zip" -Algorithm SHA256).Hash.ToLower()
+            "$hash  $archive.zip" | Set-Content "dist\$archive.zip.sha256" -Encoding ascii
+          }
 
       - name: Upload archive
         uses: actions/upload-artifact@v4

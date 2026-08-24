@@ -25,6 +25,27 @@ choices that later tests and code must share.
   duplicate, malformed, renamed, mismatched, oversized, or wrong-tag inputs fail
   before publication.
 
+## Enablement, Agent routing, and privacy
+
+- Tutor, Book, and Practice are independently `disabled` in the built-in global
+  configuration. Enable them with `lwc --scope global config set --tutor enabled`,
+  `lwc --scope global config set --book enabled`, or
+  `lwc --scope global config set --practice enabled`; project/all configuration is rejected.
+  Enabling changes configuration only. The first runtime-backed domain operation
+  lazily installs its fixed asset.
+- Canonical Skills are `using-tutor`, `using-book`, and `using-practice`. Explicit
+  intent enters the matching enabled workflow, ambiguous learning intent asks one
+  direct question, and ordinary factual Q&A stays outside Tutor. If a needed plugin is
+  disabled, ask once before enabling unless the user explicitly requested enablement.
+  Recover pending durable work before creating new work.
+- The three canonical stores and Tutor/Book private Wiki projections are user-private
+  and independent from the ordinary LWC Wiki. Skills transfer only exact typed IDs,
+  revisions/hashes, and visible evidence; hidden reasoning is never persisted.
+- Disable, runtime quarantine/replacement, archive, correction, and Sync preserve
+  canonical data. V1 has no forget/clear/purge operation and never purges safe,
+  unreferenced Book blobs. A future destructive purge requires its own Sync-aware
+  design and explicit authorization; manual deletion is outside the contract.
+
 ## CLI and JSON boundary
 
 - Plugin successes emit one UTF-8 JSON object:
