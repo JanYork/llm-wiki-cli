@@ -634,3 +634,223 @@ fn goal_needs_complete_criterion_evidence_then_explicit_learner_confirmation() {
     assert_eq!(completed["result"]["goal"]["status"], "completed");
     assert_eq!(completed["result"]["goal"]["revision"], 3);
 }
+
+fn goal(cwd: &Path, home: &Path, subject_id: &str, request_id: &str) -> String {
+    let input = serde_json::json!({
+        "subject_id": subject_id,
+        "statement": "在约束时间内完成当前学习目标",
+        "criteria": ["完成计划中的必修内容并提供阶段证据"],
+        "request_id": request_id
+    })
+    .to_string();
+    ok(cwd, home, &["goal", "create", "--json", &input])["result"]["goal"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn plan_modes_enforce_field_ownership_meaningful_adjustment_and_rollback() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let subject_id = named_subject(&cwd, &home, "英语", "subject-plan-english");
+    let goal_id = goal(&cwd, &home, &subject_id, "goal-plan-english");
+
+    let fixed_input = serde_json::json!({
+        "subject_id": subject_id,
+        "goal_id": goal_id,
+        "mode": "fixed",
+        "deadline": "2026-12-31T23:59:59+08:00",
+        "weekly_minutes": 240,
+        "core_content": ["听力", "阅读"],
+        "order": ["听力", "阅读"],
+        "pace": "每周四次，每次一小时",
+        "method": "精听与分级阅读",
+        "exercise_ratio": 0.4,
+        "request_id": "plan-fixed-english"
+    })
+    .to_string();
+    let fixed = ok(&cwd, &home, &["plan", "create", "--json", &fixed_input]);
+    let fixed_id = fixed["result"]["plan"]["id"].as_str().unwrap();
+
+    let agent_execution_change = serde_json::json!({
+        "actor": "agent",
+        "trigger": "meaningful_checkpoint",
+        "reason": "连续三次阶段检查显示听力需要提前",
+        "evidence_refs": ["checkpoint-listening-03"],
+        "order": ["阅读", "听力"],
+        "request_id": "plan-fixed-agent-change"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "plan",
+                "revise",
+                fixed_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &agent_execution_change,
+            ],
+        )["error"]["code"],
+        "fixed_plan_requires_learner"
+    );
+
+    let learner_change = serde_json::json!({
+        "actor": "learner",
+        "trigger": "learner_request",
+        "reason": "我想先集中练阅读",
+        "evidence_refs": ["learner-plan-request-01"],
+        "order": ["阅读", "听力"],
+        "request_id": "plan-fixed-learner-change"
+    })
+    .to_string();
+    let fixed_revised = ok(
+        &cwd,
+        &home,
+        &[
+            "plan",
+            "revise",
+            fixed_id,
+            "--if-revision",
+            "1",
+            "--json",
+            &learner_change,
+        ],
+    );
+    assert_eq!(fixed_revised["result"]["plan"]["revision"], 2);
+    assert_eq!(
+        fixed_revised["result"]["plan"]["order"],
+        serde_json::json!(["阅读", "听力"])
+    );
+
+    let adaptive_input = serde_json::json!({
+        "subject_id": subject_id,
+        "goal_id": goal_id,
+        "mode": "adaptive",
+        "deadline": "2026-12-31T23:59:59+08:00",
+        "weekly_minutes": 240,
+        "core_content": ["听力", "阅读"],
+        "order": ["听力", "阅读"],
+        "pace": "每周四次",
+        "method": "精听与分级阅读",
+        "exercise_ratio": 0.4,
+        "request_id": "plan-adaptive-english"
+    })
+    .to_string();
+    let adaptive = ok(&cwd, &home, &["plan", "create", "--json", &adaptive_input]);
+    let adaptive_id = adaptive["result"]["plan"]["id"].as_str().unwrap();
+
+    let hard_constraint = serde_json::json!({
+        "actor": "agent",
+        "trigger": "meaningful_checkpoint",
+        "reason": "建议延长期限",
+        "evidence_refs": ["checkpoint-pace-03"],
+        "deadline": "2027-01-31T23:59:59+08:00",
+        "request_id": "plan-agent-deadline"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "plan",
+                "revise",
+                adaptive_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &hard_constraint,
+            ],
+        )["error"]["code"],
+        "learner_owned_field"
+    );
+
+    let single_error = serde_json::json!({
+        "actor": "agent",
+        "trigger": "single_error",
+        "reason": "刚才答错一题",
+        "evidence_refs": ["response-one-error"],
+        "pace": "减半",
+        "request_id": "plan-single-error"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "plan",
+                "revise",
+                adaptive_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &single_error,
+            ],
+        )["error"]["code"],
+        "adjustment_not_meaningful"
+    );
+
+    let checkpoint = serde_json::json!({
+        "actor": "agent",
+        "trigger": "meaningful_checkpoint",
+        "reason": "三个阶段检查均显示先精听再练习更有效",
+        "evidence_refs": ["checkpoint-01", "checkpoint-02", "checkpoint-03"],
+        "pace": "每周三次",
+        "method": "先精听再即时复述",
+        "exercise_ratio": 0.5,
+        "request_id": "plan-checkpoint-adjust"
+    })
+    .to_string();
+    let revised = ok(
+        &cwd,
+        &home,
+        &[
+            "plan",
+            "revise",
+            adaptive_id,
+            "--if-revision",
+            "1",
+            "--json",
+            &checkpoint,
+        ],
+    );
+    assert_eq!(revised["result"]["plan"]["revision"], 2);
+    assert_eq!(revised["result"]["plan"]["weekly_minutes"], 240);
+    assert_eq!(revised["result"]["diff"]["pace"]["before"], "每周四次");
+    assert_eq!(revised["result"]["diff"]["pace"]["after"], "每周三次");
+
+    let rollback = serde_json::json!({
+        "actor": "agent",
+        "reason": "调整未改善阶段表现，恢复上一版本",
+        "evidence_refs": ["checkpoint-after-adjustment-02"],
+        "request_id": "plan-rollback-v1"
+    })
+    .to_string();
+    let rolled_back = ok(
+        &cwd,
+        &home,
+        &[
+            "plan",
+            "rollback",
+            adaptive_id,
+            "--if-revision",
+            "2",
+            "--to-revision",
+            "1",
+            "--json",
+            &rollback,
+        ],
+    );
+    assert_eq!(rolled_back["result"]["plan"]["revision"], 3);
+    assert_eq!(rolled_back["result"]["plan"]["pace"], "每周四次");
+    assert_eq!(rolled_back["result"]["rolled_back_to"], 1);
+}
