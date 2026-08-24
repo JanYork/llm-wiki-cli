@@ -37,6 +37,10 @@ enum TutorCommand {
         #[command(subcommand)]
         command: SoulCommand,
     },
+    Goal {
+        #[command(subcommand)]
+        command: GoalCommand,
+    },
     Status,
 }
 
@@ -110,6 +114,31 @@ enum SoulCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum GoalCommand {
+    Create {
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
+    },
+    Show {
+        id: String,
+    },
+    Evidence {
+        id: String,
+        #[arg(long)]
+        if_revision: i64,
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
+    },
+    Complete {
+        id: String,
+        #[arg(long)]
+        if_revision: i64,
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
+    },
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SessionCreate {
@@ -173,6 +202,36 @@ struct FactRevise {
     origin: Option<String>,
     #[serde(default)]
     corroborating_subject_ids: Vec<String>,
+    request_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GoalCreate {
+    subject_id: String,
+    statement: String,
+    criteria: Vec<String>,
+    request_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CriterionEvidence {
+    criterion_id: String,
+    evidence_refs: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GoalEvidence {
+    criteria: Vec<CriterionEvidence>,
+    request_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GoalComplete {
+    confirmed_by: String,
     request_id: String,
 }
 
@@ -241,6 +300,42 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
            snapshot_json TEXT NOT NULL,
            changed_at TEXT NOT NULL,
            PRIMARY KEY(fact_id,revision)
+         );
+         CREATE TABLE IF NOT EXISTS tutor_goals(
+           id TEXT PRIMARY KEY,
+           subject_id TEXT NOT NULL REFERENCES subjects(id),
+           statement TEXT NOT NULL CHECK(trim(statement)<>''),
+           status TEXT NOT NULL CHECK(status IN (
+             'active','ready_to_complete','completed','paused','abandoned'
+           )),
+           revision INTEGER NOT NULL CHECK(revision>=1),
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           completed_at TEXT
+         );
+         CREATE INDEX IF NOT EXISTS tutor_goals_subject
+           ON tutor_goals(subject_id,status,id);
+         CREATE TABLE IF NOT EXISTS tutor_goal_criteria(
+           id TEXT PRIMARY KEY,
+           goal_id TEXT NOT NULL REFERENCES tutor_goals(id),
+           ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+           description TEXT NOT NULL CHECK(trim(description)<>''),
+           UNIQUE(goal_id,ordinal)
+         );
+         CREATE TABLE IF NOT EXISTS tutor_goal_evidence(
+           goal_id TEXT NOT NULL REFERENCES tutor_goals(id),
+           criterion_id TEXT NOT NULL REFERENCES tutor_goal_criteria(id),
+           evidence_refs_json TEXT NOT NULL,
+           goal_revision INTEGER NOT NULL,
+           created_at TEXT NOT NULL,
+           PRIMARY KEY(goal_id,criterion_id,goal_revision)
+         );
+         CREATE TABLE IF NOT EXISTS tutor_goal_history(
+           goal_id TEXT NOT NULL REFERENCES tutor_goals(id),
+           revision INTEGER NOT NULL,
+           snapshot_json TEXT NOT NULL,
+           changed_at TEXT NOT NULL,
+           PRIMARY KEY(goal_id,revision)
          );",
     )?;
     if connection
@@ -269,6 +364,7 @@ fn run(cli: TutorCli) -> Result<Value> {
         TutorCommand::Turn { command } => run_turn(&mut store, command),
         TutorCommand::Learner { command } => run_learner(&mut store, command),
         TutorCommand::Soul { command } => run_soul(&mut store, command),
+        TutorCommand::Goal { command } => run_goal(&mut store, command),
         TutorCommand::Status => {
             let sessions = store.connection.query_row(
                 "SELECT COUNT(*) FROM tutor_sessions WHERE state='active'",
@@ -918,6 +1014,285 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn run_goal(store: &mut Store, command: GoalCommand) -> Result<Value> {
+    match command {
+        GoalCommand::Create { json } => {
+            let input: GoalCreate = read_json(&json)?;
+            validate_request_id(&input.request_id)?;
+            validate_text("goal statement", &input.statement, 16 * 1024)?;
+            if input.criteria.is_empty() {
+                return Err(Error::new(
+                    "goal_criteria_required",
+                    "a goal requires at least one observable criterion",
+                ));
+            }
+            if input.criteria.len() > 128 {
+                return Err(Error::new(
+                    "invalid_input",
+                    "a goal accepts at most 128 criteria",
+                ));
+            }
+            for criterion in &input.criteria {
+                validate_text("goal criterion", criterion, 4 * 1024)?;
+            }
+            subject(&store.connection, &input.subject_id)?;
+            let fingerprint = fingerprint(&input)?;
+            let tx = store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
+                return Ok(value);
+            }
+            let id = new_id(Plugin::Tutor, &input.request_id);
+            let timestamp = now(&tx)?;
+            tx.execute(
+                "INSERT INTO tutor_goals(
+                   id,subject_id,statement,status,revision,created_at,updated_at,completed_at
+                 ) VALUES(?1,?2,?3,'active',1,?4,?4,NULL)",
+                params![id, input.subject_id, input.statement, timestamp],
+            )?;
+            for (ordinal, description) in input.criteria.iter().enumerate() {
+                let criterion_id = new_id(
+                    Plugin::Tutor,
+                    &format!("{}:criterion:{ordinal}", input.request_id),
+                );
+                tx.execute(
+                    "INSERT INTO tutor_goal_criteria(id,goal_id,ordinal,description)
+                     VALUES(?1,?2,?3,?4)",
+                    params![criterion_id, id, ordinal as i64, description],
+                )?;
+            }
+            let goal = goal(&tx, &id)?;
+            append_goal_history(&tx, &goal)?;
+            let value = envelope(Plugin::Tutor, "goal.create", json!({"goal": goal}));
+            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            tx.commit()?;
+            Ok(value)
+        }
+        GoalCommand::Show { id } => Ok(envelope(
+            Plugin::Tutor,
+            "goal.show",
+            json!({"goal": goal(&store.connection, &id)?}),
+        )),
+        GoalCommand::Evidence {
+            id,
+            if_revision,
+            json,
+        } => {
+            validate_id(&id)?;
+            let mut input: GoalEvidence = read_json(&json)?;
+            validate_request_id(&input.request_id)?;
+            let fingerprint = fingerprint(&json!({
+                "id": id,
+                "if_revision": if_revision,
+                "input": &input,
+            }))?;
+            let tx = store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
+                return Ok(value);
+            }
+            let current = goal(&tx, &id)?;
+            require_goal_revision(&current, if_revision)?;
+            if current["status"] != "active" {
+                return Err(Error::new(
+                    "goal_not_active",
+                    "criterion evidence requires an active goal",
+                ));
+            }
+            let expected = current["criteria"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|criterion| criterion["id"].as_str().unwrap().to_owned())
+                .collect::<BTreeSet<_>>();
+            let mut supplied = BTreeSet::new();
+            for item in &mut input.criteria {
+                validate_id(&item.criterion_id)?;
+                item.evidence_refs = normalized_refs(std::mem::take(&mut item.evidence_refs))?;
+                if !supplied.insert(item.criterion_id.clone()) {
+                    return Err(Error::new(
+                        "invalid_input",
+                        "criterion evidence contains a duplicate criterion",
+                    ));
+                }
+            }
+            if supplied != expected {
+                return Err(Error::new(
+                    "goal_criteria_incomplete",
+                    "evidence must cover every current goal criterion exactly once",
+                ));
+            }
+            let next_revision = if_revision + 1;
+            let timestamp = now(&tx)?;
+            for item in &input.criteria {
+                tx.execute(
+                    "INSERT INTO tutor_goal_evidence(
+                       goal_id,criterion_id,evidence_refs_json,goal_revision,created_at
+                     ) VALUES(?1,?2,?3,?4,?5)",
+                    params![
+                        id,
+                        item.criterion_id,
+                        serde_json::to_string(&item.evidence_refs)
+                            .map_err(|error| Error::new("json_error", error.to_string()))?,
+                        next_revision,
+                        timestamp,
+                    ],
+                )?;
+            }
+            tx.execute(
+                "UPDATE tutor_goals SET status='ready_to_complete',revision=?2,updated_at=?3
+                 WHERE id=?1",
+                params![id, next_revision, timestamp],
+            )?;
+            let goal = goal(&tx, &id)?;
+            append_goal_history(&tx, &goal)?;
+            let value = envelope(Plugin::Tutor, "goal.evidence", json!({"goal": goal}));
+            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            tx.commit()?;
+            Ok(value)
+        }
+        GoalCommand::Complete {
+            id,
+            if_revision,
+            json,
+        } => {
+            validate_id(&id)?;
+            let input: GoalComplete = read_json(&json)?;
+            validate_request_id(&input.request_id)?;
+            let fingerprint = fingerprint(&json!({
+                "id": id,
+                "if_revision": if_revision,
+                "input": &input,
+            }))?;
+            let tx = store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
+                return Ok(value);
+            }
+            let current = goal(&tx, &id)?;
+            require_goal_revision(&current, if_revision)?;
+            if current["status"] != "ready_to_complete" {
+                return Err(Error::new(
+                    "goal_not_ready",
+                    "goal completion requires complete criterion evidence",
+                ));
+            }
+            if input.confirmed_by != "learner" {
+                return Err(Error::new(
+                    "learner_confirmation_required",
+                    "only explicit learner confirmation completes a goal",
+                ));
+            }
+            let timestamp = now(&tx)?;
+            tx.execute(
+                "UPDATE tutor_goals SET status='completed',revision=?2,
+                   updated_at=?3,completed_at=?3 WHERE id=?1",
+                params![id, if_revision + 1, timestamp],
+            )?;
+            let goal = goal(&tx, &id)?;
+            append_goal_history(&tx, &goal)?;
+            let value = envelope(Plugin::Tutor, "goal.complete", json!({"goal": goal}));
+            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            tx.commit()?;
+            Ok(value)
+        }
+    }
+}
+
+fn require_goal_revision(goal: &Value, expected: i64) -> Result<()> {
+    if expected < 1 {
+        return Err(Error::new("invalid_input", "if_revision must be positive"));
+    }
+    let current = goal["revision"].as_i64().unwrap();
+    if current == expected {
+        Ok(())
+    } else {
+        Err(Error::new("revision_conflict", "goal revision is stale")
+            .details(json!({"expected": expected, "current": current})))
+    }
+}
+
+fn goal(connection: &Connection, id: &str) -> Result<Value> {
+    validate_id(id)?;
+    let row = connection
+        .query_row(
+            "SELECT id,subject_id,statement,status,revision,created_at,updated_at,completed_at
+             FROM tutor_goals WHERE id=?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| Error::new("goal_not_found", format!("goal {id} was not found")))?;
+    let mut statement = connection.prepare(
+        "SELECT c.id,c.ordinal,c.description,
+                (SELECT e.evidence_refs_json FROM tutor_goal_evidence e
+                 WHERE e.goal_id=c.goal_id AND e.criterion_id=c.id
+                 ORDER BY e.goal_revision DESC LIMIT 1)
+         FROM tutor_goal_criteria c WHERE c.goal_id=?1 ORDER BY c.ordinal",
+    )?;
+    let criteria = statement
+        .query_map([id], |row| {
+            let evidence = row.get::<_, Option<String>>(3)?;
+            let evidence = evidence
+                .map(|value| serde_json::from_str::<Value>(&value))
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "ordinal": row.get::<_, i64>(1)?,
+                "description": row.get::<_, String>(2)?,
+                "evidence_refs": evidence,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(json!({
+        "id": row.0,
+        "subject_id": row.1,
+        "statement": row.2,
+        "status": row.3,
+        "revision": row.4,
+        "criteria": criteria,
+        "created_at": row.5,
+        "updated_at": row.6,
+        "completed_at": row.7,
+    }))
+}
+
+fn append_goal_history(tx: &rusqlite::Transaction<'_>, goal: &Value) -> Result<()> {
+    tx.execute(
+        "INSERT INTO tutor_goal_history(goal_id,revision,snapshot_json,changed_at)
+         VALUES(?1,?2,?3,?4)",
+        params![
+            goal["id"].as_str().unwrap(),
+            goal["revision"].as_i64().unwrap(),
+            serde_json::to_string(goal)
+                .map_err(|error| Error::new("json_error", error.to_string()))?,
+            goal["updated_at"].as_str().unwrap(),
+        ],
+    )?;
     Ok(())
 }
 
