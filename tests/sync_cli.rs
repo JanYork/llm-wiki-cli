@@ -2498,3 +2498,88 @@ fn sync_modes_transport_detached_drafts_and_terminal_audits_without_active_work(
         }
     }
 }
+
+fn write_preserved_plugin_export(home: &Path, plugin: &str, records: &[u8]) -> PathBuf {
+    let root = home
+        .join(".lwc/plugins")
+        .join(plugin)
+        .join("preserved/store-test/1");
+    fs::create_dir_all(root.join("blobs/sha256/aa")).unwrap();
+    fs::write(
+        root.join("manifest.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "format": 1,
+            "plugin": plugin,
+            "store_id": "store-test",
+            "revision": 1,
+            "records_sha256": Sha256::digest(records)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "blobs": [{"sha256": "aa-test", "bytes": 4}],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(root.join("records.ndjson"), records).unwrap();
+    fs::write(root.join("blobs/sha256/aa/aa-test"), b"blob").unwrap();
+    root
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_preserves_fixed_plugin_exports_when_the_destination_runtime_is_absent() {
+    let world = SyncWorld::new();
+    world.install_fake_ssh();
+    let local = write_preserved_plugin_export(&world.local_home, "book", b"book-record\n");
+
+    let output = world.sync(&[
+        "sync",
+        "peer",
+        world.remote.to_str().unwrap(),
+        "--mode",
+        "merge",
+    ]);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["plugins"][0]["status"], "preserved_not_ready",
+        "{result:#}"
+    );
+    let remote = world
+        .remote_home
+        .join(".lwc/plugins/book/preserved/store-test/1");
+    for relative in ["manifest.json", "records.ndjson", "blobs/sha256/aa/aa-test"] {
+        assert_eq!(
+            fs::read(remote.join(relative)).unwrap(),
+            fs::read(local.join(relative)).unwrap()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_fails_before_wiki_publication_on_divergent_preserved_plugin_identity() {
+    let world = SyncWorld::new();
+    world.install_fake_ssh();
+    write_preserved_plugin_export(&world.local_home, "tutor", b"local-record\n");
+    write_preserved_plugin_export(&world.remote_home, "tutor", b"remote-record\n");
+    world.put_page(&world.local, "must-not-publish", "Local", "unpublished");
+
+    let output = world.sync(&[
+        "sync",
+        "peer",
+        world.remote.to_str().unwrap(),
+        "--mode",
+        "merge",
+    ]);
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "sync_plugin_diverged");
+    assert!(!world.has_page(&world.remote, "must-not-publish"));
+}
