@@ -854,3 +854,200 @@ fn plan_modes_enforce_field_ownership_meaningful_adjustment_and_rollback() {
     assert_eq!(rolled_back["result"]["plan"]["pace"], "每周四次");
     assert_eq!(rolled_back["result"]["rolled_back_to"], 1);
 }
+
+fn session(cwd: &Path, home: &Path, subject_id: &str, mode: &str, request_id: &str) -> String {
+    let input = serde_json::json!({
+        "subject_id": subject_id,
+        "mode": mode,
+        "request_id": request_id
+    })
+    .to_string();
+    ok(cwd, home, &["session", "create", "--json", &input])["result"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn begin_turn(cwd: &Path, home: &Path, session_id: &str, input: &str, request_id: &str) -> String {
+    let input = serde_json::json!({
+        "session_id": session_id,
+        "owner": "agent-local",
+        "input": input,
+        "request_id": request_id
+    })
+    .to_string();
+    ok(cwd, home, &["turn", "begin", "--json", &input])["result"]["turn"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn teaching_checkpoint_enforces_blockage_progressive_hints_answer_timing_and_exam_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let subject_id = named_subject(&cwd, &home, "线性代数", "subject-teaching-linear");
+    let learning = session(&cwd, &home, &subject_id, "learning", "session-teaching");
+    let first = begin_turn(
+        &cwd,
+        &home,
+        &learning,
+        "直接告诉我完整证明",
+        "turn-teaching-1",
+    );
+
+    let premature_answer = serde_json::json!({
+        "reply": "完整答案",
+        "checkpoint": {
+            "kind": "teaching",
+            "blocked_by": "尚未把唯一表示转成齐次方程",
+            "hint_level": 0,
+            "learner_attempted": false,
+            "explicit_answer_request": false,
+            "full_answer": true,
+            "feedback_evidence_refs": []
+        },
+        "request_id": "turn-teaching-1-premature"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "turn",
+                "commit",
+                &first,
+                "--if-revision",
+                "1",
+                "--json",
+                &premature_answer,
+            ],
+        )["error"]["code"],
+        "full_answer_not_allowed"
+    );
+
+    let first_hint = serde_json::json!({
+        "reply": "先把两种表示相减，会得到什么？",
+        "checkpoint": {
+            "kind": "teaching",
+            "blocked_by": "尚未把唯一表示转成齐次方程",
+            "hint_level": 1,
+            "learner_attempted": false,
+            "explicit_answer_request": false,
+            "full_answer": false,
+            "feedback_evidence_refs": []
+        },
+        "request_id": "turn-teaching-1-hint"
+    })
+    .to_string();
+    ok(
+        &cwd,
+        &home,
+        &[
+            "turn",
+            "commit",
+            &first,
+            "--if-revision",
+            "1",
+            "--json",
+            &first_hint,
+        ],
+    );
+
+    let second = begin_turn(&cwd, &home, &learning, "我还是卡住了", "turn-teaching-2");
+    let skipped_hint = serde_json::json!({
+        "reply": "三级提示",
+        "checkpoint": {
+            "kind": "teaching",
+            "blocked_by": "不知道相减后的系数含义",
+            "hint_level": 3,
+            "learner_attempted": true,
+            "explicit_answer_request": false,
+            "full_answer": false,
+            "feedback_evidence_refs": ["turn-teaching-2"]
+        },
+        "request_id": "turn-teaching-2-skip"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "turn",
+                "commit",
+                &second,
+                "--if-revision",
+                "1",
+                "--json",
+                &skipped_hint,
+            ],
+        )["error"]["code"],
+        "hint_level_not_progressive"
+    );
+
+    let answer_after_attempt = serde_json::json!({
+        "reply": "现在给出完整推导。",
+        "checkpoint": {
+            "kind": "teaching",
+            "blocked_by": "不知道相减后的系数含义",
+            "hint_level": 2,
+            "learner_attempted": true,
+            "explicit_answer_request": false,
+            "full_answer": true,
+            "feedback_evidence_refs": ["turn-teaching-2"]
+        },
+        "request_id": "turn-teaching-2-answer"
+    })
+    .to_string();
+    ok(
+        &cwd,
+        &home,
+        &[
+            "turn",
+            "commit",
+            &second,
+            "--if-revision",
+            "1",
+            "--json",
+            &answer_after_attempt,
+        ],
+    );
+
+    let exam = session(&cwd, &home, &subject_id, "exam", "session-exam-no-hints");
+    let exam_turn = begin_turn(&cwd, &home, &exam, "给一点提示", "turn-exam-hint");
+    let exam_hint = serde_json::json!({
+        "reply": "提示",
+        "checkpoint": {
+            "kind": "teaching",
+            "blocked_by": "考试题卡点",
+            "hint_level": 1,
+            "learner_attempted": true,
+            "explicit_answer_request": false,
+            "full_answer": false,
+            "feedback_evidence_refs": ["turn-exam-hint"]
+        },
+        "request_id": "turn-exam-hint-commit"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "turn",
+                "commit",
+                &exam_turn,
+                "--if-revision",
+                "1",
+                "--json",
+                &exam_hint,
+            ],
+        )["error"]["code"],
+        "exam_hints_forbidden"
+    );
+}
