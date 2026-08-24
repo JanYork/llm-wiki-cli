@@ -13,6 +13,7 @@ use std::{
 
 const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+mod tutor;
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // Each fixed binary constructs exactly one of the three variants.
@@ -129,7 +130,14 @@ struct SubjectEnsure {
 }
 
 pub fn main(plugin: Plugin) {
-    let result = run(plugin, Cli::parse());
+    finish(run(plugin, Cli::parse()));
+}
+
+pub fn tutor_main() {
+    tutor::main();
+}
+
+fn finish(result: Result<Value>) {
     match result {
         Ok(value) => println!("{}", serde_json::to_string(&value).expect("JSON response")),
         Err(error) => {
@@ -161,31 +169,36 @@ fn run(plugin: Plugin, cli: Cli) -> Result<Value> {
                     })?;
             Ok(envelope(plugin, "status", json!({"subjects": subjects})))
         }
-        Command::Subject { command } => match command {
-            SubjectCommand::Create { json } => {
-                let input: SubjectCreate = read_json(&json)?;
-                create_subject(plugin, &mut store, input)
-            }
-            SubjectCommand::Ensure { json } => {
-                let input: SubjectEnsure = read_json(&json)?;
-                ensure_subject(plugin, &mut store, input)
-            }
-            SubjectCommand::Show { id } => Ok(envelope(
-                plugin,
-                "subject.show",
-                json!({"subject": subject(&store.connection, &id)?}),
-            )),
-            SubjectCommand::Rename {
-                id,
-                if_revision,
-                name,
-            } => rename_subject(plugin, &mut store, &id, if_revision, &name),
-        },
+        Command::Subject { command } => run_subject(plugin, &mut store, command),
+    }
+}
+
+fn run_subject(plugin: Plugin, store: &mut Store, command: SubjectCommand) -> Result<Value> {
+    match command {
+        SubjectCommand::Create { json } => {
+            let input: SubjectCreate = read_json(&json)?;
+            create_subject(plugin, store, input)
+        }
+        SubjectCommand::Ensure { json } => {
+            let input: SubjectEnsure = read_json(&json)?;
+            ensure_subject(plugin, store, input)
+        }
+        SubjectCommand::Show { id } => Ok(envelope(
+            plugin,
+            "subject.show",
+            json!({"subject": subject(&store.connection, &id)?}),
+        )),
+        SubjectCommand::Rename {
+            id,
+            if_revision,
+            name,
+        } => rename_subject(plugin, store, &id, if_revision, &name),
     }
 }
 
 struct Store {
     connection: Connection,
+    root: PathBuf,
 }
 
 impl Store {
@@ -232,7 +245,10 @@ impl Store {
              );
              PRAGMA user_version=1;",
         )?;
-        Ok(Self { connection })
+        if matches!(plugin, Plugin::Tutor) {
+            tutor::initialize(&connection, &root)?;
+        }
+        Ok(Self { connection, root })
     }
 }
 

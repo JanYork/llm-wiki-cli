@@ -2,5 +2,5 @@
 mod learning;
 
 fn main() {
-    learning::main(learning::Plugin::Tutor);
+    learning::tutor_main();
 }
