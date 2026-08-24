@@ -1168,3 +1168,68 @@ fn sensitive_soul_proposal_survives_until_learner_approval_and_explicit_publish(
     assert_eq!(history["result"]["proposals"][0]["id"], proposal_id);
     assert_eq!(history["result"]["proposals"][0]["state"], "published");
 }
+
+#[test]
+fn skipped_diagnosis_is_audited_without_changing_goal_or_plan() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let subject_id = named_subject(&cwd, &home, "会计学", "subject-diagnosis-accounting");
+    let goal_id = goal(&cwd, &home, &subject_id, "goal-diagnosis-accounting");
+    let plan_input = serde_json::json!({
+        "subject_id": subject_id,
+        "goal_id": goal_id,
+        "mode": "adaptive",
+        "deadline": "2026-12-31T23:59:59+08:00",
+        "weekly_minutes": 180,
+        "core_content": ["复式记账"],
+        "order": ["复式记账"],
+        "pace": "每周三次",
+        "method": "例题驱动",
+        "exercise_ratio": 0.5,
+        "request_id": "plan-diagnosis-accounting"
+    })
+    .to_string();
+    let plan = ok(&cwd, &home, &["plan", "create", "--json", &plan_input]);
+    let plan_id = plan["result"]["plan"]["id"].as_str().unwrap();
+    let session_id = session(
+        &cwd,
+        &home,
+        &subject_id,
+        "learning",
+        "session-diagnosis-accounting",
+    );
+
+    let input = serde_json::json!({
+        "outcome": "skipped",
+        "reason": "学习者已有可靠的近期掌握记录并选择跳过",
+        "evidence_refs": ["fact-accounting-baseline-01"],
+        "request_id": "diagnosis-skipped-accounting"
+    })
+    .to_string();
+    let result = ok(
+        &cwd,
+        &home,
+        &[
+            "session",
+            "diagnosis",
+            &session_id,
+            "--if-revision",
+            "1",
+            "--json",
+            &input,
+        ],
+    );
+    assert_eq!(result["result"]["diagnosis"]["outcome"], "skipped");
+    assert_eq!(result["result"]["session"]["revision"], 2);
+    assert_eq!(
+        ok(&cwd, &home, &["goal", "show", &goal_id])["result"]["goal"]["revision"],
+        1
+    );
+    assert_eq!(
+        ok(&cwd, &home, &["plan", "show", plan_id])["result"]["plan"]["revision"],
+        1
+    );
+}
