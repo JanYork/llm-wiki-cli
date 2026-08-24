@@ -471,5 +471,8 @@ fn global_promotion_requires_cross_subject_evidence_and_private_wiki_stays_priva
     let page = fs::read_to_string(private_page).unwrap();
     assert!(page.contains("学生更愿意在工作日早晨完成短练习"));
     assert!(page.contains("superseded"));
+    let learner_page = fs::read_to_string(home.join(".lwc/plugins/tutor/wiki/learner.md")).unwrap();
+    assert!(learner_page.contains("学生更愿意在工作日早晨完成短练习"));
+    assert!(learner_page.contains("confirmed"));
     assert!(!home.join(".lwc/wiki.db").exists());
 }

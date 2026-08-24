@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{fs, path::Path, sync::atomic::Ordering};
+use std::{collections::BTreeSet, fs, path::Path, sync::atomic::Ordering};
 
 const SOUL_MAX_BYTES: usize = 64 * 1024;
 const INITIAL_SOUL: &str = "# 老师的灵魂\n\n保持客观、科学、诚实，禁止谄媚。先识别学生的具体阻塞，再逐级提供提示；评价必须引用可观察证据。\n";
@@ -28,6 +28,10 @@ enum TutorCommand {
     Turn {
         #[command(subcommand)]
         command: TurnCommand,
+    },
+    Learner {
+        #[command(subcommand)]
+        command: LearnerCommand,
     },
     Soul {
         #[command(subcommand)]
@@ -63,6 +67,32 @@ enum TurnCommand {
     Pending {
         #[arg(long)]
         session: String,
+    },
+    Show {
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum LearnerCommand {
+    Fact {
+        #[command(subcommand)]
+        command: FactCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum FactCommand {
+    Record {
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
+    },
+    Revise {
+        id: String,
+        #[arg(long)]
+        if_revision: i64,
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
     },
     Show {
         id: String,
@@ -118,6 +148,34 @@ struct SoulPublish {
     request_id: String,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FactRecord {
+    scope: String,
+    #[serde(default)]
+    subject_id: Option<String>,
+    claim: String,
+    confidence: f64,
+    evidence_refs: Vec<String>,
+    origin: String,
+    request_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FactRevise {
+    action: String,
+    #[serde(default)]
+    claim: Option<String>,
+    evidence_refs: Vec<String>,
+    confidence: f64,
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default)]
+    corroborating_subject_ids: Vec<String>,
+    request_id: String,
+}
+
 pub(crate) fn main() {
     finish(run(TutorCli::parse()));
 }
@@ -158,6 +216,31 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
            sensitivity TEXT NOT NULL,
            approved INTEGER NOT NULL,
            created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS learner_facts(
+           id TEXT PRIMARY KEY,
+           scope TEXT NOT NULL CHECK(scope IN ('global','subject')),
+           subject_id TEXT REFERENCES subjects(id),
+           claim TEXT NOT NULL CHECK(trim(claim)<>''),
+           status TEXT NOT NULL CHECK(status IN ('provisional','confirmed','superseded')),
+           confidence REAL NOT NULL CHECK(confidence>=0 AND confidence<=1),
+           evidence_refs_json TEXT NOT NULL,
+           origin TEXT NOT NULL CHECK(origin IN ('agent','learner')),
+           supersedes_id TEXT REFERENCES learner_facts(id),
+           revision INTEGER NOT NULL CHECK(revision>=1),
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           CHECK((scope='global' AND subject_id IS NULL) OR
+                 (scope='subject' AND subject_id IS NOT NULL))
+         );
+         CREATE INDEX IF NOT EXISTS learner_facts_scope
+           ON learner_facts(scope,subject_id,status,id);
+         CREATE TABLE IF NOT EXISTS learner_fact_history(
+           fact_id TEXT NOT NULL REFERENCES learner_facts(id),
+           revision INTEGER NOT NULL,
+           snapshot_json TEXT NOT NULL,
+           changed_at TEXT NOT NULL,
+           PRIMARY KEY(fact_id,revision)
          );",
     )?;
     if connection
@@ -173,7 +256,8 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
             params![INITIAL_SOUL, sha256(INITIAL_SOUL.as_bytes()), timestamp],
         )?;
     }
-    materialize_soul(connection, root)
+    materialize_soul(connection, root)?;
+    materialize_fact_wiki(connection, root)
 }
 
 fn run(cli: TutorCli) -> Result<Value> {
@@ -183,6 +267,7 @@ fn run(cli: TutorCli) -> Result<Value> {
         TutorCommand::Subject { command } => run_subject(Plugin::Tutor, &mut store, command),
         TutorCommand::Session { command } => run_session(&mut store, command),
         TutorCommand::Turn { command } => run_turn(&mut store, command),
+        TutorCommand::Learner { command } => run_learner(&mut store, command),
         TutorCommand::Soul { command } => run_soul(&mut store, command),
         TutorCommand::Status => {
             let sessions = store.connection.query_row(
@@ -356,6 +441,484 @@ fn run_turn(store: &mut Store, command: TurnCommand) -> Result<Value> {
             json!({"turn": turn(&store.connection, &id)?}),
         )),
     }
+}
+
+fn run_learner(store: &mut Store, command: LearnerCommand) -> Result<Value> {
+    match command {
+        LearnerCommand::Fact { command } => run_fact(store, command),
+    }
+}
+
+fn run_fact(store: &mut Store, command: FactCommand) -> Result<Value> {
+    match command {
+        FactCommand::Record { json } => {
+            let input: FactRecord = read_json(&json)?;
+            validate_fact_record(&store.connection, &input)?;
+            let fingerprint = fingerprint(&input)?;
+            let tx = store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
+                return Ok(value);
+            }
+            let id = new_id(Plugin::Tutor, &input.request_id);
+            let timestamp = now(&tx)?;
+            let status = if input.origin == "learner" {
+                "confirmed"
+            } else {
+                "provisional"
+            };
+            let evidence = normalized_refs(input.evidence_refs)?;
+            tx.execute(
+                "INSERT INTO learner_facts(
+                   id,scope,subject_id,claim,status,confidence,evidence_refs_json,origin,
+                   supersedes_id,revision,created_at,updated_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL,1,?9,?9)",
+                params![
+                    id,
+                    input.scope,
+                    input.subject_id,
+                    input.claim,
+                    status,
+                    input.confidence,
+                    serde_json::to_string(&evidence)
+                        .map_err(|error| Error::new("json_error", error.to_string()))?,
+                    input.origin,
+                    timestamp,
+                ],
+            )?;
+            let fact = fact(&tx, &id)?;
+            append_fact_history(&tx, &fact)?;
+            let value = envelope(Plugin::Tutor, "learner.fact.record", json!({"fact": fact}));
+            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            tx.commit()?;
+            materialize_fact_wiki(&store.connection, &store.root)?;
+            Ok(value)
+        }
+        FactCommand::Revise {
+            id,
+            if_revision,
+            json,
+        } => {
+            validate_id(&id)?;
+            if if_revision < 1 {
+                return Err(Error::new("invalid_input", "if_revision must be positive"));
+            }
+            let mut input: FactRevise = read_json(&json)?;
+            validate_request_id(&input.request_id)?;
+            validate_confidence(input.confidence)?;
+            input.evidence_refs = normalized_refs(input.evidence_refs)?;
+            let fingerprint = fingerprint(&json!({
+                "id": id,
+                "if_revision": if_revision,
+                "input": input,
+            }))?;
+            let tx = store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
+                return Ok(value);
+            }
+            let current = fact(&tx, &id)?;
+            let revision = current["revision"].as_i64().unwrap();
+            if revision != if_revision {
+                return Err(
+                    Error::new("revision_conflict", "learner fact revision is stale")
+                        .details(json!({"expected": if_revision, "current": revision})),
+                );
+            }
+            if current["status"] == "superseded" {
+                return Err(Error::new(
+                    "fact_superseded",
+                    "a superseded learner fact cannot be revised",
+                ));
+            }
+            let value = match input.action.as_str() {
+                "corroborate" => corroborate_fact(&tx, &id, &current, &input)?,
+                "contradict" | "correct" => replace_fact(&tx, &id, &current, &input, false)?,
+                "promote" => replace_fact(&tx, &id, &current, &input, true)?,
+                _ => {
+                    return Err(Error::new(
+                        "invalid_input",
+                        "action must be corroborate, contradict, correct, or promote",
+                    ));
+                }
+            };
+            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            tx.commit()?;
+            materialize_fact_wiki(&store.connection, &store.root)?;
+            Ok(value)
+        }
+        FactCommand::Show { id } => Ok(envelope(
+            Plugin::Tutor,
+            "learner.fact.show",
+            json!({"fact": fact(&store.connection, &id)?}),
+        )),
+    }
+}
+
+fn validate_fact_record(connection: &Connection, input: &FactRecord) -> Result<()> {
+    validate_request_id(&input.request_id)?;
+    validate_text("claim", &input.claim, 16 * 1024)?;
+    validate_confidence(input.confidence)?;
+    normalized_refs(input.evidence_refs.clone())?;
+    validate_origin(&input.origin)?;
+    match (input.scope.as_str(), input.subject_id.as_deref()) {
+        ("global", None) => Ok(()),
+        ("subject", Some(subject_id)) => {
+            subject(connection, subject_id)?;
+            Ok(())
+        }
+        ("global", Some(_)) | ("subject", None) => Err(Error::new(
+            "invalid_input",
+            "global facts omit subject_id; subject facts require subject_id",
+        )),
+        _ => Err(Error::new(
+            "invalid_input",
+            "scope must be global or subject",
+        )),
+    }
+}
+
+fn corroborate_fact(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    current: &Value,
+    input: &FactRevise,
+) -> Result<Value> {
+    if input.claim.is_some()
+        || input.origin.is_some()
+        || !input.corroborating_subject_ids.is_empty()
+    {
+        return Err(Error::new(
+            "invalid_input",
+            "corroborate accepts only evidence_refs, confidence, and request_id",
+        ));
+    }
+    let evidence = merged_evidence(current, &input.evidence_refs)?;
+    let next_revision = current["revision"].as_i64().unwrap() + 1;
+    let timestamp = now(tx)?;
+    tx.execute(
+        "UPDATE learner_facts SET status='confirmed',confidence=?2,
+           evidence_refs_json=?3,revision=?4,updated_at=?5 WHERE id=?1",
+        params![
+            id,
+            input.confidence,
+            serde_json::to_string(&evidence)
+                .map_err(|error| Error::new("json_error", error.to_string()))?,
+            next_revision,
+            timestamp,
+        ],
+    )?;
+    let fact = fact(tx, id)?;
+    append_fact_history(tx, &fact)?;
+    Ok(envelope(
+        Plugin::Tutor,
+        "learner.fact.revise",
+        json!({"fact": fact}),
+    ))
+}
+
+fn replace_fact(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    current: &Value,
+    input: &FactRevise,
+    promote: bool,
+) -> Result<Value> {
+    let (scope, subject_id, claim, origin, status) = if promote {
+        if current["scope"] != "subject" || input.claim.is_some() || input.origin.is_some() {
+            return Err(Error::new(
+                "invalid_input",
+                "promote applies to a subject fact without changing claim or origin",
+            ));
+        }
+        let mut subjects = BTreeSet::new();
+        for subject_id in &input.corroborating_subject_ids {
+            subject(tx, subject_id)?;
+            subjects.insert(subject_id);
+        }
+        if subjects.len() < 2 {
+            return Err(Error::new(
+                "cross_subject_evidence_required",
+                "global promotion requires evidence from at least two subjects",
+            ));
+        }
+        (
+            "global",
+            None,
+            current["claim"].as_str().unwrap(),
+            "agent",
+            "confirmed",
+        )
+    } else {
+        if !input.corroborating_subject_ids.is_empty() {
+            return Err(Error::new(
+                "invalid_input",
+                "corroborating_subject_ids is only valid for promotion",
+            ));
+        }
+        let claim = input
+            .claim
+            .as_deref()
+            .ok_or_else(|| Error::new("invalid_input", "replacement claim is required"))?;
+        validate_text("claim", claim, 16 * 1024)?;
+        let origin = input
+            .origin
+            .as_deref()
+            .ok_or_else(|| Error::new("invalid_input", "replacement origin is required"))?;
+        validate_origin(origin)?;
+        if input.action == "correct" && origin != "learner" {
+            return Err(Error::new(
+                "invalid_input",
+                "a correction must have learner origin",
+            ));
+        }
+        (
+            current["scope"].as_str().unwrap(),
+            current["subject_id"].as_str(),
+            claim,
+            origin,
+            if origin == "learner" {
+                "confirmed"
+            } else {
+                "provisional"
+            },
+        )
+    };
+    let timestamp = now(tx)?;
+    let old_revision = current["revision"].as_i64().unwrap() + 1;
+    tx.execute(
+        "UPDATE learner_facts SET status='superseded',revision=?2,updated_at=?3 WHERE id=?1",
+        params![id, old_revision, timestamp],
+    )?;
+    let previous = fact(tx, id)?;
+    append_fact_history(tx, &previous)?;
+
+    let next_id = new_id(Plugin::Tutor, &input.request_id);
+    let evidence = merged_evidence(current, &input.evidence_refs)?;
+    tx.execute(
+        "INSERT INTO learner_facts(
+           id,scope,subject_id,claim,status,confidence,evidence_refs_json,origin,
+           supersedes_id,revision,created_at,updated_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10,?10)",
+        params![
+            next_id,
+            scope,
+            subject_id,
+            claim,
+            status,
+            input.confidence,
+            serde_json::to_string(&evidence)
+                .map_err(|error| Error::new("json_error", error.to_string()))?,
+            origin,
+            id,
+            timestamp,
+        ],
+    )?;
+    let fact = fact(tx, &next_id)?;
+    append_fact_history(tx, &fact)?;
+    Ok(envelope(
+        Plugin::Tutor,
+        "learner.fact.revise",
+        json!({"previous": previous, "fact": fact}),
+    ))
+}
+
+fn fact(connection: &Connection, id: &str) -> Result<Value> {
+    validate_id(id)?;
+    connection
+        .query_row(
+            "SELECT id,scope,subject_id,claim,status,confidence,evidence_refs_json,
+                    origin,supersedes_id,revision,created_at,updated_at
+             FROM learner_facts WHERE id=?1",
+            [id],
+            fact_row,
+        )
+        .optional()?
+        .ok_or_else(|| Error::new("fact_not_found", format!("learner fact {id} was not found")))
+}
+
+fn fact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let evidence: String = row.get(6)?;
+    let evidence: Value = serde_json::from_str(&evidence).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(json!({
+        "id": row.get::<_, String>(0)?,
+        "scope": row.get::<_, String>(1)?,
+        "subject_id": row.get::<_, Option<String>>(2)?,
+        "claim": row.get::<_, String>(3)?,
+        "status": row.get::<_, String>(4)?,
+        "confidence": row.get::<_, f64>(5)?,
+        "evidence_refs": evidence,
+        "origin": row.get::<_, String>(7)?,
+        "supersedes_id": row.get::<_, Option<String>>(8)?,
+        "revision": row.get::<_, i64>(9)?,
+        "created_at": row.get::<_, String>(10)?,
+        "updated_at": row.get::<_, String>(11)?,
+    }))
+}
+
+fn append_fact_history(tx: &rusqlite::Transaction<'_>, fact: &Value) -> Result<()> {
+    tx.execute(
+        "INSERT INTO learner_fact_history(fact_id,revision,snapshot_json,changed_at)
+         VALUES(?1,?2,?3,?4)",
+        params![
+            fact["id"].as_str().unwrap(),
+            fact["revision"].as_i64().unwrap(),
+            serde_json::to_string(fact)
+                .map_err(|error| Error::new("json_error", error.to_string()))?,
+            fact["updated_at"].as_str().unwrap(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn merged_evidence(current: &Value, added: &[String]) -> Result<Vec<String>> {
+    let mut values = current["evidence_refs"]
+        .as_array()
+        .ok_or_else(|| Error::new("corrupt_store", "fact evidence is not an array"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| Error::new("corrupt_store", "fact evidence is not text"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    values.extend_from_slice(added);
+    normalized_refs(values)
+}
+
+fn normalized_refs(mut refs: Vec<String>) -> Result<Vec<String>> {
+    for reference in &mut refs {
+        *reference = reference.trim().to_owned();
+        if reference.is_empty() || reference.len() > 512 {
+            return Err(Error::new(
+                "invalid_input",
+                "evidence refs must contain 1..=512 UTF-8 bytes",
+            ));
+        }
+    }
+    refs.sort();
+    refs.dedup();
+    if refs.is_empty() || refs.len() > 256 {
+        return Err(Error::new(
+            "invalid_input",
+            "learner facts require 1..=256 evidence refs",
+        ));
+    }
+    Ok(refs)
+}
+
+fn validate_origin(origin: &str) -> Result<()> {
+    if matches!(origin, "agent" | "learner") {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "invalid_input",
+            "origin must be agent or learner",
+        ))
+    }
+}
+
+fn validate_confidence(confidence: f64) -> Result<()> {
+    if confidence.is_finite() && (0.0..=1.0).contains(&confidence) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "invalid_input",
+            "confidence must be between 0 and 1",
+        ))
+    }
+}
+
+fn materialize_fact_wiki(connection: &Connection, root: &Path) -> Result<()> {
+    let wiki = root.join("wiki");
+    let directory = wiki.join("subjects");
+    for path in [wiki.clone(), directory.clone()] {
+        reject_symlink(&path)?;
+        fs::create_dir_all(path)?;
+    }
+    let mut subjects = connection.prepare(
+        "SELECT DISTINCT subject_id FROM learner_facts
+         WHERE subject_id IS NOT NULL ORDER BY subject_id",
+    )?;
+    let subject_ids = subjects
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for subject_id in subject_ids {
+        let mut statement = connection.prepare(
+            "SELECT id,scope,subject_id,claim,status,confidence,evidence_refs_json,
+                    origin,supersedes_id,revision,created_at,updated_at
+             FROM learner_facts WHERE subject_id=?1 ORDER BY created_at,id",
+        )?;
+        let facts = statement
+            .query_map([&subject_id], fact_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut body = format!("# Tutor subject {subject_id}\n\n");
+        for fact in facts {
+            body.push_str(&format!(
+                "- [{}] {} (confidence: {}, origin: {}, id: {})\n",
+                fact["status"].as_str().unwrap(),
+                fact["claim"].as_str().unwrap(),
+                fact["confidence"],
+                fact["origin"].as_str().unwrap(),
+                fact["id"].as_str().unwrap(),
+            ));
+        }
+        write_private_file(&directory.join(format!("{subject_id}.md")), body.as_bytes())?;
+    }
+    let mut statement = connection.prepare(
+        "SELECT id,scope,subject_id,claim,status,confidence,evidence_refs_json,
+                origin,supersedes_id,revision,created_at,updated_at
+         FROM learner_facts WHERE scope='global' ORDER BY created_at,id",
+    )?;
+    let facts = statement
+        .query_map([], fact_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut body = "# Tutor learner profile\n\n".to_owned();
+    for fact in facts {
+        body.push_str(&format!(
+            "- [{}] {} (confidence: {}, origin: {}, id: {})\n",
+            fact["status"].as_str().unwrap(),
+            fact["claim"].as_str().unwrap(),
+            fact["confidence"],
+            fact["origin"].as_str().unwrap(),
+            fact["id"].as_str().unwrap(),
+        ));
+    }
+    write_private_file(&wiki.join("learner.md"), body.as_bytes())?;
+    Ok(())
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    reject_symlink(path)?;
+    if fs::read(path).ok().as_deref() == Some(bytes) {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::new("unsafe_store_path", "materialized path has no parent"))?;
+    let temporary = parent.join(format!(
+        ".materialize-{}-{}.tmp",
+        std::process::id(),
+        ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    use std::io::Write;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(temporary, path)?;
+    Ok(())
 }
 
 fn run_soul(store: &mut Store, command: SoulCommand) -> Result<Value> {
