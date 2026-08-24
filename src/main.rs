@@ -8,6 +8,7 @@ mod error;
 mod external_graph;
 pub mod graph;
 mod import;
+mod learning_runtime;
 mod mcp;
 mod office;
 mod scope;

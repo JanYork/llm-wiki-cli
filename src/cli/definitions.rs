@@ -206,6 +206,21 @@ enum Command {
         #[command(subcommand)]
         command: OfficeCommand,
     },
+    /// Use the optional Tutor learning capability.
+    Tutor {
+        #[command(subcommand)]
+        command: LearningPluginCommand,
+    },
+    /// Use the optional sequential Book reading capability.
+    Book {
+        #[command(subcommand)]
+        command: LearningPluginCommand,
+    },
+    /// Use the optional Practice, question-bank, and review capability.
+    Practice {
+        #[command(subcommand)]
+        command: LearningPluginCommand,
+    },
     /// Start a foreground, loopback-only, read-only project viewer.
     #[command(
         long_about = "Start the read-only LWC viewer on 127.0.0.1. The viewer never refreshes, migrates, or mutates project state."
@@ -486,6 +501,14 @@ enum CgCommand {
 #[command(disable_help_subcommand = true)]
 enum OfficeCommand {
     /// Forward a read-only command through the pinned OfficeCLI runtime.
+    #[command(external_subcommand)]
+    Run(Vec<OsString>),
+}
+
+#[derive(Subcommand)]
+#[command(disable_help_subcommand = true)]
+enum LearningPluginCommand {
+    /// Forward a command through the fixed plugin runtime.
     #[command(external_subcommand)]
     Run(Vec<OsString>),
 }
@@ -1020,6 +1043,15 @@ enum ConfigCommand {
         /// Select disabled or officecli. Office configuration is global-only.
         #[arg(long)]
         office: Option<String>,
+        /// Select disabled or enabled. Tutor configuration is global-only.
+        #[arg(long)]
+        tutor: Option<String>,
+        /// Select disabled or enabled. Book configuration is global-only.
+        #[arg(long)]
+        book: Option<String>,
+        /// Select disabled or enabled. Practice configuration is global-only.
+        #[arg(long)]
+        practice: Option<String>,
         /// Select disabled, enabled, or inherit.
         #[arg(long)]
         memory: Option<String>,

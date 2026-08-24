@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const CONFIG_VERSION: u32 = 6;
+pub const CONFIG_VERSION: u32 = 7;
 pub const DEFAULT_TRANS_TIMEOUT_SECONDS: u16 = 120;
 pub const MIN_TRANS_TIMEOUT_SECONDS: u16 = 1;
 pub const MAX_TRANS_TIMEOUT_SECONDS: u16 = 900;
@@ -104,6 +104,12 @@ pub struct ConfigFile {
     pub todo: CapabilitySetting,
     #[serde(default = "inherit_capability")]
     pub plan: CapabilitySetting,
+    #[serde(default = "disabled_capability")]
+    pub tutor: CapabilitySetting,
+    #[serde(default = "disabled_capability")]
+    pub book: CapabilitySetting,
+    #[serde(default = "disabled_capability")]
+    pub practice: CapabilitySetting,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -149,6 +155,9 @@ pub struct ConfigPatch {
     pub memory: Option<MemorySettings>,
     pub todo: Option<CapabilitySetting>,
     pub plan: Option<CapabilitySetting>,
+    pub tutor: Option<CapabilitySetting>,
+    pub book: Option<CapabilitySetting>,
+    pub practice: Option<CapabilitySetting>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -195,6 +204,24 @@ struct ConfigFileV5 {
     pub memory: MemorySettings,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ConfigFileV6 {
+    pub version: u32,
+    #[serde(default = "default_graph")]
+    pub graph: GraphSettings,
+    #[serde(default = "default_trans")]
+    pub trans: TransSettings,
+    #[serde(default = "default_office")]
+    pub office: OfficeSetting,
+    #[serde(default = "default_memory")]
+    pub memory: MemorySettings,
+    #[serde(default = "inherit_capability")]
+    pub todo: CapabilitySetting,
+    #[serde(default = "inherit_capability")]
+    pub plan: CapabilitySetting,
+}
+
 fn inherit_graph() -> GraphSetting {
     GraphSetting::Inherit
 }
@@ -209,6 +236,10 @@ fn inherit_memory() -> MemorySetting {
 
 fn inherit_capability() -> CapabilitySetting {
     CapabilitySetting::Inherit
+}
+
+fn disabled_capability() -> CapabilitySetting {
+    CapabilitySetting::Disabled
 }
 
 fn default_graph() -> GraphSettings {
@@ -260,6 +291,9 @@ impl Default for ConfigFile {
             memory: default_memory(),
             todo: inherit_capability(),
             plan: inherit_capability(),
+            tutor: disabled_capability(),
+            book: disabled_capability(),
+            practice: disabled_capability(),
         }
     }
 }
@@ -419,6 +453,9 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                     memory: default_memory(),
                     todo: inherit_capability(),
                     plan: inherit_capability(),
+                    tutor: disabled_capability(),
+                    book: disabled_capability(),
+                    practice: disabled_capability(),
                 });
             }
             if version == 3 {
@@ -433,6 +470,9 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                     memory: default_memory(),
                     todo: inherit_capability(),
                     plan: inherit_capability(),
+                    tutor: disabled_capability(),
+                    book: disabled_capability(),
+                    practice: disabled_capability(),
                 });
             }
             if version == 4 {
@@ -447,6 +487,9 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                     memory: default_memory(),
                     todo: inherit_capability(),
                     plan: inherit_capability(),
+                    tutor: disabled_capability(),
+                    book: disabled_capability(),
+                    practice: disabled_capability(),
                 });
             }
             if version == 5 {
@@ -461,6 +504,26 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                     memory: legacy.memory,
                     todo: inherit_capability(),
                     plan: inherit_capability(),
+                    tutor: disabled_capability(),
+                    book: disabled_capability(),
+                    practice: disabled_capability(),
+                });
+            }
+            if version == 6 {
+                let legacy: ConfigFileV6 = serde_json::from_value(value).map_err(|error| {
+                    AppError::new("invalid_config", format!("invalid config: {error}"))
+                })?;
+                return validate_config_file(ConfigFile {
+                    version: CONFIG_VERSION,
+                    graph: legacy.graph,
+                    trans: legacy.trans,
+                    office: legacy.office,
+                    memory: legacy.memory,
+                    todo: legacy.todo,
+                    plan: legacy.plan,
+                    tutor: disabled_capability(),
+                    book: disabled_capability(),
+                    practice: disabled_capability(),
                 });
             }
             if version != u64::from(CONFIG_VERSION) {
@@ -623,6 +686,29 @@ pub fn resolve_todo(scope: &str, database: &Path) -> Result<EffectiveCapabilityC
 pub fn resolve_plan(scope: &str, database: &Path) -> Result<EffectiveCapabilityConfig> {
     resolve_capability(scope, database, |config| config.plan)
 }
+
+pub fn resolve_learning(name: &str) -> Result<EffectiveCapabilityConfig> {
+    let setting = match global_config_path() {
+        Some(path) => {
+            let config = load_file(&path)?;
+            match name {
+                "tutor" => config.tutor,
+                "book" => config.book,
+                "practice" => config.practice,
+                _ => CapabilitySetting::Disabled,
+            }
+        }
+        None => CapabilitySetting::Disabled,
+    };
+    Ok(EffectiveCapabilityConfig {
+        setting,
+        origin: if setting == CapabilitySetting::Enabled {
+            "global".to_owned()
+        } else {
+            "built-in".to_owned()
+        },
+    })
+}
 pub fn inherit_capability_setting() -> CapabilitySetting {
     CapabilitySetting::Inherit
 }
@@ -736,6 +822,15 @@ pub fn update(database: &Path, patch: ConfigPatch) -> Result<(PathBuf, ConfigFil
     if let Some(plan) = patch.plan {
         config.plan = plan;
     }
+    if let Some(tutor) = patch.tutor {
+        config.tutor = tutor;
+    }
+    if let Some(book) = patch.book {
+        config.book = book;
+    }
+    if let Some(practice) = patch.practice {
+        config.practice = practice;
+    }
     validate_config_file(config.clone())?;
     let bytes = serde_json::to_vec_pretty(&config)
         .map_err(|error| AppError::new("json_error", error.to_string()))?;
@@ -840,6 +935,9 @@ pub fn response(scope: &str, database: &Path) -> Result<Value> {
     let memory = resolve_memory(scope, database)?;
     let todo = resolve_todo(scope, database)?;
     let plan = resolve_plan(scope, database)?;
+    let tutor = resolve_learning("tutor")?;
+    let book = resolve_learning("book")?;
+    let practice = resolve_learning("practice")?;
     Ok(json!({
         "scope": scope,
         "path": config_path_for_database(database)?,
@@ -849,5 +947,8 @@ pub fn response(scope: &str, database: &Path) -> Result<Value> {
         "memory": memory,
         "todo":todo,
         "plan":plan,
+        "tutor":tutor,
+        "book":book,
+        "practice":practice,
     }))
 }

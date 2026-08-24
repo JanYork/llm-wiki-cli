@@ -7,8 +7,9 @@ choices that later tests and code must share.
 ## Fixed runtime and package layout
 
 - Keep the existing Cargo package. Add three bin targets: `lwc-tutor`, `lwc-book`, and
-  `lwc-practice`, with shared deterministic code in the existing library. A workspace,
-  dynamic plugin ABI, discovery, and PATH fallback are out of scope.
+  `lwc-practice`, sharing only their learning source modules. The current package has
+  no library target, so converting all of LWC into a library, a workspace, dynamic
+  plugin ABI, discovery, and PATH fallback are out of scope.
 - Core exposes exactly `lwc tutor ...`, `lwc book ...`, and `lwc practice ...`. It
   checks the independent global capability, installs the fixed runtime when missing,
   then forwards cwd, stdin, arguments, stdout, stderr, and exit status unchanged.

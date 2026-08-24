@@ -9,6 +9,9 @@ fn run(cli: Cli) -> Result<Value> {
             | Command::WorkRun { .. }
             | Command::Cg { .. }
             | Command::Office { .. }
+            | Command::Tutor { .. }
+            | Command::Book { .. }
+            | Command::Practice { .. }
             | Command::View { .. }
             | Command::Trans { .. }
             | Command::Agent { .. }
@@ -112,6 +115,24 @@ fn run(cli: Cli) -> Result<Value> {
         } => {
             changeset::reject_selector(selected_changeset.as_deref(), "office")?;
             crate::office::run(&cwd, &args)
+        }
+        Command::Tutor {
+            command: LearningPluginCommand::Run(args),
+        } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "tutor")?;
+            crate::learning_runtime::run(crate::learning_runtime::Plugin::Tutor, &cwd, &args)
+        }
+        Command::Book {
+            command: LearningPluginCommand::Run(args),
+        } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "book")?;
+            crate::learning_runtime::run(crate::learning_runtime::Plugin::Book, &cwd, &args)
+        }
+        Command::Practice {
+            command: LearningPluginCommand::Run(args),
+        } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "practice")?;
+            crate::learning_runtime::run(crate::learning_runtime::Plugin::Practice, &cwd, &args)
         }
         Command::View { port, no_open } => {
             changeset::reject_selector(selected_changeset.as_deref(), "view")?;
@@ -968,6 +989,9 @@ fn run(cli: Cli) -> Result<Value> {
                     graph,
                     trans,
                     office,
+                    tutor,
+                    book,
+                    practice,
                     memory,
                     todo,
                     plan,
@@ -979,19 +1003,30 @@ fn run(cli: Cli) -> Result<Value> {
                     if graph.is_none()
                         && trans.is_none()
                         && office.is_none()
+                        && tutor.is_none()
+                        && book.is_none()
+                        && practice.is_none()
                         && memory.is_none()
                         && todo.is_none()
                         && plan.is_none()
                     {
                         return Err(AppError::new(
                             "invalid_input",
-                            "config set requires --graph, --trans, --memory, --todo, --plan, or --office",
+                            "config set requires --graph, --trans, --memory, --todo, --plan, --office, --tutor, --book, or --practice",
                         ));
                     }
                     if office.is_some() && cli.scope != Scope::Global {
                         return Err(AppError::new(
                             "office_config_global_only",
                             "Office capability configuration requires `--scope global`",
+                        ));
+                    }
+                    if (tutor.is_some() || book.is_some() || practice.is_some())
+                        && cli.scope != Scope::Global
+                    {
+                        return Err(AppError::new(
+                            "learning_plugin_config_global_only",
+                            "Tutor, Book, and Practice capability configuration requires `--scope global`",
                         ));
                     }
                     if trans.is_none() && (trans_timeout.is_some() || !trans_args.is_empty()) {
@@ -1026,6 +1061,18 @@ fn run(cli: Cli) -> Result<Value> {
                         .as_deref()
                         .map(config::parse_office_setting)
                         .transpose()?;
+                    let tutor_setting = tutor
+                        .as_deref()
+                        .map(|value| config::parse_capability_setting("tutor", value))
+                        .transpose()?;
+                    let book_setting = book
+                        .as_deref()
+                        .map(|value| config::parse_capability_setting("book", value))
+                        .transpose()?;
+                    let practice_setting = practice
+                        .as_deref()
+                        .map(|value| config::parse_capability_setting("practice", value))
+                        .transpose()?;
                     let memory_setting = match memory {
                         Some(memory) => Some(config::build_memory_settings(
                             &store_path.path,
@@ -1043,6 +1090,9 @@ fn run(cli: Cli) -> Result<Value> {
                             graph: graph_setting,
                             trans: trans_setting,
                             office: office_setting,
+                            tutor: tutor_setting,
+                            book: book_setting,
+                            practice: practice_setting,
                             memory: memory_setting,
                             todo:todo_setting,
                             plan:plan_setting,
@@ -1088,6 +1138,9 @@ fn run(cli: Cli) -> Result<Value> {
                             memory: memory.then_some(config::inherit_memory_settings()),
                             todo:todo.then_some(config::inherit_capability_setting()),
                             plan:plan.then_some(config::inherit_capability_setting()),
+                            tutor: None,
+                            book: None,
+                            practice: None,
                         },
                     )?;
                     Store::open(scope_name(store_path.scope), &store_path.path)?;
