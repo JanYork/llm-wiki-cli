@@ -1,3 +1,4 @@
+use crate::learning_schema;
 use clap::{Parser, Subcommand};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -10,9 +11,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
-
-#[path = "../learning_schema.rs"]
-mod learning_schema;
 
 const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 const STORE_SCHEMA_VERSION: i64 = 2;
@@ -99,6 +97,7 @@ impl Error {
         self.code
     }
 
+    #[allow(dead_code)] // Core Sync reads messages; the fixed plugin binaries serialize Error directly.
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
@@ -626,6 +625,7 @@ fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+#[allow(dead_code)] // Core Sync records receipts; fixed plugin binaries only validate them.
 pub(crate) fn record_sync_receipt(
     tx: &Transaction<'_>,
     plugin: Plugin,
@@ -757,6 +757,7 @@ pub(crate) fn latest_sync_receipt(
     Ok(Some(receipt))
 }
 
+#[allow(dead_code)] // Fixed plugin binaries validate takeovers; core does not expose domain commands.
 pub(crate) fn require_latest_sync_receipt(
     connection: &Connection,
     plugin: Plugin,
@@ -880,6 +881,7 @@ fn receipt_hash(receipt: &PluginSyncReceipt) -> Result<String> {
         .collect())
 }
 
+#[allow(dead_code)] // Only receipt publication needs this in the core binary.
 fn valid_hash(value: &str) -> bool {
     value.len() == 64
         && value

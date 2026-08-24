@@ -1029,6 +1029,7 @@ This prevents completion after merely indexing raw text or writing a detached su
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // Clap owns this short-lived parse tree; boxing leaf flags adds no value.
 enum ConfigCommand {
     /// Show effective graph, trans, memory, and Office configuration plus value origins.
     Show,

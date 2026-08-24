@@ -11,6 +11,7 @@ mod import;
 #[path = "learning/mod.rs"]
 mod learning;
 mod learning_runtime;
+mod learning_schema;
 mod mcp;
 mod office;
 mod scope;

@@ -1,5 +1,6 @@
 use crate::{
     error::{AppError, Result},
+    learning_schema,
     scope::{
         Scope, StorePath, init_store_path, require_database_runtime_root,
         resolve_explicit_read_store_paths, resolve_read_store_paths,
@@ -26,9 +27,6 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-
-#[path = "learning_schema.rs"]
-mod learning_schema;
 
 const PROTOCOL_VERSION: u32 = 2;
 const MAX_PROTOCOL_BYTES: u64 = 1024 * 1024;
@@ -2105,6 +2103,7 @@ fn add_plugin_artifact_file(connection: &Connection, root: &Path, relative: &str
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // One fixed Sync phase with explicit transport/session invariants.
 fn reconcile_fixed_plugins(
     host: &str,
     scope: Scope,
