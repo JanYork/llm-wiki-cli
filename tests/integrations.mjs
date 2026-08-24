@@ -28,7 +28,15 @@ function files(directory) {
 }
 
 test("canonical LWC Skills are bundled identically for every native plugin", () => {
-  for (const skill of ["using-lwc", "using-todo", "using-plan", "using-sync"]) {
+  for (const skill of [
+    "using-lwc",
+    "using-todo",
+    "using-plan",
+    "using-sync",
+    "using-tutor",
+    "using-book",
+    "using-practice",
+  ]) {
     const canonical = join(root, `skills/${skill}`);
     const expected = files(canonical);
     if (skill === "using-lwc") assert.ok(expected.includes("references/temporal-memory.md"));

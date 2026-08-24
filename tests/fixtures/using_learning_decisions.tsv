@@ -1,0 +1,4 @@
+# plugin	scenario	expected
+tutor	ambiguous_intent	ask_once|-|no-new-work
+book	disabled_without_consent	ask_once|-|no-new-work
+practice	pending_recovery	recover|lwc practice status|no-new-work

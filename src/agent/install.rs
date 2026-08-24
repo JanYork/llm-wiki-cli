@@ -148,6 +148,36 @@ const SYNC_SKILL_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../skills/using-sync/agents/openai.yaml"),
     ),
 ];
+const TUTOR_SKILL_FILES: &[(&str, &[u8])] = &[
+    (
+        "SKILL.md",
+        include_bytes!("../../skills/using-tutor/SKILL.md"),
+    ),
+    (
+        "agents/openai.yaml",
+        include_bytes!("../../skills/using-tutor/agents/openai.yaml"),
+    ),
+];
+const BOOK_SKILL_FILES: &[(&str, &[u8])] = &[
+    (
+        "SKILL.md",
+        include_bytes!("../../skills/using-book/SKILL.md"),
+    ),
+    (
+        "agents/openai.yaml",
+        include_bytes!("../../skills/using-book/agents/openai.yaml"),
+    ),
+];
+const PRACTICE_SKILL_FILES: &[(&str, &[u8])] = &[
+    (
+        "SKILL.md",
+        include_bytes!("../../skills/using-practice/SKILL.md"),
+    ),
+    (
+        "agents/openai.yaml",
+        include_bytes!("../../skills/using-practice/agents/openai.yaml"),
+    ),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1087,6 +1117,9 @@ fn skill_files(root: &Path) -> impl Iterator<Item = (PathBuf, &'static [u8])> {
         (parent.join("using-todo"), TODO_SKILL_FILES),
         (parent.join("using-plan"), PLAN_SKILL_FILES),
         (parent.join("using-sync"), SYNC_SKILL_FILES),
+        (parent.join("using-tutor"), TUTOR_SKILL_FILES),
+        (parent.join("using-book"), BOOK_SKILL_FILES),
+        (parent.join("using-practice"), PRACTICE_SKILL_FILES),
     ]
     .into_iter()
     .flat_map(|(dir, files)| {

@@ -1,0 +1,4 @@
+interface:
+  display_name: "LWC Practice"
+  short_description: "Durable practice and scheduled review"
+  default_prompt: "Use $using-practice for durable items, attempts, grading, flashcards, and review recovery."

@@ -467,7 +467,14 @@ fn agent_install_bundles_temporal_memory_reference_byte_identically() {
         )
         .unwrap()
     );
-    for skill in ["using-todo", "using-plan", "using-sync"] {
+    for skill in [
+        "using-todo",
+        "using-plan",
+        "using-sync",
+        "using-tutor",
+        "using-book",
+        "using-practice",
+    ] {
         assert_eq!(
             fs::read(
                 world
@@ -476,7 +483,7 @@ fn agent_install_bundles_temporal_memory_reference_byte_identically() {
                     .join(skill)
                     .join("SKILL.md")
             )
-            .unwrap(),
+            .unwrap_or_else(|error| panic!("installed {skill} is missing: {error}")),
             fs::read(
                 Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("skills")
