@@ -226,6 +226,12 @@ fn disabling_or_replacing_a_runtime_never_removes_plugin_data() {
     let cwd = temp.path().join("cwd");
     let home = temp.path().join("home");
     fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    assert!(
+        run(&cwd, &home, &["--scope", "global", "init"])
+            .status
+            .success()
+    );
     fs::create_dir_all(home.join(".lwc/plugins/book")).unwrap();
     fs::write(home.join(".lwc/plugins/book/data.sqlite3"), b"canonical").unwrap();
     fs::write(
@@ -258,7 +264,7 @@ fn learning_plugin_commands_reject_changesets_before_runtime_installation() {
     let rejected = run(&cwd, &home, &["--changeset", "draft", "practice", "status"]);
     assert_eq!(
         error(&rejected)["error"]["code"],
-        "changeset_command_not_supported"
+        "changeset_command_unsupported"
     );
     assert!(!home.join(".lwc/runtime/practice").exists());
 }
