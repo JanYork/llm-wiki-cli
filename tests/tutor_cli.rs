@@ -171,6 +171,40 @@ fn visible_turn_input_is_durable_before_reply_and_commit_is_idempotent() {
 }
 
 #[test]
+fn pending_turn_takeover_is_a_receipt_gated_explicit_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let subject_id = subject(&cwd, &home);
+    let session_input = serde_json::json!({
+        "subject_id":subject_id,"mode":"learning","request_id":"takeover-session"
+    })
+    .to_string();
+    let session = ok(
+        &cwd,
+        &home,
+        &["session", "create", "--json", &session_input],
+    );
+    let begin = serde_json::json!({
+        "session_id":session["result"]["session"]["id"],"owner":"mac-old",
+        "input":"durable pending turn","request_id":"takeover-turn"
+    })
+    .to_string();
+    let turn = ok(&cwd, &home, &["turn", "begin", "--json", &begin]);
+    let takeover = serde_json::json!({
+        "entity_id":turn["result"]["turn"]["id"],"old_owner":"mac-old",
+        "new_owner":"mac-new","if_revision":1,"sync_session_id":"sync-tutor-takeover",
+        "request_id":"takeover-turn-owner"
+    })
+    .to_string();
+    let output = output(&cwd, &home, &["turn", "takeover", "--json", &takeover]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("\"code\":\"sync_receipt_missing\""));
+}
+
+#[test]
 fn hidden_turn_content_is_rejected_and_never_persisted() {
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().join("cwd");
@@ -207,6 +241,37 @@ fn hidden_turn_content_is_rejected_and_never_persisted() {
         connection
             .query_row("SELECT COUNT(*) FROM tutor_turns", [], |row| row
                 .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn existing_tutor_schema_corruption_fails_closed_instead_of_being_repaired() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    ok(&cwd, &home, &["status"]);
+    let database = home.join(".lwc/plugins/tutor/data.sqlite3");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute("DROP INDEX tutor_turns_pending", [])
+        .unwrap();
+    drop(connection);
+    assert_eq!(
+        err(&cwd, &home, &["status"])["error"]["code"],
+        "corrupt_store"
+    );
+    let connection = Connection::open(database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='tutor_turns_pending'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
             .unwrap(),
         0
     );

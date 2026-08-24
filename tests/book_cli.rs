@@ -947,6 +947,79 @@ fn lease_expiry_and_renewal_never_advance_or_change_the_source_range() {
 }
 
 #[test]
+fn renewed_lease_commit_increments_revision_with_exact_cas() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let subject_id = subject(&cwd, &home);
+    fs::write(cwd.join("renew-commit.md"), "# Renew\n\nCommit after renew.\n").unwrap();
+    let imported = import_book(
+        &cwd,
+        &home,
+        &subject_id,
+        "renew-commit.md",
+        "renew-commit-import",
+    );
+    let book_id = imported["result"]["book"]["id"].as_str().unwrap();
+    let prepare = serde_json::json!({"request_id":"renew-commit-prepare"}).to_string();
+    ok(
+        &cwd,
+        &home,
+        &["prepare", book_id, "--if-revision", "1", "--json", &prepare],
+    );
+    let next = serde_json::json!({"owner":"agent","request_id":"renew-commit-next"}).to_string();
+    let lease = ok(
+        &cwd,
+        &home,
+        &["read", "next", book_id, "--if-revision", "2", "--json", &next],
+    )["result"]["lease"]
+        .clone();
+    let renew = serde_json::json!({
+        "owner":"agent","lease_seconds":120,"request_id":"renew-commit-renew"
+    })
+    .to_string();
+    let renewed = ok(
+        &cwd,
+        &home,
+        &[
+            "read",
+            "renew",
+            lease["id"].as_str().unwrap(),
+            "--if-revision",
+            "1",
+            "--json",
+            &renew,
+        ],
+    )["result"]["lease"]
+        .clone();
+    let report = serde_json::json!({
+        "owner":"agent","range_hash":renewed["range_hash"],"summary":"renewed",
+        "key_points":[{"text":"renewed","block_id":renewed["blocks"][0]["id"],
+          "source_hash":renewed["blocks"][0]["text_hash"]}],
+        "new_concepts":[],"prior_links":[],"open_threads":[],"anomalies":[],
+        "request_id":"renew-commit-report"
+    })
+    .to_string();
+    let committed = ok(
+        &cwd,
+        &home,
+        &[
+            "read",
+            "commit",
+            lease["id"].as_str().unwrap(),
+            "--if-revision",
+            "2",
+            "--json",
+            &report,
+        ],
+    );
+    assert_eq!(committed["result"]["lease"]["revision"], 3);
+    assert_eq!(committed["result"]["lease"]["state"], "committed");
+}
+
+#[test]
 fn lease_takeover_requires_a_latest_sync_receipt_and_rejects_the_stale_owner() {
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().join("cwd");

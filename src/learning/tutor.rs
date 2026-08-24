@@ -81,6 +81,10 @@ enum TurnCommand {
         #[arg(long, value_name = "JSON|-|@PATH")]
         json: String,
     },
+    Takeover {
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
+    },
     Pending {
         #[arg(long)]
         session: String,
@@ -214,6 +218,17 @@ struct TurnCommit {
     request_id: String,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TurnTakeover {
+    entity_id: String,
+    old_owner: String,
+    new_owner: String,
+    if_revision: i64,
+    sync_session_id: String,
+    request_id: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TeachingCheckpoint {
@@ -335,6 +350,19 @@ pub(crate) fn main() {
 }
 
 fn initialize(connection: &Connection, root: &Path) -> Result<()> {
+    let existing = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN (
+           'tutor_sessions','tutor_diagnoses','tutor_turns','tutor_turn_owner_history',
+           'soul_versions','soul_settings','soul_settings_history','soul_proposals',
+           'learner_facts','learner_fact_history','tutor_goals','tutor_goal_criteria',
+           'tutor_goal_evidence','tutor_goal_history','tutor_plans','tutor_plan_versions',
+           'tutor_plan_steps','tutor_plan_step_history')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if existing != 0 {
+        validate_tutor_schema(connection)?;
+    }
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS tutor_sessions(
            id TEXT PRIMARY KEY,
@@ -374,6 +402,17 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS tutor_turns_pending
            ON tutor_turns(session_id,state,created_at,id);
+         CREATE TABLE IF NOT EXISTS tutor_turn_owner_history(
+           turn_id TEXT NOT NULL REFERENCES tutor_turns(id),
+           revision INTEGER NOT NULL CHECK(revision>=2),
+           old_owner TEXT NOT NULL,
+           new_owner TEXT NOT NULL,
+           sync_session_id TEXT NOT NULL,
+           changed_at TEXT NOT NULL,
+           PRIMARY KEY(turn_id,revision)
+         );
+         CREATE INDEX IF NOT EXISTS tutor_turn_owner_history_session
+           ON tutor_turn_owner_history(sync_session_id,turn_id,revision);
          CREATE TABLE IF NOT EXISTS soul_versions(
            revision INTEGER PRIMARY KEY,
            body TEXT NOT NULL,
@@ -507,8 +546,66 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
         )?;
     }
     crate::tutor_plan::initialize(connection)?;
+    validate_tutor_schema(connection)?;
     materialize_soul(connection, root)?;
     materialize_fact_wiki(connection, root)
+}
+
+fn validate_tutor_schema(connection: &Connection) -> Result<()> {
+    for (table, columns) in [
+        ("tutor_sessions", &["id","subject_id","mode","state","revision","created_at","updated_at"][..]),
+        ("tutor_diagnoses", &["id","session_id","outcome","reason","evidence_refs_json","created_at"]),
+        ("tutor_turns", &["id","session_id","owner","input","reply","checkpoint_json","checkpoint_kind","hint_level","full_answer","state","revision","created_at","updated_at","committed_at"][..]),
+        ("tutor_turn_owner_history", &["turn_id","revision","old_owner","new_owner","sync_session_id","changed_at"]),
+        ("soul_versions", &["revision","body","body_hash","fact_refs_json","reason","sensitivity","approved","created_at"]),
+        ("soul_settings", &["singleton","max_bytes","revision","updated_at"]),
+        ("soul_settings_history", &["revision","max_bytes","changed_at"]),
+        ("soul_proposals", &["id","base_revision","body","body_hash","fact_refs_json","reason","sensitivity","state","approved_by","published_revision","revision","created_at","updated_at"][..]),
+        ("learner_facts", &["id","scope","subject_id","claim","status","confidence","evidence_refs_json","origin","supersedes_id","revision","created_at","updated_at"][..]),
+        ("learner_fact_history", &["fact_id","revision","snapshot_json","changed_at"]),
+        ("tutor_goals", &["id","subject_id","statement","status","revision","created_at","updated_at","completed_at"]),
+        ("tutor_goal_criteria", &["id","goal_id","ordinal","description"]),
+        ("tutor_goal_evidence", &["goal_id","criterion_id","evidence_refs_json","goal_revision","created_at"]),
+        ("tutor_goal_history", &["goal_id","revision","snapshot_json","changed_at"]),
+        ("tutor_plans", &["id","subject_id","goal_id","mode","status","current_revision","created_at","updated_at"]),
+        ("tutor_plan_versions", &["plan_id","revision","goal_id","deadline","weekly_minutes","core_content_json","order_json","pace","method","exercise_ratio","actor","trigger","reason","evidence_refs_json","rolled_back_to","created_at"][..]),
+        ("tutor_plan_steps", &["id","plan_id","ordinal","title","estimated_minutes","status","practice_target_kind","practice_target_id","revision","created_at","updated_at"][..]),
+        ("tutor_plan_step_history", &["step_id","revision","status","actor","reason","evidence_refs_json","created_at"]),
+    ] {
+        require_table_schema(connection, table, columns)?;
+    }
+    require_indexes(
+        connection,
+        &[
+            "tutor_sessions_subject",
+            "tutor_diagnoses_session",
+            "tutor_turns_pending",
+            "tutor_turn_owner_history_session",
+            "learner_facts_scope",
+            "tutor_goals_subject",
+            "tutor_plans_subject",
+            "tutor_plan_steps_plan",
+        ],
+    )?;
+    let invalid = connection.query_row(
+        "SELECT
+           (SELECT COUNT(*) FROM tutor_sessions WHERE mode NOT IN ('learning','question','exam') OR state NOT IN ('active','closed')) +
+           (SELECT COUNT(*) FROM tutor_turns WHERE state NOT IN ('pending','committed')) +
+           (SELECT COUNT(*) FROM soul_proposals WHERE state NOT IN ('proposed','approved','published')) +
+           (SELECT COUNT(*) FROM learner_facts WHERE status NOT IN ('provisional','confirmed','superseded')) +
+           (SELECT COUNT(*) FROM tutor_goals WHERE status NOT IN ('active','ready_to_complete','completed','paused','abandoned')) +
+           (SELECT COUNT(*) FROM tutor_plans WHERE status NOT IN ('active','completed','abandoned')) +
+           (SELECT COUNT(*) FROM tutor_plan_steps WHERE status NOT IN ('planned','in_progress','completed','missed','deferred','skipped'))",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid != 0 {
+        return Err(Error::new(
+            "corrupt_store",
+            "Tutor store contains an unsupported future state",
+        ));
+    }
+    Ok(())
 }
 
 fn run(cli: TutorCli) -> Result<Value> {
@@ -739,11 +836,12 @@ fn run_turn(store: &mut Store, command: TurnCommand) -> Result<Value> {
             let checkpoint = serde_json::to_string(&input.checkpoint)
                 .map_err(|error| Error::new("json_error", error.to_string()))?;
             let timestamp = now(&tx)?;
-            tx.execute(
+            let changed = tx.execute(
                 "UPDATE tutor_turns
                  SET reply=?2,checkpoint_json=?3,checkpoint_kind=?4,hint_level=?5,
-                     full_answer=?6,state='committed',revision=2,
-                     updated_at=?7,committed_at=?7 WHERE id=?1",
+                     full_answer=?6,state='committed',revision=revision+1,
+                     updated_at=?7,committed_at=?7
+                 WHERE id=?1 AND owner=?8 AND revision=?9 AND state='pending'",
                 params![
                     id,
                     input.reply,
@@ -751,9 +849,17 @@ fn run_turn(store: &mut Store, command: TurnCommand) -> Result<Value> {
                     teaching.as_ref().map(|value| value.kind.as_str()),
                     teaching.as_ref().map(|value| value.hint_level),
                     teaching.as_ref().map(|value| value.full_answer),
-                    timestamp
+                    timestamp,
+                    input.owner,
+                    if_revision,
                 ],
             )?;
+            if changed != 1 {
+                return Err(Error::new(
+                    "revision_conflict",
+                    "turn changed during commit",
+                ));
+            }
             let value = envelope(
                 Plugin::Tutor,
                 "turn.commit",
@@ -764,6 +870,7 @@ fn run_turn(store: &mut Store, command: TurnCommand) -> Result<Value> {
             tx.commit()?;
             Ok(value)
         }
+        TurnCommand::Takeover { json } => takeover_turn(store, read_json(&json)?),
         TurnCommand::Pending { session: id } => {
             validate_id(&id)?;
             session(&store.connection, &id)?;
@@ -790,6 +897,82 @@ fn run_turn(store: &mut Store, command: TurnCommand) -> Result<Value> {
             json!({"turn": turn(&store.connection, &id)?}),
         )),
     }
+}
+
+fn takeover_turn(store: &mut Store, input: TurnTakeover) -> Result<Value> {
+    validate_id(&input.entity_id)?;
+    validate_text("old_owner", &input.old_owner, 256)?;
+    validate_text("new_owner", &input.new_owner, 256)?;
+    validate_request_id(&input.sync_session_id)?;
+    validate_request_id(&input.request_id)?;
+    if input.if_revision < 1 || input.old_owner == input.new_owner {
+        return Err(Error::new(
+            "invalid_takeover",
+            "takeover requires a positive revision and a different new owner",
+        ));
+    }
+    let fingerprint = fingerprint(&input)?;
+    let tx = store
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
+        return Ok(value);
+    }
+    require_latest_sync_receipt(&tx, Plugin::Tutor, &input.sync_session_id)?;
+    let timestamp = now(&tx)?;
+    let changed = tx.execute(
+        "UPDATE tutor_turns SET owner=?2,revision=revision+1,updated_at=?3
+         WHERE id=?1 AND owner=?4 AND revision=?5 AND state='pending'",
+        params![
+            input.entity_id,
+            input.new_owner,
+            timestamp,
+            input.old_owner,
+            input.if_revision,
+        ],
+    )?;
+    if changed != 1 {
+        let current = turn(&tx, &input.entity_id)?;
+        if current["owner"] != input.old_owner {
+            return Err(Error::new("stale_owner", "turn owner changed"));
+        }
+        if current["state"] != "pending" {
+            return Err(Error::new(
+                "turn_committed",
+                "committed Tutor turns cannot be taken over",
+            ));
+        }
+        return Err(Error::new(
+            "revision_conflict",
+            "turn revision changed",
+        ));
+    }
+    tx.execute(
+        "INSERT INTO tutor_turn_owner_history(
+           turn_id,revision,old_owner,new_owner,sync_session_id,changed_at
+         ) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            input.entity_id,
+            input.if_revision + 1,
+            input.old_owner,
+            input.new_owner,
+            input.sync_session_id,
+            timestamp,
+        ],
+    )?;
+    let value = finalize_mutation(
+        &tx,
+        Plugin::Tutor,
+        &input.request_id,
+        &fingerprint,
+        envelope(
+            Plugin::Tutor,
+            "turn.takeover",
+            json!({"turn":turn(&tx,&input.entity_id)?}),
+        ),
+    )?;
+    tx.commit()?;
+    Ok(value)
 }
 
 fn validate_teaching_checkpoint(
@@ -2245,4 +2428,135 @@ fn sha256(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod takeover_tests {
+    use super::*;
+
+    #[test]
+    fn latest_real_receipt_allows_one_takeover_then_becomes_stale() {
+        let home = tempfile::tempdir().unwrap();
+        // This binary test process owns HOME; Store::open therefore exercises the real
+        // shared migration and receipt schema without a hand-built drift fixture.
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let mut store = Store::open(Plugin::Tutor).unwrap();
+        initialize(&store.connection, &store.root).unwrap();
+        let tx = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute(
+            "INSERT INTO subjects(id,name,parent_id,tags_json,revision,created_at,updated_at)
+             VALUES('11111111111111111111111111111111','s',NULL,'[]',1,
+                    '2026-08-24T00:00:00.000Z','2026-08-24T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO tutor_sessions(id,subject_id,mode,state,revision,created_at,updated_at)
+             VALUES('22222222222222222222222222222222','11111111111111111111111111111111',
+                    'learning','active',1,'2026-08-24T00:00:00.000Z','2026-08-24T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO tutor_turns(id,session_id,owner,input,state,revision,created_at,updated_at)
+             VALUES('33333333333333333333333333333333','22222222222222222222222222222222',
+                    'mac-old','pending','pending',1,'2026-08-24T00:00:00.000Z','2026-08-24T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        bump_store_revision(&tx).unwrap();
+        tx.commit().unwrap();
+
+        let identity = store.identity(Plugin::Tutor).unwrap();
+        let logical_hash = canonical_logical_hash(Plugin::Tutor, &store.connection).unwrap();
+        let tx = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        for session in ["sync-a-old", "sync-z-latest"] {
+            record_sync_receipt(
+                &tx,
+                Plugin::Tutor,
+                session,
+                identity.revision,
+                identity.revision,
+                &logical_hash,
+                "ready",
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let stale = takeover_turn(
+            &mut store,
+            TurnTakeover {
+                entity_id: "33333333333333333333333333333333".into(),
+                old_owner: "mac-old".into(),
+                new_owner: "mac-new".into(),
+                if_revision: 1,
+                sync_session_id: "sync-a-old".into(),
+                request_id: "takeover-old-receipt".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(stale.code(), "stale_sync_receipt");
+
+        let taken = takeover_turn(
+            &mut store,
+            TurnTakeover {
+                entity_id: "33333333333333333333333333333333".into(),
+                old_owner: "mac-old".into(),
+                new_owner: "mac-new".into(),
+                if_revision: 1,
+                sync_session_id: "sync-z-latest".into(),
+                request_id: "takeover-latest-receipt".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(taken["result"]["turn"]["owner"], "mac-new");
+        assert_eq!(taken["result"]["turn"]["revision"], 2);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM tutor_turn_owner_history WHERE turn_id=?1",
+                    ["33333333333333333333333333333333"],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        let post_sync = takeover_turn(
+            &mut store,
+            TurnTakeover {
+                entity_id: "33333333333333333333333333333333".into(),
+                old_owner: "mac-new".into(),
+                new_owner: "mac-third".into(),
+                if_revision: 2,
+                sync_session_id: "sync-z-latest".into(),
+                request_id: "takeover-post-sync-mutation".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(post_sync.code(), "stale_sync_receipt");
+
+        let old_owner_commit = run_turn(
+            &mut store,
+            TurnCommand::Commit {
+                id: "33333333333333333333333333333333".into(),
+                if_revision: 2,
+                json: serde_json::json!({
+                    "owner":"mac-old","reply":"stale","checkpoint":{"kind":"checkpoint"},
+                    "request_id":"old-owner-commit"
+                })
+                .to_string(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(old_owner_commit.code(), "stale_owner");
+    }
 }

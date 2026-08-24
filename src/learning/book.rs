@@ -1131,6 +1131,24 @@ fn read_commit(
         ));
     }
     let timestamp = now(&tx)?;
+    let changed = tx.execute(
+        "UPDATE book_leases
+         SET state='committed',revision=revision+1,updated_at=?2,committed_at=?2
+         WHERE id=?1 AND owner=?3 AND state='active' AND revision=?4 AND range_hash=?5",
+        params![
+            lease_id,
+            timestamp,
+            input.owner,
+            if_revision,
+            input.range_hash,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::new(
+            "revision_conflict",
+            "book lease changed during commit",
+        ));
+    }
     tx.execute(
         "INSERT INTO book_window_reports(
            lease_id,summary,key_points_json,new_concepts_json,prior_links_json,
@@ -1146,11 +1164,6 @@ fn read_commit(
             json_string(&input.anomalies)?,
             timestamp,
         ],
-    )?;
-    tx.execute(
-        "UPDATE book_leases SET state='committed',revision=2,updated_at=?2,committed_at=?2
-         WHERE id=?1",
-        params![lease_id, timestamp],
     )?;
     let added = end - start + 1;
     let total = tx.query_row(
