@@ -89,6 +89,11 @@ impl Error {
         self.details = Some(details);
         self
     }
+
+    #[allow(dead_code)] // Book uses this branch discriminator; the other fixed binaries do not.
+    pub(crate) fn code(&self) -> &'static str {
+        self.code
+    }
 }
 
 impl From<io::Error> for Error {
