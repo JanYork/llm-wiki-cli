@@ -8,6 +8,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    time::Instant,
 };
 use tempfile::TempDir;
 
@@ -896,33 +897,342 @@ fn partial_plugin_publication_cannot_be_aborted_and_resume_is_idempotent() {
 }
 
 #[test]
-#[ignore = "large Pro acceptance: requires LWC_LARGE_SYNC_FIXTURE produced by the public CLI generator"]
+#[ignore = "real-book Pro acceptance; set LWC_REAL_BOOK_FIXTURE_DIR and use /usr/bin/time -l"]
 fn large_fixture_manifest_has_frozen_capacity_and_no_loss_inventory() {
-    let root = PathBuf::from(
-        std::env::var_os("LWC_LARGE_SYNC_FIXTURE")
-            .expect("set LWC_LARGE_SYNC_FIXTURE to the generated two-host fixture"),
+    let world = World::new();
+    seed_small(&world);
+    bulk_seed_tutor(&world.local_home);
+    bulk_seed_practice(&world.local_home);
+    let books = prepare_real_books(&world);
+
+    let before = ["tutor", "book", "practice"]
+        .into_iter()
+        .map(|plugin| {
+            (
+                plugin,
+                canonical_snapshot(&database(&world.local_home, plugin), plugin_tables(plugin)),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let source_blobs = blob_hashes(&world.local_home.join(".lwc/plugins/book/blobs"));
+    let started = Instant::now();
+    let preserved = world.sync("merge", None, None);
+    assert!(
+        preserved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preserved.stderr)
     );
-    let manifest: Value =
-        serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
-    assert!(manifest["tutor_turns"].as_u64().unwrap() >= 10_000);
-    assert!(manifest["book_normalized_bytes"].as_u64().unwrap() >= 256 * 1024 * 1024);
-    assert!(manifest["book_blocks"].as_u64().unwrap() >= 100_000);
-    assert!(manifest["practice_items"].as_u64().unwrap() >= 50_000);
-    assert!(manifest["responses"].as_u64().unwrap() >= 10_000);
-    for key in [
-        "category_counts",
-        "category_ids_sha256",
-        "logical_hashes",
-        "blob_hashes",
-        "canaries",
-        "wall_ms",
-        "peak_rss_bytes",
-        "transferred_bytes",
-        "rebuilt_bytes",
-    ] {
-        assert!(
-            !manifest[key].is_null(),
-            "large fixture manifest lacks {key}"
+    let preserved_result: Value = serde_json::from_slice(&preserved.stdout).unwrap();
+    for plugin in ["tutor", "book", "practice"] {
+        let report = plugin_report(&preserved_result, plugin);
+        assert_eq!(report["status"], "preserved_not_ready");
+        assert!(report["record_counts"].is_object());
+        assert!(report["blob_hashes"].is_array());
+    }
+    let preserved_book_manifest =
+        fs::read_to_string(preserved_manifest(&world.remote_home, "book")).unwrap();
+    assert!(!preserved_book_manifest.contains("book_blocks_fts"));
+    world.install_remote_runtimes();
+    let materialized = world.sync("merge", None, None);
+    assert!(
+        materialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&materialized.stderr)
+    );
+    let elapsed = started.elapsed();
+    let result: Value = serde_json::from_slice(&materialized.stdout).unwrap();
+    for plugin in ["tutor", "book", "practice"] {
+        let report = plugin_report(&result, plugin);
+        assert_eq!(report["remote_runtime_ready"], true);
+        assert_eq!(report["rebuild"]["remote"], true);
+    }
+    for plugin in ["tutor", "book", "practice"] {
+        assert_eq!(
+            canonical_snapshot(&database(&world.remote_home, plugin), plugin_tables(plugin)),
+            before[plugin],
+            "{plugin} large canonical inventory changed"
         );
     }
+    assert_eq!(
+        blob_hashes(&world.remote_home.join(".lwc/plugins/book/blobs")),
+        source_blobs
+    );
+    let counts = large_counts(&world.remote_home);
+    assert!(counts["tutor_turns"].as_i64().unwrap() >= 10_000);
+    assert!(counts["book_blocks"].as_i64().unwrap() > 0);
+    assert!(counts["practice_items"].as_i64().unwrap() >= 50_000);
+    assert!(counts["responses"].as_i64().unwrap() >= 10_000);
+    assert_large_canaries(&world, &books);
+    println!(
+        "{}",
+        json!({
+            "wall_ms": elapsed.as_millis(),
+            "books": books.iter().map(|book| json!({"name":book.name,"normalized_bytes":book.normalized_bytes,"blocks":book.blocks})).collect::<Vec<_>>(),
+            "counts": counts,
+            "blob_hashes": source_blobs,
+            "plugins": result["plugins"],
+            "rss":"capture with outer /usr/bin/time -l maximum resident set size"
+        })
+    );
+}
+
+fn bulk_seed_tutor(home: &Path) {
+    let mut connection = Connection::open(database(home, "tutor")).unwrap();
+    let session: String = connection
+        .query_row(
+            "SELECT id FROM tutor_sessions ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let transaction = connection.transaction().unwrap();
+    {
+        let mut insert = transaction
+            .prepare("INSERT INTO tutor_turns(id,session_id,owner,input,reply,checkpoint_json,checkpoint_kind,hint_level,full_answer,state,revision,created_at,updated_at,committed_at) VALUES(?1,?2,'bulk-owner',?3,'bulk-reply','{}','progress',0,0,'committed',2,'2026-08-24T00:00:00Z','2026-08-24T00:00:00Z','2026-08-24T00:00:00Z')")
+            .unwrap();
+        for index in 0..10_000_i64 {
+            insert
+                .execute(rusqlite::params![
+                    format!("d{index:031x}"),
+                    session,
+                    format!("turn-canary-{index:05}")
+                ])
+                .unwrap();
+        }
+    }
+    transaction.execute_batch(
+        "INSERT INTO tutor_goals VALUES('99999999999999999999999999999991','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','large goal','active',1,'2026-08-24T00:00:00Z','2026-08-24T00:00:00Z',NULL);
+         INSERT INTO tutor_goal_criteria VALUES('99999999999999999999999999999992','99999999999999999999999999999991',0,'large criterion');
+         INSERT INTO tutor_goal_history VALUES('99999999999999999999999999999991',1,'{}','2026-08-24T00:00:00Z');
+         INSERT INTO tutor_plans VALUES('99999999999999999999999999999993','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','99999999999999999999999999999991','fixed','active',1,'2026-08-24T00:00:00Z','2026-08-24T00:00:00Z');
+         INSERT INTO tutor_plan_versions VALUES('99999999999999999999999999999993',1,'99999999999999999999999999999991','2027-01-01',600,'[]','[]','steady','practice',0.5,'learner','large fixture','large fixture','[]',NULL,'2026-08-24T00:00:00Z');
+         INSERT INTO tutor_plan_steps VALUES('99999999999999999999999999999994','99999999999999999999999999999993',0,'large step',60,'planned',NULL,NULL,1,'2026-08-24T00:00:00Z','2026-08-24T00:00:00Z');
+         INSERT INTO tutor_plan_step_history VALUES('99999999999999999999999999999994',1,'planned','learner','large fixture','[]','2026-08-24T00:00:00Z');
+         UPDATE plugin_meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='revision';",
+    ).unwrap();
+    transaction.commit().unwrap();
+}
+
+fn bulk_seed_practice(home: &Path) {
+    let mut connection = Connection::open(database(home, "practice")).unwrap();
+    let bank: String = connection
+        .query_row(
+            "SELECT id FROM practice_banks ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let paper: String = connection
+        .query_row("SELECT id FROM papers ORDER BY id LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let attempt: String = connection
+        .query_row("SELECT id FROM attempts ORDER BY id LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let source: String = Connection::open(database(home, "tutor"))
+        .unwrap()
+        .query_row(
+            "SELECT json_object('kind','tutor_turn','id',id,'revision_or_hash',CAST(revision AS TEXT),'subject_id',?1) FROM tutor_turns WHERE state='committed' ORDER BY id LIMIT 1",
+            [SUBJECT_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let transaction = connection.transaction().unwrap();
+    {
+        let mut item = transaction.prepare("INSERT INTO practice_items VALUES(?1,1,?2,'choice','objective','verified',?3,'\"A\"',NULL,1.0,1,0.5,'large',?4,'2026-08-24T00:00:00Z')").unwrap();
+        let mut member = transaction
+            .prepare("INSERT INTO bank_items VALUES(?1,?2,1,'2026-08-24T00:00:00Z')")
+            .unwrap();
+        for index in 0..50_000_i64 {
+            let id = format!("e{index:031x}");
+            item.execute(rusqlite::params![
+                id,
+                SUBJECT_ID,
+                format!("item-canary-{index:05}"),
+                source
+            ])
+            .unwrap();
+            member.execute(rusqlite::params![bank, id]).unwrap();
+        }
+    }
+    {
+        let mut paper_item = transaction.prepare("INSERT INTO paper_items VALUES(?1,?2,?3,'general',?4,1,?5,'\"A\"',NULL,?6,1.0,'choice','objective')").unwrap();
+        let mut response = transaction
+            .prepare(
+                "INSERT INTO responses VALUES(?1,?2,?3,'choice','\"A\"',1,'2026-08-24T00:00:00Z')",
+            )
+            .unwrap();
+        let mut history = transaction
+            .prepare(
+                "INSERT INTO response_history VALUES(?1,1,'choice','\"A\"','2026-08-24T00:00:00Z')",
+            )
+            .unwrap();
+        for index in 0..10_000_i64 {
+            let item_id = format!("e{index:031x}");
+            let paper_item_id = format!("6{index:031x}");
+            let response_id = format!("f{index:031x}");
+            paper_item
+                .execute(rusqlite::params![
+                    paper_item_id,
+                    paper,
+                    index + 2,
+                    item_id,
+                    format!("item-canary-{index:05}"),
+                    source
+                ])
+                .unwrap();
+            response
+                .execute(rusqlite::params![response_id, attempt, paper_item_id])
+                .unwrap();
+            history.execute([response_id]).unwrap();
+        }
+    }
+    for index in 0..100_i64 {
+        let grade = format!("5{index:031x}");
+        let item = format!("e{index:031x}");
+        let response = format!("f{index:031x}");
+        transaction.execute("INSERT INTO grades VALUES(?1,?2,1,?3,1.0,1.0,'large objective',1.0,'objective','accepted',1,'2026-08-24T00:00:00Z')", rusqlite::params![grade,item,response]).unwrap();
+        transaction.execute("INSERT INTO grade_history VALUES(?1,1,1.0,'large objective',1.0,'objective','accepted','2026-08-24T00:00:00Z')", [grade]).unwrap();
+    }
+    transaction.execute("UPDATE plugin_meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='revision'", []).unwrap();
+    transaction.commit().unwrap();
+}
+
+struct RealBook {
+    name: &'static str,
+    id: String,
+    normalized_bytes: i64,
+    blocks: i64,
+    canaries: [&'static str; 3],
+}
+
+fn prepare_real_books(world: &World) -> Vec<RealBook> {
+    let fixture = PathBuf::from(
+        std::env::var_os("LWC_REAL_BOOK_FIXTURE_DIR")
+            .expect("LWC_REAL_BOOK_FIXTURE_DIR must point at the three real Markdown books"),
+    );
+    let specifications = [
+        ("jobs.md", ["现实扭曲力场", "皮克斯", "Macintosh"]),
+        ("sapiens.md", ["认知革命", "农业革命", "科学革命"]),
+        ("netty.md", ["EventLoop", "ChannelPipeline", "ByteBuf"]),
+    ];
+    let mut books = Vec::new();
+    for (name, canaries) in specifications {
+        let source = fixture.join(name);
+        assert!(
+            source.is_file(),
+            "real Book fixture is missing: {}",
+            source.display()
+        );
+        fs::copy(&source, world.local.join(name)).unwrap();
+        let imported = world.plugin_ok(
+            "book",
+            &world.local,
+            &world.local_home,
+            &[
+                "import",
+                "--json",
+                &json!({"subject_id":SUBJECT_ID,"path":name,"title":name,"request_id":format!("real-{name}-import")}).to_string(),
+            ],
+        );
+        let id = imported["result"]["book"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        world.plugin_ok(
+            "book",
+            &world.local,
+            &world.local_home,
+            &[
+                "prepare",
+                &id,
+                "--if-revision",
+                "1",
+                "--json",
+                &json!({"request_id":format!("real-{name}-prepare")}).to_string(),
+            ],
+        );
+        let connection = Connection::open(database(&world.local_home, "book")).unwrap();
+        let (normalized_bytes, blocks) = connection
+            .query_row(
+                "SELECT b.normalized_bytes,COUNT(k.id) FROM books b JOIN book_blocks k ON k.book_id=b.id WHERE b.id=?1 GROUP BY b.id",
+                [&id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert!(normalized_bytes > 0, "{name} has no normalized bytes");
+        assert!(blocks > 0, "{name} has no prepared blocks");
+        books.push(RealBook {
+            name,
+            id,
+            normalized_bytes,
+            blocks,
+            canaries,
+        });
+    }
+    books
+}
+
+fn large_counts(home: &Path) -> Value {
+    let count = |plugin: &str, table: &str| {
+        Connection::open(database(home, plugin))
+            .unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    json!({"tutor_turns":count("tutor","tutor_turns"),"book_blocks":count("book","book_blocks"),"practice_items":count("practice","practice_items"),"responses":count("practice","responses")})
+}
+
+fn assert_large_canaries(world: &World, books: &[RealBook]) {
+    for index in [0_i64, 5_000, 9_999] {
+        let id = format!("d{index:031x}");
+        let shown = world.plugin_ok(
+            "tutor",
+            &world.remote,
+            &world.remote_home,
+            &["turn", "show", &id],
+        );
+        assert_eq!(
+            shown["result"]["turn"]["input"],
+            format!("turn-canary-{index:05}")
+        );
+    }
+    for index in [0_i64, 25_000, 49_999] {
+        let id = format!("e{index:031x}");
+        let shown = world.plugin_ok(
+            "practice",
+            &world.remote,
+            &world.remote_home,
+            &["item", "show", &id],
+        );
+        assert_eq!(
+            shown["result"]["item"]["prompt"],
+            format!("item-canary-{index:05}")
+        );
+    }
+    for book in books {
+        for query in book.canaries {
+            let found = world.plugin_ok(
+                "book",
+                &world.remote,
+                &world.remote_home,
+                &["search", &book.id, query, "--limit", "1"],
+            );
+            assert_eq!(found["result"]["hits"][0]["book_id"], book.id);
+        }
+    }
+}
+
+fn plugin_report<'a>(result: &'a Value, plugin: &str) -> &'a Value {
+    result["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|report| report["plugin"] == plugin)
+        .unwrap()
 }
