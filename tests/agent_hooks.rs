@@ -780,6 +780,59 @@ fn boundary_hook_reports_enabled_office_without_downloading_it() {
 }
 
 #[test]
+fn boundary_hook_reports_learning_readiness_without_installing_or_reading_plugin_data() {
+    let world = World::new(true);
+    world.ok(&["--scope", "global", "init"]);
+    world.ok(&[
+        "--scope",
+        "global",
+        "config",
+        "set",
+        "--tutor",
+        "enabled",
+        "--practice",
+        "enabled",
+    ]);
+    fs::create_dir_all(world.home.join(".lwc/plugins/tutor")).unwrap();
+    fs::write(
+        world.home.join(".lwc/plugins/tutor/private.txt"),
+        "sensitive learner profile",
+    )
+    .unwrap();
+    let before = snapshot();
+    let input = serde_json::json!({"source": "startup", "cwd": world.project}).to_string();
+    let output = world.output(
+        &[
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ],
+        &input,
+    );
+    let readiness = readiness(&context(&output));
+    for (plugin, enabled) in [("tutor", true), ("book", false), ("practice", true)] {
+        assert_eq!(readiness[plugin]["enabled"], enabled, "{plugin}");
+        assert_eq!(readiness[plugin]["runtime_installed"], false, "{plugin}");
+        assert_eq!(readiness[plugin]["ready"], false, "{plugin}");
+        assert_eq!(
+            readiness[plugin]["configure"],
+            format!("lwc --scope global config set --{plugin} enabled")
+        );
+        assert_eq!(
+            readiness[plugin]["command"],
+            format!("lwc {plugin} COMMAND ...")
+        );
+    }
+    let rendered = serde_json::to_string(&readiness).unwrap();
+    assert!(!rendered.contains("sensitive learner profile"));
+    assert!(!world.home.join(".lwc/runtime").exists());
+    assert_eq!(snapshot(), before);
+}
+
+#[test]
 fn temporal_memory_readiness_is_bounded_and_hook_is_read_only() {
     let world = World::new(true);
     world.ok(&[

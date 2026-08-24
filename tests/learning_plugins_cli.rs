@@ -268,3 +268,107 @@ fn learning_plugin_commands_reject_changesets_before_runtime_installation() {
     );
     assert!(!home.join(".lwc/runtime/practice").exists());
 }
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn learning_plugin_lazily_installs_a_strict_same_release_archive_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    let release = temp.path().join("release");
+    let fake_bin = temp.path().join("bin");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&release).unwrap();
+    fs::create_dir_all(&fake_bin).unwrap();
+    assert!(
+        run(&cwd, &home, &["--scope", "global", "init"])
+            .status
+            .success()
+    );
+    assert!(
+        run(
+            &cwd,
+            &home,
+            &["--scope", "global", "config", "set", "--tutor", "enabled"]
+        )
+        .status
+        .success()
+    );
+
+    let archive_name = asset("tutor");
+    let archive_root = archive_name.trim_end_matches(".tar.gz");
+    let stage = temp.path().join("stage").join(archive_root);
+    fs::create_dir_all(&stage).unwrap();
+    let binary = stage.join("lwc-tutor");
+    fs::write(&binary, "#!/bin/sh\nprintf '{\"installed\":true}\n'\n").unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    let archive = release.join(&archive_name);
+    let packaged = Command::new("tar")
+        .args(["-C", temp.path().join("stage").to_str().unwrap(), "-czf"])
+        .arg(&archive)
+        .arg(archive_root)
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let archive_sha = Sha256::digest(fs::read(&archive).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    fs::write(
+        release.join("SHA256SUMS"),
+        format!("{archive_sha}  {archive_name}\n"),
+    )
+    .unwrap();
+
+    let downloads = temp.path().join("downloads.log");
+    let curl = fake_bin.join("curl");
+    fs::write(
+        &curl,
+        "#!/bin/sh\nout=''\nurl=''\nwhile [ \"$#\" -gt 0 ]; do\n  [ \"$1\" = --output ] && { shift; out=$1; }\n  url=$1\n  shift\ndone\nname=${url##*/}\ncp \"$LWC_TEST_LEARNING_RELEASE/$name\" \"$out\"\nprintf '%s\\n' \"$url\" >> \"$LWC_TEST_LEARNING_DOWNLOADS\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let invoke = || {
+        Command::new(env!("CARGO_BIN_EXE_lwc"))
+            .current_dir(&cwd)
+            .env("HOME", &home)
+            .env("PATH", &path)
+            .env(
+                "LWC_TEST_LEARNING_RELEASE_ROOT",
+                "https://example.invalid/releases/download",
+            )
+            .env("LWC_TEST_LEARNING_RELEASE", &release)
+            .env("LWC_TEST_LEARNING_DOWNLOADS", &downloads)
+            .args(["tutor", "status"])
+            .output()
+            .unwrap()
+    };
+
+    for _ in 0..2 {
+        let output = invoke();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"{\"installed\":true}\n");
+    }
+    let requests = fs::read_to_string(downloads).unwrap();
+    assert_eq!(requests.lines().count(), 2, "{requests}");
+    assert!(requests.contains(&format!("/v{}/SHA256SUMS", env!("CARGO_PKG_VERSION"))));
+    assert!(requests.contains(&format!("/v{}/{}", env!("CARGO_PKG_VERSION"), archive_name)));
+    assert!(runtime(&home, "tutor").join("runtime.json").is_file());
+    assert!(runtime(&home, "tutor").join("lwc-tutor").is_file());
+}
