@@ -15,6 +15,7 @@ const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // Each fixed binary constructs exactly one of the three variants.
 pub enum Plugin {
     Tutor,
     Book,
