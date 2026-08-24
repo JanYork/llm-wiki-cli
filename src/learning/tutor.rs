@@ -2476,7 +2476,7 @@ mod takeover_tests {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
-        for session in ["sync-a-old", "sync-z-latest"] {
+        for session in ["sync-z-old", "sync-a-latest"] {
             record_sync_receipt(
                 &tx,
                 Plugin::Tutor,
@@ -2497,7 +2497,7 @@ mod takeover_tests {
                 old_owner: "mac-old".into(),
                 new_owner: "mac-new".into(),
                 if_revision: 1,
-                sync_session_id: "sync-a-old".into(),
+                sync_session_id: "sync-z-old".into(),
                 request_id: "takeover-old-receipt".into(),
             },
         )
@@ -2511,7 +2511,7 @@ mod takeover_tests {
                 old_owner: "mac-old".into(),
                 new_owner: "mac-new".into(),
                 if_revision: 1,
-                sync_session_id: "sync-z-latest".into(),
+                sync_session_id: "sync-a-latest".into(),
                 request_id: "takeover-latest-receipt".into(),
             },
         )
@@ -2537,7 +2537,7 @@ mod takeover_tests {
                 old_owner: "mac-new".into(),
                 new_owner: "mac-third".into(),
                 if_revision: 2,
-                sync_session_id: "sync-z-latest".into(),
+                sync_session_id: "sync-a-latest".into(),
                 request_id: "takeover-post-sync-mutation".into(),
             },
         )
