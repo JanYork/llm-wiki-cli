@@ -1160,7 +1160,7 @@ fn sensitive_soul_proposal_survives_until_learner_approval_and_explicit_publish(
     assert!(
         fs::read_to_string(home.join(".lwc/plugins/tutor/soul.md"))
             .unwrap()
-            .contains("严格证据门槛")
+            .contains("稳定人格判断")
     );
 
     let history = ok(&cwd, &home, &["soul", "history"]);

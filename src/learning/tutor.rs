@@ -111,6 +111,27 @@ enum FactCommand {
 #[derive(Subcommand)]
 enum SoulCommand {
     Show,
+    History,
+    Propose {
+        #[arg(long)]
+        if_revision: i64,
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
+    },
+    Approve {
+        id: String,
+        #[arg(long)]
+        if_revision: i64,
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
+    },
+    PublishProposal {
+        id: String,
+        #[arg(long)]
+        if_revision: i64,
+        #[arg(long, value_name = "JSON|-|@PATH")]
+        json: String,
+    },
     Publish {
         #[arg(long)]
         if_revision: i64,
@@ -193,6 +214,30 @@ struct SoulPublish {
     sensitivity: String,
     #[serde(default)]
     approved: bool,
+    request_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SoulProposalCreate {
+    body: String,
+    #[serde(default)]
+    fact_refs: Vec<String>,
+    reason: String,
+    sensitivity: String,
+    request_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SoulApproval {
+    approved_by: String,
+    request_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SoulProposalPublish {
     request_id: String,
 }
 
@@ -297,6 +342,23 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
            sensitivity TEXT NOT NULL,
            approved INTEGER NOT NULL,
            created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS soul_proposals(
+           id TEXT PRIMARY KEY,
+           base_revision INTEGER NOT NULL REFERENCES soul_versions(revision),
+           body TEXT NOT NULL,
+           body_hash TEXT NOT NULL,
+           fact_refs_json TEXT NOT NULL,
+           reason TEXT NOT NULL,
+           sensitivity TEXT NOT NULL CHECK(sensitivity IN (
+             'ordinary','sensitive','behavior-changing'
+           )),
+           state TEXT NOT NULL CHECK(state IN ('proposed','approved','published')),
+           approved_by TEXT,
+           published_revision INTEGER REFERENCES soul_versions(revision),
+           revision INTEGER NOT NULL CHECK(revision>=1),
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS learner_facts(
            id TEXT PRIMARY KEY,
@@ -1406,38 +1468,190 @@ fn run_soul(store: &mut Store, command: SoulCommand) -> Result<Value> {
             "soul.show",
             json!({"soul": soul(&store.connection)?}),
         )),
+        SoulCommand::History => Ok(envelope(
+            Plugin::Tutor,
+            "soul.history",
+            soul_history(&store.connection)?,
+        )),
+        SoulCommand::Propose { if_revision, json } => {
+            let input: SoulProposalCreate = read_json(&json)?;
+            validate_request_id(&input.request_id)?;
+            validate_soul_content(
+                &input.body,
+                &input.fact_refs,
+                &input.reason,
+                &input.sensitivity,
+            )?;
+            let fingerprint = fingerprint(&json!({
+                "if_revision": if_revision,
+                "proposal": &input,
+            }))?;
+            let tx = store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
+                return Ok(value);
+            }
+            require_soul_revision(&tx, if_revision)?;
+            let id = new_id(Plugin::Tutor, &input.request_id);
+            let timestamp = now(&tx)?;
+            tx.execute(
+                "INSERT INTO soul_proposals(
+                   id,base_revision,body,body_hash,fact_refs_json,reason,sensitivity,
+                   state,approved_by,published_revision,revision,created_at,updated_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,'proposed',NULL,NULL,1,?8,?8)",
+                params![
+                    id,
+                    if_revision,
+                    input.body,
+                    sha256(input.body.as_bytes()),
+                    serde_json::to_string(&input.fact_refs)
+                        .map_err(|error| Error::new("json_error", error.to_string()))?,
+                    input.reason,
+                    input.sensitivity,
+                    timestamp,
+                ],
+            )?;
+            let value = envelope(
+                Plugin::Tutor,
+                "soul.propose",
+                json!({"proposal": soul_proposal(&tx, &id)?}),
+            );
+            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            tx.commit()?;
+            Ok(value)
+        }
+        SoulCommand::Approve {
+            id,
+            if_revision,
+            json,
+        } => {
+            validate_id(&id)?;
+            let input: SoulApproval = read_json(&json)?;
+            validate_request_id(&input.request_id)?;
+            if input.approved_by != "learner" {
+                return Err(Error::new(
+                    "learner_confirmation_required",
+                    "Soul approval must come from the learner",
+                ));
+            }
+            let fingerprint = fingerprint(&json!({
+                "id": id,
+                "if_revision": if_revision,
+                "approval": &input,
+            }))?;
+            let tx = store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
+                return Ok(value);
+            }
+            require_soul_revision(&tx, if_revision)?;
+            let proposal = soul_proposal(&tx, &id)?;
+            if proposal["base_revision"] != if_revision || proposal["state"] != "proposed" {
+                return Err(Error::new(
+                    "soul_proposal_conflict",
+                    "Soul proposal is stale or is not awaiting approval",
+                ));
+            }
+            let timestamp = now(&tx)?;
+            tx.execute(
+                "UPDATE soul_proposals SET state='approved',approved_by=?2,
+                   revision=revision+1,updated_at=?3 WHERE id=?1",
+                params![id, input.approved_by, timestamp],
+            )?;
+            let value = envelope(
+                Plugin::Tutor,
+                "soul.approve",
+                json!({"proposal": soul_proposal(&tx, &id)?}),
+            );
+            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            tx.commit()?;
+            Ok(value)
+        }
+        SoulCommand::PublishProposal {
+            id,
+            if_revision,
+            json,
+        } => {
+            validate_id(&id)?;
+            let input: SoulProposalPublish = read_json(&json)?;
+            validate_request_id(&input.request_id)?;
+            let fingerprint = fingerprint(&json!({
+                "id": id,
+                "if_revision": if_revision,
+                "publish": &input,
+            }))?;
+            let tx = store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
+                return Ok(value);
+            }
+            require_soul_revision(&tx, if_revision)?;
+            let proposal = soul_proposal(&tx, &id)?;
+            if proposal["base_revision"] != if_revision || proposal["state"] == "published" {
+                return Err(Error::new(
+                    "soul_proposal_conflict",
+                    "Soul proposal is stale or already published",
+                ));
+            }
+            if proposal["sensitivity"] != "ordinary" && proposal["state"] != "approved" {
+                return Err(Error::new(
+                    "soul_approval_required",
+                    "sensitive or behavior-changing Soul proposals require learner approval",
+                ));
+            }
+            let revision = if_revision + 1;
+            let timestamp = now(&tx)?;
+            tx.execute(
+                "INSERT INTO soul_versions(
+                   revision,body,body_hash,fact_refs_json,reason,sensitivity,approved,created_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    revision,
+                    proposal["body"].as_str().unwrap(),
+                    proposal["body_sha256"].as_str().unwrap(),
+                    serde_json::to_string(&proposal["fact_refs"])
+                        .map_err(|error| Error::new("json_error", error.to_string()))?,
+                    proposal["reason"].as_str().unwrap(),
+                    proposal["sensitivity"].as_str().unwrap(),
+                    proposal["state"] == "approved",
+                    timestamp,
+                ],
+            )?;
+            tx.execute(
+                "UPDATE soul_proposals SET state='published',published_revision=?2,
+                   revision=revision+1,updated_at=?3 WHERE id=?1",
+                params![id, revision, timestamp],
+            )?;
+            let value = envelope(
+                Plugin::Tutor,
+                "soul.publish-proposal",
+                json!({
+                    "soul": soul(&tx)?,
+                    "proposal": soul_proposal(&tx, &id)?,
+                }),
+            );
+            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            tx.commit()?;
+            materialize_soul(&store.connection, &store.root)?;
+            Ok(value)
+        }
         SoulCommand::Publish { if_revision, json } => {
             let input: SoulPublish = read_json(&json)?;
             validate_request_id(&input.request_id)?;
-            if input.body.trim().is_empty() {
-                return Err(Error::new("invalid_input", "Soul body must not be empty"));
-            }
-            validate_text("reason", &input.reason, 4096)?;
-            if input.body.len() > SOUL_MAX_BYTES {
-                return Err(Error::new(
-                    "soul_too_large",
-                    format!("Soul body exceeds {SOUL_MAX_BYTES} UTF-8 bytes"),
-                ));
-            }
-            if !matches!(
-                input.sensitivity.as_str(),
-                "ordinary" | "sensitive" | "behavior-changing"
-            ) {
-                return Err(Error::new("invalid_input", "invalid Soul sensitivity"));
-            }
+            validate_soul_content(
+                &input.body,
+                &input.fact_refs,
+                &input.reason,
+                &input.sensitivity,
+            )?;
             if input.sensitivity != "ordinary" && !input.approved {
                 return Err(Error::new(
                     "soul_approval_required",
                     "sensitive or behavior-changing Soul revisions require learner approval",
                 ));
-            }
-            if input.fact_refs.len() > 1024
-                || input
-                    .fact_refs
-                    .iter()
-                    .any(|reference| reference.trim().is_empty())
-            {
-                return Err(Error::new("invalid_input", "Soul fact_refs are invalid"));
             }
             let fingerprint = fingerprint(&json!({
                 "if_revision": if_revision,
@@ -1479,6 +1693,45 @@ fn run_soul(store: &mut Store, command: SoulCommand) -> Result<Value> {
             materialize_soul(&store.connection, &store.root)?;
             Ok(value)
         }
+    }
+}
+
+fn validate_soul_content(
+    body: &str,
+    fact_refs: &[String],
+    reason: &str,
+    sensitivity: &str,
+) -> Result<()> {
+    if body.trim().is_empty() {
+        return Err(Error::new("invalid_input", "Soul body must not be empty"));
+    }
+    if body.len() > SOUL_MAX_BYTES {
+        return Err(Error::new(
+            "soul_too_large",
+            format!("Soul body exceeds {SOUL_MAX_BYTES} UTF-8 bytes"),
+        ));
+    }
+    validate_text("reason", reason, 4096)?;
+    if !matches!(sensitivity, "ordinary" | "sensitive" | "behavior-changing") {
+        return Err(Error::new("invalid_input", "invalid Soul sensitivity"));
+    }
+    if fact_refs.len() > 1024
+        || fact_refs
+            .iter()
+            .any(|reference| reference.trim().is_empty())
+    {
+        return Err(Error::new("invalid_input", "Soul fact_refs are invalid"));
+    }
+    Ok(())
+}
+
+fn require_soul_revision(connection: &Connection, expected: i64) -> Result<()> {
+    let current = soul(connection)?["revision"].as_i64().unwrap();
+    if current == expected {
+        Ok(())
+    } else {
+        Err(Error::new("revision_conflict", "Soul revision is stale")
+            .details(json!({"expected": expected, "current": current})))
     }
 }
 
@@ -1585,6 +1838,110 @@ fn soul(connection: &Connection) -> Result<Value> {
         "approved": row.6,
         "created_at": row.7,
     }))
+}
+
+fn soul_proposal(connection: &Connection, id: &str) -> Result<Value> {
+    validate_id(id)?;
+    let row = connection
+        .query_row(
+            "SELECT id,base_revision,body,body_hash,fact_refs_json,reason,sensitivity,
+                    state,approved_by,published_revision,revision,created_at,updated_at
+             FROM soul_proposals WHERE id=?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            Error::new(
+                "soul_proposal_not_found",
+                format!("Soul proposal {id} was not found"),
+            )
+        })?;
+    let refs: Value = serde_json::from_str(&row.4)
+        .map_err(|error| Error::new("corrupt_store", error.to_string()))?;
+    Ok(json!({
+        "id": row.0,
+        "base_revision": row.1,
+        "body": row.2,
+        "body_sha256": row.3,
+        "body_bytes": row.2.len(),
+        "fact_refs": refs,
+        "reason": row.5,
+        "sensitivity": row.6,
+        "state": row.7,
+        "approved_by": row.8,
+        "published_revision": row.9,
+        "revision": row.10,
+        "created_at": row.11,
+        "updated_at": row.12,
+    }))
+}
+
+fn soul_history(connection: &Connection) -> Result<Value> {
+    let mut versions =
+        connection.prepare("SELECT revision FROM soul_versions ORDER BY revision")?;
+    let revisions = versions
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let versions = revisions
+        .into_iter()
+        .map(|revision| {
+            let row = connection.query_row(
+                "SELECT body,body_hash,fact_refs_json,reason,sensitivity,approved,created_at
+                 FROM soul_versions WHERE revision=?1",
+                [revision],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, bool>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )?;
+            let refs: Value = serde_json::from_str(&row.2)
+                .map_err(|error| Error::new("corrupt_store", error.to_string()))?;
+            Ok(json!({
+                "revision": revision,
+                "body": row.0,
+                "body_sha256": row.1,
+                "fact_refs": refs,
+                "reason": row.3,
+                "sensitivity": row.4,
+                "approved": row.5,
+                "created_at": row.6,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut proposals =
+        connection.prepare("SELECT id FROM soul_proposals ORDER BY created_at,id")?;
+    let proposal_ids = proposals
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let proposals = proposal_ids
+        .iter()
+        .map(|id| soul_proposal(connection, id))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(json!({"versions": versions, "proposals": proposals}))
 }
 
 fn materialize_soul(connection: &Connection, root: &Path) -> Result<()> {
