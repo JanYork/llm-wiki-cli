@@ -108,10 +108,19 @@ impl SyncWorld {
                 .success()
         );
         fs::write(self.local.join("tracked.txt"), "base\n").unwrap();
-        for cwd in [&self.local, &self.remote] {
-            self.git(cwd, &["config", "user.name", "Sync Test"]);
-            self.git(cwd, &["config", "user.email", "sync@example.invalid"]);
-        }
+        assert!(
+            self.git(&self.local, &["config", "user.name", "Sync Test"])
+                .status
+                .success()
+        );
+        assert!(
+            self.git(
+                &self.local,
+                &["config", "user.email", "sync@example.invalid"],
+            )
+            .status
+            .success()
+        );
         assert!(
             self.git(&self.local, &["add", "tracked.txt"])
                 .status
@@ -126,6 +135,19 @@ impl SyncWorld {
             self.git(&self.remote, &["init", "-b", "main"])
                 .status
                 .success()
+        );
+        assert!(
+            self.git(&self.remote, &["config", "user.name", "Sync Test"])
+                .status
+                .success()
+        );
+        assert!(
+            self.git(
+                &self.remote,
+                &["config", "user.email", "sync@example.invalid"],
+            )
+            .status
+            .success()
         );
         assert!(
             self.git(

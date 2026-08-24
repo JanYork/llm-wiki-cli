@@ -1,6 +1,6 @@
 [package]
 name = "lwc"
-version = "0.17.2"
+version = "0.17.3"
 edition = "2024"
 description = "Agent-driven proactive memory CLI for AI agents — autonomously recall, maintain, and evolve persistent, source-grounded knowledge across sessions."
 license = "Apache-2.0"
