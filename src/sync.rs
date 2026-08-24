@@ -3197,7 +3197,7 @@ fn normalized_json_to_sql(value: &Value) -> Result<rusqlite::types::Value> {
             }
             let bytes = value
                 .as_bytes()
-                .chunks_exact(2)
+                .chunks(2)
                 .map(|pair| {
                     std::str::from_utf8(pair)
                         .ok()

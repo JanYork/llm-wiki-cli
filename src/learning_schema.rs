@@ -245,7 +245,7 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
+        .chunks(2)
         .map(|pair| {
             std::str::from_utf8(pair)
                 .ok()
