@@ -559,3 +559,72 @@ fn target() -> Result<&'static str> {
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn checksum_manifest_requires_one_strict_exact_entry() {
+        let valid = format!("{HASH}  other.tar.gz\n{HASH}  wanted.tar.gz\n");
+        assert_eq!(
+            checksum_for(valid.as_bytes(), "wanted.tar.gz").unwrap(),
+            HASH
+        );
+
+        for (manifest, code) in [
+            (
+                format!("{HASH}  other.tar.gz\n"),
+                "learning_checksum_entry_invalid",
+            ),
+            (
+                format!("{HASH}  wanted.tar.gz\n{HASH}  wanted.tar.gz\n"),
+                "learning_checksum_entry_invalid",
+            ),
+            (
+                format!("{} *wanted.tar.gz\n", HASH.to_uppercase()),
+                "learning_checksums_invalid",
+            ),
+            (
+                format!("{HASH}  ../wanted.tar.gz\n"),
+                "learning_checksums_invalid",
+            ),
+        ] {
+            assert_eq!(
+                checksum_for(manifest.as_bytes(), "wanted.tar.gz")
+                    .unwrap_err()
+                    .code,
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn downloaded_metadata_rejects_oversize_and_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let oversized = temp.path().join("oversized");
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(CHECKSUMS_MAX_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            ensure_regular_bounded(&oversized, CHECKSUMS_MAX_BYTES, "too_large")
+                .unwrap_err()
+                .code,
+            "too_large"
+        );
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&oversized, temp.path().join("link")).unwrap();
+            assert_eq!(
+                ensure_regular_bounded(&temp.path().join("link"), ARCHIVE_MAX_BYTES, "unsafe")
+                    .unwrap_err()
+                    .code,
+                "unsafe"
+            );
+        }
+    }
+}
