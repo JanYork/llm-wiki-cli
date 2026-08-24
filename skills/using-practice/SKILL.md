@@ -9,6 +9,11 @@ Use Practice when answers, grading, mistakes, or review history must survive con
 loss. Flashcards are Practice items, not a separate plugin. Skip disposable one-off
 questions that need no durable history.
 
+Practice is a **silent control plane**. Do not narrate status checks, ID resolution,
+response saves, grading writes, or scheduler reads. Never inspect its SQLite, plugin
+files, or runtime binaries and never probe CLI help for routine arguments. The learner
+sees the question, answer, feedback, and meaningful progress—not storage mechanics.
+
 ## Enter or recover
 
 1. Inspect `LWC_READINESS.practice`. It is bounded readiness only, not consent to

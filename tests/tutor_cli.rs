@@ -49,6 +49,140 @@ fn named_subject(cwd: &Path, home: &Path, name: &str, request_id: &str) -> Strin
 }
 
 #[test]
+fn status_returns_complete_bounded_resume_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+
+    let subject_id = named_subject(&cwd, &home, "英语", "resume-subject");
+    let goal_id = goal(&cwd, &home, &subject_id, "resume-goal");
+    let plan_input = serde_json::json!({
+        "subject_id": subject_id,
+        "goal_id": goal_id,
+        "mode": "agent-led",
+        "deadline": "2099-12-31T23:59:59+08:00",
+        "weekly_minutes": 60,
+        "core_content": ["日常表达"],
+        "order": ["先理解，再表达"],
+        "pace": "由学习者主动推进",
+        "method": "直接讲解后做迁移练习",
+        "exercise_ratio": 0.3,
+        "request_id": "resume-plan"
+    })
+    .to_string();
+    let plan_id =
+        ok(&cwd, &home, &["plan", "create", "--json", &plan_input])["result"]["plan"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    let session_id = session(&cwd, &home, &subject_id, "learning", "resume-session");
+
+    let committed_id = begin_turn(
+        &cwd,
+        &home,
+        &session_id,
+        "为什么英语疑问句需要助动词？",
+        "resume-turn-committed",
+    );
+    let commit_input = serde_json::json!({
+        "owner": "agent-local",
+        "reply": "助动词承担时态和疑问结构，实义动词因此保持原形。",
+        "checkpoint": {
+            "kind": "teaching",
+            "blocked_by": "尚未区分助动词与实义动词的职责",
+            "hint_level": 0,
+            "learner_attempted": false,
+            "explicit_answer_request": true,
+            "full_answer": true,
+            "feedback_evidence_refs": [],
+            "anchor": {
+                "current_node": "一般疑问句中的助动词",
+                "mastered_nodes": ["陈述句基本语序"],
+                "current_mode": "learning",
+                "clearance_status": "未达标",
+                "next_action": "用一个反例区分助动词与实义动词"
+            }
+        },
+        "request_id": "resume-turn-committed-commit"
+    })
+    .to_string();
+    ok(
+        &cwd,
+        &home,
+        &[
+            "turn",
+            "commit",
+            &committed_id,
+            "--if-revision",
+            "1",
+            "--json",
+            &commit_input,
+        ],
+    );
+    let pending_id = begin_turn(
+        &cwd,
+        &home,
+        &session_id,
+        "继续讲一般疑问句。",
+        "resume-turn-pending",
+    );
+    let _unplanned_goal_id = goal(&cwd, &home, &subject_id, "resume-goal-unplanned");
+
+    let status = ok(&cwd, &home, &["status"]);
+    let result = &status["result"];
+    assert_eq!(result["active_sessions"], 1);
+    assert_eq!(result["pending_turns"], 1);
+    assert_eq!(result["resume_contexts_truncated"], false);
+    assert!(
+        result["soul"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("老师的灵魂")
+    );
+
+    let contexts = result["resume_contexts"].as_array().unwrap();
+    assert_eq!(contexts.len(), 1);
+    let context = &contexts[0];
+    assert_eq!(context["session"]["id"], session_id);
+    assert_eq!(context["subject"]["id"], subject_id);
+    assert_eq!(context["goal"]["id"], goal_id);
+    assert_eq!(context["plan"]["id"], plan_id);
+    assert_eq!(context["latest_committed_turn"]["id"], committed_id);
+    assert_eq!(
+        context["latest_committed_turn"]["checkpoint"]["anchor"]["current_node"],
+        "一般疑问句中的助动词"
+    );
+    assert_eq!(context["pending_turn_count"], 1);
+    assert_eq!(context["pending_turns_truncated"], false);
+    assert_eq!(context["pending_turns"][0]["id"], pending_id);
+    assert_eq!(context["pending_turns"][0]["input"], "继续讲一般疑问句。");
+    assert!(!status.to_string().contains("system_prompt"));
+    assert!(!status.to_string().contains("chain_of_thought"));
+
+    for ordinal in 0..20 {
+        session(
+            &cwd,
+            &home,
+            &subject_id,
+            "learning",
+            &format!("resume-session-{ordinal}"),
+        );
+    }
+    let bounded = ok(&cwd, &home, &["status"]);
+    assert_eq!(bounded["result"]["active_sessions"], 21);
+    assert_eq!(
+        bounded["result"]["resume_contexts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        20
+    );
+    assert_eq!(bounded["result"]["resume_contexts_truncated"], true);
+}
+
+#[test]
 fn visible_turn_input_is_durable_before_reply_and_commit_is_idempotent() {
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().join("cwd");

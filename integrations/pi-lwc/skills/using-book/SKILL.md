@@ -9,6 +9,12 @@ Use Book when the user wants whole-book absorption, ordered reading, or recovery
 active Book lease. Skip ordinary lookup, summarization of supplied excerpts, and
 unsupported HTML, scanned/OCR PDF, MOBI, or AZW3 input.
 
+Book is a **silent control plane**. Do not narrate status checks, leases, locators,
+coverage commits, source lookup, or other routine tool calls. Never inspect its SQLite,
+plugin files, or runtime binaries and never probe CLI help for routine arguments. Give
+the user only the requested reading result, progress that materially affects them, or
+a concise actionable failure.
+
 ## Enter or recover
 
 1. Inspect `LWC_READINESS.book`. It is read-only capability metadata, not consent to

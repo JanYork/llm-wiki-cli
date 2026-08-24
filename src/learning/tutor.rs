@@ -9,6 +9,7 @@ use std::{collections::BTreeSet, fs, path::Path, sync::atomic::Ordering};
 
 const SOUL_DEFAULT_MAX_BYTES: usize = 64 * 1024;
 const SOUL_HARD_MAX_BYTES: usize = 256 * 1024;
+const RESUME_CONTEXT_LIMIT: usize = 20;
 const INITIAL_SOUL: &str = "# 老师的灵魂\n\n保持客观、科学、诚实，禁止谄媚。先识别学生的具体阻塞，再逐级提供提示；评价必须引用可观察证据。\n";
 
 #[derive(Parser)]
@@ -241,6 +242,18 @@ struct TeachingCheckpoint {
     feedback_evidence_refs: Vec<String>,
     #[serde(default)]
     praise: Option<String>,
+    #[serde(default)]
+    anchor: Option<CognitiveAnchor>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CognitiveAnchor {
+    current_node: String,
+    mastered_nodes: Vec<String>,
+    current_mode: String,
+    clearance_status: String,
+    next_action: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -807,24 +820,132 @@ fn run(cli: TutorCli) -> Result<Value> {
         TutorCommand::Soul { command } => run_soul(&mut store, command),
         TutorCommand::Goal { command } => run_goal(&mut store, command),
         TutorCommand::Plan { command } => crate::tutor_plan::run(&mut store, command),
-        TutorCommand::Status => {
-            let sessions = store.connection.query_row(
-                "SELECT COUNT(*) FROM tutor_sessions WHERE state='active'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )?;
-            let pending = store.connection.query_row(
-                "SELECT COUNT(*) FROM tutor_turns WHERE state='pending'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )?;
-            Ok(envelope(
-                Plugin::Tutor,
-                "status",
-                json!({"active_sessions": sessions, "pending_turns": pending}),
-            ))
-        }
+        TutorCommand::Status => tutor_status(&store.connection),
     }
+}
+
+fn tutor_status(connection: &Connection) -> Result<Value> {
+    let active_sessions = connection.query_row(
+        "SELECT COUNT(*) FROM tutor_sessions WHERE state='active'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let pending_turns = connection.query_row(
+        "SELECT COUNT(*) FROM tutor_turns WHERE state='pending'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT s.id FROM tutor_sessions s
+         WHERE s.state='active'
+         ORDER BY COALESCE(
+           (SELECT MAX(t.updated_at) FROM tutor_turns t WHERE t.session_id=s.id),
+           s.updated_at
+         ) DESC,s.id
+         LIMIT ?1",
+    )?;
+    let mut session_ids = statement
+        .query_map([RESUME_CONTEXT_LIMIT as i64 + 1], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let resume_contexts_truncated = session_ids.len() > RESUME_CONTEXT_LIMIT;
+    session_ids.truncate(RESUME_CONTEXT_LIMIT);
+
+    let mut resume_contexts = Vec::with_capacity(session_ids.len());
+    for session_id in session_ids {
+        let session = session(connection, &session_id)?;
+        let subject_id = session["subject_id"].as_str().unwrap();
+        let plan_id = connection
+            .query_row(
+                "SELECT id FROM tutor_plans
+                 WHERE subject_id=?1 AND status='active'
+                 ORDER BY updated_at DESC,id LIMIT 1",
+                [subject_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let plan = plan_id
+            .map(|id| crate::tutor_plan::current_plan(connection, &id))
+            .transpose()?;
+        let goal_id = if let Some(plan) = &plan {
+            Some(
+                plan["goal_id"]
+                    .as_str()
+                    .ok_or_else(|| Error::new("corrupt_store", "Tutor plan goal_id is missing"))?
+                    .to_owned(),
+            )
+        } else {
+            connection
+                .query_row(
+                    "SELECT id FROM tutor_goals
+                     WHERE subject_id=?1 AND status IN ('active','ready_to_complete')
+                     ORDER BY updated_at DESC,id LIMIT 1",
+                    [subject_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+        };
+        let latest_committed_id = connection
+            .query_row(
+                "SELECT id FROM tutor_turns
+                 WHERE session_id=?1 AND state='committed'
+                 ORDER BY committed_at DESC,id LIMIT 1",
+                [&session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let pending_turn_count = connection.query_row(
+            "SELECT COUNT(*) FROM tutor_turns WHERE session_id=?1 AND state='pending'",
+            [&session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let mut pending_statement = connection.prepare(
+            "SELECT id FROM tutor_turns
+             WHERE session_id=?1 AND state='pending'
+             ORDER BY created_at,id LIMIT ?2",
+        )?;
+        let mut pending_ids = pending_statement
+            .query_map(
+                params![session_id, RESUME_CONTEXT_LIMIT as i64 + 1],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let pending_turns_truncated = pending_ids.len() > RESUME_CONTEXT_LIMIT;
+        pending_ids.truncate(RESUME_CONTEXT_LIMIT);
+        let pending = pending_ids
+            .iter()
+            .map(|id| turn(connection, id))
+            .collect::<Result<Vec<_>>>()?;
+
+        let subject = subject(connection, subject_id)?;
+        let goal = goal_id.map(|id| goal(connection, &id)).transpose()?;
+        let latest_committed_turn = latest_committed_id
+            .map(|id| turn(connection, &id))
+            .transpose()?;
+        resume_contexts.push(json!({
+            "session": session,
+            "subject": subject,
+            "goal": goal,
+            "plan": plan,
+            "latest_committed_turn": latest_committed_turn,
+            "pending_turn_count": pending_turn_count,
+            "pending_turns": pending,
+            "pending_turns_truncated": pending_turns_truncated,
+        }));
+    }
+
+    Ok(envelope(
+        Plugin::Tutor,
+        "status",
+        json!({
+            "active_sessions": active_sessions,
+            "pending_turns": pending_turns,
+            "soul": soul(connection)?,
+            "resume_contexts": resume_contexts,
+            "resume_contexts_truncated": resume_contexts_truncated,
+        }),
+    ))
 }
 
 fn run_session(store: &mut Store, command: SessionCommand) -> Result<Value> {
@@ -1224,6 +1345,21 @@ fn validate_teaching_checkpoint(
                 "feedback_evidence_required",
                 "praise and feedback must cite observed evidence",
             ));
+        }
+    }
+    if let Some(anchor) = &checkpoint.anchor {
+        validate_text("anchor.current_node", &anchor.current_node, 16 * 1024)?;
+        validate_text("anchor.current_mode", &anchor.current_mode, 64)?;
+        validate_text("anchor.clearance_status", &anchor.clearance_status, 64)?;
+        validate_text("anchor.next_action", &anchor.next_action, 16 * 1024)?;
+        if anchor.mastered_nodes.len() > 256 {
+            return Err(Error::new(
+                "invalid_input",
+                "anchor.mastered_nodes may contain at most 256 entries",
+            ));
+        }
+        for node in &anchor.mastered_nodes {
+            validate_text("anchor.mastered_nodes", node, 512)?;
         }
     }
     Ok(Some(checkpoint))

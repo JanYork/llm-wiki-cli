@@ -301,6 +301,11 @@ workflow; ambiguous intent causes one direct question. Ordinary factual Q&A stay
 outside Tutor and is not recorded. If a required plugin is disabled, the Agent asks
 once before enabling it unless the user explicitly requested enablement.
 
+Learning operations are a silent control plane: routine status, persistence, and
+source/assessment calls are not narrated. `lwc tutor status` returns the complete Soul
+and bounded active-session resume contexts in one read; control invocations such as
+`$using-tutor` are never stored as learner turns.
+
 Plugin roots are private user data. They are not projected into the ordinary LWC Wiki,
 and v1 provides no forget/clear/purge command. Disable, runtime replacement, archive,
 correction, and Sync preserve canonical history; any future destructive purge requires

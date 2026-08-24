@@ -52,6 +52,13 @@ generic plugin. Before new work, invoke the matching `using-tutor`, `using-book`
 `using-practice` Skill and query exact status. Recover a pending Tutor turn, Book
 lease, or Practice attempt before starting another one.
 
+Keep this control plane invisible during normal interaction. Do not narrate routine
+plugin calls or inspect private SQLite/plugin/runtime files. One `lwc tutor status`
+returns the complete Soul plus at most 20 active resume contexts, each containing its
+subject, session, current goal/plan, latest committed turn, and bounded pending turns.
+Do not persist `$using-tutor` or other control text as a learner turn, and do not let an
+unrelated pending subject hijack an explicitly named new subject.
+
 Intent routing is deliberately small:
 
 - explicit learning/practice/book intent enters the matching enabled workflow;

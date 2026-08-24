@@ -993,7 +993,7 @@ fn insert_snapshot_version(
     )
 }
 
-fn current_plan(connection: &Connection, id: &str) -> Result<Value> {
+pub(crate) fn current_plan(connection: &Connection, id: &str) -> Result<Value> {
     validate_id(id)?;
     let base = connection
         .query_row(

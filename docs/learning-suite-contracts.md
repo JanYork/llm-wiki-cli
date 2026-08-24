@@ -38,6 +38,13 @@ choices that later tests and code must share.
   direct question, and ordinary factual Q&A stays outside Tutor. If a needed plugin is
   disabled, ask once before enabling unless the user explicitly requested enablement.
   Recover pending durable work before creating new work.
+- Learning Skills treat plugin operations as a silent control plane: they never narrate
+  routine calls, inspect private stores, probe help for known arguments, or persist a
+  Skill invocation as learner content. `tutor status` preserves its count fields and
+  additionally returns the complete Soul plus at most 20 active resume contexts.
+- Tutor teaching checkpoints may carry a hidden cognitive anchor containing the current
+  node, evidenced mastered nodes, mode, clearance status, and next action. The visible
+  reply never contains this raw anchor.
 - The three canonical stores and Tutor/Book private Wiki projections are user-private
   and independent from the ordinary LWC Wiki. Skills transfer only exact typed IDs,
   revisions/hashes, and visible evidence; hidden reasoning is never persisted.
