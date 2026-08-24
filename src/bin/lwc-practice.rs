@@ -1,7 +1,6 @@
+#[path = "../learning/mod.rs"]
+mod learning;
+
 fn main() {
-    eprintln!(
-        "{}",
-        r#"{"error":{"code":"plugin_not_implemented","message":"practice is not implemented"}}"#
-    );
-    std::process::exit(1);
+    learning::main(learning::Plugin::Practice);
 }
