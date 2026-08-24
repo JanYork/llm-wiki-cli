@@ -2933,7 +2933,8 @@ fn sync_fast_forward_records_the_current_receipt_on_the_unchanged_source_side() 
 fn sync_three_way_merges_disjoint_book_rows_from_a_common_baseline() {
     let world = SyncWorld::new();
     world.install_fake_ssh();
-    for (home, request_id, name) in [(&world.local_home, "sync-baseline-subject", "Baseline")] {
+    {
+        let (home, request_id, name) = (&world.local_home, "sync-baseline-subject", "Baseline");
         assert!(
             Command::new(env!("CARGO_BIN_EXE_lwc-book"))
                 .env("HOME", home)
