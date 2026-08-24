@@ -1,4 +1,4 @@
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::Connection;
 use std::{
     fs::{self, File},
     io::Write,
@@ -49,7 +49,7 @@ fn external_book_blobs_avoid_putting_canonical_content_in_the_sqlite_wal() {
     let rowid = transaction.last_insert_rowid();
     {
         let mut blob = transaction
-            .blob_open(DatabaseName::Main, "blobs", "data", rowid, false)
+            .blob_open("main", "blobs", "data", rowid, false)
             .unwrap();
         for _ in 0..(CORPUS_BYTES / CHUNK_BYTES) {
             blob.write_all(&chunk).unwrap();
