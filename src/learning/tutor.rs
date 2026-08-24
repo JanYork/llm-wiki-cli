@@ -169,6 +169,20 @@ struct TurnCommit {
     request_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TeachingCheckpoint {
+    kind: String,
+    blocked_by: String,
+    hint_level: i64,
+    learner_attempted: bool,
+    explicit_answer_request: bool,
+    full_answer: bool,
+    feedback_evidence_refs: Vec<String>,
+    #[serde(default)]
+    praise: Option<String>,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SoulPublish {
@@ -263,6 +277,9 @@ fn initialize(connection: &Connection, root: &Path) -> Result<()> {
            input TEXT NOT NULL,
            reply TEXT,
            checkpoint_json TEXT,
+           checkpoint_kind TEXT,
+           hint_level INTEGER,
+           full_answer INTEGER,
            state TEXT NOT NULL CHECK(state IN ('pending','committed')),
            revision INTEGER NOT NULL,
            created_at TEXT NOT NULL,
@@ -500,14 +517,24 @@ fn run_turn(store: &mut Store, command: TurnCommand) -> Result<Value> {
                 return Err(Error::new("revision_conflict", "turn revision is stale")
                     .details(json!({"expected": if_revision, "current": current["revision"]})));
             }
+            let teaching = validate_teaching_checkpoint(&tx, &current, &input.checkpoint)?;
             let checkpoint = serde_json::to_string(&input.checkpoint)
                 .map_err(|error| Error::new("json_error", error.to_string()))?;
             let timestamp = now(&tx)?;
             tx.execute(
                 "UPDATE tutor_turns
-                 SET reply=?2,checkpoint_json=?3,state='committed',revision=2,
-                     updated_at=?4,committed_at=?4 WHERE id=?1",
-                params![id, input.reply, checkpoint, timestamp],
+                 SET reply=?2,checkpoint_json=?3,checkpoint_kind=?4,hint_level=?5,
+                     full_answer=?6,state='committed',revision=2,
+                     updated_at=?7,committed_at=?7 WHERE id=?1",
+                params![
+                    id,
+                    input.reply,
+                    checkpoint,
+                    teaching.as_ref().map(|value| value.kind.as_str()),
+                    teaching.as_ref().map(|value| value.hint_level),
+                    teaching.as_ref().map(|value| value.full_answer),
+                    timestamp
+                ],
             )?;
             let value = envelope(
                 Plugin::Tutor,
@@ -544,6 +571,75 @@ fn run_turn(store: &mut Store, command: TurnCommand) -> Result<Value> {
             json!({"turn": turn(&store.connection, &id)?}),
         )),
     }
+}
+
+fn validate_teaching_checkpoint(
+    connection: &Connection,
+    turn: &Value,
+    checkpoint: &Value,
+) -> Result<Option<TeachingCheckpoint>> {
+    if checkpoint.get("kind").and_then(Value::as_str) != Some("teaching") {
+        return Ok(None);
+    }
+    let checkpoint: TeachingCheckpoint = serde_json::from_value(checkpoint.clone())
+        .map_err(|error| Error::new("invalid_input", error.to_string()))?;
+    validate_text("blocked_by", &checkpoint.blocked_by, 16 * 1024)?;
+    if checkpoint.kind != "teaching" || !(0..=32).contains(&checkpoint.hint_level) {
+        return Err(Error::new(
+            "invalid_input",
+            "teaching hint_level must be within 0..=32",
+        ));
+    }
+    let session_id = turn["session_id"].as_str().unwrap();
+    let mode = connection.query_row(
+        "SELECT mode FROM tutor_sessions WHERE id=?1",
+        [session_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    if mode == "exam" && checkpoint.hint_level > 0 {
+        return Err(Error::new(
+            "exam_hints_forbidden",
+            "exam sessions do not permit hints",
+        ));
+    }
+    let previous = connection.query_row(
+        "SELECT COALESCE(MAX(hint_level),0) FROM tutor_turns
+         WHERE session_id=?1 AND state='committed' AND checkpoint_kind='teaching'",
+        [session_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if checkpoint.hint_level > previous + 1 {
+        return Err(Error::new(
+            "hint_level_not_progressive",
+            "teaching hints may advance by only one level at a time",
+        ));
+    }
+    if checkpoint.full_answer
+        && !checkpoint.learner_attempted
+        && !checkpoint.explicit_answer_request
+    {
+        return Err(Error::new(
+            "full_answer_not_allowed",
+            "a full answer requires a learner attempt or explicit request",
+        ));
+    }
+    let evidence = normalized_refs(checkpoint.feedback_evidence_refs.clone()).or_else(|error| {
+        if checkpoint.praise.is_none() && checkpoint.feedback_evidence_refs.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(error)
+        }
+    })?;
+    if let Some(praise) = &checkpoint.praise {
+        validate_text("praise", praise, 16 * 1024)?;
+        if evidence.is_empty() {
+            return Err(Error::new(
+                "feedback_evidence_required",
+                "praise and feedback must cite observed evidence",
+            ));
+        }
+    }
+    Ok(Some(checkpoint))
 }
 
 fn run_learner(store: &mut Store, command: LearnerCommand) -> Result<Value> {
