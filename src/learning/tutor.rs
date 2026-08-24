@@ -574,7 +574,8 @@ fn run_session(store: &mut Store, command: SessionCommand) -> Result<Value> {
                 "session.create",
                 json!({"session": session(&tx, &id)?}),
             );
-            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            let value =
+                finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
             tx.commit()?;
             Ok(value)
         }
@@ -654,7 +655,8 @@ fn run_session(store: &mut Store, command: SessionCommand) -> Result<Value> {
                 "session.diagnosis",
                 json!({"diagnosis": diagnosis, "session": session(&tx, &id)?}),
             );
-            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            let value =
+                finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
             tx.commit()?;
             Ok(value)
         }
@@ -693,7 +695,8 @@ fn run_turn(store: &mut Store, command: TurnCommand) -> Result<Value> {
                 "turn.begin",
                 json!({"turn": turn(&tx, &id)?}),
             );
-            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            let value =
+                finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
             tx.commit()?;
             Ok(value)
         }
@@ -756,7 +759,8 @@ fn run_turn(store: &mut Store, command: TurnCommand) -> Result<Value> {
                 "turn.commit",
                 json!({"turn": turn(&tx, &id)?}),
             );
-            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            let value =
+                finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
             tx.commit()?;
             Ok(value)
         }
@@ -904,7 +908,8 @@ fn run_fact(store: &mut Store, command: FactCommand) -> Result<Value> {
             let fact = fact(&tx, &id)?;
             append_fact_history(&tx, &fact)?;
             let value = envelope(Plugin::Tutor, "learner.fact.record", json!({"fact": fact}));
-            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            let value =
+                finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
             tx.commit()?;
             materialize_fact_wiki(&store.connection, &store.root)?;
             Ok(value)
@@ -958,7 +963,8 @@ fn run_fact(store: &mut Store, command: FactCommand) -> Result<Value> {
                     ));
                 }
             };
-            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            let value =
+                finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
             tx.commit()?;
             materialize_fact_wiki(&store.connection, &store.root)?;
             Ok(value)
@@ -1386,7 +1392,8 @@ fn run_goal(store: &mut Store, command: GoalCommand) -> Result<Value> {
             let goal = goal(&tx, &id)?;
             append_goal_history(&tx, &goal)?;
             let value = envelope(Plugin::Tutor, "goal.create", json!({"goal": goal}));
-            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            let value =
+                finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
             tx.commit()?;
             Ok(value)
         }
@@ -1470,7 +1477,8 @@ fn run_goal(store: &mut Store, command: GoalCommand) -> Result<Value> {
             let goal = goal(&tx, &id)?;
             append_goal_history(&tx, &goal)?;
             let value = envelope(Plugin::Tutor, "goal.evidence", json!({"goal": goal}));
-            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            let value =
+                finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
             tx.commit()?;
             Ok(value)
         }
@@ -1516,7 +1524,8 @@ fn run_goal(store: &mut Store, command: GoalCommand) -> Result<Value> {
             let goal = goal(&tx, &id)?;
             append_goal_history(&tx, &goal)?;
             let value = envelope(Plugin::Tutor, "goal.complete", json!({"goal": goal}));
-            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            let value =
+                finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
             tx.commit()?;
             Ok(value)
         }
@@ -1679,7 +1688,8 @@ fn run_soul(store: &mut Store, command: SoulCommand) -> Result<Value> {
                 "soul.configure",
                 json!({"settings": soul_settings(&tx)?}),
             );
-            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            let value =
+                finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
             tx.commit()?;
             Ok(value)
         }
@@ -1728,7 +1738,8 @@ fn run_soul(store: &mut Store, command: SoulCommand) -> Result<Value> {
                 "soul.propose",
                 json!({"proposal": soul_proposal(&tx, &id)?}),
             );
-            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            let value =
+                finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
             tx.commit()?;
             Ok(value)
         }
@@ -1776,7 +1787,8 @@ fn run_soul(store: &mut Store, command: SoulCommand) -> Result<Value> {
                 "soul.approve",
                 json!({"proposal": soul_proposal(&tx, &id)?}),
             );
-            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            let value =
+                finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
             tx.commit()?;
             Ok(value)
         }
@@ -1844,7 +1856,8 @@ fn run_soul(store: &mut Store, command: SoulCommand) -> Result<Value> {
                     "proposal": soul_proposal(&tx, &id)?,
                 }),
             );
-            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            let value =
+                finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
             tx.commit()?;
             materialize_soul(&store.connection, &store.root)?;
             Ok(value)
@@ -1900,7 +1913,8 @@ fn run_soul(store: &mut Store, command: SoulCommand) -> Result<Value> {
                 ],
             )?;
             let value = envelope(Plugin::Tutor, "soul.publish", json!({"soul": soul(&tx)?}));
-            remember(&tx, &input.request_id, &fingerprint, &value)?;
+            let value =
+                finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
             tx.commit()?;
             materialize_soul(&store.connection, &store.root)?;
             Ok(value)

@@ -288,7 +288,7 @@ fn create(store: &mut Store, input: PlanCreate) -> Result<Value> {
     }
     let plan = current_plan(&tx, &id)?;
     let value = envelope(Plugin::Tutor, "plan.create", json!({"plan": plan}));
-    remember(&tx, &input.request_id, &fingerprint, &value)?;
+    let value = finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
     tx.commit()?;
     Ok(value)
 }
@@ -376,7 +376,7 @@ fn update_step(
     )?;
     let step = plan_step(&tx, plan_id, step_id)?;
     let value = envelope(Plugin::Tutor, "plan.step.update", json!({"step": step}));
-    remember(&tx, &input.request_id, &fingerprint, &value)?;
+    let value = finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
     tx.commit()?;
     Ok(value)
 }
@@ -447,7 +447,7 @@ fn revise(store: &mut Store, id: &str, if_revision: i64, input: PlanRevise) -> R
         "plan.revise",
         json!({"plan": plan, "diff": diff(&current, &plan)}),
     );
-    remember(&tx, &input.request_id, &fingerprint, &value)?;
+    let value = finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
     tx.commit()?;
     Ok(value)
 }
@@ -525,7 +525,7 @@ fn rollback(
             "diff": diff(&current, &plan),
         }),
     );
-    remember(&tx, &input.request_id, &fingerprint, &value)?;
+    let value = finalize_mutation(&tx, Plugin::Tutor, &input.request_id, &fingerprint, value)?;
     tx.commit()?;
     Ok(value)
 }
