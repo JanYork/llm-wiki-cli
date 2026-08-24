@@ -12,6 +12,8 @@ use std::path::Path;
 
 const SCHEDULER_CRATE: &str = "rs-fsrs";
 const SCHEDULER_VERSION: &str = "1.2.1";
+const MAX_BLUEPRINT_CANDIDATES: usize = 256;
+const MAX_BLUEPRINT_SEARCH_STATES: usize = 5_000;
 
 #[derive(Parser)]
 struct PracticeCli {
@@ -243,6 +245,8 @@ enum ReviewCommand {
     Queue {
         #[arg(long)]
         subject: String,
+        #[arg(long)]
+        goal_bank: Option<String>,
         #[arg(long)]
         budget_minutes: i64,
         #[arg(long)]
@@ -1031,9 +1035,17 @@ fn run_review(store: &mut Store, command: ReviewCommand) -> Result<Value> {
         )),
         ReviewCommand::Queue {
             subject,
+            goal_bank,
             budget_minutes,
             now,
-        } => review_queue(store, &subject, budget_minutes, &now, "review.queue"),
+        } => review_queue(
+            store,
+            &subject,
+            goal_bank.as_deref(),
+            budget_minutes,
+            &now,
+            "review.queue",
+        ),
         ReviewCommand::Show { item_id } => Ok(envelope(
             Plugin::Practice,
             "review.show",
@@ -1042,25 +1054,76 @@ fn run_review(store: &mut Store, command: ReviewCommand) -> Result<Value> {
     }
 }
 
-fn validate_source(source: &SourceRef) -> Result<()> {
-    if source.kind.trim().is_empty()
-        || source.id.trim().is_empty()
-        || source.revision_or_hash.trim().is_empty()
+fn valid_exact_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn valid_exact_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn validate_source_base(source: &SourceRef) -> Result<()> {
+    if !valid_exact_id(&source.id)
+        || source
+            .subject_id
+            .as_deref()
+            .is_none_or(|id| !valid_exact_id(id))
     {
         return Err(Error::new(
             "invalid_source_ref",
-            "source kind, id, and revision_or_hash are required",
+            "source id and subject_id must be exact lowercase identifiers",
         ));
     }
-    if source.kind == "book"
-        && source
-            .locator
-            .as_deref()
-            .is_none_or(|v| v.trim().is_empty())
+    Ok(())
+}
+
+fn validate_bank_source(source: &SourceRef, subject_id: &str) -> Result<()> {
+    validate_source_base(source)?;
+    if source.subject_id.as_deref() != Some(subject_id)
+        || source.kind != "book"
+        || !valid_exact_hash(&source.revision_or_hash)
+        || source.locator.is_some()
     {
         return Err(Error::new(
             "invalid_source_ref",
-            "book source requires locator",
+            "bank source must be an exact same-subject Book id and content hash",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_item_source(source: &SourceRef, subject_id: &str) -> Result<()> {
+    validate_source_base(source)?;
+    if source.subject_id.as_deref() != Some(subject_id) {
+        return Err(Error::new(
+            "source_subject_mismatch",
+            "source belongs to another subject",
+        ));
+    }
+    let valid = match source.kind.as_str() {
+        "book" => {
+            valid_exact_hash(&source.revision_or_hash)
+                && source.locator.as_deref().is_some_and(valid_exact_id)
+        }
+        "tutor_turn" => {
+            source.locator.is_none()
+                && source
+                    .revision_or_hash
+                    .parse::<i64>()
+                    .is_ok_and(|revision| revision > 0)
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(Error::new(
+            "invalid_source_ref",
+            "item source must be an exact Book block/hash or committed Tutor turn revision",
         ));
     }
     Ok(())
@@ -1068,7 +1131,7 @@ fn validate_source(source: &SourceRef) -> Result<()> {
 
 fn create_bank(store: &mut Store, input: BankCreate) -> Result<Value> {
     validate_request_id(&input.request_id)?;
-    validate_source(&input.source)?;
+    validate_bank_source(&input.source, &input.subject_id)?;
     if input.key.trim().is_empty() || input.title.trim().is_empty() {
         return Err(Error::new(
             "invalid_input",
@@ -1091,6 +1154,7 @@ fn create_bank(store: &mut Store, input: BankCreate) -> Result<Value> {
     if let Some(value) = replay(&tx, &input.request_id, &fingerprint)? {
         return Ok(value);
     }
+    validate_bank_source_truth(&store.root, &input.source, &input.subject_id)?;
     require_subject(&tx, &input.subject_id)?;
     let id = new_id(Plugin::Practice, &input.request_id);
     let at = now(&tx)?;
@@ -1148,7 +1212,7 @@ fn add_bank_item(store: &mut Store, id: &str, if_revision: i64, input: BankAdd) 
 
 fn create_item(store: &mut Store, input: ItemCreate) -> Result<Value> {
     validate_request_id(&input.request_id)?;
-    validate_source(&input.source)?;
+    validate_item_source(&input.source, &input.subject_id)?;
     validate_item_fields(&input)?;
     let fp = fingerprint(&input)?;
     let tx = store
@@ -1208,7 +1272,6 @@ fn validate_item_fields(input: &ItemCreate) -> Result<()> {
 
 fn verify_item(store: &mut Store, id: &str, if_revision: i64, input: ItemVerify) -> Result<Value> {
     validate_request_id(&input.request_id)?;
-    validate_source(&input.source)?;
     let fp = fingerprint(&json!({"id":id,"if_revision":if_revision,"input":input}))?;
     let tx = store
         .connection
@@ -1217,6 +1280,7 @@ fn verify_item(store: &mut Store, id: &str, if_revision: i64, input: ItemVerify)
         return Ok(v);
     }
     let current = item(&tx, id, None)?;
+    validate_item_source(&input.source, current["subject_id"].as_str().unwrap())?;
     require_revision(&current, if_revision)?;
     if current["state"] != "draft" {
         return Err(Error::new(
@@ -1234,7 +1298,11 @@ fn verify_item(store: &mut Store, id: &str, if_revision: i64, input: ItemVerify)
             "verification must match the current prompt, answer, rubric, and exact source",
         ));
     }
-    validate_source_truth(&store.root, &input.source)?;
+    validate_source_truth(
+        &store.root,
+        &input.source,
+        current["subject_id"].as_str().unwrap(),
+    )?;
     tx.execute("INSERT INTO practice_items SELECT id,revision+1,subject_id,item_type,grading_kind,'verified',prompt,answer_json,rubric,max_points,estimated_minutes,difficulty,topic,source_json,?2 FROM practice_items WHERE id=?1 AND revision=?3",params![id,now(&tx)?,if_revision])?;
     let value = envelope(
         Plugin::Practice,
@@ -1246,10 +1314,47 @@ fn verify_item(store: &mut Store, id: &str, if_revision: i64, input: ItemVerify)
     Ok(value)
 }
 
-fn validate_source_truth(practice_root: &Path, source: &SourceRef) -> Result<()> {
+fn source_connection(practice_root: &Path, plugin: &str) -> Result<Connection> {
     let plugins = practice_root
         .parent()
         .ok_or_else(|| Error::new("source_truth_unavailable", "plugin root is invalid"))?;
+    let root = plugins.join(plugin);
+    let database = root.join("data.sqlite3");
+    reject_symlink(&root)?;
+    reject_symlink(&database)?;
+    Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_| {
+        Error::new(
+            "source_truth_unavailable",
+            format!("{plugin} source store is unavailable"),
+        )
+    })
+}
+
+fn validate_bank_source_truth(
+    practice_root: &Path,
+    source: &SourceRef,
+    subject_id: &str,
+) -> Result<()> {
+    let connection = source_connection(practice_root, "book")?;
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM books WHERE id=?1 AND subject_id=?2 AND COALESCE(normalized_sha256,original_sha256)=?3",
+            params![source.id, subject_id, source.revision_or_hash],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| Error::new("source_truth_unavailable", "Book source schema is unavailable"))?
+        .is_some();
+    if !exists {
+        return Err(Error::new(
+            "source_truth_mismatch",
+            "current Book id, content hash, or subject does not match",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source_truth(practice_root: &Path, source: &SourceRef, subject_id: &str) -> Result<()> {
     let (plugin, sql) = match source.kind.as_str() {
         "book" => {
             if source.locator.as_deref().is_none_or(str::is_empty) {
@@ -1260,12 +1365,12 @@ fn validate_source_truth(practice_root: &Path, source: &SourceRef) -> Result<()>
             }
             (
                 "book",
-                "SELECT 1 FROM book_blocks WHERE id=?1 AND book_id=?2 AND text_hash=?3",
+                "SELECT 1 FROM book_blocks block JOIN books book ON book.id=block.book_id WHERE block.id=?1 AND block.book_id=?2 AND block.text_hash=?3 AND book.subject_id=?4",
             )
         }
         "tutor_turn" => (
             "tutor",
-            "SELECT 1 FROM tutor_turns WHERE id=?1 AND state='committed' AND CAST(revision AS TEXT)=?3",
+            "SELECT 1 FROM tutor_turns turn JOIN tutor_sessions session ON session.id=turn.session_id WHERE turn.id=?1 AND turn.state='committed' AND CAST(turn.revision AS TEXT)=?3 AND session.subject_id=?4",
         ),
         _ => {
             return Err(Error::new(
@@ -1274,14 +1379,7 @@ fn validate_source_truth(practice_root: &Path, source: &SourceRef) -> Result<()>
             ));
         }
     };
-    let database = plugins.join(plugin).join("data.sqlite3");
-    let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|_| {
-            Error::new(
-                "source_truth_unavailable",
-                format!("{plugin} source store is unavailable"),
-            )
-        })?;
+    let connection = source_connection(practice_root, plugin)?;
     let key = if plugin == "book" {
         source.locator.as_deref().unwrap()
     } else {
@@ -1290,7 +1388,7 @@ fn validate_source_truth(practice_root: &Path, source: &SourceRef) -> Result<()>
     let exists = connection
         .query_row(
             sql,
-            params![key, source.id, source.revision_or_hash],
+            params![key, source.id, source.revision_or_hash, subject_id],
             |_| Ok(()),
         )
         .optional()
@@ -1570,6 +1668,15 @@ fn create_paper(store: &mut Store, input: PaperCreate) -> Result<Value> {
         )?
         .collect::<std::result::Result<Vec<Candidate>, _>>()?;
     drop(stmt);
+    if candidates.len() > MAX_BLUEPRINT_CANDIDATES {
+        return Err(Error::new(
+            "blueprint_too_complex",
+            "paper blueprint candidate set exceeds the search limit",
+        )
+        .details(
+            json!({"candidate_limit":MAX_BLUEPRINT_CANDIDATES,"candidates":candidates.len()}),
+        ));
+    }
     fn satisfies(rows: &[Candidate], input: &PaperCreate) -> bool {
         let count = |values: &BTreeMap<String, i64>, field: fn(&Candidate) -> Option<&str>| {
             values.iter().all(|(value, required)| {
@@ -1581,36 +1688,76 @@ fn create_paper(store: &mut Store, input: PaperCreate) -> Result<Value> {
         };
         count(&input.item_type_counts, |row| Some(row.7.as_str()))
             && count(&input.topic_counts, |row| row.11.as_deref())
-            && count(&input.section_counts, |row| row.11.as_deref())
             && rows.iter().map(|row| row.9).sum::<i64>() <= input.duration_minutes
             && input.total_points.is_none_or(|required| {
                 (rows.iter().map(|row| row.6).sum::<f64>() - required).abs() <= f64::EPSILON
             })
+    }
+    fn can_meet(
+        selected: &[Candidate],
+        remaining: &[Candidate],
+        values: &BTreeMap<String, i64>,
+        field: fn(&Candidate) -> Option<&str>,
+    ) -> bool {
+        values.iter().all(|(value, required)| {
+            selected
+                .iter()
+                .chain(remaining)
+                .filter(|row| field(row) == Some(value.as_str()))
+                .count() as i64
+                >= *required
+        })
     }
     fn choose(
         candidates: &[Candidate],
         input: &PaperCreate,
         start: usize,
         selected: &mut Vec<Candidate>,
-    ) -> bool {
+        searched: &mut usize,
+    ) -> Result<bool> {
+        *searched += 1;
+        if *searched > MAX_BLUEPRINT_SEARCH_STATES {
+            return Err(Error::new(
+                "blueprint_too_complex",
+                "paper blueprint exceeded the deterministic search-state limit",
+            )
+            .details(json!({"search_state_limit":MAX_BLUEPRINT_SEARCH_STATES})));
+        }
         if selected.len() as i64 == input.count {
-            return satisfies(selected, input);
+            return Ok(satisfies(selected, input));
         }
         let remaining = input.count as usize - selected.len();
         if candidates.len().saturating_sub(start) < remaining {
-            return false;
+            return Ok(false);
+        }
+        if selected.iter().map(|row| row.9).sum::<i64>() > input.duration_minutes
+            || input
+                .total_points
+                .is_some_and(|points| selected.iter().map(|row| row.6).sum::<f64>() > points)
+            || !can_meet(
+                selected,
+                &candidates[start..],
+                &input.item_type_counts,
+                |row| Some(row.7.as_str()),
+            )
+            || !can_meet(selected, &candidates[start..], &input.topic_counts, |row| {
+                row.11.as_deref()
+            })
+        {
+            return Ok(false);
         }
         for index in start..candidates.len() {
             selected.push(candidates[index].clone());
-            if choose(candidates, input, index + 1, selected) {
-                return true;
+            if choose(candidates, input, index + 1, selected, searched)? {
+                return Ok(true);
             }
             selected.pop();
         }
-        false
+        Ok(false)
     }
     let mut selected = Vec::new();
-    if !choose(&candidates, &input, 0, &mut selected) {
+    let mut searched = 0;
+    if !choose(&candidates, &input, 0, &mut selected, &mut searched)? {
         return Err(Error::new("paper_shortage","blueprint cannot be satisfied").details(json!({"required":input.count,"available":candidates.len(),"missing":(input.count-candidates.len() as i64).max(0)})));
     }
     let available = selected.len() as i64;
@@ -1635,6 +1782,12 @@ fn create_paper(store: &mut Store, input: PaperCreate) -> Result<Value> {
             now(&tx)?
         ],
     )?;
+    let mut sections = input
+        .section_counts
+        .iter()
+        .flat_map(|(section, count)| std::iter::repeat_n(section.clone(), *count as usize))
+        .collect::<Vec<_>>();
+    sections.resize(input.count as usize, "general".to_owned());
     for (ordinal, row) in selected.into_iter().enumerate() {
         let pid = new_id(Plugin::Practice, &format!("{}:{ordinal}", input.request_id));
         tx.execute(
@@ -1643,7 +1796,7 @@ fn create_paper(store: &mut Store, input: PaperCreate) -> Result<Value> {
                 pid,
                 id,
                 ordinal as i64,
-                row.11.as_deref().unwrap_or("general"),
+                sections[ordinal].as_str(),
                 row.0,
                 row.1,
                 row.2,
@@ -2205,7 +2358,7 @@ fn rate_review(store: &mut Store, item_id: &str, input: ReviewRate) -> Result<Va
         Some((raw, r)) => {
             let card = serde_json::from_str::<Card>(&raw)
                 .map_err(|e| Error::new("corrupt_store", e.to_string()))?;
-            if reviewed < card.last_review {
+            if reviewed <= card.last_review {
                 return Err(Error::new(
                     "non_monotonic_review_time",
                     "reviewed_at must be later than the previous review",
@@ -2249,7 +2402,7 @@ fn rate_review(store: &mut Store, item_id: &str, input: ReviewRate) -> Result<Va
             item_id,
             ordinal,
             input.rating,
-            input.reviewed_at,
+            reviewed.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             next.card.scheduled_days,
             raw,
             SCHEDULER_CRATE,
@@ -2408,6 +2561,7 @@ fn resolve_target(connection: &Connection, input: NextTarget) -> Result<Value> {
 fn review_queue(
     store: &mut Store,
     subject: &str,
+    goal_bank: Option<&str>,
     budget: i64,
     at: &str,
     command: &str,
@@ -2421,10 +2575,17 @@ fn review_queue(
     let queue_time = DateTime::parse_from_rfc3339(at)
         .map_err(|_| Error::new("invalid_time", "now must be RFC3339"))?
         .with_timezone(&Utc);
-    let tx = store
-        .connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = store.connection.transaction()?;
     require_subject(&tx, subject)?;
+    if let Some(goal_bank) = goal_bank {
+        let target = bank(&tx, goal_bank)?;
+        if target["subject_id"] != subject {
+            return Err(Error::new(
+                "target_subject_mismatch",
+                "goal bank belongs to another subject",
+            ));
+        }
+    }
     let configured: Option<i64> = tx
         .query_row(
             "SELECT daily_budget_minutes FROM review_controls WHERE subject_id=?1",
@@ -2433,9 +2594,9 @@ fn review_queue(
         )
         .optional()?;
     let effective_budget = configured.map_or(budget, |hard| hard.min(budget));
-    let mut stmt=tx.prepare("SELECT d.item_id,d.due_at,d.estimated_minutes,c.card_json,i.difficulty FROM review_debt d JOIN fsrs_cards c ON c.item_id=d.item_id JOIN practice_items i ON i.id=d.item_id AND i.revision=(SELECT MAX(revision) FROM practice_items WHERE id=d.item_id) WHERE d.subject_id=?1 AND d.state='open'")?;
+    let mut stmt=tx.prepare("SELECT d.item_id,d.due_at,d.estimated_minutes,c.card_json,CASE WHEN ?2 IS NOT NULL AND EXISTS(SELECT 1 FROM bank_items goal WHERE goal.bank_id=?2 AND goal.item_id=i.id AND goal.item_revision=i.revision) THEN 1.0 ELSE 0.0 END FROM review_debt d JOIN fsrs_cards c ON c.item_id=d.item_id JOIN practice_items i ON i.id=d.item_id AND i.revision=(SELECT MAX(revision) FROM practice_items WHERE id=d.item_id) WHERE d.subject_id=?1 AND d.state='open' AND i.state='verified' AND i.item_type='flashcard'")?;
     let raw_due = stmt
-        .query_map([subject], |r| {
+        .query_map(params![subject, goal_bank], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,

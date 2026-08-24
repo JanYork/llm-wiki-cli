@@ -1,5 +1,11 @@
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 use std::{path::Path, process::Command};
+
+const BOOK_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const BOOK_BLOCK_ID: &str = "cccccccccccccccccccccccccccccccc";
+const BOOK_HASH: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const TUTOR_TURN_ID: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
 fn run(cwd: &Path, home: &Path, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lwc-practice"));
@@ -29,30 +35,53 @@ fn json_arg(value: Value) -> String {
 }
 
 fn subject(cwd: &Path, home: &Path) -> String {
-    seed_source_truth(home);
     let input = json_arg(json!({"name":"会计学","request_id":"practice-subject-accounting"}));
-    ok(cwd, home, &["subject", "create", "--json", &input])["result"]["subject"]["id"]
+    let id = ok(cwd, home, &["subject", "create", "--json", &input])["result"]["subject"]["id"]
         .as_str()
         .unwrap()
-        .to_owned()
+        .to_owned();
+    seed_source_truth(home, &id);
+    id
 }
 
-fn seed_source_truth(home: &Path) {
+fn seed_source_truth(home: &Path, subject_id: &str) {
     let book_root = home.join(".lwc/plugins/book");
     let tutor_root = home.join(".lwc/plugins/tutor");
     std::fs::create_dir_all(&book_root).unwrap();
     std::fs::create_dir_all(&tutor_root).unwrap();
     let book = rusqlite::Connection::open(book_root.join("data.sqlite3")).unwrap();
     book.execute_batch(
-        "CREATE TABLE IF NOT EXISTS book_blocks(id TEXT PRIMARY KEY,book_id TEXT NOT NULL,text_hash TEXT NOT NULL);
-         INSERT OR REPLACE INTO book_blocks VALUES('chapter/1','book_exact_1','bookhash1');",
+        "CREATE TABLE IF NOT EXISTS books(id TEXT PRIMARY KEY,subject_id TEXT NOT NULL,original_sha256 TEXT NOT NULL,normalized_sha256 TEXT,state TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS book_blocks(id TEXT PRIMARY KEY,book_id TEXT NOT NULL,text_hash TEXT NOT NULL);",
+    )
+    .unwrap();
+    book.execute(
+        "INSERT OR REPLACE INTO books VALUES(?1,?2,?3,?3,'ready')",
+        rusqlite::params![BOOK_ID, subject_id, BOOK_HASH],
+    )
+    .unwrap();
+    book.execute(
+        "INSERT OR REPLACE INTO book_blocks VALUES(?1,?2,?3)",
+        rusqlite::params![BOOK_BLOCK_ID, BOOK_ID, BOOK_HASH],
     )
     .unwrap();
     let tutor = rusqlite::Connection::open(tutor_root.join("data.sqlite3")).unwrap();
     tutor
         .execute_batch(
-            "CREATE TABLE IF NOT EXISTS tutor_turns(id TEXT PRIMARY KEY,state TEXT NOT NULL,revision INTEGER NOT NULL);
-             INSERT OR REPLACE INTO tutor_turns VALUES('turn_exact_1','committed',1);",
+            "CREATE TABLE IF NOT EXISTS tutor_sessions(id TEXT PRIMARY KEY,subject_id TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS tutor_turns(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,state TEXT NOT NULL,revision INTEGER NOT NULL);",
+        )
+        .unwrap();
+    tutor
+        .execute(
+            "INSERT OR REPLACE INTO tutor_sessions VALUES('ffffffffffffffffffffffffffffffff',?1)",
+            [subject_id],
+        )
+        .unwrap();
+    tutor
+        .execute(
+            "INSERT OR REPLACE INTO tutor_turns VALUES(?1,'ffffffffffffffffffffffffffffffff','committed',1)",
+            [TUTOR_TURN_ID],
         )
         .unwrap();
 }
@@ -62,7 +91,7 @@ fn bank(cwd: &Path, home: &Path, subject_id: &str, key: &str, request_id: &str) 
         "subject_id": subject_id,
         "key": key,
         "title": "精准题库",
-        "source": {"kind":"book","id":"book_exact_1","revision_or_hash":"bookhash1","locator":"chapter/1"},
+        "source": {"kind":"book","id":BOOK_ID,"revision_or_hash":BOOK_HASH,"subject_id":subject_id},
         "request_id": request_id
     }));
     ok(cwd, home, &["bank", "create", "--json", &input])["result"]["bank"].clone()
@@ -79,7 +108,7 @@ fn item_input(subject_id: &str, request_id: &str, prompt: &str, answer: Value) -
         "max_points": 2.0,
         "estimated_minutes": 3,
         "difficulty": 0.5,
-        "source": {"kind":"book","id":"book_exact_1","revision_or_hash":"bookhash1","locator":"chapter/1"},
+        "source": {"kind":"book","id":BOOK_ID,"revision_or_hash":BOOK_HASH,"locator":BOOK_BLOCK_ID,"subject_id":subject_id},
         "request_id": request_id
     })
 }
@@ -144,10 +173,10 @@ fn exact_sources_verification_and_bank_membership_are_versioned() {
         world.path(),
         home.path(),
         &subject_id,
-        "book:book_exact_1",
+        &format!("book:{BOOK_ID}"),
         "bank-book",
     );
-    assert_eq!(bank["key"], "book:book_exact_1");
+    assert_eq!(bank["key"], format!("book:{BOOK_ID}"));
 
     let input = item_input(&subject_id, "item-ledger", "借方增加哪类账户？", json!("A"));
     let draft = create_item(world.path(), home.path(), &input);
@@ -155,7 +184,7 @@ fn exact_sources_verification_and_bank_membership_are_versioned() {
 
     let stale = json_arg(json!({
         "prompt": input["prompt"], "answer": input["answer"], "rubric": null,
-        "source": {"kind":"book","id":"book_exact_1","revision_or_hash":"changed","locator":"chapter/1"},
+        "source": {"kind":"book","id":BOOK_ID,"revision_or_hash":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","locator":BOOK_BLOCK_ID,"subject_id":subject_id},
         "request_id":"verify-stale"
     }));
     let failure = err(
@@ -176,7 +205,7 @@ fn exact_sources_verification_and_bank_membership_are_versioned() {
     let source_database = home.path().join(".lwc/plugins/book/data.sqlite3");
     let source = rusqlite::Connection::open(&source_database).unwrap();
     source
-        .execute("UPDATE book_blocks SET text_hash='changed'", [])
+        .execute("UPDATE book_blocks SET text_hash='ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'", [])
         .unwrap();
     drop(source);
     let exact_but_mutated = json_arg(json!({
@@ -201,7 +230,7 @@ fn exact_sources_verification_and_bank_membership_are_versioned() {
     );
     let source = rusqlite::Connection::open(source_database).unwrap();
     source
-        .execute("UPDATE book_blocks SET text_hash='bookhash1'", [])
+        .execute("UPDATE book_blocks SET text_hash=?1", [BOOK_HASH])
         .unwrap();
 
     let verified = verify_item(world.path(), home.path(), &draft, &input, "verify-ledger");
@@ -257,6 +286,90 @@ fn exact_sources_verification_and_bank_membership_are_versioned() {
             &["item", "create", "--json", &changed]
         )["error"]["code"],
         "request_id_reused"
+    );
+}
+
+#[test]
+fn missing_stale_wrong_kind_and_cross_subject_sources_write_nothing() {
+    let world = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let subject_id = subject(world.path(), home.path());
+    let stale_bank = json_arg(json!({
+        "subject_id":subject_id,"key":format!("book:{BOOK_ID}"),"title":"stale",
+        "source":{"kind":"book","id":BOOK_ID,"revision_or_hash":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","subject_id":subject_id},
+        "request_id":"stale-bank-source"
+    }));
+    assert_eq!(
+        err(
+            world.path(),
+            home.path(),
+            &["bank", "create", "--json", &stale_bank],
+        )["error"]["code"],
+        "source_truth_mismatch"
+    );
+    let wrong_kind = json_arg(json!({
+        "subject_id":subject_id,"key":"subject:wrong-kind","title":"wrong",
+        "source":{"kind":"tutor_turn","id":TUTOR_TURN_ID,"revision_or_hash":"1","subject_id":subject_id},
+        "request_id":"wrong-kind-bank-source"
+    }));
+    assert_eq!(
+        err(
+            world.path(),
+            home.path(),
+            &["bank", "create", "--json", &wrong_kind],
+        )["error"]["code"],
+        "invalid_source_ref"
+    );
+    let mut missing_hash = item_input(&subject_id, "missing-item-hash", "missing", json!("A"));
+    missing_hash["source"]["revision_or_hash"] = json!("");
+    assert_eq!(
+        err(
+            world.path(),
+            home.path(),
+            &["item", "create", "--json", &json_arg(missing_hash)],
+        )["error"]["code"],
+        "invalid_source_ref"
+    );
+    let other = json_arg(json!({"name":"审计学","request_id":"other-subject"}));
+    let other_id = ok(
+        world.path(),
+        home.path(),
+        &["subject", "create", "--json", &other],
+    )["result"]["subject"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cross = json!({
+        "subject_id":other_id,"item_type":"text","grading_kind":"subjective",
+        "prompt":"cross","answer":null,"rubric":"exact","max_points":2,
+        "estimated_minutes":1,"difficulty":0.5,
+        "source":{"kind":"tutor_turn","id":TUTOR_TURN_ID,"revision_or_hash":"1","subject_id":other_id},
+        "request_id":"cross-subject-item"
+    });
+    let draft = create_item(world.path(), home.path(), &cross);
+    let verify = json_arg(json!({
+        "prompt":"cross","answer":null,"rubric":"exact","source":cross["source"],
+        "request_id":"cross-subject-verify"
+    }));
+    assert_eq!(
+        err(
+            world.path(),
+            home.path(),
+            &[
+                "item",
+                "verify",
+                draft["id"].as_str().unwrap(),
+                "--if-revision",
+                "1",
+                "--json",
+                &verify,
+            ],
+        )["error"]["code"],
+        "source_truth_mismatch"
+    );
+    assert_eq!(
+        ok(world.path(), home.path(), &["status"])["result"]["banks"],
+        0
     );
 }
 
@@ -416,7 +529,7 @@ fn grading_sets_and_review_budget_preserve_history_and_visible_debt() {
     let world = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let subject_id = subject(world.path(), home.path());
-    let mut bank = bank(
+    let mut review_bank = bank(
         world.path(),
         home.path(),
         &subject_id,
@@ -442,10 +555,10 @@ fn grading_sets_and_review_budget_preserve_history_and_visible_debt() {
             &input,
             &format!("verify-review-{n}"),
         );
-        bank = add_to_bank(
+        review_bank = add_to_bank(
             world.path(),
             home.path(),
-            &bank,
+            &review_bank,
             &item,
             &format!("bank-review-add-{n}"),
         );
@@ -518,7 +631,7 @@ fn grading_sets_and_review_budget_preserve_history_and_visible_debt() {
 
     for (n, item_id) in item_ids.iter().enumerate() {
         let review = json_arg(json!({
-            "rating": if n == 0 { 1 } else { 3 },
+            "rating": 3,
             "reviewed_at": "2026-08-01T00:00:00Z",
             "estimated_minutes": 4,
             "request_id": format!("review-rate-{n}")
@@ -534,6 +647,27 @@ fn grading_sets_and_review_budget_preserve_history_and_visible_debt() {
         assert!(state["due_at"].as_str().unwrap() >= "2026-08-01T00:00:00Z");
     }
 
+    let goal_bank = bank(
+        world.path(),
+        home.path(),
+        &subject_id,
+        "subject:review-goal",
+        "review-goal-bank",
+    );
+    let goal_item = ok(
+        world.path(),
+        home.path(),
+        &["item", "show", item_ids[1].as_str()],
+    )["result"]["item"]
+        .clone();
+    let goal_bank = add_to_bank(
+        world.path(),
+        home.path(),
+        &goal_bank,
+        &goal_item,
+        "review-goal-add",
+    );
+
     let queue = ok(
         world.path(),
         home.path(),
@@ -542,6 +676,8 @@ fn grading_sets_and_review_budget_preserve_history_and_visible_debt() {
             "queue",
             "--subject",
             &subject_id,
+            "--goal-bank",
+            goal_bank["id"].as_str().unwrap(),
             "--budget-minutes",
             "4",
             "--now",
@@ -551,6 +687,8 @@ fn grading_sets_and_review_budget_preserve_history_and_visible_debt() {
         .clone();
     assert_eq!(queue["selected_minutes"], 4);
     assert_eq!(queue["selected"].as_array().unwrap().len(), 1);
+    assert_eq!(queue["selected"][0]["item_id"], item_ids[1]);
+    assert_eq!(queue["selected"][0]["goal_value"], 1.0);
     assert_eq!(queue["debt"]["count"], 1);
     assert_eq!(queue["debt"]["minutes"], 4);
     let database = home.path().join(".lwc/plugins/practice/data.sqlite3");
@@ -576,6 +714,8 @@ fn grading_sets_and_review_budget_preserve_history_and_visible_debt() {
             "queue",
             "--subject",
             &subject_id,
+            "--goal-bank",
+            goal_bank["id"].as_str().unwrap(),
             "--budget-minutes",
             "4",
             "--now",
@@ -610,7 +750,7 @@ fn subjective_grades_require_frozen_rubric_and_low_confidence_review() {
         "subject_id":subject_id,"item_type":"text","grading_kind":"subjective",
         "prompt":"解释复式记账","answer":null,"rubric":"同时说明借贷对应与恒等关系",
         "max_points":10,"estimated_minutes":5,"difficulty":0.7,
-        "source":{"kind":"tutor_turn","id":"turn_exact_1","revision_or_hash":"1"},
+        "source":{"kind":"tutor_turn","id":TUTOR_TURN_ID,"revision_or_hash":"1","subject_id":subject_id},
         "request_id":"essay-item"
     });
     let item = create_item(world.path(), home.path(), &input);
@@ -1167,7 +1307,7 @@ fn paper_blueprint_solves_overlapping_constraints_and_freezes_sections() {
         "bank_id":bank["id"], "count":2, "duration_minutes":10,
         "item_type_counts":{"choice":1,"text":1},
         "topic_counts":{"assets":1,"liabilities":1},
-        "section_counts":{"assets":1,"liabilities":1},
+        "section_counts":{"calculation":1,"concepts":1},
         "total_points":4.0, "request_id":"blueprint-overlap"
     }));
     let paper = ok(
@@ -1184,7 +1324,71 @@ fn paper_blueprint_solves_overlapping_constraints_and_freezes_sections() {
         .map(|item| item["section"].as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
     sections.sort();
-    assert_eq!(sections, ["assets", "liabilities"]);
+    assert_eq!(sections, ["calculation", "concepts"]);
+}
+
+#[test]
+fn adversarial_blueprint_stops_at_an_explicit_complexity_gate() {
+    let world = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let subject_id = subject(world.path(), home.path());
+    let mut bank = bank(
+        world.path(),
+        home.path(),
+        &subject_id,
+        "subject:complexity",
+        "complexity-bank",
+    );
+    for ordinal in 0..20 {
+        let (topic, item_type) = if ordinal < 10 {
+            ("assets", "choice")
+        } else {
+            ("liabilities", "text")
+        };
+        let mut input = item_input(
+            &subject_id,
+            &format!("complexity-item-{ordinal}"),
+            &format!("complexity-{ordinal}"),
+            json!("A"),
+        );
+        input["item_type"] = json!(item_type);
+        input["topic"] = json!(topic);
+        let item = create_item(world.path(), home.path(), &input);
+        let item = verify_item(
+            world.path(),
+            home.path(),
+            &item,
+            &input,
+            &format!("complexity-verify-{ordinal}"),
+        );
+        bank = add_to_bank(
+            world.path(),
+            home.path(),
+            &bank,
+            &item,
+            &format!("complexity-add-{ordinal}"),
+        );
+    }
+    let blueprint = json_arg(json!({
+        "bank_id":bank["id"], "count":10, "duration_minutes":100,
+        "topic_counts":{"assets":5,"liabilities":5},
+        "item_type_counts":{"choice":6,"text":4},
+        "request_id":"complexity-paper"
+    }));
+    let started = std::time::Instant::now();
+    assert_eq!(
+        err(
+            world.path(),
+            home.path(),
+            &["paper", "create", "--json", &blueprint],
+        )["error"]["code"],
+        "blueprint_too_complex"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(
+        ok(world.path(), home.path(), &["status"])["result"]["papers"],
+        0
+    );
 }
 
 #[test]
@@ -1205,6 +1409,7 @@ fn official_fsrs_rating_vector_is_exact() {
     let ratings = [3, 3, 3, 3, 3, 3, 1, 1, 3, 3, 3, 3, 3];
     let expected = [0, 4, 15, 48, 136, 351, 0, 0, 7, 13, 24, 43, 77];
     let mut reviewed_at = "2022-11-29T12:30:00Z".to_owned();
+    let mut last_reviewed_at = reviewed_at.clone();
     let mut actual = Vec::new();
     for (ordinal, rating) in ratings.into_iter().enumerate() {
         let review = json_arg(
@@ -1223,11 +1428,22 @@ fn official_fsrs_rating_vector_is_exact() {
         )["result"]["card"]
             .clone();
         actual.push(card["events"][ordinal]["scheduled_days"].as_i64().unwrap());
-        reviewed_at = card["due_at"].as_str().unwrap().to_owned();
+        last_reviewed_at = reviewed_at;
+        let due = DateTime::parse_from_rfc3339(card["due_at"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        let previous = DateTime::parse_from_rfc3339(&last_reviewed_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        reviewed_at = if due <= previous {
+            (previous + Duration::seconds(1)).to_rfc3339()
+        } else {
+            due.to_rfc3339()
+        };
     }
     assert_eq!(actual, expected);
     let backwards = json_arg(
-        json!({"rating":3,"reviewed_at":"2022-11-29T12:29:59Z","estimated_minutes":1,"request_id":"fsrs-backwards"}),
+        json!({"rating":3,"reviewed_at":last_reviewed_at,"estimated_minutes":1,"request_id":"fsrs-backwards"}),
     );
     assert_eq!(
         err(
@@ -1302,7 +1518,7 @@ fn learner_owned_review_controls_cap_queue_and_due_is_not_writable() {
         "control-item-verify",
     );
     let review = json_arg(
-        json!({"rating":3,"reviewed_at":"2026-01-01T00:00:00Z","estimated_minutes":1,"request_id":"control-rate-card"}),
+        json!({"rating":3,"reviewed_at":"2026-01-01T08:00:00+08:00","estimated_minutes":1,"request_id":"control-rate-card"}),
     );
     let card = ok(
         world.path(),
@@ -1318,6 +1534,43 @@ fn learner_owned_review_controls_cap_queue_and_due_is_not_writable() {
         .clone();
     assert_eq!(card["scheduler"]["parameters"]["request_retention"], 0.85);
     assert!(card["scheduler"]["parameters"]["weights"].is_array());
+    assert_eq!(card["events"][0]["reviewed_at"], "2026-01-01T00:00:00Z");
+    let retire = json_arg(json!({"reason":"retired card","request_id":"control-card-retire"}));
+    ok(
+        world.path(),
+        home.path(),
+        &[
+            "item",
+            "retire",
+            card_item["id"].as_str().unwrap(),
+            "--if-revision",
+            "2",
+            "--json",
+            &retire,
+        ],
+    );
+    let retired_queue = ok(
+        world.path(),
+        home.path(),
+        &[
+            "review",
+            "queue",
+            "--subject",
+            &subject_id,
+            "--budget-minutes",
+            "4",
+            "--now",
+            "2030-01-01T00:00:00Z",
+        ],
+    )["result"]
+        .clone();
+    assert!(retired_queue["selected"].as_array().unwrap().is_empty());
+    assert!(
+        retired_queue["debt"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     let due_edit = json_arg(
         json!({"rating":3,"reviewed_at":"2026-01-01T00:00:00Z","estimated_minutes":1,"due_at":"2026-01-02T00:00:00Z","request_id":"due-edit"}),
     );
@@ -1473,7 +1726,7 @@ fn critical_practice_queries_use_indexes() {
     let connection = rusqlite::Connection::open(database).unwrap();
     for (sql, expected) in [
         (
-            "EXPLAIN QUERY PLAN SELECT item_id FROM review_debt WHERE subject_id='s' AND state='open' AND due_at<='2030' ORDER BY due_at,item_id",
+            "EXPLAIN QUERY PLAN SELECT d.item_id,d.due_at,d.estimated_minutes,c.card_json,CASE WHEN 'goal' IS NOT NULL AND EXISTS(SELECT 1 FROM bank_items goal WHERE goal.bank_id='goal' AND goal.item_id=i.id AND goal.item_revision=i.revision) THEN 1.0 ELSE 0.0 END FROM review_debt d JOIN fsrs_cards c ON c.item_id=d.item_id JOIN practice_items i ON i.id=d.item_id AND i.revision=(SELECT MAX(revision) FROM practice_items WHERE id=d.item_id) WHERE d.subject_id='s' AND d.state='open' AND i.state='verified' AND i.item_type='flashcard'",
             "review_debt_subject",
         ),
         (
