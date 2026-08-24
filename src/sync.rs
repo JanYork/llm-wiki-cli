@@ -2552,29 +2552,11 @@ fn preview_plugin_logical_hash<'a>(
     plugin_id: &str,
     records: impl Iterator<Item = &'a NormalizedPluginRecord>,
 ) -> Result<String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| AppError::new("home_unavailable", "HOME is not configured"))?;
-    let database = home
-        .join(".lwc/plugins")
-        .join(plugin_id)
-        .join("data.sqlite3");
-    reject_plugin_file(&database)?;
-    let mut connection = Connection::open(database)?;
-    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    tx.execute_batch("PRAGMA foreign_keys=ON; PRAGMA defer_foreign_keys=ON;")?;
-    for table in learning_schema::canonical_tables(plugin_id)
-        .expect("fixed plugin")
-        .iter()
-        .rev()
-    {
-        tx.execute(&format!("DELETE FROM {}", quote_sql(table)), [])?;
-    }
-    for record in records {
-        insert_normalized_plugin_record(&tx, record)?;
-    }
-    learning_schema::canonical_logical_hash(plugin_id, &tx)
-        .map_err(|message| AppError::new("sync_plugin_invalid", message))
+    learning_schema::canonical_logical_hash_from_normalized(
+        plugin_id,
+        records.map(|record| (record.table.as_str(), &record.values)),
+    )
+    .map_err(|message| AppError::new("sync_plugin_invalid", message))
 }
 
 fn merge_plugin_blobs(plugin_id: &str, roots: &[&Path], destination: &Path) -> Result<Vec<Value>> {

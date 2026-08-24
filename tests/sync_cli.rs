@@ -2599,6 +2599,81 @@ fn install_learning_runtime(home: &Path, plugin: &str, binary: &Path) {
 }
 
 #[cfg(unix)]
+fn snapshot_live_plugin(
+    cwd: &Path,
+    home: &Path,
+    session_id: &str,
+    plugin: &str,
+) -> (String, u64, PathBuf) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lwc"))
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("LWC_PROJECT_ROOT", cwd)
+        .arg("__sync-peer")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let request = serde_json::json!({
+        "protocol": 2,
+        "action": "handshake",
+        "session_id": session_id,
+        "scope": "project",
+        "directory": cwd,
+    });
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(serde_json::to_string(&request).unwrap().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let export = response["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["plugin_id"] == plugin)
+        .unwrap()["export"]
+        .clone();
+    let store_id = export["store_id"].as_str().unwrap().to_owned();
+    let revision = export["revision"].as_u64().unwrap();
+    let path = home
+        .join(".lwc/sync/plugins")
+        .join(session_id)
+        .join(format!("{plugin}-live"));
+    assert!(path.join("manifest.json").is_file());
+    (store_id, revision, path)
+}
+
+#[cfg(unix)]
+fn preserve_plugin_export(source: &Path, home: &Path, plugin: &str, store: &str, revision: u64) {
+    let parent = home
+        .join(".lwc/plugins")
+        .join(plugin)
+        .join("preserved")
+        .join(store);
+    fs::create_dir_all(&parent).unwrap();
+    let destination = parent.join(revision.to_string());
+    assert!(
+        Command::new("cp")
+            .args(["-R"])
+            .arg(source)
+            .arg(&destination)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn sync_exports_live_book_canonical_state_to_an_absent_runtime() {
     let world = SyncWorld::new();
@@ -3018,6 +3093,136 @@ fn sync_three_way_merges_disjoint_book_rows_from_a_common_baseline() {
             );
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_three_way_merges_preserved_only_exports_without_creating_a_runtime_database() {
+    let world = SyncWorld::new();
+    world.install_fake_ssh();
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+            .env("HOME", &world.local_home)
+            .arg("status")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let baseline = serde_json::json!({
+        "name": "Preserved baseline",
+        "request_id": "preserved-only-baseline",
+    })
+    .to_string();
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+            .env("HOME", &world.local_home)
+            .args(["subject", "create", "--json", &baseline])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let (store_id, revision, baseline_export) = snapshot_live_plugin(
+        &world.local,
+        &world.local_home,
+        "11111111111111111111111111111111",
+        "book",
+    );
+    assert_eq!(revision, 1);
+    preserve_plugin_export(
+        &baseline_export,
+        &world.local_home,
+        "book",
+        &store_id,
+        revision,
+    );
+    preserve_plugin_export(
+        &baseline_export,
+        &world.remote_home,
+        "book",
+        &store_id,
+        revision,
+    );
+    let local_database = world.local_home.join(".lwc/plugins/book/data.sqlite3");
+    let remote_database = world.remote_home.join(".lwc/plugins/book/data.sqlite3");
+    fs::create_dir_all(remote_database.parent().unwrap()).unwrap();
+    fs::copy(&local_database, &remote_database).unwrap();
+
+    for (home, name, request_id) in [
+        (&world.local_home, "Preserved local", "preserved-only-local"),
+        (
+            &world.remote_home,
+            "Preserved remote",
+            "preserved-only-remote",
+        ),
+    ] {
+        let input = serde_json::json!({"name":name,"request_id":request_id}).to_string();
+        let output = Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+            .env("HOME", home)
+            .args(["subject", "create", "--json", &input])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for (cwd, home, session_id) in [
+        (
+            &world.local,
+            &world.local_home,
+            "22222222222222222222222222222222",
+        ),
+        (
+            &world.remote,
+            &world.remote_home,
+            "33333333333333333333333333333333",
+        ),
+    ] {
+        let (branch_store, branch_revision, export) =
+            snapshot_live_plugin(cwd, home, session_id, "book");
+        assert_eq!(branch_store, store_id);
+        assert_eq!(branch_revision, 2);
+        preserve_plugin_export(&export, home, "book", &branch_store, branch_revision);
+    }
+    fs::remove_file(&local_database).unwrap();
+    fs::remove_file(&remote_database).unwrap();
+
+    let merged = world.sync(&[
+        "sync",
+        "peer",
+        world.remote.to_str().unwrap(),
+        "--mode",
+        "merge",
+    ]);
+    assert!(
+        merged.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&merged.stdout),
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    let result: Value = serde_json::from_slice(&merged.stdout).unwrap();
+    let book = result["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|plugin| plugin["plugin"] == "book")
+        .unwrap();
+    assert_eq!(book["status"], "preserved_not_ready");
+    assert!(!local_database.exists());
+    assert!(!remote_database.exists());
+    let records = fs::read_to_string(
+        world
+            .local_home
+            .join(".lwc/plugins/book/sync-history")
+            .join(&store_id)
+            .join("3/records.ndjson"),
+    )
+    .unwrap();
+    assert!(records.contains("Preserved local"));
+    assert!(records.contains("Preserved remote"));
 }
 
 #[cfg(unix)]
