@@ -1419,7 +1419,10 @@ fn synthesis_requires_full_coverage_complete_source_links_and_builds_only_privat
     let blocked_projection = private_books.join(format!("{book_id}.md"));
     let symlink_target = home.join("wiki-target");
     fs::write(&symlink_target, "must remain unchanged").unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&symlink_target, &blocked_projection).unwrap();
+    #[cfg(not(unix))]
+    fs::create_dir(&blocked_projection).unwrap();
     let pending = err(
         &cwd,
         &home,
@@ -1443,11 +1446,16 @@ fn synthesis_requires_full_coverage_complete_source_links_and_builds_only_privat
         })
         .unwrap();
     assert_eq!(committed_state, "synthesized");
-    assert_eq!(
-        fs::read_to_string(&symlink_target).unwrap(),
-        "must remain unchanged"
-    );
-    fs::remove_file(&blocked_projection).unwrap();
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::read_to_string(&symlink_target).unwrap(),
+            "must remain unchanged"
+        );
+        fs::remove_file(&blocked_projection).unwrap();
+    }
+    #[cfg(not(unix))]
+    fs::remove_dir(&blocked_projection).unwrap();
     let synthesized = ok(
         &cwd,
         &home,
