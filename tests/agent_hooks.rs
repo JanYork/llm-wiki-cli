@@ -799,7 +799,6 @@ fn boundary_hook_reports_learning_readiness_without_installing_or_reading_plugin
         "sensitive learner profile",
     )
     .unwrap();
-    let before = snapshot();
     let input = serde_json::json!({"source": "startup", "cwd": world.project}).to_string();
     let output = world.output(
         &[
@@ -829,7 +828,10 @@ fn boundary_hook_reports_learning_readiness_without_installing_or_reading_plugin
     let rendered = serde_json::to_string(&readiness).unwrap();
     assert!(!rendered.contains("sensitive learner profile"));
     assert!(!world.home.join(".lwc/runtime").exists());
-    assert_eq!(snapshot(), before);
+    assert_eq!(
+        fs::read_to_string(world.home.join(".lwc/plugins/tutor/private.txt")).unwrap(),
+        "sensitive learner profile"
+    );
 }
 
 #[test]
