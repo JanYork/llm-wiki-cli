@@ -12,12 +12,11 @@ use std::{
 };
 
 const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
-static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-mod tutor;
+pub(crate) static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // Each fixed binary constructs exactly one of the three variants.
-pub enum Plugin {
+pub(crate) enum Plugin {
     Tutor,
     Book,
     Practice,
@@ -49,7 +48,7 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum SubjectCommand {
+pub(crate) enum SubjectCommand {
     Create {
         #[arg(long, value_name = "JSON|-|@PATH")]
         json: String,
@@ -71,14 +70,14 @@ enum SubjectCommand {
 }
 
 #[derive(Debug)]
-struct Error {
+pub(crate) struct Error {
     code: &'static str,
     message: String,
     details: Option<Value>,
 }
 
 impl Error {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -86,7 +85,7 @@ impl Error {
         }
     }
 
-    fn details(mut self, details: Value) -> Self {
+    pub(crate) fn details(mut self, details: Value) -> Self {
         self.details = Some(details);
         self
     }
@@ -104,7 +103,7 @@ impl From<rusqlite::Error> for Error {
     }
 }
 
-type Result<T> = std::result::Result<T, Error>;
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -129,15 +128,12 @@ struct SubjectEnsure {
     request_id: String,
 }
 
-pub fn main(plugin: Plugin) {
+#[allow(dead_code)] // Tutor has its own parser; Book and Practice use this shared entrypoint.
+pub(crate) fn main(plugin: Plugin) {
     finish(run(plugin, Cli::parse()));
 }
 
-pub fn tutor_main() {
-    tutor::main();
-}
-
-fn finish(result: Result<Value>) {
+pub(crate) fn finish(result: Result<Value>) {
     match result {
         Ok(value) => println!("{}", serde_json::to_string(&value).expect("JSON response")),
         Err(error) => {
@@ -173,7 +169,11 @@ fn run(plugin: Plugin, cli: Cli) -> Result<Value> {
     }
 }
 
-fn run_subject(plugin: Plugin, store: &mut Store, command: SubjectCommand) -> Result<Value> {
+pub(crate) fn run_subject(
+    plugin: Plugin,
+    store: &mut Store,
+    command: SubjectCommand,
+) -> Result<Value> {
     match command {
         SubjectCommand::Create { json } => {
             let input: SubjectCreate = read_json(&json)?;
@@ -196,13 +196,14 @@ fn run_subject(plugin: Plugin, store: &mut Store, command: SubjectCommand) -> Re
     }
 }
 
-struct Store {
-    connection: Connection,
-    root: PathBuf,
+pub(crate) struct Store {
+    pub(crate) connection: Connection,
+    #[allow(dead_code)] // Used by Tutor; Book and Practice share this module without Tutor.
+    pub(crate) root: PathBuf,
 }
 
 impl Store {
-    fn open(plugin: Plugin) -> Result<Self> {
+    pub(crate) fn open(plugin: Plugin) -> Result<Self> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| Error::new("home_unavailable", "HOME is not configured"))?;
@@ -245,9 +246,6 @@ impl Store {
              );
              PRAGMA user_version=1;",
         )?;
-        if matches!(plugin, Plugin::Tutor) {
-            tutor::initialize(&connection, &root)?;
-        }
         Ok(Self { connection, root })
     }
 }
@@ -385,7 +383,7 @@ fn rename_subject(
     Ok(value)
 }
 
-fn subject(connection: &Connection, id: &str) -> Result<Value> {
+pub(crate) fn subject(connection: &Connection, id: &str) -> Result<Value> {
     validate_id(id)?;
     subject_optional(connection, id)?
         .ok_or_else(|| Error::new("subject_not_found", format!("subject {id} was not found")))
@@ -428,7 +426,11 @@ fn subject_optional(connection: &Connection, id: &str) -> Result<Option<Value>> 
     .transpose()
 }
 
-fn replay(tx: &Transaction<'_>, request_id: &str, fingerprint: &str) -> Result<Option<Value>> {
+pub(crate) fn replay(
+    tx: &Transaction<'_>,
+    request_id: &str,
+    fingerprint: &str,
+) -> Result<Option<Value>> {
     let existing = tx
         .query_row(
             "SELECT fingerprint,result_json FROM requests WHERE request_id=?1",
@@ -450,7 +452,7 @@ fn replay(tx: &Transaction<'_>, request_id: &str, fingerprint: &str) -> Result<O
         .map_err(|error| Error::new("corrupt_store", error.to_string()))
 }
 
-fn remember(
+pub(crate) fn remember(
     tx: &Transaction<'_>,
     request_id: &str,
     fingerprint: &str,
@@ -465,7 +467,7 @@ fn remember(
     Ok(())
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(source: &str) -> Result<T> {
+pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(source: &str) -> Result<T> {
     let bytes = if source == "-" {
         let mut bytes = Vec::new();
         io::stdin()
@@ -515,7 +517,7 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_request_id(request_id: &str) -> Result<()> {
+pub(crate) fn validate_request_id(request_id: &str) -> Result<()> {
     if request_id.trim().is_empty() || request_id.len() > 256 {
         return Err(Error::new(
             "invalid_input",
@@ -532,12 +534,12 @@ fn validate_optional_id(id: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn validate_id(id: &str) -> Result<()> {
+pub(crate) fn validate_id(id: &str) -> Result<()> {
     if id.len() < 16
         || id.len() > 64
         || !id
             .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'z').contains(&byte))
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
     {
         return Err(Error::new("invalid_id", "subject ID is invalid"));
     }
@@ -585,7 +587,7 @@ fn ensure_parent(tx: &Transaction<'_>, parent_id: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn fingerprint(value: &impl Serialize) -> Result<String> {
+pub(crate) fn fingerprint(value: &impl Serialize) -> Result<String> {
     let bytes =
         serde_json::to_vec(value).map_err(|error| Error::new("json_error", error.to_string()))?;
     Ok(Sha256::digest(bytes)
@@ -594,7 +596,7 @@ fn fingerprint(value: &impl Serialize) -> Result<String> {
         .collect())
 }
 
-fn new_id(plugin: Plugin, request_id: &str) -> String {
+pub(crate) fn new_id(plugin: Plugin, request_id: &str) -> String {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -611,7 +613,7 @@ fn new_id(plugin: Plugin, request_id: &str) -> String {
         .collect()
 }
 
-fn now(connection: &Connection) -> Result<String> {
+pub(crate) fn now(connection: &Connection) -> Result<String> {
     connection
         .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
             row.get(0)
@@ -619,7 +621,7 @@ fn now(connection: &Connection) -> Result<String> {
         .map_err(Into::into)
 }
 
-fn envelope(plugin: Plugin, command: &str, result: Value) -> Value {
+pub(crate) fn envelope(plugin: Plugin, command: &str, result: Value) -> Value {
     json!({
         "schema_version": 1,
         "plugin": plugin.id(),
@@ -628,7 +630,7 @@ fn envelope(plugin: Plugin, command: &str, result: Value) -> Value {
     })
 }
 
-fn reject_symlink(path: &Path) -> Result<()> {
+pub(crate) fn reject_symlink(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::new(
             "unsafe_store_path",

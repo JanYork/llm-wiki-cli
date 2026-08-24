@@ -1,4 +1,10 @@
-use super::*;
+use crate::learning::*;
+use clap::{Parser, Subcommand};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{fs, path::Path, sync::atomic::Ordering};
 
 const SOUL_MAX_BYTES: usize = 64 * 1024;
 const INITIAL_SOUL: &str = "# 老师的灵魂\n\n保持客观、科学、诚实，禁止谄媚。先识别学生的具体阻塞，再逐级提供提示；评价必须引用可观察证据。\n";
@@ -112,11 +118,11 @@ struct SoulPublish {
     request_id: String,
 }
 
-pub(super) fn main() {
+pub(crate) fn main() {
     finish(run(TutorCli::parse()));
 }
 
-pub(super) fn initialize(connection: &Connection, root: &Path) -> Result<()> {
+fn initialize(connection: &Connection, root: &Path) -> Result<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS tutor_sessions(
            id TEXT PRIMARY KEY,
@@ -172,6 +178,7 @@ pub(super) fn initialize(connection: &Connection, root: &Path) -> Result<()> {
 
 fn run(cli: TutorCli) -> Result<Value> {
     let mut store = Store::open(Plugin::Tutor)?;
+    initialize(&store.connection, &store.root)?;
     match cli.command {
         TutorCommand::Subject { command } => run_subject(Plugin::Tutor, &mut store, command),
         TutorCommand::Session { command } => run_session(&mut store, command),
@@ -365,7 +372,7 @@ fn run_soul(store: &mut Store, command: SoulCommand) -> Result<Value> {
                 return Err(Error::new("invalid_input", "Soul body must not be empty"));
             }
             validate_text("reason", &input.reason, 4096)?;
-            if input.body.as_bytes().len() > SOUL_MAX_BYTES {
+            if input.body.len() > SOUL_MAX_BYTES {
                 return Err(Error::new(
                     "soul_too_large",
                     format!("Soul body exceeds {SOUL_MAX_BYTES} UTF-8 bytes"),
@@ -529,7 +536,7 @@ fn soul(connection: &Connection) -> Result<Value> {
         "revision": row.0,
         "body": row.1,
         "body_sha256": row.2,
-        "body_bytes": row.1.as_bytes().len(),
+        "body_bytes": row.1.len(),
         "max_bytes": SOUL_MAX_BYTES,
         "fact_refs": fact_refs,
         "reason": row.4,
