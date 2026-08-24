@@ -1,7 +1,5 @@
 use clap::{Parser, Subcommand};
-use rusqlite::{
-    Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::ValueRef,
-};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -12,6 +10,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[path = "../learning_schema.rs"]
+mod learning_schema;
 
 const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 const STORE_SCHEMA_VERSION: i64 = 2;
@@ -96,6 +97,10 @@ impl Error {
     #[allow(dead_code)] // Book uses this branch discriminator; the other fixed binaries do not.
     pub(crate) fn code(&self) -> &'static str {
         self.code
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -565,152 +570,17 @@ pub(crate) fn bump_store_revision(tx: &Transaction<'_>) -> Result<i64> {
 
 pub(crate) fn canonical_logical_hash(plugin: Plugin, connection: &Connection) -> Result<String> {
     require_canonical_table_coverage(connection, plugin)?;
-    let mut tables = connection
-        .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    tables.retain(|table| canonical_tables(plugin).contains(&table.as_str()));
-    let mut hasher = Sha256::new();
-    hash_field(&mut hasher, plugin.id().as_bytes());
-    for table in tables {
-        hash_field(&mut hasher, table.as_bytes());
-        let columns = table_columns(connection, &table)?;
-        if columns.is_empty() {
-            return Err(Error::new(
-                "corrupt_store",
-                format!("canonical table {table} has no columns"),
-            ));
-        }
-        for column in &columns {
-            hash_field(&mut hasher, column.as_bytes());
-        }
-        let selected = columns
-            .iter()
-            .map(|column| quote_identifier(column))
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT {selected} FROM {} ORDER BY {selected}",
-            quote_identifier(&table)
-        );
-        let mut statement = connection.prepare(&sql)?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            hasher.update([0xff]);
-            for index in 0..columns.len() {
-                match row.get_ref(index)? {
-                    ValueRef::Null => hasher.update([0]),
-                    ValueRef::Integer(value) => {
-                        hasher.update([1]);
-                        hash_field(&mut hasher, &value.to_be_bytes());
-                    }
-                    ValueRef::Real(value) => {
-                        hasher.update([2]);
-                        hash_field(&mut hasher, &value.to_bits().to_be_bytes());
-                    }
-                    ValueRef::Text(value) => {
-                        hasher.update([3]);
-                        hash_field(&mut hasher, value);
-                    }
-                    ValueRef::Blob(value) => {
-                        hasher.update([4]);
-                        hash_field(&mut hasher, value);
-                    }
-                }
-            }
-        }
-    }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    learning_schema::canonical_logical_hash(plugin.id(), connection)
+        .map_err(|message| Error::new("corrupt_store", message))
 }
 
 fn canonical_tables(plugin: Plugin) -> &'static [&'static str] {
-    const TUTOR: &[&str] = &[
-        "subjects",
-        "subject_name_history",
-        "requests",
-        "tutor_sessions",
-        "tutor_diagnoses",
-        "tutor_turns",
-        "soul_versions",
-        "soul_settings",
-        "soul_settings_history",
-        "soul_proposals",
-        "learner_facts",
-        "learner_fact_history",
-        "tutor_goals",
-        "tutor_goal_criteria",
-        "tutor_goal_evidence",
-        "tutor_goal_history",
-        "tutor_plans",
-        "tutor_plan_versions",
-        "tutor_plan_steps",
-        "tutor_plan_step_history",
-    ];
-    const BOOK: &[&str] = &[
-        "subjects",
-        "subject_name_history",
-        "requests",
-        "books",
-        "book_blocks",
-        "book_anomalies",
-        "book_cursors",
-        "book_leases",
-        "book_lease_owner_history",
-        "book_window_reports",
-        "book_syntheses",
-        "book_summaries",
-        "book_mainline",
-        "book_relations",
-    ];
-    const PRACTICE: &[&str] = &[
-        "subjects",
-        "subject_name_history",
-        "requests",
-        "practice_banks",
-        "practice_items",
-        "bank_items",
-        "practice_sets",
-        "set_members",
-        "set_member_events",
-        "papers",
-        "paper_items",
-        "attempts",
-        "attempt_takeover_history",
-        "responses",
-        "response_history",
-        "grades",
-        "grade_history",
-        "review_controls",
-        "review_events",
-        "fsrs_cards",
-        "review_debt",
-        "review_debt_events",
-    ];
-    match plugin {
-        Plugin::Tutor => TUTOR,
-        Plugin::Book => BOOK,
-        Plugin::Practice => PRACTICE,
-    }
+    learning_schema::canonical_tables(plugin.id()).expect("fixed plugin")
 }
 
 fn require_canonical_table_coverage(connection: &Connection, plugin: Plugin) -> Result<()> {
     const SHARED_NON_CANONICAL: &[&str] = &["plugin_meta", "sync_receipts"];
-    const BOOK_DERIVED: &[&str] = &[
-        "book_blocks_fts",
-        "book_blocks_fts_data",
-        "book_blocks_fts_idx",
-        "book_blocks_fts_content",
-        "book_blocks_fts_docsize",
-        "book_blocks_fts_config",
-    ];
-    let derived: &[&str] = match plugin {
-        Plugin::Book => BOOK_DERIVED,
-        Plugin::Tutor | Plugin::Practice => &[],
-    };
+    let derived = learning_schema::derived_tables(plugin.id());
     let tables = connection
         .prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'")?
         .query_map([], |row| row.get::<_, String>(0))?
@@ -749,10 +619,6 @@ fn require_canonical_table_coverage(connection: &Connection, plugin: Plugin) -> 
         ));
     }
     Ok(())
-}
-
-fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
@@ -845,6 +711,11 @@ pub(crate) fn record_sync_receipt(
             receipt.receipt_hash,
         ],
     )?;
+    tx.execute(
+        "INSERT INTO plugin_meta(key,value) VALUES('latest_sync_receipt_session',?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [&receipt.session_id],
+    )?;
     Ok(receipt)
 }
 
@@ -852,19 +723,31 @@ pub(crate) fn latest_sync_receipt(
     connection: &Connection,
     plugin: Plugin,
 ) -> Result<Option<PluginSyncReceipt>> {
-    let receipt = connection
+    let session_id = connection
         .query_row(
-            "SELECT session_id,plugin_id,store_id,source_revision,resolved_revision,
-                    logical_hash,completed_at,runtime_state,state,receipt_hash
-             FROM sync_receipts ORDER BY resolved_revision DESC,completed_at DESC,session_id DESC
-             LIMIT 1",
+            "SELECT value FROM plugin_meta WHERE key='latest_sync_receipt_session'",
             [],
-            receipt_row,
+            |row| row.get::<_, String>(0),
         )
         .optional()?;
-    let Some(receipt) = receipt else {
-        return Ok(None);
+    let Some(session_id) = session_id else {
+        let count = connection.query_row("SELECT COUNT(*) FROM sync_receipts", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        if count == 0 {
+            return Ok(None);
+        }
+        return Err(Error::new(
+            "corrupt_store",
+            "Sync receipts exist without a latest receipt pointer",
+        ));
     };
+    let receipt = sync_receipt(connection, &session_id)?.ok_or_else(|| {
+        Error::new(
+            "corrupt_store",
+            "latest Sync receipt pointer references a missing receipt",
+        )
+    })?;
     if receipt.plugin_id != plugin.id() || receipt.receipt_hash != receipt_hash(&receipt)? {
         return Err(Error::new(
             "invalid_sync_receipt",
@@ -1484,4 +1367,61 @@ fn make_private_file(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn make_private_file(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod shared_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn latest_receipt_pointer_ignores_timestamp_and_session_lexical_order() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_store(&connection, Plugin::Tutor).unwrap();
+        for table in canonical_tables(Plugin::Tutor).iter().skip(3) {
+            connection
+                .execute_batch(&format!(
+                    "CREATE TABLE {}(id TEXT PRIMARY KEY);",
+                    quote_test(table)
+                ))
+                .unwrap();
+        }
+        let logical_hash = canonical_logical_hash(Plugin::Tutor, &connection).unwrap();
+        for session in ["sync-z", "sync-a"] {
+            let tx = connection.transaction().unwrap();
+            record_sync_receipt(&tx, Plugin::Tutor, session, 0, 0, &logical_hash, "ready").unwrap();
+            tx.commit().unwrap();
+        }
+        for session in ["sync-z", "sync-a"] {
+            let mut receipt = sync_receipt(&connection, session).unwrap().unwrap();
+            receipt.completed_at = "2026-08-24T00:00:00.000Z".to_owned();
+            receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+            connection
+                .execute(
+                    "UPDATE sync_receipts SET completed_at=?2,receipt_hash=?3 WHERE session_id=?1",
+                    params![session, receipt.completed_at, receipt.receipt_hash],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            latest_sync_receipt(&connection, Plugin::Tutor)
+                .unwrap()
+                .unwrap()
+                .session_id,
+            "sync-a"
+        );
+        let tx = connection.transaction().unwrap();
+        record_sync_receipt(&tx, Plugin::Tutor, "sync-z", 0, 0, &logical_hash, "ready").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            latest_sync_receipt(&connection, Plugin::Tutor)
+                .unwrap()
+                .unwrap()
+                .session_id,
+            "sync-a"
+        );
+    }
+
+    fn quote_test(identifier: &str) -> String {
+        format!("\"{}\"", identifier.replace('"', "\"\""))
+    }
 }

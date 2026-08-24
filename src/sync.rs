@@ -12,7 +12,7 @@ use crate::{
     },
 };
 use clap::ValueEnum;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -27,11 +27,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const PROTOCOL_VERSION: u32 = 1;
+#[path = "learning_schema.rs"]
+mod learning_schema;
+
+const PROTOCOL_VERSION: u32 = 2;
 const MAX_PROTOCOL_BYTES: u64 = 1024 * 1024;
 const SSH_TIMEOUT: Duration = Duration::from_secs(30);
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_TRANSFER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const FIXED_PLUGINS: [&str; 3] = ["tutor", "book", "practice"];
 static STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, ValueEnum)]
@@ -63,6 +67,34 @@ struct PeerRequest {
     baseline_digest: Option<String>,
     #[serde(default)]
     requester_store_id: Option<String>,
+    #[serde(default)]
+    plugin: Option<PluginRequest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct PluginRequest {
+    plugin_id: String,
+    store_id: String,
+    revision: u64,
+    records_sha256: String,
+    logical_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct PluginExportInventory {
+    store_id: String,
+    revision: u64,
+    records_sha256: String,
+    logical_hash: String,
+    artifact_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct PeerPlugin {
+    plugin_id: String,
+    runtime_ready: bool,
+    export: Option<PluginExportInventory>,
+    history: Vec<PluginExportInventory>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -81,6 +113,7 @@ struct PeerResponse {
     session_id: String,
     version: String,
     stores: Vec<PeerStore>,
+    plugins: Vec<PeerPlugin>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -98,6 +131,42 @@ struct PeerTransfer {
     identity: StoreIdentity,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PeerPluginTransfer {
+    protocol: u32,
+    action: String,
+    session_id: String,
+    plugin: PluginRequest,
+    size: u64,
+    artifact_digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginManifest {
+    format: u32,
+    plugin: String,
+    store_id: String,
+    revision: u64,
+    records_sha256: String,
+    logical_hash: String,
+    blobs: Vec<PluginBlobManifest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginBlobManifest {
+    sha256: String,
+    bytes: u64,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct NormalizedPluginRecord {
+    table: String,
+    key: Vec<Value>,
+    values: serde_json::Map<String, Value>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct SessionState {
     protocol: u32,
@@ -109,6 +178,10 @@ struct SessionState {
     phase: String,
     peer_digest: Option<String>,
     peer_stores: Vec<PeerStore>,
+    #[serde(default)]
+    peer_plugins: Vec<PeerPlugin>,
+    #[serde(default)]
+    plugin_results: Vec<Value>,
     #[serde(default)]
     conflict_count: u64,
     #[serde(default)]
@@ -320,6 +393,7 @@ pub(crate) fn run(
                 "scope": state.scope,
                 "mode": state.mode,
                 "stores": receipts,
+                "plugins": state.plugin_results,
                 "git_derived": state.git_derived,
                 "idempotent": true,
             }));
@@ -394,6 +468,8 @@ pub(crate) fn run(
             state.next_action = Some("resume_derived_rebuild".to_string());
             state.updated_at_unix_ms = now_unix_ms()?;
         } else {
+            cleanup_plugin_session(&session_id)?;
+            cleanup_plugin_session_on_peer(host, scope, remote_directory.as_deref(), &session_id)?;
             state.phase = "completed".to_string();
             state.conflict_count = 0;
             state.conflict_kinds.clear();
@@ -409,6 +485,7 @@ pub(crate) fn run(
             "git": git,
             "git_derived": state.git_derived,
             "stores": session_receipts(&state),
+            "plugins": state.plugin_results,
         }));
     }
 
@@ -419,6 +496,7 @@ pub(crate) fn run(
             session_id: saved.session_id.clone(),
             version: "bound-session".to_string(),
             stores: saved.peer_stores.clone(),
+            plugins: saved.peer_plugins.clone(),
         }
     } else {
         let request = PeerRequest {
@@ -433,6 +511,7 @@ pub(crate) fn run(
             expected: None,
             baseline_digest: None,
             requester_store_id: None,
+            plugin: None,
         };
         call_peer(host, &request)?
     };
@@ -451,6 +530,8 @@ pub(crate) fn run(
             "remote handshake does not match the requested Sync session",
         ));
     }
+    let local_plugins = fixed_plugin_inventory(&session_id)?;
+    let plugin_results = validate_fixed_plugin_preflight(&local_plugins, &peer.plugins)?;
     let peer_bytes = serde_json::to_vec(&peer)
         .map_err(|error| AppError::new("sync_protocol_invalid", error.to_string()))?;
     let state_created_at = now_unix_ms()?;
@@ -464,6 +545,8 @@ pub(crate) fn run(
         phase: "handshake_complete".to_string(),
         peer_digest: Some(hex_digest(&peer_bytes)),
         peer_stores: peer.stores,
+        peer_plugins: peer.plugins,
+        plugin_results,
         conflict_count: 0,
         conflict_kinds: Vec::new(),
         next_action: None,
@@ -647,6 +730,7 @@ pub(crate) fn run(
                     .then(|| sync_state_digest(&base_remote_state))
                     .transpose()?,
                 requester_store_id: Some(local_identity.store_id.clone()),
+                plugin: None,
             };
             let transfer = call_peer_export(
                 host,
@@ -848,6 +932,33 @@ pub(crate) fn run(
         state.phase = "publishing".to_string();
         state.updated_at_unix_ms = now_unix_ms()?;
         write_state_all(&stores, &mut state)?;
+        let local_plugin_inventory = fixed_plugin_inventory(&session_id)?;
+        let peer_plugins = state.peer_plugins.clone();
+        let mut plugin_progress = state.plugin_results.clone();
+        state.plugin_results = reconcile_fixed_plugins(
+            host,
+            scope,
+            remote_directory.as_deref(),
+            &session_id,
+            mode,
+            &local_plugin_inventory,
+            &peer_plugins,
+            |result| {
+                if let Some(index) = plugin_progress
+                    .iter()
+                    .position(|entry| entry["plugin"] == result["plugin"])
+                {
+                    plugin_progress[index] = result.clone();
+                } else {
+                    plugin_progress.push(result.clone());
+                }
+                state.plugin_results = plugin_progress.clone();
+                state.updated_at_unix_ms = now_unix_ms()?;
+                write_state_all(&stores, &mut state)
+            },
+        )?;
+        state.updated_at_unix_ms = now_unix_ms()?;
+        write_state_all(&stores, &mut state)?;
         for staged_store in &staged {
             let unit_index = state
                 .units
@@ -877,6 +988,7 @@ pub(crate) fn run(
                             .store_id
                             .clone(),
                     ),
+                    plugin: None,
                 };
                 let response = call_peer_publish(host, &publish, &staged_store.merged_state)?;
                 state.units[unit_index].published_remote = true;
@@ -920,6 +1032,7 @@ pub(crate) fn run(
                             .store_id
                             .clone(),
                     ),
+                    plugin: None,
                 };
                 let response = call_peer_value(host, &rebuild)?;
                 if response["protocol"] != PROTOCOL_VERSION
@@ -1045,6 +1158,7 @@ pub(crate) fn run(
                             .store_id
                             .clone(),
                     ),
+                    plugin: None,
                 };
                 let response = call_peer_value(host, &acknowledge)?;
                 if response["protocol"] != PROTOCOL_VERSION
@@ -1184,6 +1298,8 @@ pub(crate) fn run(
             .to_string(),
         );
     } else {
+        cleanup_plugin_session(&session_id)?;
+        cleanup_plugin_session_on_peer(host, scope, remote_directory.as_deref(), &session_id)?;
         state.phase = "completed".to_string();
         state.next_action = None;
     }
@@ -1197,6 +1313,7 @@ pub(crate) fn run(
         "mode": mode,
         "remote_version": peer.version,
         "stores": results,
+        "plugins": state.plugin_results,
         "git": git,
         "git_derived": state.git_derived,
         "conflicts": conflict_batch,
@@ -1235,6 +1352,1836 @@ fn session_receipts(state: &SessionState) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn fixed_plugin_inventory(session_id: &str) -> Result<Vec<PeerPlugin>> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::new("home_unavailable", "HOME is not configured"))?;
+    FIXED_PLUGINS
+        .iter()
+        .map(|plugin| plugin_inventory(&home, session_id, plugin))
+        .collect()
+}
+
+fn plugin_inventory(home: &Path, session_id: &str, plugin: &str) -> Result<PeerPlugin> {
+    let root = home.join(".lwc/plugins").join(plugin);
+    let data_present = root.join("data.sqlite3").is_file();
+    let runtime_ready = plugin_runtime_ready(plugin)?;
+    let mut exports: Vec<PluginExportInventory> = Vec::new();
+    for archive in [root.join("preserved"), root.join("sync-history")] {
+        if !archive.is_dir() {
+            continue;
+        }
+        for store in fs::read_dir(&archive)? {
+            let store = store?;
+            if !store.file_type()?.is_dir() {
+                return Err(unsafe_plugin_export(plugin));
+            }
+            let store_id = store.file_name().to_string_lossy().into_owned();
+            if !valid_plugin_store_id(&store_id) {
+                return Err(unsafe_plugin_export(plugin));
+            }
+            for revision in fs::read_dir(store.path())? {
+                let revision = revision?;
+                if !revision.file_type()?.is_dir() {
+                    return Err(unsafe_plugin_export(plugin));
+                }
+                let revision_name = revision.file_name().to_string_lossy().into_owned();
+                if revision_name
+                    .parse::<u64>()
+                    .ok()
+                    .map(|value| value.to_string())
+                    != Some(revision_name)
+                {
+                    return Err(AppError::new(
+                        "sync_plugin_invalid",
+                        "plugin revision path is not canonical decimal",
+                    ));
+                }
+                let export = validate_plugin_export(plugin, &revision.path())?;
+                if export.revision.to_string() != revision.file_name().to_string_lossy() {
+                    return Err(AppError::new(
+                        "sync_plugin_invalid",
+                        "plugin revision path does not match its manifest",
+                    ));
+                }
+                if export.store_id != store_id {
+                    return Err(AppError::new(
+                        "sync_plugin_invalid",
+                        "preserved plugin StoreIdentity does not match its path",
+                    ));
+                }
+                if let Some(existing) = exports.iter().find(|existing| {
+                    existing.store_id == export.store_id && existing.revision == export.revision
+                }) {
+                    if existing != &export {
+                        return Err(AppError::new(
+                            "sync_plugin_diverged",
+                            format!("{plugin} archive revision has different canonical content"),
+                        ));
+                    }
+                } else {
+                    exports.push(export);
+                }
+            }
+        }
+    }
+    if data_present {
+        let live = ensure_live_plugin_export(home, session_id, plugin)?;
+        if let Some(existing) = exports
+            .iter()
+            .find(|export| export.store_id == live.store_id && export.revision == live.revision)
+        {
+            if existing != &live {
+                return Err(AppError::new(
+                    "sync_plugin_changed",
+                    format!("{plugin} canonical content changed without a revision bump"),
+                ));
+            }
+        } else {
+            exports.push(live);
+        }
+    }
+    exports.sort_by_key(|export| export.revision);
+    if exports.len() > 64 {
+        return Err(AppError::new(
+            "sync_plugin_history_too_large",
+            format!("{plugin} preserved history exceeds the bounded inventory"),
+        ));
+    }
+    if exports
+        .iter()
+        .map(|export| &export.store_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        > 1
+    {
+        return Err(AppError::new(
+            "sync_plugin_diverged",
+            format!("{plugin} has multiple preserved StoreIdentity values"),
+        ));
+    }
+    let export = exports.last().cloned();
+    Ok(PeerPlugin {
+        plugin_id: plugin.to_owned(),
+        runtime_ready,
+        export,
+        history: exports,
+    })
+}
+
+fn validate_plugin_export(plugin: &str, root: &Path) -> Result<PluginExportInventory> {
+    reject_plugin_path(root)?;
+    let manifest_path = root.join("manifest.json");
+    let records_path = root.join("records.ndjson");
+    reject_plugin_file(&manifest_path)?;
+    reject_plugin_file(&records_path)?;
+    if fs::metadata(&manifest_path)?.len() > MAX_PROTOCOL_BYTES {
+        return Err(AppError::new(
+            "sync_plugin_invalid",
+            "plugin manifest exceeds the bounded format",
+        ));
+    }
+    let manifest: PluginManifest = serde_json::from_slice(&fs::read(&manifest_path)?)
+        .map_err(|error| AppError::new("sync_plugin_invalid", error.to_string()))?;
+    if manifest.format != 1
+        || manifest.plugin != plugin
+        || !valid_plugin_store_id(&manifest.store_id)
+        || !valid_sha256(&manifest.records_sha256)
+        || !valid_sha256(&manifest.logical_hash)
+        || file_digest(&records_path)? != manifest.records_sha256
+    {
+        return Err(AppError::new(
+            "sync_plugin_invalid",
+            format!("{plugin} normalized export manifest is invalid"),
+        ));
+    }
+    let mut hasher = Sha256::new();
+    plugin_digest_field(&mut hasher, b"manifest.json");
+    plugin_digest_field(&mut hasher, file_digest(&manifest_path)?.as_bytes());
+    plugin_digest_field(&mut hasher, b"records.ndjson");
+    plugin_digest_field(&mut hasher, manifest.records_sha256.as_bytes());
+    let mut expected = std::collections::BTreeSet::new();
+    for blob in &manifest.blobs {
+        if !valid_sha256(&blob.sha256) || !expected.insert(blob.sha256.clone()) {
+            return Err(AppError::new(
+                "sync_plugin_invalid",
+                "plugin blob inventory is invalid",
+            ));
+        }
+        let relative = format!("blobs/sha256/{}/{}", &blob.sha256[..2], blob.sha256);
+        let path = root.join(&relative);
+        reject_plugin_file(&path)?;
+        let metadata = fs::metadata(&path)?;
+        if metadata.len() != blob.bytes || file_digest(&path)? != blob.sha256 {
+            return Err(AppError::new(
+                "sync_plugin_invalid",
+                "plugin blob does not match its canonical inventory",
+            ));
+        }
+        plugin_digest_field(&mut hasher, relative.as_bytes());
+        plugin_digest_field(&mut hasher, blob.sha256.as_bytes());
+    }
+    let artifact_sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(PluginExportInventory {
+        store_id: manifest.store_id,
+        revision: manifest.revision,
+        records_sha256: manifest.records_sha256,
+        logical_hash: manifest.logical_hash,
+        artifact_sha256,
+    })
+}
+
+fn plugin_digest_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn valid_plugin_store_id(value: &str) -> bool {
+    valid_sha256(value)
+}
+
+fn plugin_runtime_ready(plugin: &str) -> Result<bool> {
+    use crate::config::CapabilitySetting;
+    let enabled = crate::config::resolve_learning(plugin)?.setting == CapabilitySetting::Enabled;
+    let runtime = match plugin {
+        "tutor" => crate::learning_runtime::status(crate::learning_runtime::Plugin::Tutor)?,
+        "book" => crate::learning_runtime::status(crate::learning_runtime::Plugin::Book)?,
+        "practice" => crate::learning_runtime::status(crate::learning_runtime::Plugin::Practice)?,
+        _ => return Err(AppError::new("sync_plugin_invalid", "unknown fixed plugin")),
+    };
+    Ok(enabled && runtime["installed"] == true)
+}
+
+fn ensure_live_plugin_export(
+    home: &Path,
+    session_id: &str,
+    plugin: &str,
+) -> Result<PluginExportInventory> {
+    let root = home.join(".lwc/plugins").join(plugin);
+    let database = root.join("data.sqlite3");
+    reject_plugin_file(&database)?;
+    let connection =
+        Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.execute_batch("BEGIN;")?;
+    let store_id: String = connection
+        .query_row(
+            "SELECT value FROM plugin_meta WHERE key='store_id'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| AppError::new("sync_plugin_invalid", "plugin StoreIdentity is missing"))?;
+    if !valid_plugin_store_id(&store_id) {
+        return Err(AppError::new(
+            "sync_plugin_invalid",
+            "plugin StoreIdentity is invalid",
+        ));
+    }
+    let revision: u64 = connection
+        .query_row(
+            "SELECT value FROM plugin_meta WHERE key='revision'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?
+        .parse()
+        .map_err(|_| AppError::new("sync_plugin_invalid", "plugin revision is invalid"))?;
+    require_live_plugin_schema(plugin, &connection)?;
+    let logical_hash = learning_schema::canonical_logical_hash(plugin, &connection)
+        .map_err(|message| AppError::new("sync_plugin_invalid", message))?;
+    let lwc = home.join(".lwc");
+    let sync = lwc.join("sync");
+    let plugins = sync.join("plugins");
+    let session = plugins.join(session_id);
+    for directory in [&lwc, &sync, &plugins, &session] {
+        ensure_real_directory(directory)?;
+    }
+    let destination = plugin_live_export_path(home, session_id, plugin);
+    if destination.is_dir() {
+        let export = validate_plugin_export(plugin, &destination)?;
+        if export.store_id != store_id
+            || export.revision != revision
+            || export.logical_hash != logical_hash
+        {
+            return Err(AppError::new(
+                "sync_plugin_changed",
+                format!("{plugin} canonical content changed during the Sync session"),
+            ));
+        }
+        return Ok(export);
+    }
+    let staging = destination
+        .parent()
+        .expect("live export parent")
+        .join(format!(
+            ".{plugin}-export-{}-{}",
+            std::process::id(),
+            STATE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+    fs::create_dir(&staging)?;
+    let outcome = (|| -> Result<PluginExportInventory> {
+        let records_path = staging.join("records.ndjson");
+        let mut records = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&records_path)?;
+        for table in learning_schema::canonical_tables(plugin).expect("fixed plugin") {
+            write_normalized_table(&connection, table, &mut records)?;
+        }
+        records.sync_all()?;
+        let records_sha256 = file_digest(&records_path)?;
+        let blobs = plugin_blob_inventory(plugin, &root, &connection, &staging)?;
+        let manifest = json!({
+            "format": 1,
+            "plugin": plugin,
+            "store_id": store_id,
+            "revision": revision,
+            "logical_hash": logical_hash,
+            "records_sha256": records_sha256,
+            "blobs": blobs,
+        });
+        let manifest_path = staging.join("manifest.json");
+        let mut manifest_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&manifest_path)?;
+        serde_json::to_writer_pretty(&mut manifest_file, &manifest)
+            .map_err(|error| AppError::new("json_error", error.to_string()))?;
+        manifest_file.sync_all()?;
+        let export = validate_plugin_export(plugin, &staging)?;
+        fs::rename(&staging, &destination)?;
+        Ok(export)
+    })();
+    if outcome.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    outcome
+}
+
+fn plugin_live_export_path(home: &Path, session_id: &str, plugin: &str) -> PathBuf {
+    home.join(".lwc/sync/plugins")
+        .join(session_id)
+        .join(format!("{plugin}-live"))
+}
+
+fn retain_plugin_history(
+    session_id: &str,
+    plugin: &str,
+    export: &PluginExportInventory,
+) -> Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::new("home_unavailable", "HOME is not configured"))?;
+    let source = plugin_export_path(session_id, plugin, export)?;
+    let history = home.join(".lwc/plugins").join(plugin).join("sync-history");
+    ensure_real_directory(&history)?;
+    let store = history.join(&export.store_id);
+    ensure_real_directory(&store)?;
+    let destination = store.join(export.revision.to_string());
+    if destination.is_dir() {
+        if validate_plugin_export(plugin, &destination)? == *export {
+            return Ok(());
+        }
+        return Err(AppError::new(
+            "sync_plugin_diverged",
+            "plugin history revision differs from the resolved export",
+        ));
+    }
+    let staging = history.join(format!(
+        ".retain-{plugin}-{}-{}",
+        std::process::id(),
+        STATE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&staging)?;
+    let outcome = (|| -> Result<()> {
+        fs::copy(source.join("manifest.json"), staging.join("manifest.json"))?;
+        fs::copy(
+            source.join("records.ndjson"),
+            staging.join("records.ndjson"),
+        )?;
+        let manifest: PluginManifest =
+            serde_json::from_slice(&fs::read(source.join("manifest.json"))?)
+                .map_err(|error| AppError::new("sync_plugin_invalid", error.to_string()))?;
+        for blob in manifest.blobs {
+            let relative = format!("blobs/sha256/{}/{}", &blob.sha256[..2], blob.sha256);
+            let target = staging.join(&relative);
+            fs::create_dir_all(target.parent().expect("blob parent"))?;
+            fs::hard_link(source.join(&relative), target)?;
+        }
+        if validate_plugin_export(plugin, &staging)? != *export {
+            return Err(AppError::new(
+                "sync_plugin_changed",
+                "plugin export changed while retaining its Sync baseline",
+            ));
+        }
+        fs::rename(&staging, destination)?;
+        Ok(())
+    })();
+    if outcome.is_err() {
+        let _ = fs::remove_dir_all(staging);
+    }
+    outcome
+}
+
+fn require_live_plugin_schema(plugin: &str, connection: &Connection) -> Result<()> {
+    let canonical = learning_schema::canonical_tables(plugin).expect("fixed plugin");
+    let derived = learning_schema::derived_tables(plugin);
+    let tables = connection
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for table in canonical {
+        if !tables.iter().any(|actual| actual == table) {
+            return Err(AppError::new(
+                "sync_plugin_invalid",
+                format!("canonical plugin table {table} is missing"),
+            ));
+        }
+    }
+    if let Some(table) = tables.iter().find(|table| {
+        !canonical.contains(&table.as_str())
+            && !["plugin_meta", "sync_receipts"].contains(&table.as_str())
+            && !derived.contains(&table.as_str())
+    }) {
+        return Err(AppError::new(
+            "sync_plugin_invalid",
+            format!("plugin table {table} is outside the fixed normalized schema"),
+        ));
+    }
+    Ok(())
+}
+
+fn write_normalized_table(
+    connection: &Connection,
+    table: &str,
+    output: &mut impl Write,
+) -> Result<()> {
+    let mut schema = connection.prepare(&format!("PRAGMA table_info({})", quote_sql(table)))?;
+    let columns = schema
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.is_empty() || !columns.iter().any(|(_, primary)| *primary > 0) {
+        return Err(AppError::new(
+            "sync_plugin_invalid",
+            format!("canonical table {table} has no stable primary key"),
+        ));
+    }
+    let selected = columns
+        .iter()
+        .map(|(column, _)| quote_sql(column))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT {selected} FROM {} ORDER BY {selected}",
+        quote_sql(table)
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let mut values = serde_json::Map::new();
+        let mut key = Vec::new();
+        for (index, (column, primary)) in columns.iter().enumerate() {
+            let value = normalized_sql_value(row.get_ref(index)?)?;
+            if *primary > 0 {
+                key.push((*primary, value.clone()));
+            }
+            values.insert(column.clone(), value);
+        }
+        key.sort_by_key(|(ordinal, _)| *ordinal);
+        serde_json::to_writer(
+            &mut *output,
+            &json!({
+                "table": table,
+                "key": key.into_iter().map(|(_, value)| value).collect::<Vec<_>>(),
+                "values": values,
+            }),
+        )
+        .map_err(|error| AppError::new("json_error", error.to_string()))?;
+        output.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn normalized_sql_value(value: rusqlite::types::ValueRef<'_>) -> Result<Value> {
+    Ok(match value {
+        rusqlite::types::ValueRef::Null => Value::Null,
+        rusqlite::types::ValueRef::Integer(value) => json!(value),
+        rusqlite::types::ValueRef::Real(value) => json!(value),
+        rusqlite::types::ValueRef::Text(value) => Value::String(
+            std::str::from_utf8(value)
+                .map_err(|_| {
+                    AppError::new("sync_plugin_invalid", "canonical TEXT is not valid UTF-8")
+                })?
+                .to_owned(),
+        ),
+        rusqlite::types::ValueRef::Blob(value) => json!({
+            "$blob_hex": value.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+        }),
+    })
+}
+
+fn quote_sql(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn plugin_blob_inventory(
+    plugin: &str,
+    root: &Path,
+    connection: &Connection,
+    staging: &Path,
+) -> Result<Vec<Value>> {
+    if plugin != "book" {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection.prepare(
+        "SELECT original_sha256 FROM books
+         UNION SELECT normalized_sha256 FROM books WHERE normalized_sha256 IS NOT NULL
+         ORDER BY 1",
+    )?;
+    let hashes = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut inventory = Vec::new();
+    for hash in hashes {
+        if !valid_sha256(&hash) {
+            return Err(AppError::new(
+                "sync_plugin_invalid",
+                "Book blob hash is invalid",
+            ));
+        }
+        let source = root.join(format!("blobs/sha256/{}/{}", &hash[..2], hash));
+        reject_plugin_file(&source)?;
+        let relative = format!("blobs/sha256/{}/{}", &hash[..2], hash);
+        let destination = staging.join(&relative);
+        let blobs = staging.join("blobs");
+        let sha = blobs.join("sha256");
+        let prefix = sha.join(&hash[..2]);
+        for directory in [&blobs, &sha, &prefix] {
+            ensure_real_directory(directory)?;
+        }
+        fs::hard_link(&source, &destination).map_err(|error| {
+            AppError::new(
+                "sync_plugin_stage_failed",
+                format!("failed to stage Book blob without copying it: {error}"),
+            )
+        })?;
+        let bytes = fs::metadata(&destination)?.len();
+        if file_digest(&destination)? != hash {
+            return Err(AppError::new(
+                "sync_plugin_invalid",
+                "Book blob hash changed",
+            ));
+        }
+        inventory.push(json!({"sha256": hash, "bytes": bytes}));
+    }
+    Ok(inventory)
+}
+
+fn reject_plugin_path(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(unsafe_plugin_export("unknown"));
+    }
+    Ok(())
+}
+
+fn reject_plugin_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(unsafe_plugin_export("unknown"));
+    }
+    Ok(())
+}
+
+fn unsafe_plugin_export(plugin: &str) -> AppError {
+    AppError::new(
+        "unsafe_sync_plugin_path",
+        format!("{plugin} normalized export contains an unsafe path"),
+    )
+}
+
+fn plugin_export_path(
+    session_id: &str,
+    plugin: &str,
+    export: &PluginExportInventory,
+) -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::new("home_unavailable", "HOME is not configured"))?;
+    let live = plugin_live_export_path(&home, session_id, plugin);
+    if live.is_dir() && validate_plugin_export(plugin, &live)? == *export {
+        return Ok(live);
+    }
+    let resolved = home
+        .join(".lwc/sync/plugins")
+        .join(session_id)
+        .join(format!("{plugin}-resolved"));
+    if resolved.is_dir() && validate_plugin_export(plugin, &resolved)? == *export {
+        return Ok(resolved);
+    }
+    let history = home
+        .join(".lwc/plugins")
+        .join(plugin)
+        .join("sync-history")
+        .join(&export.store_id)
+        .join(export.revision.to_string());
+    if history.is_dir() && validate_plugin_export(plugin, &history)? == *export {
+        return Ok(history);
+    }
+    Ok(home
+        .join(".lwc/plugins")
+        .join(plugin)
+        .join("preserved")
+        .join(&export.store_id)
+        .join(export.revision.to_string()))
+}
+
+fn plugin_artifact_path(session_id: &str, plugin: &str, suffix: &str) -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::new("home_unavailable", "HOME is not configured"))?;
+    let lwc = home.join(".lwc");
+    let sync = lwc.join("sync");
+    let plugins = sync.join("plugins");
+    let root = plugins.join(session_id);
+    for directory in [&lwc, &sync, &plugins, &root] {
+        ensure_real_directory(directory)?;
+    }
+    Ok(root.join(format!("{plugin}-{suffix}.db")))
+}
+
+fn cleanup_plugin_session(session_id: &str) -> Result<()> {
+    validate_session_id(session_id)?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::new("home_unavailable", "HOME is not configured"))?;
+    let root = home.join(".lwc/sync/plugins").join(session_id);
+    if root.is_dir() {
+        fs::remove_dir_all(root)?;
+    } else if fs::symlink_metadata(&root).is_ok() {
+        return Err(AppError::new(
+            "sync_state_invalid",
+            "plugin session cleanup path is not a real directory",
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_plugin_session_on_peer(
+    host: &str,
+    scope: Scope,
+    remote_directory: Option<&Path>,
+    session_id: &str,
+) -> Result<()> {
+    let request = PeerRequest {
+        protocol: PROTOCOL_VERSION,
+        action: "plugin-cleanup".to_owned(),
+        session_id: session_id.to_owned(),
+        scope,
+        directory: remote_directory.map(Path::to_path_buf),
+        store_scope: None,
+        payload_size: None,
+        state_digest: None,
+        expected: None,
+        baseline_digest: None,
+        requester_store_id: None,
+        plugin: None,
+    };
+    let response = call_peer_value(host, &request)?;
+    if response["protocol"] != PROTOCOL_VERSION
+        || response["action"] != "plugin-cleaned"
+        || response["session_id"] != session_id
+    {
+        return Err(AppError::new(
+            "sync_protocol_invalid",
+            "remote plugin cleanup response does not match the request",
+        ));
+    }
+    Ok(())
+}
+
+fn build_plugin_artifact(
+    session_id: &str,
+    plugin: &str,
+    export: &PluginExportInventory,
+    destination: &Path,
+) -> Result<()> {
+    reject_non_regular_artifact(destination)?;
+    if destination.exists() {
+        fs::remove_file(destination)?;
+    }
+    let root = plugin_export_path(session_id, plugin, export)?;
+    if validate_plugin_export(plugin, &root)? != *export {
+        return Err(AppError::new(
+            "sync_plugin_changed",
+            "plugin export changed after the Sync handshake",
+        ));
+    }
+    let connection = Connection::open(destination)?;
+    connection.execute_batch(
+        "PRAGMA journal_mode=DELETE;
+         PRAGMA synchronous=FULL;
+         CREATE TABLE files(
+           id INTEGER PRIMARY KEY,
+           path TEXT NOT NULL UNIQUE,
+           size INTEGER NOT NULL,
+           sha256 TEXT NOT NULL,
+           content BLOB NOT NULL
+         );",
+    )?;
+    add_plugin_artifact_file(&connection, &root, "manifest.json")?;
+    add_plugin_artifact_file(&connection, &root, "records.ndjson")?;
+    let manifest: PluginManifest =
+        serde_json::from_slice(&fs::read(root.join("manifest.json"))?)
+            .map_err(|error| AppError::new("sync_plugin_invalid", error.to_string()))?;
+    for blob in manifest.blobs {
+        add_plugin_artifact_file(
+            &connection,
+            &root,
+            &format!("blobs/sha256/{}/{}", &blob.sha256[..2], blob.sha256),
+        )?;
+    }
+    connection.execute_batch("VACUUM;")?;
+    Ok(())
+}
+
+fn add_plugin_artifact_file(connection: &Connection, root: &Path, relative: &str) -> Result<()> {
+    let source = root.join(relative);
+    reject_plugin_file(&source)?;
+    let size = fs::metadata(&source)?.len();
+    let size_i64 = i64::try_from(size)
+        .map_err(|_| AppError::new("sync_plugin_too_large", "plugin file exceeds SQLite limits"))?;
+    let digest = file_digest(&source)?;
+    connection.execute(
+        "INSERT INTO files(path,size,sha256,content) VALUES(?1,?2,?3,zeroblob(?2))",
+        params![relative, size_i64, digest],
+    )?;
+    let rowid = connection.query_row("SELECT id FROM files WHERE path=?1", [relative], |row| {
+        row.get(0)
+    })?;
+    let mut blob = connection.blob_open("main", "files", "content", rowid, false)?;
+    std::io::copy(&mut fs::File::open(source)?, &mut blob)?;
+    Ok(())
+}
+
+fn reconcile_fixed_plugins(
+    host: &str,
+    scope: Scope,
+    remote_directory: Option<&Path>,
+    session_id: &str,
+    mode: SyncMode,
+    local: &[PeerPlugin],
+    remote: &[PeerPlugin],
+    mut checkpoint: impl FnMut(&Value) -> Result<()>,
+) -> Result<Vec<Value>> {
+    let mut results = Vec::new();
+    for plugin_id in FIXED_PLUGINS {
+        #[cfg(debug_assertions)]
+        if std::env::var("LWC_TEST_SYNC_FAIL_PLUGIN").as_deref() == Ok(plugin_id) {
+            return Err(AppError::new(
+                "sync_plugin_test_failure",
+                format!("test failure before {plugin_id} publication"),
+            ));
+        }
+        let local = local
+            .iter()
+            .find(|plugin| plugin.plugin_id == plugin_id)
+            .ok_or_else(|| AppError::new("sync_protocol_invalid", "local plugin unit missing"))?;
+        let remote = remote
+            .iter()
+            .find(|plugin| plugin.plugin_id == plugin_id)
+            .ok_or_else(|| AppError::new("sync_protocol_invalid", "remote plugin unit missing"))?;
+        let status = match (&local.export, &remote.export) {
+            (Some(left), Some(right)) if left != right => {
+                let baseline = common_plugin_baseline(local, remote).ok_or_else(|| {
+                    AppError::new(
+                        "sync_plugin_diverged",
+                        format!("{plugin_id} has no common normalized baseline"),
+                    )
+                })?;
+                let resolved = if left == &baseline {
+                    right.clone()
+                } else if right == &baseline {
+                    left.clone()
+                } else {
+                    merge_plugin_exports(
+                        host,
+                        scope,
+                        remote_directory,
+                        session_id,
+                        plugin_id,
+                        &baseline,
+                        left,
+                        right,
+                    )?
+                };
+                if mode != SyncMode::Push && left != &resolved {
+                    if &resolved == right {
+                        fetch_plugin_from_peer(
+                            host,
+                            scope,
+                            remote_directory,
+                            session_id,
+                            plugin_id,
+                            &resolved,
+                        )?;
+                    } else if local.runtime_ready {
+                        materialize_existing_plugin(session_id, plugin_id, &resolved)?;
+                    }
+                }
+                if mode != SyncMode::Pull && right != &resolved {
+                    publish_plugin_to_peer(
+                        host,
+                        scope,
+                        remote_directory,
+                        session_id,
+                        plugin_id,
+                        &resolved,
+                    )?;
+                }
+                retain_plugin_history(session_id, plugin_id, &resolved)?;
+                if local.runtime_ready && remote.runtime_ready {
+                    "ready"
+                } else {
+                    "preserved_not_ready"
+                }
+            }
+            (Some(export), Some(_)) => {
+                if local.runtime_ready && mode != SyncMode::Push {
+                    materialize_existing_plugin(session_id, plugin_id, export)?;
+                }
+                if remote.runtime_ready && mode != SyncMode::Pull {
+                    materialize_plugin_on_peer(
+                        host,
+                        scope,
+                        remote_directory,
+                        session_id,
+                        plugin_id,
+                        export,
+                    )?;
+                }
+                if local.runtime_ready && remote.runtime_ready {
+                    "ready"
+                } else {
+                    "preserved_not_ready"
+                }
+            }
+            (Some(export), None) if mode != SyncMode::Pull => {
+                publish_plugin_to_peer(
+                    host,
+                    scope,
+                    remote_directory,
+                    session_id,
+                    plugin_id,
+                    export,
+                )?;
+                "preserved_not_ready"
+            }
+            (None, Some(export)) if mode != SyncMode::Push => {
+                fetch_plugin_from_peer(
+                    host,
+                    scope,
+                    remote_directory,
+                    session_id,
+                    plugin_id,
+                    export,
+                )?;
+                "preserved_not_ready"
+            }
+            (None, None) => "absent",
+            _ => "retained_source_only",
+        };
+        if let Some(export) = local.export.as_ref().or(remote.export.as_ref()) {
+            retain_plugin_history(session_id, plugin_id, export)?;
+        }
+        let result = json!({
+            "plugin": plugin_id,
+            "status": status,
+            "local_runtime_ready": local.runtime_ready,
+            "remote_runtime_ready": remote.runtime_ready,
+            "local": local.export,
+            "remote": remote.export,
+        });
+        checkpoint(&result)?;
+        results.push(result);
+    }
+    Ok(results)
+}
+
+fn validate_fixed_plugin_preflight(
+    local: &[PeerPlugin],
+    remote: &[PeerPlugin],
+) -> Result<Vec<Value>> {
+    let mut results = Vec::new();
+    for plugin_id in FIXED_PLUGINS {
+        let local = local
+            .iter()
+            .find(|plugin| plugin.plugin_id == plugin_id)
+            .ok_or_else(|| AppError::new("sync_protocol_invalid", "local plugin unit missing"))?;
+        let remote = remote
+            .iter()
+            .find(|plugin| plugin.plugin_id == plugin_id)
+            .ok_or_else(|| AppError::new("sync_protocol_invalid", "remote plugin unit missing"))?;
+        if let (Some(left), Some(right)) = (&local.export, &remote.export)
+            && left != right
+        {
+            let baseline = common_plugin_baseline(local, remote);
+            let valid_descendant = baseline.as_ref().is_some_and(|baseline| {
+                left.store_id == baseline.store_id
+                    && right.store_id == baseline.store_id
+                    && (left == baseline || left.revision > baseline.revision)
+                    && (right == baseline || right.revision > baseline.revision)
+            });
+            if !valid_descendant {
+                let code = if left.store_id == right.store_id && left.revision == right.revision {
+                    "sync_plugin_changed"
+                } else {
+                    "sync_plugin_diverged"
+                };
+                return Err(AppError::new(
+                    code,
+                    format!("{plugin_id} normalized exports diverged before Wiki publication"),
+                )
+                .with_details(json!({"local": left, "remote": right, "baseline": baseline})));
+            }
+        }
+        results.push(json!({
+            "plugin": plugin_id,
+            "status": "preflight_complete",
+            "local_runtime_ready": local.runtime_ready,
+            "remote_runtime_ready": remote.runtime_ready,
+            "local": local.export,
+            "remote": remote.export,
+        }));
+    }
+    Ok(results)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_plugin_exports(
+    host: &str,
+    scope: Scope,
+    remote_directory: Option<&Path>,
+    session_id: &str,
+    plugin_id: &str,
+    baseline: &PluginExportInventory,
+    local: &PluginExportInventory,
+    remote: &PluginExportInventory,
+) -> Result<PluginExportInventory> {
+    if local.store_id != baseline.store_id || remote.store_id != baseline.store_id {
+        return Err(AppError::new(
+            "sync_plugin_diverged",
+            format!("{plugin_id} StoreIdentity changed after the common baseline"),
+        ));
+    }
+    let baseline_root = plugin_export_path(session_id, plugin_id, baseline)?;
+    let local_root = plugin_export_path(session_id, plugin_id, local)?;
+    let remote_artifact = plugin_artifact_path(session_id, plugin_id, "merge-remote")?;
+    download_plugin_export(
+        host,
+        scope,
+        remote_directory,
+        session_id,
+        plugin_id,
+        remote,
+        &remote_artifact,
+    )?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::new("home_unavailable", "HOME is not configured"))?;
+    let remote_root = home
+        .join(".lwc/sync/plugins")
+        .join(session_id)
+        .join(format!("{plugin_id}-merge-remote"));
+    extract_plugin_artifact(plugin_id, remote, &remote_artifact, &remote_root)?;
+
+    let base = normalized_record_map(read_normalized_plugin_records(plugin_id, &baseline_root)?)?;
+    let left = normalized_record_map(read_normalized_plugin_records(plugin_id, &local_root)?)?;
+    let right = normalized_record_map(read_normalized_plugin_records(plugin_id, &remote_root)?)?;
+    let keys = base
+        .keys()
+        .chain(left.keys())
+        .chain(right.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut merged = std::collections::BTreeMap::new();
+    let mut conflicts = Vec::new();
+    for key in keys.iter() {
+        let base_value = base.get(key);
+        let left_value = left.get(key);
+        let right_value = right.get(key);
+        let resolved = if left_value == right_value {
+            left_value
+        } else if left_value == base_value {
+            right_value
+        } else if right_value == base_value {
+            left_value
+        } else {
+            conflicts.push(key.clone());
+            continue;
+        };
+        if let Some(record) = resolved {
+            merged.insert(key.clone(), record.clone());
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(AppError::new(
+            "sync_plugin_conflict",
+            format!("{plugin_id} has concurrent changes to the same canonical records"),
+        )
+        .with_details(json!({"conflicts": conflicts})));
+    }
+
+    let destination = home
+        .join(".lwc/sync/plugins")
+        .join(session_id)
+        .join(format!("{plugin_id}-resolved"));
+    if destination.exists() {
+        fs::remove_dir_all(&destination)?;
+    }
+    fs::create_dir(&destination)?;
+    let outcome = (|| -> Result<PluginExportInventory> {
+        let mut records = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination.join("records.ndjson"))?;
+        for table in learning_schema::canonical_tables(plugin_id).expect("fixed plugin") {
+            for record in merged.values().filter(|record| record.table == *table) {
+                serde_json::to_writer(&mut records, record)
+                    .map_err(|error| AppError::new("json_error", error.to_string()))?;
+                records.write_all(b"\n")?;
+            }
+        }
+        records.sync_all()?;
+        let records_sha256 = file_digest(&destination.join("records.ndjson"))?;
+        let blobs = merge_plugin_blobs(
+            plugin_id,
+            [&baseline_root, &local_root, &remote_root],
+            &destination,
+        )?;
+        let revision = local
+            .revision
+            .max(remote.revision)
+            .checked_add(1)
+            .ok_or_else(|| AppError::new("sync_plugin_invalid", "plugin revision overflow"))?;
+        let logical_hash = preview_plugin_logical_hash(plugin_id, merged.values())?;
+        let manifest = json!({
+            "format": 1,
+            "plugin": plugin_id,
+            "store_id": baseline.store_id,
+            "revision": revision,
+            "records_sha256": records_sha256,
+            "logical_hash": logical_hash,
+            "blobs": blobs,
+        });
+        fs::write(
+            destination.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)
+                .map_err(|error| AppError::new("json_error", error.to_string()))?,
+        )?;
+        validate_plugin_export(plugin_id, &destination)
+    })();
+    if outcome.is_err() {
+        let _ = fs::remove_dir_all(destination);
+    }
+    outcome
+}
+
+fn normalized_record_map(
+    records: Vec<NormalizedPluginRecord>,
+) -> Result<std::collections::BTreeMap<String, NormalizedPluginRecord>> {
+    let mut mapped = std::collections::BTreeMap::new();
+    for record in records {
+        let key = serde_json::to_string(&json!([&record.table, &record.key]))
+            .map_err(|error| AppError::new("json_error", error.to_string()))?;
+        if mapped.insert(key, record).is_some() {
+            return Err(AppError::new(
+                "sync_plugin_invalid",
+                "normalized plugin export contains a duplicate canonical key",
+            ));
+        }
+    }
+    Ok(mapped)
+}
+
+fn preview_plugin_logical_hash<'a>(
+    plugin_id: &str,
+    records: impl Iterator<Item = &'a NormalizedPluginRecord>,
+) -> Result<String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::new("home_unavailable", "HOME is not configured"))?;
+    let database = home
+        .join(".lwc/plugins")
+        .join(plugin_id)
+        .join("data.sqlite3");
+    reject_plugin_file(&database)?;
+    let mut connection = Connection::open(database)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch("PRAGMA foreign_keys=ON; PRAGMA defer_foreign_keys=ON;")?;
+    for table in learning_schema::canonical_tables(plugin_id)
+        .expect("fixed plugin")
+        .iter()
+        .rev()
+    {
+        tx.execute(&format!("DELETE FROM {}", quote_sql(table)), [])?;
+    }
+    for record in records {
+        insert_normalized_plugin_record(&tx, record)?;
+    }
+    learning_schema::canonical_logical_hash(plugin_id, &tx)
+        .map_err(|message| AppError::new("sync_plugin_invalid", message))
+}
+
+fn merge_plugin_blobs(
+    plugin_id: &str,
+    roots: [&Path; 3],
+    destination: &Path,
+) -> Result<Vec<Value>> {
+    if plugin_id != "book" {
+        return Ok(Vec::new());
+    }
+    let mut blobs = std::collections::BTreeMap::new();
+    for root in roots {
+        let manifest: PluginManifest =
+            serde_json::from_slice(&fs::read(root.join("manifest.json"))?)
+                .map_err(|error| AppError::new("sync_plugin_invalid", error.to_string()))?;
+        for blob in manifest.blobs {
+            if let Some(bytes) = blobs.insert(blob.sha256.clone(), blob.bytes)
+                && bytes != blob.bytes
+            {
+                return Err(AppError::new(
+                    "sync_plugin_diverged",
+                    "Book blob inventory differs for the same content hash",
+                ));
+            }
+        }
+    }
+    let mut inventory = Vec::new();
+    for (hash, bytes) in blobs {
+        let relative = format!("blobs/sha256/{}/{}", &hash[..2], hash);
+        let source = roots
+            .iter()
+            .map(|root| root.join(&relative))
+            .find(|path| path.is_file())
+            .ok_or_else(|| AppError::new("sync_plugin_invalid", "Book blob is missing"))?;
+        let target = destination.join(&relative);
+        fs::create_dir_all(target.parent().expect("blob parent"))?;
+        fs::hard_link(&source, &target).or_else(|_| fs::copy(&source, &target).map(|_| ()))?;
+        inventory.push(json!({"sha256": hash, "bytes": bytes}));
+    }
+    Ok(inventory)
+}
+
+fn common_plugin_baseline(
+    local: &PeerPlugin,
+    remote: &PeerPlugin,
+) -> Option<PluginExportInventory> {
+    local
+        .history
+        .iter()
+        .filter(|left| remote.history.iter().any(|right| right == *left))
+        .max_by_key(|export| export.revision)
+        .cloned()
+}
+
+fn publish_plugin_to_peer(
+    host: &str,
+    scope: Scope,
+    remote_directory: Option<&Path>,
+    session_id: &str,
+    plugin_id: &str,
+    export: &PluginExportInventory,
+) -> Result<()> {
+    let artifact = plugin_artifact_path(session_id, plugin_id, "publish")?;
+    build_plugin_artifact(session_id, plugin_id, export, &artifact)?;
+    let request = PeerRequest {
+        protocol: PROTOCOL_VERSION,
+        action: "plugin-publish".to_owned(),
+        session_id: session_id.to_owned(),
+        scope,
+        directory: remote_directory.map(Path::to_path_buf),
+        store_scope: None,
+        payload_size: Some(fs::metadata(&artifact)?.len()),
+        state_digest: Some(file_digest(&artifact)?),
+        expected: None,
+        baseline_digest: None,
+        requester_store_id: None,
+        plugin: Some(PluginRequest {
+            plugin_id: plugin_id.to_owned(),
+            store_id: export.store_id.clone(),
+            revision: export.revision,
+            records_sha256: export.records_sha256.clone(),
+            logical_hash: export.logical_hash.clone(),
+        }),
+    };
+    call_peer_publish(host, &request, &artifact)?;
+    Ok(())
+}
+
+fn materialize_plugin_on_peer(
+    host: &str,
+    scope: Scope,
+    remote_directory: Option<&Path>,
+    session_id: &str,
+    plugin_id: &str,
+    export: &PluginExportInventory,
+) -> Result<()> {
+    let request = PeerRequest {
+        protocol: PROTOCOL_VERSION,
+        action: "plugin-materialize".to_owned(),
+        session_id: session_id.to_owned(),
+        scope,
+        directory: remote_directory.map(Path::to_path_buf),
+        store_scope: None,
+        payload_size: None,
+        state_digest: None,
+        expected: None,
+        baseline_digest: None,
+        requester_store_id: None,
+        plugin: Some(PluginRequest {
+            plugin_id: plugin_id.to_owned(),
+            store_id: export.store_id.clone(),
+            revision: export.revision,
+            records_sha256: export.records_sha256.clone(),
+            logical_hash: export.logical_hash.clone(),
+        }),
+    };
+    let response = call_peer_value(host, &request)?;
+    if response["protocol"] != PROTOCOL_VERSION
+        || response["action"] != "plugin-materialized"
+        || response["session_id"] != session_id
+        || response["plugin"] != plugin_id
+    {
+        return Err(AppError::new(
+            "sync_protocol_invalid",
+            "remote plugin materialization response does not match the request",
+        ));
+    }
+    Ok(())
+}
+
+fn materialize_existing_plugin(
+    session_id: &str,
+    plugin_id: &str,
+    export: &PluginExportInventory,
+) -> Result<()> {
+    let root = plugin_export_path(session_id, plugin_id, export)?;
+    materialize_plugin_export(session_id, plugin_id, export, &root)
+}
+
+fn fetch_plugin_from_peer(
+    host: &str,
+    scope: Scope,
+    remote_directory: Option<&Path>,
+    session_id: &str,
+    plugin_id: &str,
+    export: &PluginExportInventory,
+) -> Result<()> {
+    let request = PeerRequest {
+        protocol: PROTOCOL_VERSION,
+        action: "plugin-export".to_owned(),
+        session_id: session_id.to_owned(),
+        scope,
+        directory: remote_directory.map(Path::to_path_buf),
+        store_scope: None,
+        payload_size: None,
+        state_digest: None,
+        expected: None,
+        baseline_digest: None,
+        requester_store_id: None,
+        plugin: Some(PluginRequest {
+            plugin_id: plugin_id.to_owned(),
+            store_id: export.store_id.clone(),
+            revision: export.revision,
+            records_sha256: export.records_sha256.clone(),
+            logical_hash: export.logical_hash.clone(),
+        }),
+    };
+    let artifact = plugin_artifact_path(session_id, plugin_id, "export")?;
+    call_peer_plugin_export(host, &request, &artifact)?;
+    publish_plugin_artifact(
+        session_id,
+        plugin_id,
+        request.plugin.as_ref().expect("plugin request"),
+        &artifact,
+    )?;
+    Ok(())
+}
+
+fn download_plugin_export(
+    host: &str,
+    scope: Scope,
+    remote_directory: Option<&Path>,
+    session_id: &str,
+    plugin_id: &str,
+    export: &PluginExportInventory,
+    artifact: &Path,
+) -> Result<()> {
+    let request = PeerRequest {
+        protocol: PROTOCOL_VERSION,
+        action: "plugin-export".to_owned(),
+        session_id: session_id.to_owned(),
+        scope,
+        directory: remote_directory.map(Path::to_path_buf),
+        store_scope: None,
+        payload_size: None,
+        state_digest: None,
+        expected: None,
+        baseline_digest: None,
+        requester_store_id: None,
+        plugin: Some(PluginRequest {
+            plugin_id: plugin_id.to_owned(),
+            store_id: export.store_id.clone(),
+            revision: export.revision,
+            records_sha256: export.records_sha256.clone(),
+            logical_hash: export.logical_hash.clone(),
+        }),
+    };
+    call_peer_plugin_export(host, &request, artifact)?;
+    Ok(())
+}
+
+fn extract_plugin_artifact(
+    plugin_id: &str,
+    expected: &PluginExportInventory,
+    artifact: &Path,
+    destination: &Path,
+) -> Result<()> {
+    if destination.exists() {
+        fs::remove_dir_all(destination)?;
+    }
+    fs::create_dir(destination)?;
+    let connection =
+        Connection::open_with_flags(artifact, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let files = connection
+        .prepare("SELECT id,path,size,sha256 FROM files ORDER BY path")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let outcome = (|| -> Result<()> {
+        for (id, relative, size, digest) in files {
+            if size < 0 || !valid_plugin_artifact_relative(&relative) || !valid_sha256(&digest) {
+                return Err(AppError::new(
+                    "sync_plugin_invalid",
+                    "plugin merge artifact inventory is invalid",
+                ));
+            }
+            let target = destination.join(&relative);
+            fs::create_dir_all(target.parent().expect("artifact parent"))?;
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)?;
+            let mut blob = connection.blob_open("main", "files", "content", id, true)?;
+            let copied = std::io::copy(&mut blob, &mut output)?;
+            output.sync_all()?;
+            if copied != size as u64 || file_digest(&target)? != digest {
+                return Err(AppError::new(
+                    "sync_checksum_mismatch",
+                    "plugin merge artifact checksum differs",
+                ));
+            }
+        }
+        if validate_plugin_export(plugin_id, destination)? != *expected {
+            return Err(AppError::new(
+                "sync_plugin_changed",
+                "plugin merge artifact changed after the handshake",
+            ));
+        }
+        Ok(())
+    })();
+    if outcome.is_err() {
+        let _ = fs::remove_dir_all(destination);
+    }
+    outcome
+}
+
+fn publish_plugin_artifact(
+    session_id: &str,
+    plugin_id: &str,
+    expected: &PluginRequest,
+    artifact: &Path,
+) -> Result<bool> {
+    let connection =
+        Connection::open_with_flags(artifact, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let files = connection
+        .prepare("SELECT id,path,size,sha256 FROM files ORDER BY path")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !files.iter().any(|(_, path, _, _)| path == "manifest.json")
+        || !files.iter().any(|(_, path, _, _)| path == "records.ndjson")
+        || files
+            .iter()
+            .any(|(_, path, _, _)| !valid_plugin_artifact_relative(path))
+    {
+        return Err(AppError::new(
+            "sync_plugin_invalid",
+            "normalized plugin artifact has an invalid file inventory",
+        ));
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::new("home_unavailable", "HOME is not configured"))?;
+    let plugin_root = home.join(".lwc/plugins").join(plugin_id);
+    let preserved = plugin_root.join("preserved");
+    for directory in [
+        home.join(".lwc"),
+        home.join(".lwc/plugins"),
+        plugin_root,
+        preserved.clone(),
+    ] {
+        ensure_real_directory(&directory)?;
+    }
+    let staging = preserved.join(format!(
+        ".receive-{}-{}",
+        std::process::id(),
+        STATE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&staging)?;
+    let outcome = (|| -> Result<bool> {
+        for (id, relative, size, digest) in &files {
+            if !valid_sha256(digest) {
+                return Err(AppError::new(
+                    "sync_plugin_invalid",
+                    "artifact hash is invalid",
+                ));
+            }
+            let destination = staging.join(relative);
+            if let Some(parent) = destination.parent() {
+                let relative_parent = parent.strip_prefix(&staging).unwrap();
+                let mut current = staging.clone();
+                for component in relative_parent.components() {
+                    current.push(component);
+                    ensure_real_directory(&current)?;
+                }
+            }
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)?;
+            let mut blob = connection.blob_open("main", "files", "content", *id, true)?;
+            let copied = std::io::copy(&mut blob, &mut output)?;
+            output.sync_all()?;
+            if *size < 0 || copied != *size as u64 || file_digest(&destination)? != *digest {
+                return Err(AppError::new(
+                    "sync_checksum_mismatch",
+                    "normalized plugin artifact file checksum differs",
+                ));
+            }
+        }
+        let export = validate_plugin_export(plugin_id, &staging)?;
+        if export.store_id != expected.store_id
+            || export.revision != expected.revision
+            || export.records_sha256 != expected.records_sha256
+            || export.logical_hash != expected.logical_hash
+        {
+            return Err(AppError::new(
+                "sync_plugin_changed",
+                "plugin artifact does not match the handshake inventory",
+            ));
+        }
+        let store = preserved.join(&export.store_id);
+        ensure_real_directory(&store)?;
+        let destination = store.join(export.revision.to_string());
+        if destination.is_dir() {
+            if validate_plugin_export(plugin_id, &destination)? == export {
+                if plugin_runtime_ready(plugin_id)? {
+                    materialize_plugin_export(session_id, plugin_id, &export, &destination)?;
+                }
+                return Ok(false);
+            }
+            return Err(AppError::new(
+                "sync_plugin_diverged",
+                "plugin revision already exists with different canonical content",
+            ));
+        }
+        fs::rename(&staging, &destination)?;
+        if plugin_runtime_ready(plugin_id)? {
+            materialize_plugin_export(session_id, plugin_id, &export, &destination)?;
+        }
+        Ok(true)
+    })();
+    if outcome.is_err() || matches!(outcome, Ok(false)) {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    outcome
+}
+
+fn materialize_plugin_export(
+    session_id: &str,
+    plugin_id: &str,
+    export: &PluginExportInventory,
+    source: &Path,
+) -> Result<()> {
+    if validate_plugin_export(plugin_id, source)? != *export {
+        return Err(AppError::new(
+            "sync_plugin_changed",
+            "plugin export changed before canonical materialization",
+        ));
+    }
+    run_plugin_status(plugin_id)?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::new("home_unavailable", "HOME is not configured"))?;
+    let root = home.join(".lwc/plugins").join(plugin_id);
+    materialize_plugin_blobs(plugin_id, source, &root)?;
+    let database = root.join("data.sqlite3");
+    reject_plugin_file(&database)?;
+    let mut connection = Connection::open(&database)?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+    require_live_plugin_schema(plugin_id, &connection)?;
+    let current_store_id = connection.query_row(
+        "SELECT value FROM plugin_meta WHERE key='store_id'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    let current_revision = connection
+        .query_row(
+            "SELECT value FROM plugin_meta WHERE key='revision'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?
+        .parse::<u64>()
+        .map_err(|_| AppError::new("sync_plugin_invalid", "plugin revision is invalid"))?;
+    let canonical_count = canonical_record_count(plugin_id, &connection)?;
+    let mutation_count = connection.query_row("SELECT COUNT(*) FROM requests", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    let receipt_count = connection.query_row("SELECT COUNT(*) FROM sync_receipts", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    if current_store_id != export.store_id
+        && (current_revision != 0 || mutation_count != 0 || receipt_count != 0)
+    {
+        return Err(AppError::new(
+            "sync_plugin_diverged",
+            "runtime StoreIdentity differs from the normalized export",
+        ));
+    }
+    if current_store_id == export.store_id && current_revision > export.revision {
+        return Err(AppError::new(
+            "sync_plugin_changed",
+            "runtime revision advanced beyond the normalized export",
+        ));
+    }
+    if current_store_id == export.store_id && current_revision == export.revision {
+        let current_hash = learning_schema::canonical_logical_hash(plugin_id, &connection)
+            .map_err(|message| AppError::new("sync_plugin_invalid", message))?;
+        if current_hash == export.logical_hash {
+            return record_ready_plugin_receipt(&mut connection, plugin_id, session_id, export);
+        }
+        if canonical_count != 0 {
+            return Err(AppError::new(
+                "sync_plugin_changed",
+                "runtime canonical content changed without a revision bump",
+            ));
+        }
+    }
+
+    let records = read_normalized_plugin_records(plugin_id, source)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
+    for table in learning_schema::canonical_tables(plugin_id)
+        .expect("fixed plugin")
+        .iter()
+        .rev()
+    {
+        tx.execute(&format!("DELETE FROM {}", quote_sql(table)), [])?;
+    }
+    for record in records {
+        insert_normalized_plugin_record(&tx, &record)?;
+    }
+    tx.execute(
+        "UPDATE plugin_meta SET value=?1 WHERE key='store_id'",
+        [&export.store_id],
+    )?;
+    tx.execute(
+        "UPDATE plugin_meta SET value=?1 WHERE key='revision'",
+        [export.revision.to_string()],
+    )?;
+    let actual = learning_schema::canonical_logical_hash(plugin_id, &tx)
+        .map_err(|message| AppError::new("sync_plugin_invalid", message))?;
+    if actual != export.logical_hash {
+        return Err(AppError::new(
+            "sync_plugin_invalid",
+            "materialized canonical plugin hash differs from its manifest",
+        ));
+    }
+    tx.commit()?;
+    run_plugin_status(plugin_id)?;
+    record_ready_plugin_receipt(&mut connection, plugin_id, session_id, export)
+}
+
+fn canonical_record_count(plugin_id: &str, connection: &Connection) -> Result<u64> {
+    let mut count = 0_u64;
+    for table in learning_schema::canonical_tables(plugin_id).expect("fixed plugin") {
+        let table_count = connection.query_row(
+            &format!("SELECT COUNT(*) FROM {}", quote_sql(table)),
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        count =
+            count
+                .checked_add(u64::try_from(table_count).map_err(|_| {
+                    AppError::new("sync_plugin_invalid", "plugin row count is invalid")
+                })?)
+                .ok_or_else(|| AppError::new("sync_plugin_invalid", "plugin row count overflow"))?;
+    }
+    Ok(count)
+}
+
+fn read_normalized_plugin_records(
+    plugin_id: &str,
+    source: &Path,
+) -> Result<Vec<NormalizedPluginRecord>> {
+    let input = fs::File::open(source.join("records.ndjson"))?;
+    let mut records = Vec::new();
+    for line in BufReader::new(input).lines() {
+        let line = line?;
+        if line.is_empty() {
+            return Err(AppError::new(
+                "sync_plugin_invalid",
+                "normalized plugin records contain an empty line",
+            ));
+        }
+        let record: NormalizedPluginRecord = serde_json::from_str(&line)
+            .map_err(|error| AppError::new("sync_plugin_invalid", error.to_string()))?;
+        if !learning_schema::canonical_tables(plugin_id)
+            .expect("fixed plugin")
+            .contains(&record.table.as_str())
+            || record.key.is_empty()
+        {
+            return Err(AppError::new(
+                "sync_plugin_invalid",
+                "normalized plugin record is outside the fixed schema",
+            ));
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn insert_normalized_plugin_record(
+    tx: &rusqlite::Transaction<'_>,
+    record: &NormalizedPluginRecord,
+) -> Result<()> {
+    let mut schema = tx.prepare(&format!("PRAGMA table_info({})", quote_sql(&record.table)))?;
+    let columns = schema
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(schema);
+    if columns.len() != record.values.len()
+        || columns
+            .iter()
+            .any(|column| !record.values.contains_key(column))
+    {
+        return Err(AppError::new(
+            "sync_plugin_invalid",
+            format!("normalized {} record columns differ", record.table),
+        ));
+    }
+    let values = columns
+        .iter()
+        .map(|column| normalized_json_to_sql(&record.values[column]))
+        .collect::<Result<Vec<_>>>()?;
+    let placeholders = (1..=columns.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    tx.execute(
+        &format!(
+            "INSERT INTO {}({}) VALUES({placeholders})",
+            quote_sql(&record.table),
+            columns
+                .iter()
+                .map(|column| quote_sql(column))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        rusqlite::params_from_iter(values),
+    )?;
+    Ok(())
+}
+
+fn normalized_json_to_sql(value: &Value) -> Result<rusqlite::types::Value> {
+    match value {
+        Value::Null => Ok(rusqlite::types::Value::Null),
+        Value::Number(value) if value.is_i64() => Ok(rusqlite::types::Value::Integer(
+            value.as_i64().expect("checked integer"),
+        )),
+        Value::Number(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(rusqlite::types::Value::Real)
+            .ok_or_else(|| AppError::new("sync_plugin_invalid", "invalid normalized number")),
+        Value::String(value) => Ok(rusqlite::types::Value::Text(value.clone())),
+        Value::Object(value) if value.len() == 1 && value.contains_key("$blob_hex") => {
+            let value = value["$blob_hex"]
+                .as_str()
+                .ok_or_else(|| AppError::new("sync_plugin_invalid", "invalid normalized blob"))?;
+            if value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(AppError::new(
+                    "sync_plugin_invalid",
+                    "invalid normalized blob",
+                ));
+            }
+            let bytes = value
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    std::str::from_utf8(pair)
+                        .ok()
+                        .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                        .ok_or_else(|| {
+                            AppError::new("sync_plugin_invalid", "invalid normalized blob")
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(rusqlite::types::Value::Blob(bytes))
+        }
+        _ => Err(AppError::new(
+            "sync_plugin_invalid",
+            "unsupported normalized SQLite value",
+        )),
+    }
+}
+
+fn materialize_plugin_blobs(plugin_id: &str, source: &Path, root: &Path) -> Result<()> {
+    if plugin_id != "book" {
+        return Ok(());
+    }
+    let manifest: PluginManifest = serde_json::from_slice(&fs::read(source.join("manifest.json"))?)
+        .map_err(|error| AppError::new("sync_plugin_invalid", error.to_string()))?;
+    for blob in manifest.blobs {
+        let relative = format!("blobs/sha256/{}/{}", &blob.sha256[..2], blob.sha256);
+        let source = source.join(&relative);
+        let destination = root.join(&relative);
+        if destination.is_file() {
+            if file_digest(&destination)? != blob.sha256 {
+                return Err(AppError::new(
+                    "sync_plugin_diverged",
+                    "existing Book blob differs from its content hash",
+                ));
+            }
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let staging = destination.with_extension(format!(
+            "sync-{}-{}",
+            std::process::id(),
+            STATE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::hard_link(&source, &staging).or_else(|_| fs::copy(&source, &staging).map(|_| ()))?;
+        if file_digest(&staging)? != blob.sha256 {
+            let _ = fs::remove_file(&staging);
+            return Err(AppError::new(
+                "sync_checksum_mismatch",
+                "staged Book blob differs from its content hash",
+            ));
+        }
+        fs::rename(staging, destination)?;
+    }
+    Ok(())
+}
+
+fn run_plugin_status(plugin_id: &str) -> Result<()> {
+    let status = match plugin_id {
+        "tutor" => crate::learning_runtime::status(crate::learning_runtime::Plugin::Tutor)?,
+        "book" => crate::learning_runtime::status(crate::learning_runtime::Plugin::Book)?,
+        "practice" => crate::learning_runtime::status(crate::learning_runtime::Plugin::Practice)?,
+        _ => return Err(AppError::new("sync_plugin_invalid", "unknown fixed plugin")),
+    };
+    if status["installed"] != true {
+        return Err(AppError::new(
+            "learning_runtime_missing",
+            format!("{plugin_id} runtime is not installed"),
+        ));
+    }
+    let runtime = status["runtime"]
+        .as_str()
+        .ok_or_else(|| AppError::new("sync_plugin_invalid", "runtime path is invalid"))?;
+    let output = Command::new(Path::new(runtime).join(format!("lwc-{plugin_id}")))
+        .arg("status")
+        .env("LWC_PLUGIN_SKIP_UPDATE", "1")
+        .env("LWC_PLUGIN_NO_BACKGROUND", "1")
+        .output()?;
+    if !output.status.success() {
+        return Err(AppError::new(
+            "sync_plugin_materialize_failed",
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn record_ready_plugin_receipt(
+    connection: &mut Connection,
+    plugin_id: &str,
+    session_id: &str,
+    export: &PluginExportInventory,
+) -> Result<()> {
+    let plugin = match plugin_id {
+        "tutor" => crate::learning::Plugin::Tutor,
+        "book" => crate::learning::Plugin::Book,
+        "practice" => crate::learning::Plugin::Practice,
+        _ => return Err(AppError::new("sync_plugin_invalid", "unknown fixed plugin")),
+    };
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    crate::learning::record_sync_receipt(
+        &tx,
+        plugin,
+        session_id,
+        export.revision as i64,
+        export.revision as i64,
+        &export.logical_hash,
+        "ready",
+    )
+    .map_err(|error| AppError::new(error.code(), error.message()))?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn valid_plugin_artifact_relative(path: &str) -> bool {
+    if matches!(path, "manifest.json" | "records.ndjson") {
+        return true;
+    }
+    let parts = path.split('/').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts[0] == "blobs"
+        && parts[1] == "sha256"
+        && parts[2].len() == 2
+        && valid_sha256(parts[3])
+        && parts[3].starts_with(parts[2])
 }
 
 pub(crate) fn peer() -> Result<Value> {
@@ -1277,11 +3224,135 @@ pub(crate) fn peer() -> Result<Value> {
         return serde_json::to_value(PeerResponse {
             protocol: PROTOCOL_VERSION,
             action: "handshake".to_string(),
-            session_id: request.session_id,
+            session_id: request.session_id.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             stores,
+            plugins: fixed_plugin_inventory(&request.session_id)?,
         })
         .map_err(|error| AppError::new("sync_protocol_invalid", error.to_string()));
+    }
+    if request.action == "plugin-cleanup" {
+        cleanup_plugin_session(&request.session_id)?;
+        return Ok(json!({
+            "protocol": PROTOCOL_VERSION,
+            "action": "plugin-cleaned",
+            "session_id": request.session_id,
+        }));
+    }
+    if matches!(
+        request.action.as_str(),
+        "plugin-export" | "plugin-publish" | "plugin-materialize"
+    ) {
+        let plugin = request.plugin.as_ref().ok_or_else(|| {
+            AppError::new("sync_protocol_invalid", "fixed plugin request is missing")
+        })?;
+        if !FIXED_PLUGINS.contains(&plugin.plugin_id.as_str())
+            || !valid_plugin_store_id(&plugin.store_id)
+            || !valid_sha256(&plugin.records_sha256)
+            || !valid_sha256(&plugin.logical_hash)
+        {
+            return Err(AppError::new(
+                "sync_protocol_invalid",
+                "fixed plugin request identity is invalid",
+            ));
+        }
+        if matches!(
+            request.action.as_str(),
+            "plugin-export" | "plugin-materialize"
+        ) {
+            let entry = fixed_plugin_inventory(&request.session_id)?
+                .into_iter()
+                .find(|entry| entry.plugin_id == plugin.plugin_id)
+                .ok_or_else(|| {
+                    AppError::new("sync_plugin_changed", "remote plugin export is missing")
+                })?;
+            let inventory = entry
+                .history
+                .into_iter()
+                .find(|inventory| {
+                    inventory.store_id == plugin.store_id
+                        && inventory.revision == plugin.revision
+                        && inventory.records_sha256 == plugin.records_sha256
+                        && inventory.logical_hash == plugin.logical_hash
+                })
+                .ok_or_else(|| {
+                    AppError::new("sync_plugin_changed", "remote plugin export changed")
+                })?;
+            if inventory.store_id != plugin.store_id
+                || inventory.revision != plugin.revision
+                || inventory.records_sha256 != plugin.records_sha256
+                || inventory.logical_hash != plugin.logical_hash
+            {
+                return Err(AppError::new(
+                    "sync_plugin_changed",
+                    "remote plugin export changed after the handshake",
+                ));
+            }
+            if request.action == "plugin-materialize" {
+                materialize_existing_plugin(&request.session_id, &plugin.plugin_id, &inventory)?;
+                return Ok(json!({
+                    "protocol": PROTOCOL_VERSION,
+                    "action": "plugin-materialized",
+                    "session_id": request.session_id,
+                    "plugin": plugin.plugin_id,
+                }));
+            }
+            let artifact =
+                plugin_artifact_path(&request.session_id, &plugin.plugin_id, "peer-export")?;
+            build_plugin_artifact(
+                &request.session_id,
+                &plugin.plugin_id,
+                &inventory,
+                &artifact,
+            )?;
+            let transfer = PeerPluginTransfer {
+                protocol: PROTOCOL_VERSION,
+                action: "plugin-export".to_owned(),
+                session_id: request.session_id,
+                plugin: plugin.clone(),
+                size: fs::metadata(&artifact)?.len(),
+                artifact_digest: file_digest(&artifact)?,
+            };
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            serde_json::to_writer(&mut stdout, &transfer)
+                .map_err(|error| AppError::new("sync_protocol_invalid", error.to_string()))?;
+            stdout.write_all(b"\n")?;
+            std::io::copy(&mut fs::File::open(artifact)?, &mut stdout)?;
+            stdout.flush()?;
+            return Ok(Value::Null);
+        }
+        let size = request
+            .payload_size
+            .filter(|size| *size <= MAX_TRANSFER_BYTES)
+            .ok_or_else(|| {
+                AppError::new("sync_protocol_invalid", "plugin payload size is invalid")
+            })?;
+        let digest = request.state_digest.as_deref().ok_or_else(|| {
+            AppError::new("sync_protocol_invalid", "plugin artifact digest is missing")
+        })?;
+        let artifact =
+            plugin_artifact_path(&request.session_id, &plugin.plugin_id, "peer-publish")?;
+        if artifact.is_file() {
+            fs::remove_file(&artifact)?;
+        }
+        receive_exact_file(&mut stdin, &artifact, size)?;
+        require_payload_eof(&mut stdin)?;
+        if file_digest(&artifact)? != digest {
+            return Err(AppError::new(
+                "sync_checksum_mismatch",
+                "published plugin artifact checksum differs",
+            ));
+        }
+        let committed =
+            publish_plugin_artifact(&request.session_id, &plugin.plugin_id, plugin, &artifact)?;
+        return Ok(json!({
+            "protocol": PROTOCOL_VERSION,
+            "action": "plugin-published",
+            "session_id": request.session_id,
+            "plugin": plugin.plugin_id,
+            "committed": committed,
+        }));
     }
     if paths.len() != 1 || request.store_scope != Some(request.scope) {
         return Err(AppError::new(
@@ -2004,6 +4075,7 @@ fn rebuild_codegraph_after_git(
             expected: None,
             baseline_digest: None,
             requester_store_id: None,
+            plugin: None,
         };
         let response = call_peer_value(host, &request)?;
         if response["protocol"] != PROTOCOL_VERSION
@@ -2247,8 +4319,13 @@ fn call_peer_publish(host: &str, request: &PeerRequest, payload: &Path) -> Resul
             format!("remote publish response is invalid: {error}"),
         )
     })?;
+    let expected_action = if request.action == "plugin-publish" {
+        "plugin-published"
+    } else {
+        "published"
+    };
     if response["protocol"] != PROTOCOL_VERSION
-        || response["action"] != "published"
+        || response["action"] != expected_action
         || response["session_id"] != request.session_id
     {
         return Err(AppError::new(
@@ -2257,6 +4334,84 @@ fn call_peer_publish(host: &str, request: &PeerRequest, payload: &Path) -> Resul
         ));
     }
     Ok(response)
+}
+
+fn call_peer_plugin_export(
+    host: &str,
+    request: &PeerRequest,
+    destination: &Path,
+) -> Result<PeerPluginTransfer> {
+    let mut child = spawn_peer(host)?;
+    write_peer_request(
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| AppError::new("sync_transport_failed", "SSH stdin unavailable"))?,
+        request,
+        None,
+    )?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::new("sync_transport_failed", "SSH stdout unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::new("sync_transport_failed", "SSH stderr unavailable"))?;
+    let output = destination.with_extension(format!(
+        "download-{}-{}",
+        std::process::id(),
+        STATE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let reader_path = output.clone();
+    let reader = thread::spawn(move || receive_plugin_export(stdout, &reader_path));
+    let stderr = thread::spawn(move || read_bounded(stderr, MAX_PROTOCOL_BYTES));
+    let status = wait_child(
+        &mut child,
+        SYNC_TIMEOUT,
+        "SSH plugin export exceeded 120 seconds",
+    )?;
+    let transfer = reader
+        .join()
+        .map_err(|_| AppError::new("sync_transport_failed", "plugin reader failed"))?;
+    let stderr = stderr
+        .join()
+        .map_err(|_| AppError::new("sync_transport_failed", "SSH stderr reader failed"))??;
+    if !status.success() {
+        let _ = fs::remove_file(&output);
+        return Err(remote_peer_error(&stderr));
+    }
+    let transfer = transfer?;
+    if transfer.protocol != PROTOCOL_VERSION
+        || transfer.action != "plugin-export"
+        || transfer.session_id != request.session_id
+        || request.plugin.as_ref() != Some(&transfer.plugin)
+        || file_digest(&output)? != transfer.artifact_digest
+    {
+        let _ = fs::remove_file(&output);
+        return Err(AppError::new(
+            "sync_protocol_invalid",
+            "remote plugin export metadata does not match the request",
+        ));
+    }
+    replace_file(&output, destination)?;
+    Ok(transfer)
+}
+
+fn receive_plugin_export(input: impl Read, destination: &Path) -> Result<PeerPluginTransfer> {
+    let mut input = BufReader::new(input);
+    let header = read_bounded_line(&mut input, MAX_PROTOCOL_BYTES)?;
+    let transfer: PeerPluginTransfer = serde_json::from_slice(&header)
+        .map_err(|error| AppError::new("sync_protocol_invalid", error.to_string()))?;
+    if transfer.size > MAX_TRANSFER_BYTES {
+        return Err(AppError::new(
+            "sync_transfer_too_large",
+            "remote plugin artifact exceeds transfer limit",
+        ));
+    }
+    receive_exact_file(&mut input, destination, transfer.size)?;
+    require_payload_eof(&mut input)?;
+    Ok(transfer)
 }
 
 fn spawn_peer(host: &str) -> Result<std::process::Child> {

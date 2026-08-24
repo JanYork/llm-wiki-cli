@@ -1338,7 +1338,7 @@ fn sync_peer_rejects_an_incompatible_protocol_before_store_access() {
         .take()
         .unwrap()
         .write_all(
-            br#"{"protocol":2,"action":"handshake","session_id":"0123456789abcdef0123456789abcdef","scope":"project","directory":"/definitely/not/a/store"}"#,
+            br#"{"protocol":1,"action":"handshake","session_id":"0123456789abcdef0123456789abcdef","scope":"project","directory":"/definitely/not/a/store"}"#,
         )
         .unwrap();
     let output = child.wait_with_output().unwrap();
@@ -1376,7 +1376,7 @@ fn sync_peer_does_not_treat_an_unsafe_store_path_as_a_missing_store() {
             child.stdin.take().unwrap(),
             "{}",
             serde_json::json!({
-                "protocol": 1,
+                "protocol": 2,
                 "action": "handshake",
                 "session_id": "0123456789abcdef0123456789abcdef",
                 "scope": "project",
@@ -1746,7 +1746,7 @@ fn committed_peer_replay_still_rejects_bytes_beyond_the_declared_payload() {
         serde_json::from_slice(&fs::read(session_root.join("state.json")).unwrap()).unwrap();
     let payload = fs::read(session_root.join("project/merged.db")).unwrap();
     let request = serde_json::json!({
-        "protocol": 1,
+        "protocol": 2,
         "action": "publish",
         "session_id": session,
         "scope": "project",
@@ -2499,31 +2499,481 @@ fn sync_modes_transport_detached_drafts_and_terminal_audits_without_active_work(
     }
 }
 
+const TEST_PLUGIN_STORE_ID: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111";
+
 fn write_preserved_plugin_export(home: &Path, plugin: &str, records: &[u8]) -> PathBuf {
+    let blob_hash = Sha256::digest(b"blob")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     let root = home
         .join(".lwc/plugins")
         .join(plugin)
-        .join("preserved/store-test/1");
-    fs::create_dir_all(root.join("blobs/sha256/aa")).unwrap();
+        .join(format!("preserved/{TEST_PLUGIN_STORE_ID}/1"));
+    fs::create_dir_all(root.join(format!("blobs/sha256/{}", &blob_hash[..2]))).unwrap();
     fs::write(
         root.join("manifest.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "format": 1,
             "plugin": plugin,
-            "store_id": "store-test",
+            "store_id": TEST_PLUGIN_STORE_ID,
             "revision": 1,
             "records_sha256": Sha256::digest(records)
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>(),
-            "blobs": [{"sha256": "aa-test", "bytes": 4}],
+            "logical_hash": Sha256::digest(records)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "blobs": [{"sha256": blob_hash, "bytes": 4}],
         }))
         .unwrap(),
     )
     .unwrap();
     fs::write(root.join("records.ndjson"), records).unwrap();
-    fs::write(root.join("blobs/sha256/aa/aa-test"), b"blob").unwrap();
+    fs::write(
+        root.join(format!("blobs/sha256/{}/{}", &blob_hash[..2], blob_hash)),
+        b"blob",
+    )
+    .unwrap();
     root
+}
+
+#[cfg(unix)]
+fn install_learning_runtime(home: &Path, plugin: &str, binary: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        other => panic!("unsupported test platform {other:?}"),
+    };
+    let version = env!("CARGO_PKG_VERSION");
+    let runtime = home
+        .join(".lwc/runtime")
+        .join(plugin)
+        .join(version)
+        .join(target);
+    fs::create_dir_all(&runtime).unwrap();
+    let binary_name = format!("lwc-{plugin}");
+    let installed = runtime.join(&binary_name);
+    fs::copy(binary, &installed).unwrap();
+    fs::set_permissions(&installed, fs::Permissions::from_mode(0o700)).unwrap();
+    let sha256 = Sha256::digest(fs::read(&installed).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    fs::write(
+        runtime.join("runtime.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "plugin": plugin,
+            "version": version,
+            "target": target,
+            "asset": format!("lwc-{plugin}-{version}-{target}.tar.gz"),
+            "sha256": sha256,
+            "binary": binary_name,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_exports_live_book_canonical_state_to_an_absent_runtime() {
+    let world = SyncWorld::new();
+    world.install_fake_ssh();
+    let status = Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+        .env("HOME", &world.local_home)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let subject = serde_json::json!({
+        "name": "Sync canonical Book",
+        "request_id": "sync-live-book-subject",
+    })
+    .to_string();
+    let created = Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+        .env("HOME", &world.local_home)
+        .args(["subject", "create", "--json", &subject])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let output = world.sync(&[
+        "sync",
+        "peer",
+        world.remote.to_str().unwrap(),
+        "--mode",
+        "merge",
+    ]);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let book = result["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|plugin| plugin["plugin"] == "book")
+        .unwrap();
+    assert_eq!(book["status"], "preserved_not_ready", "{result:#}");
+    let preserved = world.remote_home.join(".lwc/plugins/book/preserved");
+    let store = fs::read_dir(&preserved)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let revision = fs::read_dir(store).unwrap().next().unwrap().unwrap().path();
+    let records = fs::read_to_string(revision.join("records.ndjson")).unwrap();
+    assert!(records.contains("Sync canonical Book"));
+    assert!(!preserved.join("data.sqlite3").exists());
+    assert!(
+        !world
+            .local_home
+            .join(".lwc/plugins/book/preserved")
+            .exists(),
+        "a live runtime export is session state, not a permanent preserved copy"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_rejects_canonical_plugin_mutation_without_a_revision_bump() {
+    let world = SyncWorld::new();
+    world.install_fake_ssh();
+    let status = Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+        .env("HOME", &world.local_home)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let subject = serde_json::json!({
+        "name": "Before",
+        "request_id": "sync-same-revision-subject",
+    })
+    .to_string();
+    let created = Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+        .env("HOME", &world.local_home)
+        .args(["subject", "create", "--json", &subject])
+        .output()
+        .unwrap();
+    assert!(created.status.success());
+
+    let first = world.sync(&[
+        "sync",
+        "peer",
+        world.remote.to_str().unwrap(),
+        "--mode",
+        "merge",
+    ]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let database = world.local_home.join(".lwc/plugins/book/data.sqlite3");
+    let connection = Connection::open(database).unwrap();
+    connection
+        .execute("UPDATE subjects SET name='After'", [])
+        .unwrap();
+    drop(connection);
+
+    let second = world.sync(&[
+        "sync",
+        "peer",
+        world.remote.to_str().unwrap(),
+        "--mode",
+        "merge",
+    ]);
+    assert!(!second.status.success(), "same revision changed unnoticed");
+    let error: Value = serde_json::from_slice(&second.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "sync_plugin_changed");
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_materializes_preserved_book_when_its_runtime_becomes_ready() {
+    let world = SyncWorld::new();
+    world.install_fake_ssh();
+    let status = Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+        .env("HOME", &world.local_home)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let subject = serde_json::json!({
+        "name": "Materialize me",
+        "request_id": "sync-materialize-subject",
+    })
+    .to_string();
+    let created = Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+        .env("HOME", &world.local_home)
+        .args(["subject", "create", "--json", &subject])
+        .output()
+        .unwrap();
+    assert!(created.status.success());
+    let remote = world.remote.to_str().unwrap();
+    let first = world.sync(&["sync", "peer", remote, "--mode", "merge"]);
+    assert!(first.status.success());
+    assert!(
+        world
+            .remote_home
+            .join(".lwc/plugins/book/preserved")
+            .is_dir()
+    );
+
+    install_learning_runtime(
+        &world.remote_home,
+        "book",
+        Path::new(env!("CARGO_BIN_EXE_lwc-book")),
+    );
+    world.ok_home(
+        &world.remote,
+        &world.remote_home,
+        &["--scope", "global", "init"],
+    );
+    world.ok_home(
+        &world.remote,
+        &world.remote_home,
+        &["--scope", "global", "config", "set", "--book", "enabled"],
+    );
+    let second = world.sync(&["sync", "peer", remote, "--mode", "merge"]);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let result: Value = serde_json::from_slice(&second.stdout).unwrap();
+    let session_id = result["session_id"].as_str().unwrap();
+    let database = world.remote_home.join(".lwc/plugins/book/data.sqlite3");
+    assert!(
+        database.is_file(),
+        "ready runtime did not receive canonical DB"
+    );
+    let connection = Connection::open(database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM subjects WHERE name='Materialize me'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    let receipt = connection
+        .query_row(
+            "SELECT runtime_state,state FROM sync_receipts
+             WHERE session_id=?1",
+            [session_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(receipt, ("ready".to_owned(), "completed".to_owned()));
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM book_blocks_fts", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_three_way_merges_disjoint_book_rows_from_a_common_baseline() {
+    let world = SyncWorld::new();
+    world.install_fake_ssh();
+    for (home, request_id, name) in [(&world.local_home, "sync-baseline-subject", "Baseline")] {
+        assert!(
+            Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+                .env("HOME", home)
+                .arg("status")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let input = serde_json::json!({"name": name, "request_id": request_id}).to_string();
+        assert!(
+            Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+                .env("HOME", home)
+                .args(["subject", "create", "--json", &input])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let remote = world.remote.to_str().unwrap();
+    let first = world.sync(&["sync", "peer", remote, "--mode", "merge"]);
+    assert!(first.status.success());
+
+    for (cwd, home) in [
+        (&world.local, &world.local_home),
+        (&world.remote, &world.remote_home),
+    ] {
+        install_learning_runtime(home, "book", Path::new(env!("CARGO_BIN_EXE_lwc-book")));
+        world.ok_home(cwd, home, &["--scope", "global", "init"]);
+        world.ok_home(
+            cwd,
+            home,
+            &["--scope", "global", "config", "set", "--book", "enabled"],
+        );
+    }
+    let materialized = world.sync(&["sync", "peer", remote, "--mode", "merge"]);
+    assert!(
+        materialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&materialized.stderr)
+    );
+
+    for (home, request_id, name) in [
+        (&world.local_home, "sync-local-subject", "Local branch"),
+        (&world.remote_home, "sync-remote-subject", "Remote branch"),
+    ] {
+        let input = serde_json::json!({"name": name, "request_id": request_id}).to_string();
+        let output = Command::new(env!("CARGO_BIN_EXE_lwc-book"))
+            .env("HOME", home)
+            .args(["subject", "create", "--json", &input])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let merged = world.sync(&["sync", "peer", remote, "--mode", "merge"]);
+    assert!(
+        merged.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&merged.stdout),
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    for home in [&world.local_home, &world.remote_home] {
+        let connection = Connection::open(home.join(".lwc/plugins/book/data.sqlite3")).unwrap();
+        for name in ["Baseline", "Local branch", "Remote branch"] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM subjects WHERE name=?1",
+                        [name],
+                        |row| { row.get::<_, i64>(0) }
+                    )
+                    .unwrap(),
+                1,
+                "{name} missing from {}",
+                home.display()
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_checkpoints_each_fixed_plugin_and_resumes_after_the_next_unit_fails() {
+    let world = SyncWorld::new();
+    world.install_fake_ssh();
+    write_preserved_plugin_export(&world.local_home, "tutor", b"tutor-record\n");
+    write_preserved_plugin_export(&world.local_home, "book", b"book-record\n");
+    let mut command = world.sync_command(&[
+        "sync",
+        "peer",
+        world.remote.to_str().unwrap(),
+        "--mode",
+        "merge",
+    ]);
+    command.env("LWC_TEST_SYNC_FAIL_PLUGIN", "book");
+    let first = command.output().unwrap();
+    assert!(!first.status.success());
+    let error: Value = serde_json::from_slice(&first.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "sync_plugin_test_failure");
+    assert!(
+        world
+            .remote_home
+            .join(format!(
+                ".lwc/plugins/tutor/preserved/{TEST_PLUGIN_STORE_ID}/1"
+            ))
+            .is_dir()
+    );
+    assert!(
+        !world
+            .remote_home
+            .join(".lwc/plugins/book/preserved")
+            .exists()
+    );
+    let state = fs::read_dir(world.local.join(".lwc/sync"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("state.json").is_file())
+        .unwrap();
+    let saved: Value =
+        serde_json::from_slice(&fs::read(state.join("state.json")).unwrap()).unwrap();
+    assert_eq!(saved["phase"], "publishing");
+    let progress = saved["plugin_results"].as_array().unwrap();
+    assert_eq!(progress.len(), 3);
+    assert_eq!(
+        progress
+            .iter()
+            .find(|plugin| plugin["plugin"] == "tutor")
+            .unwrap()["status"],
+        "preserved_not_ready"
+    );
+    assert_eq!(
+        progress
+            .iter()
+            .find(|plugin| plugin["plugin"] == "book")
+            .unwrap()["status"],
+        "preflight_complete"
+    );
+    let session = saved["session_id"].as_str().unwrap();
+
+    let resumed = world.sync(&[
+        "sync",
+        "peer",
+        world.remote.to_str().unwrap(),
+        "--mode",
+        "merge",
+        "--resume",
+        session,
+    ]);
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let result: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(result["action"], "completed");
+    assert_eq!(result["plugins"].as_array().unwrap().len(), 3);
+    assert!(
+        world
+            .remote_home
+            .join(format!(
+                ".lwc/plugins/book/preserved/{TEST_PLUGIN_STORE_ID}/1"
+            ))
+            .is_dir()
+    );
 }
 
 #[cfg(unix)]
@@ -2547,14 +2997,25 @@ fn sync_preserves_fixed_plugin_exports_when_the_destination_runtime_is_absent() 
         String::from_utf8_lossy(&output.stderr)
     );
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plugins = result["plugins"].as_array().unwrap();
     assert_eq!(
-        result["plugins"][0]["status"], "preserved_not_ready",
-        "{result:#}"
+        plugins.len(),
+        3,
+        "all fixed plugin units must remain visible"
     );
-    let remote = world
-        .remote_home
-        .join(".lwc/plugins/book/preserved/store-test/1");
-    for relative in ["manifest.json", "records.ndjson", "blobs/sha256/aa/aa-test"] {
+    let book = plugins
+        .iter()
+        .find(|plugin| plugin["plugin"] == "book")
+        .unwrap();
+    assert_eq!(book["status"], "preserved_not_ready", "{result:#}");
+    let remote = world.remote_home.join(format!(
+        ".lwc/plugins/book/preserved/{TEST_PLUGIN_STORE_ID}/1"
+    ));
+    for relative in [
+        "manifest.json",
+        "records.ndjson",
+        "blobs/sha256/fa/fa2c8cc4f28176bbeed4b736df569a34c79cd3723e9ec42f9674b4d46ac6b8b8",
+    ] {
         assert_eq!(
             fs::read(remote.join(relative)).unwrap(),
             fs::read(local.join(relative)).unwrap()
@@ -2568,7 +3029,27 @@ fn sync_fails_before_wiki_publication_on_divergent_preserved_plugin_identity() {
     let world = SyncWorld::new();
     world.install_fake_ssh();
     write_preserved_plugin_export(&world.local_home, "tutor", b"local-record\n");
-    write_preserved_plugin_export(&world.remote_home, "tutor", b"remote-record\n");
+    let remote_export =
+        write_preserved_plugin_export(&world.remote_home, "tutor", b"remote-record\n");
+    let remote_store_id = "2".repeat(64);
+    let manifest_path = remote_export.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["store_id"] = Value::String(remote_store_id.clone());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    fs::rename(
+        remote_export.parent().unwrap(),
+        remote_export
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(remote_store_id),
+    )
+    .unwrap();
     world.put_page(&world.local, "must-not-publish", "Local", "unpublished");
 
     let output = world.sync(&[
@@ -2582,4 +3063,60 @@ fn sync_fails_before_wiki_publication_on_divergent_preserved_plugin_identity() {
     let error: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(error["error"]["code"], "sync_plugin_diverged");
     assert!(!world.has_page(&world.remote, "must-not-publish"));
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_does_not_publish_plugin_units_before_wiki_conflicts_are_resolved() {
+    let world = SyncWorld::new();
+    world.install_fake_ssh();
+    write_preserved_plugin_export(&world.local_home, "book", b"book-record\n");
+    world.put_page(&world.local, "guide", "Local", "local body");
+    world.put_page(&world.remote, "guide", "Remote", "remote body");
+
+    let output = world.sync(&[
+        "sync",
+        "peer",
+        world.remote.to_str().unwrap(),
+        "--mode",
+        "merge",
+    ]);
+    assert!(output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["action"], "conflicts", "{result:#}");
+    assert!(
+        !world
+            .remote_home
+            .join(".lwc/plugins/book/preserved")
+            .exists(),
+        "plugin publication started before Wiki semantic conflicts were resolved"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_rejects_a_plugin_manifest_whose_revision_does_not_match_its_path() {
+    let world = SyncWorld::new();
+    world.install_fake_ssh();
+    let export = write_preserved_plugin_export(&world.local_home, "practice", b"record\n");
+    let manifest_path = export.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["revision"] = serde_json::json!(2);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let output = world.sync(&[
+        "sync",
+        "peer",
+        world.remote.to_str().unwrap(),
+        "--mode",
+        "merge",
+    ]);
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "sync_plugin_invalid");
+    assert!(!world.remote_home.join(".lwc/plugins/practice").exists());
 }

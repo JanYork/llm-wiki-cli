@@ -8,6 +8,8 @@ mod error;
 mod external_graph;
 pub mod graph;
 mod import;
+#[path = "learning/mod.rs"]
+mod learning;
 mod learning_runtime;
 mod mcp;
 mod office;
