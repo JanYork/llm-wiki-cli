@@ -1051,3 +1051,120 @@ fn teaching_checkpoint_enforces_blockage_progressive_hints_answer_timing_and_exa
         "exam_hints_forbidden"
     );
 }
+
+#[test]
+fn sensitive_soul_proposal_survives_until_learner_approval_and_explicit_publish() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let initial = ok(&cwd, &home, &["soul", "show"]);
+    let initial_body = initial["result"]["soul"]["body"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let proposal_input = serde_json::json!({
+        "body": "# 老师的灵魂\n\n在多次独立证据确认前，不对学生形成稳定人格判断。\n",
+        "fact_refs": ["fact-sensitive-01", "fact-sensitive-02"],
+        "reason": "将人格判断改为严格证据门槛",
+        "sensitivity": "behavior-changing",
+        "request_id": "soul-proposal-sensitive"
+    })
+    .to_string();
+    let proposed = ok(
+        &cwd,
+        &home,
+        &[
+            "soul",
+            "propose",
+            "--if-revision",
+            "1",
+            "--json",
+            &proposal_input,
+        ],
+    );
+    let proposal_id = proposed["result"]["proposal"]["id"].as_str().unwrap();
+    assert_eq!(proposed["result"]["proposal"]["state"], "proposed");
+    assert_eq!(
+        ok(&cwd, &home, &["soul", "show"])["result"]["soul"]["revision"],
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".lwc/plugins/tutor/soul.md")).unwrap(),
+        initial_body
+    );
+
+    let publish_before_approval = serde_json::json!({
+        "request_id": "soul-publish-before-approval"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "soul",
+                "publish-proposal",
+                proposal_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &publish_before_approval,
+            ],
+        )["error"]["code"],
+        "soul_approval_required"
+    );
+
+    let approval = serde_json::json!({
+        "approved_by": "learner",
+        "request_id": "soul-approve-sensitive"
+    })
+    .to_string();
+    let approved = ok(
+        &cwd,
+        &home,
+        &[
+            "soul",
+            "approve",
+            proposal_id,
+            "--if-revision",
+            "1",
+            "--json",
+            &approval,
+        ],
+    );
+    assert_eq!(approved["result"]["proposal"]["state"], "approved");
+    assert_eq!(
+        ok(&cwd, &home, &["soul", "show"])["result"]["soul"]["revision"],
+        1
+    );
+
+    let publish = serde_json::json!({"request_id": "soul-publish-sensitive"}).to_string();
+    let published = ok(
+        &cwd,
+        &home,
+        &[
+            "soul",
+            "publish-proposal",
+            proposal_id,
+            "--if-revision",
+            "1",
+            "--json",
+            &publish,
+        ],
+    );
+    assert_eq!(published["result"]["soul"]["revision"], 2);
+    assert_eq!(published["result"]["proposal"]["state"], "published");
+    assert!(
+        fs::read_to_string(home.join(".lwc/plugins/tutor/soul.md"))
+            .unwrap()
+            .contains("严格证据门槛")
+    );
+
+    let history = ok(&cwd, &home, &["soul", "history"]);
+    assert_eq!(history["result"]["versions"].as_array().unwrap().len(), 2);
+    assert_eq!(history["result"]["proposals"][0]["id"], proposal_id);
+    assert_eq!(history["result"]["proposals"][0]["state"], "published");
+}
