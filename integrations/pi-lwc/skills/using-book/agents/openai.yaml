@@ -2,4 +2,3 @@ interface:
   display_name: "LWC Book"
   short_description: "Verified sequential whole-book reading"
   default_prompt: "Use $using-book to preserve, prepare, and read a supported book in exact source order."
-

@@ -2,4 +2,3 @@ interface:
   display_name: "LWC Tutor"
   short_description: "Durable teacher-led learning sessions"
   default_prompt: "Use $using-tutor for explicit learning sessions and recover durable Tutor state before continuing."
-
