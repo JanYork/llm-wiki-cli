@@ -1689,11 +1689,13 @@ fn required_heading_summaries(
                 continue;
             }
             let key = path[..depth].join(" / ");
-            if let Some(last) = required.last_mut() {
-                if last.level == level && last.title == key && last.end + 1 == *ordinal {
-                    last.end = *ordinal;
-                    continue;
-                }
+            if let Some(last) = required.last_mut()
+                && last.level == level
+                && last.title == key
+                && last.end + 1 == *ordinal
+            {
+                last.end = *ordinal;
+                continue;
             }
             required.push(RequiredSummary {
                 level,

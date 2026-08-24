@@ -83,7 +83,7 @@ fn every_plugin_owns_an_independent_idempotent_subject_store() {
         id.len() >= 16
             && id
                 .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'z').contains(&byte))
+                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
     );
     assert_eq!(
         ok(
