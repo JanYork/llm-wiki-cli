@@ -31,6 +31,14 @@ impl Plugin {
             Self::Practice => "practice",
         }
     }
+
+    fn disabled_code(self) -> &'static str {
+        match self {
+            Self::Tutor => "tutor_disabled",
+            Self::Book => "book_disabled",
+            Self::Practice => "practice_disabled",
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -82,7 +90,7 @@ impl Paths {
 pub(crate) fn run(plugin: Plugin, cwd: &Path, args: &[OsString]) -> Result<Value> {
     if config::resolve_learning(plugin.id())?.setting != CapabilitySetting::Enabled {
         return Err(AppError::new(
-            format!("{}_disabled", plugin.id()),
+            plugin.disabled_code(),
             format!("{} capability is disabled", plugin.id()),
         )
         .with_details(json!({
@@ -165,7 +173,11 @@ fn file_sha256(path: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn valid_sha256(value: &str) -> bool {
