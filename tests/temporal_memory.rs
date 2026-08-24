@@ -239,7 +239,7 @@ fn memory_config_is_layered_validated_and_unsettable() {
 
     world.ok(&["config", "set", "--memory", "enabled"]);
     let stored: Value = serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
-    assert_eq!(stored["version"], 6);
+    assert_eq!(stored["version"], 7);
     assert_eq!(stored["memory"]["setting"], "enabled");
 }
 
