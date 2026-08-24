@@ -2276,6 +2276,7 @@ fn override_grade(
     Ok(value)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_grade(
     tx: &Transaction<'_>,
     id: &str,
@@ -2395,9 +2396,11 @@ fn rate_review(store: &mut Store, item_id: &str, input: ReviewRate) -> Result<Va
             (card, r + 1)
         }
         None => {
-            let mut c = Card::default();
-            c.due = reviewed;
-            c.last_review = reviewed;
+            let c = Card {
+                due: reviewed,
+                last_review: reviewed,
+                ..Card::default()
+            };
             (c, 1)
         }
     };
