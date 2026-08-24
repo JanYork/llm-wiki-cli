@@ -476,3 +476,161 @@ fn global_promotion_requires_cross_subject_evidence_and_private_wiki_stays_priva
     assert!(learner_page.contains("confirmed"));
     assert!(!home.join(".lwc/wiki.db").exists());
 }
+
+#[test]
+fn goal_needs_complete_criterion_evidence_then_explicit_learner_confirmation() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let subject_id = named_subject(&cwd, &home, "线性代数", "subject-goal-linear");
+
+    let no_criteria = serde_json::json!({
+        "subject_id": subject_id,
+        "statement": "掌握线性无关",
+        "criteria": [],
+        "request_id": "goal-no-criteria"
+    })
+    .to_string();
+    assert_eq!(
+        err(&cwd, &home, &["goal", "create", "--json", &no_criteria])["error"]["code"],
+        "goal_criteria_required"
+    );
+
+    let create = serde_json::json!({
+        "subject_id": subject_id,
+        "statement": "能够判断并解释有限向量组是否线性无关",
+        "criteria": [
+            "能独立判断三组向量并说明依据",
+            "能解释线性无关与表示唯一性的关系"
+        ],
+        "request_id": "goal-linear-independence"
+    })
+    .to_string();
+    let created = ok(&cwd, &home, &["goal", "create", "--json", &create]);
+    let goal = &created["result"]["goal"];
+    let goal_id = goal["id"].as_str().unwrap();
+    let criterion_a = goal["criteria"][0]["id"].as_str().unwrap();
+    let criterion_b = goal["criteria"][1]["id"].as_str().unwrap();
+    assert_eq!(goal["status"], "active");
+    assert_eq!(goal["revision"], 1);
+
+    let premature = serde_json::json!({
+        "confirmed_by": "learner",
+        "request_id": "goal-premature-complete"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "goal",
+                "complete",
+                goal_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &premature,
+            ],
+        )["error"]["code"],
+        "goal_not_ready"
+    );
+
+    let incomplete = serde_json::json!({
+        "criteria": [{
+            "criterion_id": criterion_a,
+            "evidence_refs": ["attempt-vector-set-01"]
+        }],
+        "request_id": "goal-incomplete-evidence"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "goal",
+                "evidence",
+                goal_id,
+                "--if-revision",
+                "1",
+                "--json",
+                &incomplete,
+            ],
+        )["error"]["code"],
+        "goal_criteria_incomplete"
+    );
+    assert_eq!(
+        ok(&cwd, &home, &["goal", "show", goal_id])["result"]["goal"]["revision"],
+        1
+    );
+
+    let evidence = serde_json::json!({
+        "criteria": [
+            {"criterion_id": criterion_a, "evidence_refs": ["attempt-vector-set-01"]},
+            {"criterion_id": criterion_b, "evidence_refs": ["turn-unique-representation-04"]}
+        ],
+        "request_id": "goal-complete-evidence"
+    })
+    .to_string();
+    let ready = ok(
+        &cwd,
+        &home,
+        &[
+            "goal",
+            "evidence",
+            goal_id,
+            "--if-revision",
+            "1",
+            "--json",
+            &evidence,
+        ],
+    );
+    assert_eq!(ready["result"]["goal"]["status"], "ready_to_complete");
+    assert_eq!(ready["result"]["goal"]["revision"], 2);
+
+    let agent = serde_json::json!({
+        "confirmed_by": "agent",
+        "request_id": "goal-agent-complete"
+    })
+    .to_string();
+    assert_eq!(
+        err(
+            &cwd,
+            &home,
+            &[
+                "goal",
+                "complete",
+                goal_id,
+                "--if-revision",
+                "2",
+                "--json",
+                &agent,
+            ],
+        )["error"]["code"],
+        "learner_confirmation_required"
+    );
+
+    let learner = serde_json::json!({
+        "confirmed_by": "learner",
+        "request_id": "goal-learner-complete"
+    })
+    .to_string();
+    let completed = ok(
+        &cwd,
+        &home,
+        &[
+            "goal",
+            "complete",
+            goal_id,
+            "--if-revision",
+            "2",
+            "--json",
+            &learner,
+        ],
+    );
+    assert_eq!(completed["result"]["goal"]["status"], "completed");
+    assert_eq!(completed["result"]["goal"]["revision"], 3);
+}
