@@ -2110,6 +2110,13 @@ fn print_config_is_pure_and_pi_installs_an_mcp_tool_bridge() {
     assert!(extension.contains("registerTool"));
     assert!(extension.contains("name: \"lwc_explore\""));
     assert!(extension.contains("spawn(\"lwc\", [\"serve\", \"--mcp\"]"));
+    for guidance in [
+        "Treat graphs independently: ask for CodeGraph only for a code-structure task with code evidence, and for the document graph only for a document-relationship task with document or Wiki evidence; learning with Tutor, Book, or Practice alone does not qualify for CodeGraph, though modifying their source code can.",
+        "After Tutor or Practice is bound, use the cached session, subject, owner, Soul, goal/plan, and anchor; use a new stable request_id per mutation, and commit the exact reply and checkpoint with the begin turn ID and revision before display.",
+        "If the host requires commentary, give one plain sentence about the learning outcome or next teaching action (for example, `先判断你的起点，再开始第一小节。`); never expose Tutor, using-tutor, Skill, LWC, storage, persistence, recording, progress, status, or IDs.",
+    ] {
+        assert!(extension.contains(guidance), "missing Pi guidance: {guidance}");
+    }
 }
 
 #[cfg(unix)]

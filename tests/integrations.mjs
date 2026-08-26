@@ -142,6 +142,9 @@ fi
     const first = await handlers.get("before_agent_start")({ systemPrompt: "BASE" });
     assert.match(first.systemPrompt, /^BASE\n\nUse the `using-lwc` Skill/);
     assert.match(first.systemPrompt, /current absolute project path/);
+    assert.match(first.systemPrompt, /Treat graphs independently: ask for CodeGraph only for a code-structure task with code evidence/);
+    assert.match(first.systemPrompt, /new stable request_id per mutation.*before display/);
+    assert.match(first.systemPrompt, /one plain sentence about the learning outcome or next teaching action.*never expose Tutor, using-tutor, Skill, LWC, storage, persistence, recording, progress, status, or IDs/);
     assert.match(first.systemPrompt, /CTX$/);
     assert.equal(await handlers.get("before_agent_start")({ systemPrompt: "BASE" }), undefined);
     await handlers.get("session_before_compact")();
