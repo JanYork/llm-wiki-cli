@@ -1,4 +1,8 @@
-# plugin	scenario	expected
-tutor	ambiguous_intent	ask_once|-|no-new-work
-book	disabled_without_consent	ask_once|-|no-new-work
-practice	pending_recovery	recover|lwc practice status|no-new-work
+# scenario	state_source	turn_flow	practice
+explicit-intent	enter-directly	begin-teach-commit	skip
+ambiguous-intent	ask-once	no-turn-until-answer	skip
+ordinary-qa	outside-tutor	no-turn	skip
+cold	status-once	begin-teach-commit	skip
+recovery	status-once	begin-teach-commit	only-if-durable-work
+hot	cached-exact-binding	begin-teach-commit	skip
+practice-transition	cached-exact-binding	begin-teach-commit	enter

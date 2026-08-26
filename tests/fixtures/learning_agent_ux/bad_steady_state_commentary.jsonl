@@ -1,0 +1,11 @@
+{"turn":"A","kind":"assistant","phase":"commentary","text":"我先检查 Tutor status 并把这次回答持久化。"}
+{"turn":"A","kind":"command","action":"begin","argv":["lwc","tutor","turn","begin"],"session_id":"session-1","owner":"agent-1","request_id":"begin-A","turn_id":"turn-A","revision":3,"input":"A","exit_code":0,"elapsed_ms":10}
+{"turn":"A","kind":"command","action":"commit","argv":["lwc","tutor","turn","commit"],"session_id":"session-1","owner":"agent-1","request_id":"commit-A","turn_id":"turn-A","if_revision":3,"exit_code":0,"elapsed_ms":10}
+{"turn":"A","kind":"assistant","phase":"final_answer","text":"对，继续选 A 或 B。"}
+{"turn":"A","kind":"state","pending":0}
+{"turn":"A","kind":"agent_timing","elapsed_ms":1000}
+{"turn":"B","kind":"command","action":"begin","argv":["lwc","tutor","turn","begin"],"session_id":"session-1","owner":"agent-1","request_id":"begin-B","turn_id":"turn-B","revision":7,"input":"B","exit_code":0,"elapsed_ms":10}
+{"turn":"B","kind":"command","action":"commit","argv":["lwc","tutor","turn","commit"],"session_id":"session-1","owner":"agent-1","request_id":"commit-B","turn_id":"turn-B","if_revision":7,"exit_code":0,"elapsed_ms":10}
+{"turn":"B","kind":"assistant","phase":"final_answer","text":"这里 B 正确。"}
+{"turn":"B","kind":"state","pending":0}
+{"turn":"B","kind":"agent_timing","elapsed_ms":1000}

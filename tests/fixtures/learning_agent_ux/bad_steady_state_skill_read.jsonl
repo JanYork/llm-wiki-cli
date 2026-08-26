@@ -1,0 +1,12 @@
+{"turn":"A","kind":"command","action":"status","argv":["lwc","tutor","status"],"exit_code":0,"elapsed_ms":105}
+{"turn":"A","kind":"command","action":"begin","argv":["lwc","tutor","turn","begin"],"session_id":"session-1","owner":"agent-1","request_id":"begin-A","turn_id":"turn-A","revision":2,"input":"A","exit_code":0,"elapsed_ms":92}
+{"turn":"A","kind":"command","action":"commit","argv":["lwc","tutor","turn","commit"],"session_id":"session-1","owner":"agent-1","request_id":"commit-A","turn_id":"turn-A","if_revision":2,"exit_code":0,"elapsed_ms":101}
+{"turn":"A","kind":"assistant","text":"对，I am tired 表示“我累了”。下一步把 am 换成 is：He ___ tired。"}
+{"turn":"A","kind":"state","pending":0}
+{"turn":"A","kind":"agent_timing","elapsed_ms":8200}
+{"turn":"B","kind":"command","argv":["sed","-n","1,240p","/tmp/skills/using-tutor/SKILL.md"],"exit_code":0,"elapsed_ms":31}
+{"turn":"B","kind":"command","action":"begin","argv":["lwc","tutor","turn","begin"],"session_id":"session-1","owner":"agent-1","request_id":"begin-B","turn_id":"turn-B","revision":4,"input":"B","exit_code":0,"elapsed_ms":94}
+{"turn":"B","kind":"command","action":"commit","argv":["lwc","tutor","turn","commit"],"session_id":"session-1","owner":"agent-1","request_id":"commit-B","turn_id":"turn-B","if_revision":4,"exit_code":0,"elapsed_ms":100}
+{"turn":"B","kind":"assistant","text":"对，He is tired。he 后面用 is。再换成复数：They ___ tired。"}
+{"turn":"B","kind":"state","pending":0}
+{"turn":"B","kind":"agent_timing","elapsed_ms":9700}

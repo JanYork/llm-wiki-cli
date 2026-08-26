@@ -306,6 +306,11 @@ source/assessment calls are not narrated. `lwc tutor status` returns the complet
 and bounded active-session resume contexts in one read; control invocations such as
 `$using-tutor` are never stored as learner turns.
 
+Cold entry and recovery run Tutor status once; a bound hot turn uses the cached exact binding, then begin → teach → commit → display.
+Each mutation has its own stable request ID, reused only to retry that same mutation.
+Practice is entered only for durable papers, attempts, grades, flashcards, scheduled review, mistake history, or goal evidence.
+Routine control-plane work stays silent; before a meaningful batch, phase change, or visible wait, the Agent gives one outcome-level sentence.
+
 Plugin roots are private user data. They are not projected into the ordinary LWC Wiki,
 and v1 provides no forget/clear/purge command. Disable, runtime replacement, archive,
 correction, and Sync preserve canonical history; any future destructive purge requires
@@ -481,6 +486,10 @@ distinguishes configured consent from a pending or failed projection. Detection
 is read-only and never enables or initializes a graph. When both graphs need
 authorization, the portable baseline is plain text, so Agents without checkbox
 support behave the same way:
+
+Graph applicability is independent: the physical document graph requires a document-relationship task plus document or Wiki evidence in the project root.
+CodeGraph requires a code-structure task and code evidence in the current working root.
+No-code learning never prompts for CodeGraph.
 
 ```text
 1. Enable physical document graph and CodeGraph (recommended)

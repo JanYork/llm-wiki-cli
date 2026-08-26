@@ -32,6 +32,13 @@ Use `lwc` as durable external memory. The database stores evidence and compiled 
 14. Lifecycle Hooks may report memory readiness and commands, but must not
     record, rate, maintain, or inject raw temporal events automatically.
 
+## Graph capability routing
+
+Graph applicability is independent: the physical document graph requires a document-relationship task plus document or Wiki evidence in the project root.
+CodeGraph requires a code-structure task and code evidence in the current working root.
+No-code learning never prompts for CodeGraph.
+Ask only for an applicable missing graph. Using Tutor, Book, or Practice for learning, reading, or practice alone does not trigger graph authorization; modifying their source code can qualify when the task needs code structure and the current root contains code evidence. Ordinary questions and sessions without a project root do not trigger graph authorization.
+
 ## Optional Learning Suite
 
 Tutor, Book, and Practice are independent global capabilities and are disabled by
@@ -48,9 +55,9 @@ lwc practice status
 
 The first domain command lazily installs the same-version target asset under
 `~/.lwc/runtime/<plugin>/<version>/<target>/`; never substitute a `PATH` binary or a
-generic plugin. Before new work, invoke the matching `using-tutor`, `using-book`, or
-`using-practice` Skill and query exact status. Recover a pending Tutor turn, Book
-lease, or Practice attempt before starting another one.
+generic plugin. Invoke the matching `using-tutor`, `using-book`, or `using-practice`
+Skill on explicit entry or recovery. Recover pending durable work before starting
+another item; a bound hot turn does not reload Skills or status.
 
 Keep this control plane invisible during normal interaction. Do not narrate routine
 plugin calls or inspect private SQLite/plugin/runtime files. One `lwc tutor status`
@@ -58,6 +65,11 @@ returns the complete Soul plus at most 20 active resume contexts, each containin
 subject, session, current goal/plan, latest committed turn, and bounded pending turns.
 Do not persist `$using-tutor` or other control text as a learner turn, and do not let an
 unrelated pending subject hijack an explicitly named new subject.
+
+Cold entry and recovery run Tutor status once; a bound hot turn uses the cached exact binding, then begin → teach → commit → display.
+Each mutation has its own stable request ID, reused only to retry that same mutation.
+Practice is entered only for durable papers, attempts, grades, flashcards, scheduled review, mistake history, or goal evidence.
+Routine control-plane work stays silent; before a meaningful batch, phase change, or visible wait, the Agent gives one outcome-level sentence.
 
 Intent routing is deliberately small:
 

@@ -278,6 +278,11 @@ Sync 分别盘点三套 store，即使目标端缺少对应 runtime，也能保�
 `lwc tutor status` 一次返回完整 Soul 与有界的活动会话恢复上下文；`$using-tutor`
 等控制调用永远不会被保存为学习 turn。
 
+Tutor 冷启动和恢复只运行一次 status；已绑定的热回合使用缓存的精确 binding，然后执行 begin → teach → commit → display。
+每个 mutation 使用各自独立的稳定 request_id，只在重试同一个 mutation 时复用。
+Practice 仅在创建或恢复持久试卷、作答、评分、闪卡、计划复习、错题历史或目标证据时进入。
+例行控制面保持静默；只在有意义的批次、阶段变化或明显等待前，用一句面向结果的话说明。
+
 插件根目录属于用户私有数据，不会投影到普通 LWC Wiki。v1 不提供
 forget/clear/purge 命令；关闭、替换 runtime、归档、纠正和 Sync 都会保留 canonical
 历史。未来任何破坏性 purge 都必须另行设计并获得明确授权。详见
@@ -429,6 +434,10 @@ LWC 在其上增加统一 LWC MCP、逐能力状态、Skills、Hooks、共享文
 Office 能力，以及 Agent 集成检查命令。物理图会区分“已经授权配置”和“投影仍在等待或失败”。
 检测过程只读，不会静默启用或初始化任何图。当两个图都需要授权时，最低兼容协议
 使用纯文本，因此不支持勾选框的 Agent 也能正常工作：
+
+两种图能力按任务与目录证据独立适用：物理文档图要求文档关系任务以及项目根目录中的文档或 Wiki 证据。
+CodeGraph 只在当前工作根目录存在代码证据且任务需要代码结构时适用。
+无代码学习绝不提示启用 CodeGraph。
 
 ```text
 1. 同时启用物理文档图和 CodeGraph（推荐）

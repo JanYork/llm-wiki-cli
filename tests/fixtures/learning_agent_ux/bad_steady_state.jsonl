@@ -1,0 +1,15 @@
+{"turn":"A","kind":"command","argv":["lwc","tutor","status"],"exit_code":0,"elapsed_ms":105}
+{"turn":"A","kind":"command","argv":["lwc","tutor","turn","begin"],"exit_code":0,"elapsed_ms":92}
+{"turn":"A","kind":"command","argv":["lwc","tutor","turn","commit"],"exit_code":0,"elapsed_ms":101}
+{"turn":"A","kind":"assistant","text":"对，I am tired 表示“我累了”。下一步把 am 换成 is：He ___ tired."}
+{"turn":"A","kind":"state","pending":0}
+{"turn":"A","kind":"agent_timing","elapsed_ms":8200}
+{"turn":"B","kind":"command","argv":["lwc","tutor","status"],"exit_code":0,"elapsed_ms":108}
+{"turn":"B","kind":"command","argv":["lwc","practice","status"],"exit_code":0,"elapsed_ms":84}
+{"turn":"B","kind":"command","argv":["lwc","tutor","--help"],"exit_code":0,"elapsed_ms":51}
+{"turn":"B","kind":"command","argv":["sqlite3","/tmp/tutor.sqlite3"],"exit_code":0,"elapsed_ms":33}
+{"turn":"B","kind":"command","argv":["lwc","tutor","turn","begin"],"exit_code":0,"elapsed_ms":94}
+{"turn":"B","kind":"command","argv":["lwc","tutor","turn","commit"],"exit_code":0,"elapsed_ms":100}
+{"turn":"B","kind":"assistant","text":"我先检查 Tutor 状态并加载 Practice。正确答案是 is：He is tired。再试：They ___ tired."}
+{"turn":"B","kind":"state","pending":0}
+{"turn":"B","kind":"agent_timing","elapsed_ms":9700}

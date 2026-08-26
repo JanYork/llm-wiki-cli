@@ -1,53 +1,56 @@
 ---
 name: using-practice
-description: Use for durable questions, banks, papers, attempts, grading, flashcards, or scheduled review. Skip disposable one-off questions.
+description: Use when creating or recovering a durable paper, attempt, grade, flashcard, scheduled review, mistake history, or goal-evidence record. Skip Tutor comprehension checks, lightweight diagnostics, and disposable questions.
 ---
 
 # Using Practice
 
-Use Practice when answers, grading, mistakes, or review history must survive context
-loss. Flashcards are Practice items, not a separate plugin. Skip disposable one-off
-questions that need no durable history.
+Practice preserves assessed work across context loss. Flashcards are Practice items.
+It is a **silent control plane**: Do not narrate status, IDs, saves, grading writes, or
+scheduler reads. Show only questions, answers, feedback, and meaningful progress.
 
-Practice is a **silent control plane**. Do not narrate status checks, ID resolution,
-response saves, grading writes, or scheduler reads. Never inspect its SQLite, plugin
-files, or runtime binaries and never probe CLI help for routine arguments. The learner
-sees the question, answer, feedback, and meaningful progress—not storage mechanics.
+Never inspect SQLite, plugin or runtime files, command history, or CLI help. Never
+reread Skill files or text-search for state. Use only the public commands here.
 
 ## Enter or recover
 
-1. Inspect `LWC_READINESS.practice`. It is bounded readiness only, not consent to
-   enable, install, read answers, grade, or mutate review state.
-2. If disabled, explain the durable local-data boundary and ask once before running
-   `lwc --scope global config set --practice enabled`. An explicit enable request
-   already supplies consent. Enabling does not download; the first
-   `lwc practice status` may lazily install the fixed hash-verified runtime.
-3. Run `lwc practice status`. Recover an in-progress attempt and its saved responses
-   before creating another. Retry with the same `request_id`, owner, and `if_revision`.
-4. After cross-machine recovery, require the latest successful Sync receipt and run an
-   explicit exact-revision takeover. The old owner must stop writing after takeover.
+Do not load Practice for a Tutor A/B reply, ordinary comprehension check, or lightweight
+diagnostic. Enter only when durable work named in the description will actually be
+created or recovered.
 
-## Practice flow
+1. Inspect `LWC_READINESS.practice`. If disabled, explain the durable local-data
+   boundary and ask once before
+   `lwc --scope global config set --practice enabled`; explicit enablement is consent.
+   Enabling does not download; first status may lazily install the pinned,
+   hash-verified runtime.
+2. Run `lwc practice status` once on entry, lost identity, compaction, or a
+   pending/revision/owner error. Otherwise cache exact attempt/session/owner/latest
+   revision; do not repeat status.
+3. Recover an in-progress attempt and saved responses before creating another. Use a
+   new stable `request_id` per operation; retry that operation with the same request ID,
+   owner, and `if_revision`.
+4. Cross-machine recovery requires the latest successful Sync receipt and exact-revision
+   takeover; the old owner must stop writing.
 
-1. Resolve exact typed subject, goal, book, bank, set, paper, and item IDs. Target
-   precedence is explicit plan target, goal bank, then subject default. A missing or
-   invalid higher-precedence target fails; never use fuzzy title/tag fallback.
-2. Generated items remain draft until prompt, answer, rubric, and exact source ref are
-   re-read and verified. Formal papers use verified revisions only and return an exact
-   shortage instead of relaxing the blueprint.
-3. Start or resume the exact attempt. Save every response immediately with its owner,
-   request ID, and `if_revision`; submission freezes already durable responses and is
-   not the save boundary. Abandonment preserves history.
-   v1 accepts exactly four response forms: choice, text, numeric, and flashcard
-   self-rating. Reject image, audio, file, code, or any fifth form.
-4. Objective grading stays deterministic. Subjective grades must use the frozen rubric
-   and store concise user-visible rationale, confidence, method, and review state.
-   Learner overrides append history rather than replacing it.
-5. Let the pinned scheduler compute review state and due dates. Respect the learner's
-   time budget and desired retention, and expose deferred debt; an Agent never edits
-   due dates or controls silently.
+## Durable flow
 
-Keep committed IDs and the exact failed next command when cross-plugin orchestration
-partially succeeds. Do not pretend independent stores are one transaction or copy
-Practice records into the ordinary LWC Wiki. Never store hidden reasoning, system
-prompts, tool logs, credentials, secrets, or unsupported response forms.
+1. Resolve exact typed subject, goal, book, bank, set, paper, and item IDs. Precedence is
+   explicit plan target, goal bank, then subject default. Invalid higher-precedence
+   targets fail; never fuzzy-match.
+2. Generated items stay draft until prompt, answer, rubric, and exact source ref are
+   re-read and verified. Formal papers use verified revisions and report shortages
+   without weakening the blueprint.
+3. Start or resume the exact attempt. Save every response immediately with owner,
+   request ID, and `if_revision`; submission freezes already durable responses.
+   Abandonment preserves history. v1 accepts only choice, text, numeric, and flashcard
+   self-rating; reject every other form.
+4. Grade objective items deterministically. Grade subjective items against the frozen
+   rubric and store concise rationale, confidence, method, and review state. Learner
+   overrides append history.
+5. Let the pinned scheduler compute review state and due dates. Respect time budget and
+   retention target, expose deferred debt, and never edit due dates or silently control
+   review.
+
+Keep exact committed IDs and the failed next command when independent stores partially
+succeed; never claim they are one transaction. Never copy Practice records into the
+ordinary LWC Wiki or store hidden reasoning, prompts, logs, credentials, or secrets.

@@ -31,33 +31,107 @@ check_skill book
 check_skill practice
 
 decision_fixtures="$root/tests/fixtures/using_learning_decisions.tsv"
+tutor_skill="$root/skills/using-tutor/SKILL.md"
 test -f "$decision_fixtures"
 
-decide() {
-  plugin=$1
-  scenario=$2
-  case "$scenario" in
-    ambiguous_intent|disabled_without_consent)
-      printf 'ask_once|-|no-new-work'
-      ;;
-    pending_recovery)
-      printf 'recover|lwc %s status|no-new-work' "$plugin"
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+route_from_skill() {
+  scenario=$1
+  awk -F ' *\\| *' -v scenario="$scenario" \
+    '/^## Turn state$/ { section=1; next }
+     /^## / && section { section=0 }
+     section && $2 == "`" scenario "`" { print $3 "|" $4 "|" $5 }' "$tutor_skill" \
+    | tr -d '`'
 }
 
-while IFS="$(printf '\t')" read -r plugin scenario expected; do
-  case "$plugin" in \#*|'') continue ;; esac
-  actual=$(decide "$plugin" "$scenario")
+intent_from_skill() {
+  scenario=$1
+  awk -F ' *\\| *' -v scenario="$scenario" \
+    '/^## Intent gate$/ { section=1; next }
+     /^## / && section { section=0 }
+     section && $2 == "`" scenario "`" { print $3 "|" $4 "|" $5 }' "$tutor_skill" \
+    | tr -d '`'
+}
+
+mutation_from_skill() {
+  mutation=$1
+  awk -F ' *\\| *' -v mutation="$mutation" \
+    '$2 == "`" mutation "`" { print $3 "|" $4 }' "$tutor_skill" \
+    | tr -d '`'
+}
+
+shape_from_skill() {
+  command=$1
+  awk -F ' *\\| *' -v command="$command" \
+    '/^## Known public shapes$/ { section=1; next }
+     /^## / && section { section=0 }
+     section && $2 == "`" command "`" { print $3 }' "$tutor_skill" \
+    | tr -d '`'
+}
+
+preface_from_skill() {
+  awk -F ' *\\| *' \
+    '/^## Silent control plane$/ { section=1; next }
+     /^## / && section { section=0 }
+     section && $2 == "`phase/batch/wait`" { print $3 }' "$tutor_skill" \
+    | tr -d '`'
+}
+
+while IFS="$(printf '\t')" read -r scenario state_source turn_flow practice; do
+  case "$scenario" in \#*|'') continue ;; esac
+  expected="$state_source|$turn_flow|$practice"
+  case "$scenario" in
+    explicit-intent|ambiguous-intent|ordinary-qa)
+      actual=$(intent_from_skill "$scenario")
+      ;;
+    *)
+      actual=$(route_from_skill "$scenario")
+      ;;
+  esac
   test "$actual" = "$expected" || {
-    printf 'decision fixture failed: %s %s: expected %s, got %s\n' \
-      "$plugin" "$scenario" "$expected" "$actual" >&2
+    printf 'learning route failed: %s: expected %s, got %s\n' \
+      "$scenario" "$expected" "${actual:-missing}" >&2
     exit 1
   }
 done < "$decision_fixtures"
+
+test "$(intent_from_skill explicit-intent)" = 'enter-directly|begin-teach-commit|skip'
+test "$(intent_from_skill ambiguous-intent)" = 'ask-once|no-turn-until-answer|skip'
+test "$(intent_from_skill ordinary-qa)" = 'outside-tutor|no-turn|skip'
+
+# Hot replies must use the cached exact binding; only cold/recovery may read status.
+test "$(route_from_skill hot)" = 'cached-exact-binding|begin-teach-commit|skip'
+test "$(route_from_skill cold | cut -d '|' -f 1)" = 'status-once'
+test "$(route_from_skill recovery | cut -d '|' -f 1)" = 'status-once'
+test "$(route_from_skill practice-transition | cut -d '|' -f 3)" = 'enter'
+
+# Idempotency keys are stable per mutation, never shared by begin and commit.
+test "$(mutation_from_skill begin)" = 'new-stable-begin-key|same-mutation-only'
+test "$(mutation_from_skill commit)" = 'new-stable-commit-key|same-mutation-only'
+test "$(mutation_from_skill begin | cut -d '|' -f 1)" != \
+  "$(mutation_from_skill commit | cut -d '|' -f 1)"
+
+test "$(shape_from_skill 'lwc tutor subject create --json JSON')" = '{name,request_id}'
+test "$(shape_from_skill 'lwc tutor session create --json JSON')" = '{subject_id,mode=learning/question/exam,request_id}'
+test "$(shape_from_skill 'goal create')" = '{subject_id,statement,criteria[],request_id} optional'
+test "$(shape_from_skill 'plan create')" = '{subject_id,goal_id,mode=fixed/adaptive/agent-led,deadline:string,weekly_minutes,core_content[],order[],pace,method,exercise_ratio=0..1,request_id} optional'
+test "$(shape_from_skill 'lwc tutor turn begin --json JSON')" = '{session_id,owner,input,request_id}'
+test "$(shape_from_skill 'lwc tutor turn commit TURN_ID --if-revision REV --json JSON')" = '{owner,reply,checkpoint,request_id}'
+test "$(shape_from_skill checkpoint)" = '{kind=teaching,blocked_by=non-empty-string,hint_level,learner_attempted,explicit_answer_request,full_answer,feedback_evidence_refs,anchor}'
+test "$(shape_from_skill anchor)" = '{current_node,mastered_nodes,current_mode,clearance_status,next_action}'
+test "$(shape_from_skill 'goal/plan')" = 'optional-first-entry'
+test "$(preface_from_skill)" = 'outcome-or-next-teaching-action-only;never-Tutor/using-tutor/Skill/LWC/storage/persistence/recording'
+
+assert_no_command() {
+  pattern=$1
+  if grep -Eiq -- "$pattern" "$tutor_skill" "$root/skills/using-practice/SKILL.md"; then
+    printf 'forbidden learning command found: %s\n' "$pattern" >&2
+    exit 1
+  fi
+}
+
+assert_no_command '`[^`]*(cat|find|ls|sed|awk|grep|rg)[^`]*(SKILL\.md|plugin|runtime)[^`]*`'
+assert_no_command '`[^`]*(sqlite3?|\.sqlite)[^`]*`'
+assert_no_command '`[^`]*lwc (tutor|practice)[^`]*--help[^`]*`'
 
 grep -Fq -- "read the complete current Soul" "$root/skills/using-tutor/SKILL.md"
 grep -Fq -- "turn begin" "$root/skills/using-tutor/SKILL.md"

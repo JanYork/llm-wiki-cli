@@ -1,0 +1,9 @@
+{"turn":"init","kind":"command","argv":["lwc","cg","status"],"exit_code":0,"elapsed_ms":80}
+{"turn":"init","kind":"command","action":"status","argv":["lwc","tutor","status"],"exit_code":0,"elapsed_ms":110}
+{"turn":"init","kind":"command","action":"subject","argv":["lwc","tutor","subject","create"],"exit_code":0,"elapsed_ms":20}
+{"turn":"init","kind":"command","action":"session","argv":["lwc","tutor","session","create"],"exit_code":0,"elapsed_ms":20}
+{"turn":"init","kind":"command","action":"begin","argv":["lwc","tutor","turn","begin"],"session_id":"session-1","owner":"agent-1","request_id":"begin-init","turn_id":"turn-init","revision":2,"input":"开始学习英语","exit_code":0,"elapsed_ms":95}
+{"turn":"init","kind":"command","action":"commit","argv":["lwc","tutor","turn","commit"],"session_id":"session-1","owner":"agent-1","request_id":"commit-init","turn_id":"turn-init","if_revision":2,"exit_code":0,"elapsed_ms":105}
+{"turn":"init","kind":"assistant","text":"英语最直接的价值，是让你能读懂更多信息并与更多人交流。我们先从 I am 开始。"}
+{"turn":"init","kind":"state","pending":0}
+{"turn":"init","kind":"agent_timing","elapsed_ms":9100}

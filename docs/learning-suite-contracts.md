@@ -27,6 +27,10 @@ choices that later tests and code must share.
 
 ## Enablement, Agent routing, and privacy
 
+Graph applicability remains outside Learning Suite routing and is evaluated independently: the physical document graph requires a document-relationship task plus document or Wiki evidence in the project root.
+CodeGraph requires a code-structure task and code evidence in the current working root.
+No-code learning never prompts for CodeGraph.
+
 - Tutor, Book, and Practice are independently `disabled` in the built-in global
   configuration. Enable them with `lwc --scope global config set --tutor enabled`,
   `lwc --scope global config set --book enabled`, or
@@ -42,6 +46,10 @@ choices that later tests and code must share.
   routine calls, inspect private stores, probe help for known arguments, or persist a
   Skill invocation as learner content. `tutor status` preserves its count fields and
   additionally returns the complete Soul plus at most 20 active resume contexts.
+- Cold entry and recovery run Tutor status once; a bound hot turn uses the cached exact binding, then begin → teach → commit → display.
+- Each mutation has its own stable request ID, reused only to retry that same mutation.
+- Practice is entered only for durable papers, attempts, grades, flashcards, scheduled review, mistake history, or goal evidence.
+- Routine control-plane work stays silent; before a meaningful batch, phase change, or visible wait, the Agent gives one outcome-level sentence.
 - Tutor teaching checkpoints may carry a hidden cognitive anchor containing the current
   node, evidenced mastered nodes, mode, clearance status, and next action. The visible
   reply never contains this raw anchor.

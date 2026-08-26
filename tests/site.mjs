@@ -212,6 +212,51 @@ test("both locales expose continuity and Learning Suite capabilities", () => {
   }
 });
 
+test("public docs and Pages share the bounded graph and learning-turn contract", () => {
+  const englishContract = [
+    "CodeGraph requires a code-structure task and code evidence in the current working root.",
+    "No-code learning never prompts for CodeGraph.",
+    "Cold entry and recovery run Tutor status once; a bound hot turn uses the cached exact binding, then begin → teach → commit → display.",
+    "Each mutation has its own stable request ID, reused only to retry that same mutation.",
+    "Practice is entered only for durable papers, attempts, grades, flashcards, scheduled review, mistake history, or goal evidence.",
+    "Routine control-plane work stays silent; before a meaningful batch, phase change, or visible wait, the Agent gives one outcome-level sentence.",
+  ];
+  const chineseContract = [
+    "CodeGraph 只在当前工作根目录存在代码证据且任务需要代码结构时适用。",
+    "无代码学习绝不提示启用 CodeGraph。",
+    "Tutor 冷启动和恢复只运行一次 status；已绑定的热回合使用缓存的精确 binding，然后执行 begin → teach → commit → display。",
+    "每个 mutation 使用各自独立的稳定 request_id，只在重试同一个 mutation 时复用。",
+    "Practice 仅在创建或恢复持久试卷、作答、评分、闪卡、计划复习、错题历史或目标证据时进入。",
+    "例行控制面保持静默；只在有意义的批次、阶段变化或明显等待前，用一句面向结果的话说明。",
+  ];
+
+  for (const path of ["README.md", "docs/agent-workflow.md", "docs/learning-suite-contracts.md"]) {
+    const text = read(path);
+    for (const statement of englishContract)
+      assert.ok(text.includes(statement), `${path}: missing ${statement}`);
+  }
+  const chineseReadme = read("README.zh-CN.md");
+  for (const statement of chineseContract)
+    assert.ok(chineseReadme.includes(statement), `README.zh-CN.md: missing ${statement}`);
+
+  const workflow = read("docs/agent-workflow.md");
+  for (const statement of [
+    "learning, reading, or practice alone does not trigger graph authorization",
+    "modifying their source code can qualify",
+  ]) assert.ok(workflow.includes(statement), `docs/agent-workflow.md: missing ${statement}`);
+
+  for (const statement of [
+    "No-code learning never prompts for CodeGraph.",
+    "Bound Tutor turns stay silent and display only after commit.",
+    "Before a meaningful batch, phase change, or visible wait, the Agent gives one outcome-level sentence.",
+  ]) assert.ok(page("en").includes(statement), `site/index.html: missing ${statement}`);
+  for (const statement of [
+    "无代码学习绝不提示启用 CodeGraph。",
+    "已绑定的 Tutor 回合保持静默，只在 commit 成功后展示回复。",
+    "只在有意义的批次、阶段变化或明显等待前，用一句面向结果的话说明。",
+  ]) assert.ok(page("zh").includes(statement), `site/zh-CN/index.html: missing ${statement}`);
+});
+
 test("assets resolve from both locale directories and controls stay accessible", () => {
   for (const locale of ["en", "zh"]) {
     const path = files[locale];

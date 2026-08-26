@@ -33,9 +33,18 @@ global `lwc` command on `PATH`; no private Skill manager or maintainer-specific
 environment is required. CodeGraph remains internal to the LWC MCP and is never registered as a
 second Agent server.
 
-At fresh init or a boundary Hook, inspect `LWC_READINESS`. When both graphs are
-missing and the current task is substantive, ask once using this portable text
-protocol; do not require checkbox support:
+At fresh init or a boundary Hook, inspect `LWC_READINESS` and treat graph
+applicability independently. CodeGraph authorization applies only when the task
+requires code structure and the current working root contains code evidence.
+Physical document graph authorization applies only when the task requires
+document relationships and the project root contains document or Wiki evidence.
+Ask only for each applicable missing capability. If neither applies, do not ask.
+Using Tutor, Book, or Practice for learning, reading, or practice does not by
+itself make CodeGraph applicable. Modifying their source code can qualify when
+the task requires code structure and the current working root contains code
+evidence. Ordinary questions and sessions without a project root do not qualify
+for either graph. When both apply and are missing, ask once using this portable
+text protocol; do not require checkbox support:
 
 ```text
 1. Enable physical document graph and CodeGraph (recommended)
@@ -43,6 +52,16 @@ protocol; do not require checkbox support:
 3. Enable CodeGraph only
 4. Later
 ```
+
+For physical-document-graph-only consent, including choice `2`, run
+`lwc --scope project init` if the project Wiki is missing. Then run
+`lwc --scope project config set --graph grafeo`, wait for its Work, and run
+`lwc --scope project graph status` plus `lwc --scope project graph verify`.
+
+For CodeGraph-only consent, including choice `3`, run
+`lwc --scope project init` if the project Wiki is missing. Then run
+`lwc --scope project cg init` and require
+`lwc --scope project cg status` to report an initialized index.
 
 Choice `1` is one combined authorization. Execute existing commands immediately
 after consent, skipping project init only when it already exists:

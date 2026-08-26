@@ -49,6 +49,10 @@ fn assert_onboarding_guidance(text: &str) {
         "lwc serve --mcp",
         "single read-only `lwc_explore` tool",
         "plain-text choice",
+        "Keep routine LWC bookkeeping silent",
+        "meaningful multi-step operation, phase transition, or visible wait",
+        "one outcome-level sentence",
+        "do not narrate individual commands",
         "Detection is not consent",
         "1. Enable both graphs",
         "lwc --scope project config set --graph grafeo",
@@ -62,6 +66,28 @@ fn assert_onboarding_guidance(text: &str) {
             "missing Agent guidance: {expected}"
         );
     }
+    let graph_branches = "Ask only for each applicable missing capability. Show the four choices only when both capabilities apply and are missing; if only one applies or is missing, ask only for that capability. If neither applies, do not ask.\n\
+For physical-document-graph-only consent, including choice 2, run `lwc --scope project init` if the project Wiki is missing. Then run `lwc --scope project config set --graph grafeo`, wait for its Work, and run `lwc --scope project graph status` plus `lwc --scope project graph verify`.\n\
+For CodeGraph-only consent, including choice 3, run `lwc --scope project init` if the project Wiki is missing. Then run `lwc --scope project cg init` and require `lwc --scope project cg status` to report an initialized index.";
+    assert!(
+        text.contains(graph_branches),
+        "missing ordered single-graph guidance: {graph_branches}"
+    );
+    let learning_graph_boundary = "Using Tutor, Book, or Practice for learning, reading, or practice does not by itself make CodeGraph applicable. Modifying their source code can qualify when the task requires code structure and the current working root contains code evidence.";
+    assert!(
+        text.contains(learning_graph_boundary),
+        "missing Learning Suite source-code boundary: {learning_graph_boundary}"
+    );
+    let learning_hot_path = "After Tutor or Practice is bound in the current conversation, cache the exact session, subject, owner, Soul, goal/plan, and cognitive anchor. For steady-state learner replies, use the cached binding and required begin/commit or response-save calls. Use a new stable `request_id` per mutation, and reuse it only when retrying that same mutation. For Tutor, begin with the exact input, use the returned turn ID and revision, then commit the exact visible reply and checkpoint with owner and `if_revision`; show the reply only after commit succeeds. For Practice, save each response with its own request ID and latest revision before grading or visible feedback.";
+    assert!(
+        text.contains(learning_hot_path),
+        "missing ordered learning hot-path guidance: {learning_hot_path}"
+    );
+    let learning_announcement = "When the host requires a pre-tool or Skill announcement for learning, use one plain sentence about the learning outcome or next teaching action (for example, `先判断你的起点，再开始第一小节。`); never mention Tutor, using-tutor, Skill, LWC, storage, persistence, recording, saving progress, status, IDs, or other control-plane mechanics.";
+    assert!(
+        text.contains(learning_announcement),
+        "missing learning announcement boundary: {learning_announcement}"
+    );
     assert!(!text.contains("native LWC integration package"));
 }
 

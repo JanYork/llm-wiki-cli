@@ -38,10 +38,17 @@ Read `references/temporal-memory.md` before the first temporal record or recall
 decision. Temporal memory is history; the Wiki remains the first source for
 current architecture, instructions, and stable facts.
 
-Hooks are signals, not commands to mutate. At a lifecycle boundary, use the
-provided readiness facts to decide whether the current task is substantive enough
-to ask for graph authorization. Do not repeat the question in the same project
-conversation.
+Hooks are signals, not commands to mutate. At a lifecycle boundary, evaluate each
+graph independently: CodeGraph requires a code-structure task plus code evidence
+in the current working root; the physical document graph requires a document
+relationship task plus document or Wiki evidence in the project root. Ask only
+for applicable missing capabilities, and show the combined choices only when
+both apply and are missing. Using Tutor, Book, or Practice for learning, reading,
+or practice does not alone make CodeGraph applicable; modifying their source
+code can when the task requires code structure and the working root contains
+code evidence. Ask nothing for ordinary questions, sessions without a project
+root, or when neither graph applies. Do not repeat the question in the same
+project conversation.
 
 ## Consent boundaries
 
