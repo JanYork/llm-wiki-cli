@@ -106,504 +106,204 @@ Este projeto adapta essas ideias para uma CLI Rust pensada primeiro para agentes
 
 <p align="center"><img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-architecture-en.png" alt="Arquitetura do LWC" width="100%"></p>
 
-O modelo persistente de conhecimento tem três camadas lógicas:
+O LWC separa o conhecimento durável em camadas com responsabilidades claras:
 
-| Camada | Conteúdo | Contrato |
-| --- | --- | --- |
-| Fontes brutas | Snapshots imutáveis de entradas selecionadas | Adicione por `source`; nunca reescreva a verdade da fonte. |
-| Wiki | Páginas, citações, links e proveniência mantidos pelo agente | Atualize por `page`; cite fontes e classifique conhecimento duradouro que não vem de uma fonte. |
-| Esquema e propósito | Regras de manutenção e intenção do projeto | Orientam cada ingestão e revisão futura. |
+| Camada | Finalidade |
+| --- | --- |
+| Fontes originais | Snapshots imutáveis de evidências selecionadas |
+| Wiki | Páginas, citações, links e proveniência mantidos pelo agente |
+| Esquema e propósito | Regras do projeto que orientam a manutenção futura |
 
-SQLite é a fonte canônica. A árvore Markdown é uma projeção reconstruível para pessoas e ferramentas como o Obsidian. Agentes alteram o conhecimento pelo `lwc`, não editando `.lwc/wiki.db` nem o Markdown projetado diretamente. Comandos bem-sucedidos retornam JSON em stdout; falhas retornam JSON estruturado em stderr.
+O SQLite é a fonte canônica. Markdown, índices de texto completo e grafos
+opcionais são projeções reconstruíveis. As operações retornam JSON estruturado
+para facilitar auditoria e recuperação.
 
-Comandos de leitura mantêm os armazenamentos no formato atual em modo somente leitura. Quando uma CLI nova abre pela primeira vez um armazenamento antigo gravável, migra o schema uma vez, dentro de uma transação, antes de continuar a leitura.
+[Conheça a arquitetura →](https://github.com/JanYork/llm-wiki-cli/wiki/Architecture-Overview)
 
 ## Recuperação hierárquica e grafo de conhecimento
 
-Cada Source e página Wiki atual é indexada de forma determinística em passagens e frases. SQLite continua sendo a autoridade; span FTS e o grafo externo opcional são índices reconstruíveis. A busca existente continua retornando apenas documentos, a menos que uma granularidade seja pedida.
+O LWC indexa Sources e páginas da Wiki nos níveis de documento, passagem e
+frase. O agente pode começar com um contexto pequeno e relevante e expandir
+somente o trecho exato de que precisa.
 
 <p align="center"><img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-memory-graph-en.png" alt="Grafo de memória do LWC" width="100%"></p>
 
-```bash
-lwc search "projection consistency" --granularity sentence --type page
-lwc search "projection consistency" --granularity passage
-lwc search "projection consistency" --granularity all --group-by document
-lwc span get <SPAN_ID>
-lwc span expand <SPAN_ID> --before 1 --after 1 --children 20
-```
+O grafo documental opcional conecta páginas, fontes, citações, links e relações
+semânticas explícitas. O SQLite continua sendo a autoridade; Grafeo ou
+SurrealDB fornece uma camada de navegação reconstruível. Cada relação preserva
+motivo, proveniência, confiança e evidência.
 
-Localizadores de spans incluem a impressão digital do documento e a versão da segmentação. Um localizador cujo corpo foi substituído falha com `stale_span` e informa metadados anteriores e atuais; o LWC nunca o remapeia silenciosamente para texto semelhante.
+### Conversão de documentos e leitura de Office
 
-Use a API de grafo tipada e limitada para explorar sem palavras-chave:
+Os adaptadores opcionais Anydoc ou MarkItDown convertem arquivos locais
+compatíveis em Markdown revisável antes da ingestão. O OfficeCLI oferece um
+caminho separado, somente leitura e sujeito a consentimento para Word, Excel e
+PowerPoint. Nenhum recurso é instalado ou ativado silenciosamente, e os arquivos
+originais do Office não são modificados.
 
-```bash
-lwc graph explore                         # representative macro view
-lwc graph node page:projection-policy
-lwc graph neighbors page:projection-policy --direction outgoing
-lwc graph path page:implementation page:policy --max-depth 6
-lwc graph impact page:policy --max-depth 4
-lwc graph overview
-lwc graph status
-lwc graph verify
-```
-
-Arestas automáticas se limitam a fatos estruturais ou sustentados por evidência. Relações semânticas precisam ser explícitas e auditáveis:
-
-```bash
-lwc graph relation set page:implementation DEPENDS_ON page:policy \
-  --provenance source-grounded --source 12 \
-  --reason "Source 12 states the required policy" --confidence 0.95
-lwc graph relation list --from page:implementation
-lwc graph relation retract page:implementation DEPENDS_ON page:policy \
-  --reason "The dependency was superseded"
-```
-
-Os motivos das relações são conteúdo duradouro: nunca inclua credenciais, segredos ou cadeia de pensamento bruta.
-
-Os documentos SQLite continuam sendo a autoridade. O armazenamento do grafo vem desativado; habilite exatamente um engine externo quando precisar percorrê-lo. A configuração combina, em camadas, valores internos, globais e do projeto:
-
-```bash
-lwc config show
-lwc config set --graph grafeo
-lwc config set --graph surrealdb
-lwc config set --graph disabled
-lwc config unset --graph
-```
-
-A conversão para Markdown é uma operação opcional separada. `lwc init` mostra a mesma orientação legível por máquina, mas nunca instala nem habilita um conversor. Instale um adaptador, selecione-o explicitamente, converta para um novo arquivo Markdown local, revise e só então faça a ingestão:
-
-```bash
-# Choose one adapter; both are disabled unless configured.
-npm install --global @firecrawl/anydoc
-lwc config set --trans anydoc
-
-# Or:
-python3 -m pip install 'markitdown[all]'
-lwc config set --trans markitdown
-
-lwc trans INPUT --output OUTPUT.md
-lwc source add OUTPUT.md
-```
-
-A configuração aceita `--trans-timeout 1..900` e várias opções `--trans-arg=<value>`. O LWC executa diretamente o binário fixo escolhido, nunca cai para o outro adaptador, só aceita arquivos locais, limita entrada e saída a 64 MiB e nunca sobrescreve uma saída existente. Guarde credenciais no ambiente do adaptador, não na configuração do LWC. Consulte a documentação oficial do [Anydoc](https://github.com/firecrawl/anydoc) e do [MarkItDown](https://github.com/microsoft/markitdown) para formatos e opções.
-
-Grafeo e o SurrealDB embarcado usam armazenamentos auxiliares descartáveis em `.lwc/`. Cada Work `graph-project` confirma uma Source/Page atual e seus links, citações e relações explícitas antes de iniciar o próximo documento. Atualizações e exclusões enfileiram somente documentos afetados; rebuild e resume usam as mesmas unidades. Revisões históricas permanecem imutáveis e nunca são tokenizadas ou projetadas de novo. Acompanhe por `work list`, `work status` ou `work watch`, e use `work resume` após interrupções. `graph status` informa o engine e a quantidade de documentos projetados; `graph verify` compara as chaves atuais com o SQLite.
+[Recuperação e indexação →](https://github.com/JanYork/llm-wiki-cli/wiki/Retrieval-and-Indexing) ·
+[Grafo documental →](https://github.com/JanYork/llm-wiki-cli/wiki/Document-Knowledge-Graph) ·
+[Conversão de documentos →](https://github.com/JanYork/llm-wiki-cli/wiki/Document-Conversion)
 
 ## Instalação
 
-A maioria das pessoas deve usar o prompt de configuração acima. Os comandos manuais servem para manutenção, depuração ou ambientes que não podem instalar o Skill complementar.
+Para a maioria das pessoas, basta um comando:
 
-Homebrew (há Bottles para macOS Apple silicon e Linux x86_64):
+    npm install --global @i-xor/lwc
 
-```bash
-brew install JanYork/tap/lwc
-```
+Também há suporte para Homebrew, crates.io, releases do GitHub verificadas por
+checksum e builds locais com Cargo.
 
-npm (Node.js 22+):
-
-```bash
-npm install --global @i-xor/lwc
-```
-
-crates.io:
-
-```bash
-cargo install --locked lwc
-```
-
-GitHub:
-
-```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://github.com/JanYork/llm-wiki-cli/releases/latest/download/install.sh | sh
-```
-
-O instalador aceita macOS x86_64/aarch64, Linux glibc e Windows Git Bash, verifica o checksum e instala ou atualiza `lwc`. O padrão é `~/.local/bin`; uma cópia existente em `~/.local/bin` ou `~/.cargo/bin` é atualizada. Para escolher outro diretório:
-
-```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://github.com/JanYork/llm-wiki-cli/releases/latest/download/install.sh | LWC_INSTALL_DIR="$HOME/bin" sh
-```
-
-Ou compile do GitHub com Cargo:
-
-```bash
-cargo install --locked --git https://github.com/JanYork/llm-wiki-cli
-```
-
-Ou instale a partir de uma cópia local do repositório:
-
-```bash
-git clone https://github.com/JanYork/llm-wiki-cli.git
-cd llm-wiki-cli
-cargo install --locked --path .
-```
+[Instalação e atualizações →](https://github.com/JanYork/llm-wiki-cli/wiki/Installation-and-Upgrades)
 
 ## Skill complementar para agentes
 
-O repositório inclui [`skills/using-lwc`](../../skills/using-lwc), um Agent Skill que torna `lwc` uma camada de memória proativa em sessões substanciais. Instale pelo [skills.sh](https://skills.sh/JanYork/llm-wiki-cli):
+A [Skill using-lwc](../../skills/using-lwc) incluída transforma o LWC em uma
+camada de memória proativa. Ela recupera contexto limitado, separa conhecimento
+de projeto e global, integra fontes, mantém citações e grava apenas conhecimento
+verificado que vale a pena reutilizar.
 
-```bash
-npx skills add JanYork/llm-wiki-cli --skill using-lwc -g
-```
+Instale pelo [skills.sh](https://skills.sh/JanYork/llm-wiki-cli):
 
-Também é possível copiar de uma cópia local do repositório para o diretório de Skills do ambiente de execução. Para Codex:
+    npx skills add JanYork/llm-wiki-cli --skill using-lwc -g
 
-```bash
-mkdir -p "$HOME/.agents/skills"
-cp -R skills/using-lwc "$HOME/.agents/skills/"
-```
-
-A invocação canônica é `$using-lwc`.
-
-Quando ativado, o Skill:
-
-- encontra uma CLI compatível ou instala a versão oficial verificada por checksum;
-- inicializa uma vez a memória global em `~/.lwc/`;
-- recupera contexto global e de projeto limitado antes de repetir uma investigação;
-- inicializa o projeto ativo quando chamado explicitamente e, caso contrário, pergunta primeiro;
-- recusa gravações de projeto fora da raiz autorizada do workspace atual;
-- separa fatos do projeto de conhecimento global reutilizável;
-- integra fontes e registra respostas duradouras de volta na Wiki.
-
-`SKILL.md` é um roteador curto, não um manual monolítico. Ele aponta para documentos específicos sobre memória básica, momento de ativação, memória ativa, grafo físico, Word Graph limitado, CodeGraph, strong tags, conversão, onboarding e recuperação/manutenção. Cada documento diz quando usar ou pular o recurso, o fluxo mínimo, o limite de consentimento e a evidência de conclusão.
-
-O Skill normalmente descobre o projeto pelo diretório atual e chama diretamente o `lwc` global. `LWC_PROJECT_ROOT` é um limite explícito para um projeto escolhido deliberadamente, não um prefixo para comandos cotidianos no projeto atual.
-
-Defina `LWC_AUTO_INSTALL=0` para desativar a instalação automática. Ela executa o instalador revisado incluído no Skill, confia neste repositório e no perímetro de publicação do GitHub Releases e compara o arquivo com `SHA256SUMS`; checksum protege integridade, não é assinatura do editor. Os binários cobrem macOS x86_64/aarch64, Linux glibc e Windows via Git Bash. `SKILL.md` segue o layout de Agent Skills e `agents/openai.yaml` fornece metadados para OpenAI/Codex. A CLI não depende do ambiente de execução: qualquer agente que possa executá-la e carregar ou adaptar as instruções pode usar o LWC. Comandos do Skill, instruções globais e Hooks são específicos de cada ambiente; por isso o prompt detecta e configura o host atual.
+A invocação canônica é <code>$using-lwc</code>. A Skill independe do agente e
+inclui orientações específicas para memória, grafos documentais, Word Graph,
+CodeGraph, tags fortes, conversão, configuração, recuperação e manutenção.
 
 ### Configuração nativa de agentes
 
-O LWC detecta agentes compatíveis e instala um único MCP LWC somente leitura. Os 12 AgentTargets registrados são adaptadores completos: instalam todos os pontos de integração oficiais baseados em arquivos — MCP, Skill, Hook e Instructions — disponíveis em cada host e escopo, e informam claramente os que são controlados pela interface, estão em prévia ou não têm suporte.
+O LWC detecta agentes compatíveis e configura as superfícies MCP, Skill, Hook e
+Instructions disponíveis por meio de adaptadores AgentTarget idempotentes:
 
-```bash
-lwc agent install --yes
-lwc agent status --target all --location global
-lwc agent install --print-config codex
-lwc agent refresh --target codex,claude
-lwc agent uninstall --target codex,claude --yes
-```
+    lwc agent install --yes
 
-`--yes` seleciona agentes detectados, escopo global e Hooks padrão de ciclo de vida/prompt. Use `--no-prompt-hook` para omitir o Hook por prompt do Claude. A entrada instalada é `lwc -> serve --mcp`; a única ferramenta, `lwc_explore`, lê por padrão memória Wiki limitada e aceita modos explícitos `code` e `all`. O `projectPath` precisa ficar dentro do workspace onde o host MCP iniciou o LWC. A ferramenta nunca baixa nem inicializa CodeGraph. Install e refresh repetidos são idempotentes byte a byte; uninstall só restaura estado pertencente ao LWC e mantém índices do projeto. Pacotes opcionais para Codex, Claude Code e Pi ficam em `integrations/`. Instalar um pacote não concede nem contorna confiança nativa. Não combine instalação direta e pacote nativo para o mesmo agente. Cada pacote traz o Skill `using-lwc` completo, sem depender de gerenciador externo ou do ambiente do mantenedor.
+O MCP unificado e somente leitura oferece memória Wiki limitada e contexto de
+código opcional sem ampliar o workspace. Há suporte para Claude Code, Codex,
+Cursor, OpenCode, Gemini CLI, Kiro, Hermes, Antigravity e pi.
 
-Como Pi não tem MCP embutido, ele expõe o MCP LWC pela ponte oficial de extensão. Os demais Targets só registram `lwc serve --mcp`; CodeGraph permanece um plano interno de contexto e não vira um segundo MCP. Confiança e permissões controladas pela interface continuam sob responsabilidade do usuário. Os pontos de integração em prévia são identificados; escopos parciais instalam o que é suportado sem degradar ou rejeitar o Target inteiro. Caminhos globais do Kiro respeitam `KIRO_HOME`.
-
-A interface de Target, ordem de registro, detecção e caminhos MCP seguem o design do adaptador do CodeGraph, licenciado sob MIT. O LWC acrescenta MCP unificado, status por superfície, Skills e Hooks, propriedade de arquivos compartilhados e rollback exato. Consulte [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md).
-
-A saída de `lwc init` e os Hooks de início/compactação expõem fatos `LWC_READINESS` limitados sobre Wiki, grafo físico, runtime e índice do CodeGraph e integração de agentes. O estado do grafo físico separa consentimento configurado de projeção pendente ou com falha. A detecção é somente leitura e nunca habilita nem inicializa grafos. Quando ambos precisam de autorização, a base portátil é texto simples:
-
-```text
-1. Enable physical document graph and CodeGraph (recommended)
-2. Enable physical document graph only
-3. Enable CodeGraph only
-4. Later
-```
-
-Após escolher `1`, o agente inicializa uma Wiki ausente, habilita Grafeo, aguarda e verifica o Work de projeção, inicializa CodeGraph e confere os dois resultados separadamente. `Later` não altera nada nem bloqueia a tarefa. Plugins podem mostrar os mesmos IDs em sua interface; checkboxes não são obrigatórios.
-
-Strong tags carregam integralmente poucas regras ou runbooks, de forma explícita e limitada:
-
-```bash
-lwc tag set "operations" incident-response --priority 100 --reason "primary runbook"
-lwc load tag "operations" --limit 3
-lwc tag autoload "operations" --enable --priority 100 --limit 3 \
-  --max-chars 50000 --reason "required at session boundaries"
-```
-
-Não é busca derivada de tokens: limites e orçamento de caracteres são aplicados antes de páginas completas entrarem no contexto.
+[Integração AgentTarget →](https://github.com/JanYork/llm-wiki-cli/wiki/AgentTarget-Installation-and-Integration)
 
 ## Início rápido
 
-Esta seção descreve o protocolo executado pelo agente. Pessoas não precisam rodar estes comandos no uso normal.
+Normalmente, a pessoa descreve o objetivo e revisa o resultado; o agente opera
+a CLI. O percurso completo está no
+[guia de início rápido](https://github.com/JanYork/llm-wiki-cli/wiki/Quick-Start).
 
 ### 1. Inicializar uma Wiki de projeto
 
-```bash
-cd your-project
-lwc init
-printf '# Schema\nEvery page declares provenance; source-grounded claims cite sources.\n' | lwc schema set -
-printf '# Purpose\nBuild a durable project Wiki.\n' | lwc purpose set -
-```
-
-A inicialização adiciona `.lwc/` ao `info/exclude` local do Git quando necessário, sem mudar `.gitignore`. Use `lwc init --no-git-exclude` somente quando a Wiki for versionada intencionalmente.
+O agente cria uma Wiki local do projeto e define seu propósito e suas regras de
+manutenção. O estado é excluído localmente do Git, a menos que o versionamento
+seja uma escolha explícita.
 
 ### 2. Adicionar material de origem
 
-```bash
-lwc source add-dir docs/
-```
-
-Arquivos sem título explícito usam a origem como fallback estável e legível. Bytes idênticos são deduplicados por SHA-256. Fontes resolvidas fora da raiz ativa exigem `--allow-external-source`. Marcadores de credenciais de alta confiança são recusados, a menos que a fonte revisada seja reconhecida com `--acknowledge-sensitive-source`.
-
-Cada adição registra também o caminho observado e o snapshot imutável atual. Antes de confiar em evidência baseada em arquivo, verifique apenas as fontes relevantes:
-
-```bash
-lwc source status 7 12
-```
-
-O comando transmite cada arquivo atual por SHA-256 e informa separadamente a linhagem (`current` ou `superseded`) e o estado do sistema (`current`, `modified`, `missing`, `unreadable`, `oversized` ou `unstable`). É somente leitura. Use `source status --all` apenas para manutenção explícita, pois o custo é proporcional a todos os bytes rastreados. Revise um caminho modificado antes de atualizar conhecimento:
-
-```bash
-lwc source diff 7
-lwc source refs 7 --limit 1000
-```
-
-`source diff` compara a fonte imutável com o arquivo atual ou outro snapshot via `--to-source`. O diff é limitado a 8 MiB e 200.000 linhas por lado, 20.000 caracteres Unicode por padrão e 100.000 com `--max-chars`. Se uma fonte foi observada em vários caminhos, escolha um `--path`. Um diff truncado é só prévia. `source refs` lista candidatos que citam diretamente a fonte; não prova impacto semântico. Rode `source add` novamente só após revisar uma nova revisão relevante. A sequência A -> B -> A mantém três observações, mesmo reutilizando o source ID de A. Caminhos externos exigem novamente `--allow-external-source`; texto sinalizado também exige `--acknowledge-sensitive-source` após revisão.
-
-Fontes migradas de armazenamentos antigos ficam explicitamente sem rastreamento porque o LWC não adivinha caminhos históricos. Adicione o arquivo uma vez para criar a primeira revisão. Se o arquivo ou a revisão mais recente do caminho mudar durante a checagem, o LWC retorna `source_status_unstable`; tente novamente.
-
-Para importação atômica, caminhos de um manifest JSON são resolvidos a partir do diretório do manifest:
-
-```json
-{
-  "sources": [
-    {"path": "ARCHITECTURE.md", "title": "Architecture contract"},
-    {"path": "src/store.rs", "title": "SQLite store"}
-  ]
-}
-```
-
-```bash
-lwc source add-manifest lwc-sources.json
-```
+Os arquivos selecionados se tornam snapshots imutáveis e sem duplicatas. O LWC
+rastreia os caminhos e informa se o arquivo atual está inalterado, modificado,
+ausente ou substituído.
 
 ### 3. Analisar e integrar uma fonte
 
-```bash
-lwc ingest next --context-limit 50 --source-max-chars 100000
-lwc ingest analyze 1 --file analysis.md
-```
-
-Use `lwc ingest claim 7` quando um manifest ou scheduler já selecionou um source ID pendente.
-
-Se `source_window.has_more` for true, continue em `source_window.next_offset_chars`:
-
-```bash
-lwc source show 1 --offset-chars 100000 --max-chars 100000
-```
-
-Antes de concluir, crie uma página source-summary citada e integre a contribuição em pelo menos uma página não source:
-
-```bash
-lwc page put source-1 \
-  --title "Source 1 Summary" \
-  --kind source \
-  --summary "What this source contributes" \
-  --file source-summary.md \
-  --source 1
-
-lwc page put durable-concept \
-  --title "Durable Concept" \
-  --kind concept \
-  --summary "How this source changes shared knowledge" \
-  --file concept.md \
-  --source 1
-
-lwc ingest complete 1
-```
-
-As duas camadas são necessárias: a página source ajuda em navegação e proveniência; a página compartilhada faz o conhecimento acumular. Se uma fonte realmente não muda página compartilhada, conclua com explicação específica e auditável:
-
-```bash
-lwc ingest complete 1 \
-  --no-derived-pages-reason "Duplicate evidence; existing synthesis already covers every supported claim"
-```
-
-Citações geram automaticamente proveniência `source-grounded`. Para conhecimento vindo do usuário, observação do agente ou hipótese, repita `--provenance` em vez de inventar uma fonte:
-
-```bash
-lwc page put architecture-decision \
-  --title "Architecture decision" \
-  --kind query \
-  --summary "Accepted constraint and remaining uncertainty" \
-  --file decision.md \
-  --provenance user-provided \
-  --provenance hypothesis
-```
-
-`page put` substitui todo o conjunto de citações e proveniência explícita. Leia a página existente e repita cada `--source` e `--provenance` ainda válido. Não passe `source-grounded`: ele é derivado das citações. Proveniência aparece em page, context, search, refs e projeção, mas não altera ranking.
+O agente lê a fonte completa dentro de limites explícitos, escreve um resumo com
+citações, atualiza o conhecimento compartilhado e só então conclui a ingestão.
 
 ### 4. Consultar a Wiki acumulada
 
-```bash
-lwc context --limit 50
-lwc search "question keywords" --limit 20
-lwc search "question keywords" --limit 20 --explain
-lwc search "concept only" --type page --kind concept
-lwc search "exact evidence" --type source
-lwc page show source-1
-```
+A busca prioriza páginas mantidas sem perder o vínculo com a evidência. O agente
+abre o texto original exato quando uma afirmação precisa ser verificada.
 
 ## Fluxo de trabalho do agente
 
-1. Colete fontes imutáveis.
-2. Reivindique uma tarefa com `lwc ingest next`, ou `ingest claim <ID>` quando a fonte já estiver escolhida.
-3. Leia todas as janelas, schema, purpose e contexto limitado.
-4. Analise antes de gerar páginas.
-5. Crie ou revise resumo e páginas compartilhadas com citações `--source` explícitas.
-6. Conclua apenas após as duas condições, ou registre por que nenhuma página deve mudar.
-7. Coloque ingestão multicomando ou revisão ampla em um changeset, valide o rascunho e publique atomicamente.
-8. Use `search`, `context`, `graph` e `lint` para manter coerência.
+O ciclo normal recupera conhecimento relevante, verifica fontes ou código atuais
+quando a atualização importa, realiza a menor alteração comprovada e valida a
+recuperação, os links e os grafos aplicáveis. Revisões amplas são publicadas
+atomicamente em um changeset.
 
-Veja [docs/agent-workflow.md](../../docs/agent-workflow.md) para o contrato completo. `lwc --help` e `lwc <command> --help` mostram pré-condições, transições, efeitos e próximas ações.
+[Fluxo completo →](../../docs/agent-workflow.md)
 
 ## Alterações atômicas com vários comandos
 
-Um comando `source` ou `page` é transacional. Use changeset quando uma atualização precisar de vários comandos sem expor uma Wiki parcial:
+Um changeset mantém uma atualização de várias etapas invisível até que seja
+revisada e validada. O commit publica em uma transação apenas as entidades
+afetadas, preserva trabalho não relacionado e falha com segurança quando há
+conflito de revisão na mesma entidade.
 
-```bash
-lwc --scope project changeset begin architecture-refresh
-lwc --scope project --changeset architecture-refresh source add-manifest sources.json
-lwc --scope project --changeset architecture-refresh ingest claim 1
-# Analyze, write cited pages, and complete ingest with the same selector.
-lwc --scope project --changeset architecture-refresh lint
-lwc --scope project --changeset architecture-refresh search "expected answer" --limit 5
-lwc --scope project changeset show architecture-refresh
-lwc --scope project changeset commit architecture-refresh
-```
+Para operações compatíveis, um patch inverso exato permite rollback protegido
+sem substituir toda a Wiki.
 
-Leituras do rascunho veem gravações preparadas; SQLite e Markdown ativos não mudam. O banco começa como overlay esparso pequeno, sem copiar ou criar checkpoint da Wiki. `changeset show` relata operações, revisões e prontidão sem lint. Commit valida e aplica apenas entidades afetadas, preservando gravações não relacionadas; conflito na mesma entidade falha sem sobrescrever lados. Rascunhos vazios e problemas de lint são recusados; não há force nem merge automático. Use `--allow-lint-issues --reason "reviewed pre-existing debt"` só para dívida auditada que não foi introduzida. Depois do commit, repita as mesmas buscas no estado ativo. Commit congela o rascunho; `changeset_frozen` bloqueia novas gravações. Tente o mesmo commit para recuperação ou descarte após conflito — não acrescente trabalho.
-
-```bash
-lwc --scope project changeset discard architecture-refresh
-lwc --scope project changeset rollback <CHANGESET_ID>
-```
-
-Discard só afeta rascunho sem commit. Commit grava patch inverso com checksum e retorna o ID exato; rollback restaura só essas entidades e recusa se alguma mudou. Changesets project/global são separados, `--scope all` é inválido, e `init`, `maintenance`, `checkpoint` e changesets aninhados recusam `--changeset`. Rascunhos não criam segunda projeção. Se erro indicar `committed=true` com cleanup ou materialização pendente, não repita a mudança; execute a recuperação indicada.
-
-Commit esparso tem patches exatos para Source add/ingest, Page put/remove, schema, purpose e buscas registradas. Pesos e relações semânticas falham antes de checkpoint, lock ou mudança ativa com `changeset_sparse_unsupported`; aplique-os como transações diretas até haver patches inversos.
+[Guia de changesets →](https://github.com/JanYork/llm-wiki-cli/wiki/Changesets)
 
 ## Escopos
 
-| Escopo | Store | Uso |
-| --- | --- | --- |
-| `project` | `.lwc/wiki.db` no ancestral mais próximo | Padrão; conhecimento do projeto |
-| `global` | `~/.lwc/wiki.db` | Conhecimento reutilizável |
-| `all` | project e global | Apenas `search` e `context` combinados |
+| Escopo | Uso |
+| --- | --- |
+| project | Conhecimento pertencente à Wiki de projeto mais próxima |
+| global | Conhecimento reutilizável entre projetos |
+| all | Recuperação combinada somente leitura e Sync coordenado |
 
-```bash
-lwc --scope global init
-lwc --scope global source add shared.md
-lwc --scope all search "shared term"
-lwc --scope all context
-```
+As gravações sempre apontam para um único armazenamento explícito; o LWC não
+cria citações nem links implícitos entre projetos.
 
-Gravações são explícitas. `all` não cria citações ou links entre armazenamentos; `search --record` só adiciona a operação a cada armazenamento selecionado.
+[Escopos e descoberta de projetos →](https://github.com/JanYork/llm-wiki-cli/wiki/Scopes-and-Project-Discovery)
 
 ## Busca e CJK
 
-A busca é lexical e determinística.
+A busca é lexical, determinística e prioriza páginas mantidas. Título, caminho,
+resumo, corpo, proveniência e evidência do grafo são pontuados separadamente;
+há filtros por página, fonte e tipo e explicação exata da pontuação.
 
-- Termos são texto simples, não FTS bruto.
-- `--type auto` prioriza páginas compiladas, oculta fontes pareadas e usa fontes como fallback.
-- Use `--type page`, `--type source` ou `--type all`; repita `--kind` para limitar tipos.
-- Termos CJK usam bigramas adjacentes; unigramas não vazios mantêm buscas de um caractere.
-- Texto latino vira tokens alfanuméricos minúsculos.
-- Título, nome de arquivo, path/slug, resumo e corpo são avaliados separadamente; título e caminho recebem aumentos limitados de pontuação.
-- README, índices, visões gerais e documentos centrais de navegação são rebaixados conforme a consulta; pedir o README desativa a penalidade.
-- Candidatos podem receber um aumento de pontuação por link direto ou fonte compartilhada. Vizinhos comuns sozinhos não mudam a ordem, e documentos de navegação genéricos recebem penalidade.
-- `--explain` retorna a aritmética exata de sinais lexicais, genéricos, grafo, peso manual e feedback. Só `--record` registra a consulta.
-- Coeficientes fixos e a regra «quanto menor a pontuação, maior a relevância» mantêm project/global comparáveis em `--scope all`.
-
-Não há dependência de dicionário de segmentação, para manter estabilidade com nomes de produto, codinomes, termos mistos e vocabulário novo.
+Para CJK, usa bigramas adjacentes e unigramas úteis; para texto latino, termos
+alfanuméricos em minúsculas. Sem depender de dicionários, mantém estabilidade
+com nomes de produtos, símbolos de código, texto multilíngue e vocabulário novo.
 
 ### Pesos e feedback explícitos
 
-Use peso documental para julgamento duradouro e independente da consulta. Use feedback para a impressão exata de tokens ordenados:
+Pesos auditáveis expressam a importância duradoura de um documento. O feedback
+de uma consulta só reordena candidatos correspondentes e armazena uma impressão
+digital, não a consulta original. Nenhum dos dois faz conteúdo irrelevante
+aparecer.
 
-```bash
-lwc weight set page payment-rules \
-  --value 2 \
-  --reason "Canonical payment rules specification" \
-  --provenance agent-observed
-lwc weight list page payment-rules
-
-lwc weight feedback page payment-rules \
-  --query "payment reconciliation rules" \
-  --signal relevant \
-  --reason "Verified against the expected answer" \
-  --provenance agent-observed
-
-lwc weight feedback-clear page payment-rules \
-  --query "payment reconciliation rules" \
-  --provenance agent-observed
-lwc weight clear page payment-rules --provenance agent-observed
-```
-
-Valores são `-2`, `-1`, `1` e `2`; use `clear` para zero. Ambos só reordenam candidatos lexicais. `user-provided` prevalece sobre `agent-observed`, mantendo ambos auditáveis. Feedback guarda SHA-256, não a consulta, e não transfere para paráfrases com tokens diferentes. Motivos e operações são duradouros: não copie consulta sensível para `--reason`. Mutações exigem `project` ou `global`; `--scope all` é recusado.
+[Busca e contexto →](https://github.com/JanYork/llm-wiki-cli/wiki/Search-and-Context)
 
 ## Visualizador somente leitura e CodeGraph
 
-`lwc view` inicia em primeiro plano um inspetor limitado ao loopback e abre o navegador. Ele serve um único app TS + Lit embarcado, sem CDN ou runtime Node durante o uso, e só expõe APIs GET/HEAD. Páginas, fontes, Markdown, grafo de conhecimento e grafo de código opcional são lidos do projeto atual sem migração, refresh ou construção:
-
-```bash
-lwc view
-lwc view --port 4173 --no-open
-```
-
-O visualizador começa em inglês. Use `中文` / `EN` para alternar; o navegador lembra a escolha e o conteúdo da Wiki permanece no idioma original. Os grafos usam uma visão 3D inspirada no Obsidian, com nós pequenos, rótulos persistentes, links finos, rotação e zoom.
+O visualizador local apresenta páginas, fontes, Markdown, relações documentais
+e estrutura do código por uma interface loopback limitada a GET/HEAD. Ele não
+migra, atualiza nem constrói grafos.
 
 <p align="center"><img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-codegraph-en.png" alt="Inteligência de código do LWC CodeGraph" width="100%"></p>
 
-Indexação de código existe somente em project e fica desativada até inicialização explícita. O fork fixado do CodeGraph é baixado uma vez do GitHub Releases, verificado com SHA-256 e guardado em `~/.lwc/runtime/codegraph/<PIN>/<TARGET>/`; cada projeto mantém só o índice em `.lwc/codegraph`. Telemetria fica sempre desligada e nenhum estado `.codegraph` é usado.
+O CodeGraph é exclusivo do projeto e inicializado explicitamente. Ele consulta
+símbolos, chamadores, chamadas, dependências, arquivos e impacto, mantém a
+telemetria desativada e atualiza o grafo atomicamente por arquivo proprietário.
 
-```bash
-lwc cg status
-lwc cg init                 # download once, then index one complete file at a time
-lwc cg sync
-lwc cg query UserService
-lwc cg node UserService
-lwc cg callers UserService
-lwc cg callees UserService
-lwc cg impact UserService
-lwc cg files
-```
+O runtime reconhece TypeScript, TSX, JavaScript, JSX, ArkTS, Python, Go, Rust,
+Java, C, C++, C#, Razor, PHP, Ruby, Swift, Kotlin, Dart, Svelte, Vue, Astro,
+Liquid, Pascal, Scala, Lua, Luau, Objective-C, R, Solidity, Nix, YAML, Twig,
+XML, .properties, CFML, CFScript, CFQuery, COBOL, VB.NET, Erlang e Terraform.
 
-A versão fixada do runtime reconhece estas linguagens e formatos relacionados a código: TypeScript, TSX, JavaScript, JSX, ArkTS, Python, Go, Rust, Java, C, C++, C#, Razor, PHP, Ruby, Swift, Kotlin, Dart, Svelte, Vue, Astro, Liquid, Pascal, Scala, Lua, Luau, Objective-C, R, Solidity, Nix, YAML, Twig, XML, `.properties`, CFML, CFScript, CFQuery, COBOL, VB.NET, Erlang e Terraform. YAML, Twig e `.properties` são rastreados no nível do arquivo; resolvedores de frameworks ainda podem adicionar relações. XML é reconhecido para extrair mappers MyBatis.
-
-`lwc cg` encaminha todas as consultas do CodeGraph. Comandos globais de ciclo de vida (`install`, `uninstall`, `upgrade`, `telemetry`, `daemon`, `daemons`) são bloqueados. A ponte `lwc cg serve --mcp` permanece para compatibilidade manual antiga; integrações novas usam `lwc serve --mcp`, reunindo exploração limitada de Wiki e CodeGraph em uma ferramenta somente leitura. O LWC controla o runtime e impõe o limite do projeto. Gravações iniciais, incrementais, completas, de atualização, exclusão, resolução e recuperação confirmam integralmente cada arquivo ao qual pertencem antes do próximo; o grafo atual continua legível e revisões históricas não são atualizadas.
+[Visualizador →](https://github.com/JanYork/llm-wiki-cli/wiki/Read-Only-Viewer) ·
+[CodeGraph →](https://github.com/JanYork/llm-wiki-cli/wiki/Code-Graph)
 
 ## Manutenção e projeção
 
-```bash
-lwc lint
-lwc maintenance reindex
-lwc maintenance materialize
-lwc maintenance compact
-lwc work list
-lwc work status <WORK_ID>
-lwc work watch <WORK_ID>
-lwc work cancel <WORK_ID>
-lwc work resume <WORK_ID>
-lwc checkpoint create before-large-update
-lwc checkpoint list
-lwc log --limit 20
-```
+Lint, reindexação, materialização de Markdown, compactação, checkpoints e
+projeção de grafos são operações explícitas. Trabalhos demorados são duráveis,
+observáveis, retomáveis e aplicados em unidades documentais limitadas.
 
-- Comandos de manutenção retornam um `work` duradouro imediatamente. Leia com `work status` ou espere com `work watch` e confira `work.result`. A migração schema v10-v11 usa o mesmo mecanismo; comandos normais não a executam inline.
-- `lint` é somente leitura por padrão. Adicione `--record` só quando a checagem deve entrar no histórico.
-- `maintenance reindex` reconstrói artefatos de busca derivados do SQLite.
-- `maintenance materialize` reconstrói a árvore Markdown projetada.
-- `maintenance compact` só tenta checkpoint WAL truncate; não esconde otimização FTS. Execute com a Wiki ociosa e confira `busy` e `after_bytes`. Reader ocupado retorna sem mudar conteúdo canônico.
-- Consultas são privadas por padrão; use `--record` só quando quiser gravar o texto.
+O SQLite permanece canônico. Índices, Markdown e grafos podem ser reconstruídos
+sem reescrever o histórico das fontes nem o conhecimento atual da Wiki.
 
-`lwc checkpoint create <NAME>` usa a API de backup em linha do SQLite. Restaure com `lwc checkpoint restore <NAME>`; o LWC primeiro cria `pre-restore-*` e depois reconstrói a projeção. Use `source remove <ID>` e `page remove <SLUG>` para exclusão protegida: fontes citadas e páginas com links de entrada são recusadas. Excluir a fonte atual de um caminho rastreado encerra o rastreamento sem expor uma revisão antiga como atual.
-
-Para ingestão de várias fontes ou substituição ampla, prefira changeset a checkpoint manual: commit grava patch inverso esparso, publica só entidades afetadas em uma transação e materializa Markdown incrementalmente. Depois tenta truncar o WAL; `wal_checkpointed=false` indica um processo de leitura ativo, não uma falha no commit canônico.
-
-Para backup externo, pare comandos `lwc` ativos e copie `.lwc/` inteiro. Não copie apenas `wiki.db` enquanto um processo de escrita puder usar o WAL.
+[Manutenção e diagnóstico →](https://github.com/JanYork/llm-wiki-cli/wiki/Maintenance-and-Diagnostics)
 
 ## Suíte de benchmarks
 
-O benchmark opcional importa um corpus UTF-8 local para uma Wiki temporária e mede importação, busca P50/P95, Recall@5/10, MRR e armazenamento antes/depois de compactar. O conjunto de referência é um JSONL de consultas e caminhos esperados:
+O benchmark opcional mede tempo de importação, latência de busca, Recall@5/10,
+MRR e armazenamento em um corpus higienizado fornecido pelo usuário. Uma
+comparação justa fixa máquina, corpus, consultas e condições e compara medianas
+de várias execuções.
 
-```bash
-cargo build --release
-LWC_BENCH_CORPUS=/path/to/sanitized-corpus \
-LWC_BENCH_QUERY_SET=/path/to/query-set.jsonl \
-LWC_BENCH_BINARY="$PWD/target/release/lwc" \
-cargo test --test search_benchmark -- --ignored --nocapture
-```
-
-`cargo test --all-targets` cobre busca page-first, filtros type/kind, janelas UTF-8, condições de ingestão, precisão do grafo, migrações, lint e compactação WAL. Veja [benchmarks/README.md](../../benchmarks/README.md) para contrato e comparação justa.
+[Metodologia →](../../benchmarks/README.md)
 
 ## Limites e não objetivos
 

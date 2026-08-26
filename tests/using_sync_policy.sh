@@ -77,13 +77,11 @@ done
 for integration in codex-lwc claude-lwc pi-lwc; do
   diff -ru "$root/skills/using-sync" "$root/integrations/$integration/skills/using-sync"
 done
-for document in README.md README.zh-CN.md docs/agent-workflow.md SECURITY.md; do
+for document in docs/agent-workflow.md SECURITY.md; do
   grep -Fq -- 'conflict_id' "$root/$document"
   grep -Fq -- '256 KiB' "$root/$document"
 done
-grep -Fq -- 'at most 20 conflict objects' "$root/README.md"
 grep -Fq -- 'at most 20 conflict objects' "$root/docs/agent-workflow.md"
-grep -Fq -- 'untrusted data' "$root/README.md"
 grep -Fq -- 'untrusted data' "$root/docs/agent-workflow.md"
 grep -Fq -- 'untrusted data' "$root/SECURITY.md"
 for expected in \
@@ -96,13 +94,9 @@ for expected in \
   'candidate resolution would discard one side'; do
   grep -Fq -- "$expected" "$root/docs/agent-workflow.md"
 done
-for document in README.md docs/agent-workflow.md SECURITY.md; do
+for document in docs/agent-workflow.md SECURITY.md; do
   grep -Fq -- 'resume_continuity' "$root/$document"
   grep -Fq -- 'resume_derived_rebuild' "$root/$document"
   grep -Fq -- '4,096' "$root/$document"
   grep -Fq -- 'refs/lwc-sync/' "$root/$document"
 done
-grep -Fq -- 'resume_continuity' "$root/README.zh-CN.md"
-grep -Fq -- 'resume_derived_rebuild' "$root/README.zh-CN.md"
-grep -Fq -- '4,096' "$root/README.zh-CN.md"
-grep -Fq -- 'refs/lwc-sync/' "$root/README.zh-CN.md"

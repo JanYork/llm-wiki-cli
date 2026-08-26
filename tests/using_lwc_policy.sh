@@ -199,10 +199,7 @@ for document in "$skill" "$policy"; do
   done
 done
 
-for document in \
-  "$repo_root/README.md" \
-  "$repo_root/README.zh-CN.md" \
-  "$repo_root/docs/agent-workflow.md"; do
+for document in "$repo_root/docs/agent-workflow.md"; do
   for expected in \
     'changeset begin' \
     '--changeset' \
@@ -216,30 +213,6 @@ for document in \
     }
   done
 done
-
-for document in "$repo_root/README.md" "$repo_root/README.zh-CN.md"; do
-  for expected in \
-    '--allow-lint-issues' \
-    'committed=true' \
-    'changeset_frozen' \
-    'wal_checkpointed' \
-    'checkpoint' \
-    '--scope all'; do
-    grep -Fq -- "$expected" "$document" || {
-      printf 'missing bilingual changeset contract in %s: %s\n' "$document" "$expected" >&2
-      exit 1
-    }
-  done
-done
-
-grep -Fq -- 'revision conflict' "$repo_root/README.md" || {
-  printf 'missing English changeset conflict contract\n' >&2
-  exit 1
-}
-grep -Fq -- '同一实体发生版本冲突' "$repo_root/README.zh-CN.md" || {
-  printf 'missing Chinese changeset conflict contract\n' >&2
-  exit 1
-}
 
 if grep -ERn 'using_lwc_(bootstrap|policy)\.sh' "$repo_root/.github/workflows" >/dev/null; then
   printf 'using-lwc Skill checks must remain local-only\n' >&2

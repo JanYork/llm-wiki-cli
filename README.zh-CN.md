@@ -127,882 +127,236 @@ LWC 的幂等 AgentTarget 安装器；只有尚未注册的 Agent 才按自身�
   <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-architecture-zh.png" alt="LWC 架构图" width="100%">
 </p>
 
-持久化知识模型分为四个逻辑层：
+LWC 将长期知识分成四个边界清晰的层次：
 
-| 层 | 内容 | 约束 |
-| --- | --- | --- |
-| Raw sources | 经过筛选的输入内容的不可变快照 | 通过 `source` 加入，不改写来源事实。 |
-| Wiki | Agent 维护的页面、引用、链接和溯源信息 | 通过 `page` 更新；引用来源，并分类需要长期保留的非来源知识。 |
-| 时序记忆 | 关于变化、决策、结果和未决事项的小型规范化事件 | 通过 `remember` 记录；显式关联修订，让保留策略有界淘汰普通历史。 |
-| Schema and purpose | 维护规则与项目目标 | 约束后续每一次 ingest 和修订。 |
+| 层次 | 用途 |
+| --- | --- |
+| 原始来源 | 保存经过筛选的不可变证据快照 |
+| Wiki | 保存由 Agent 维护的页面、引用、链接和来源证明 |
+| 时序记忆 | 记录变化、决策、结果和未解决事项 |
+| Schema 与 Purpose | 约束项目后续的知识维护方式 |
 
-SQLite 是唯一的权威事实源。Markdown 树是供人和 Obsidian 等工具使用的可重建
-投影。Agent 通过 `lwc` 修改知识，而不是直接编辑 `.lwc/wiki.db` 或投影出来的
-Markdown。命令成功时向 stdout 返回 JSON，失败时向 stderr 返回结构化 JSON。
+SQLite 是权威数据源；Markdown、全文索引和可选图存储都是可重建投影。Agent 通过
+CLI 修改知识，所有结果使用结构化 JSON，便于审计和恢复。
 
-对于当前格式的存储，读取命令始终只读；新版 CLI 第一次打开可写的旧版存储时，
-会先在事务中完成一次数据库结构迁移，再继续读取。
+[查看总体架构 →](https://github.com/JanYork/llm-wiki-cli/wiki/Architecture-Overview-zh-CN)
 
 ## 分层检索与知识图
 
-每个当前 Source 和 Wiki 页面都会被确定性拆分并索引为段、句和规范化词。SQLite
-仍是权威数据源；Span FTS 和可选的外部文档图都是可重建索引。现有搜索默认仍只返回
-文档，只有显式指定粒度才检索段句：
+LWC 会在文档、段落和句子三个粒度索引 Source 与 Wiki 页面。Agent 可以先取得小而
+相关的上下文，只在必要时展开精确片段；内容变化后，旧定位符会明确失效。
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-memory-graph-zh.png" alt="LWC 记忆图" width="100%">
 </p>
 
-```bash
-lwc search "投影一致性" --granularity sentence --type page
-lwc search "投影一致性" --granularity passage
-lwc search "投影一致性" --granularity all --group-by document
-lwc span get <SPAN_ID>
-lwc span expand <SPAN_ID> --before 1 --after 1 --children 20
-```
+可选文档图连接页面、来源、引用、链接和显式语义关系。SQLite 始终保持权威，
+Grafeo 或 SurrealDB 只负责可重建的图遍历。显式关系保留理由、来源证明、置信度和
+证据来源。
 
-Span locator 绑定文档指纹和切分器版本。页面正文替换后，旧 locator 会以
-`stale_span` 失败并返回新旧元数据；LWC 不会把它模糊映射到相似文本。
+### 文档转换与 Office 读取
 
-无需关键词也可使用有界、类型化图 API：
+可选的 Anydoc 或 MarkItDown 适配器先把受支持的本地文件转换为可审核的 Markdown，
+再交给 LWC 摄取。OfficeCLI 则为 Word、Excel 和 PowerPoint 提供独立、需授权、
+只读的读取路径。两项能力都不会被静默安装或启用，也不会修改源 Office 文件。
 
-```bash
-lwc graph explore
-lwc graph node page:projection-policy
-lwc graph neighbors page:projection-policy --direction outgoing
-lwc graph path page:implementation page:policy --max-depth 6
-lwc graph impact page:policy --max-depth 4
-lwc graph overview
-lwc graph status
-lwc graph verify
-```
-
-自动边只表达结构或可证明的证据关系；语义关系必须显式写入并可审计：
-
-```bash
-lwc graph relation set page:implementation DEPENDS_ON page:policy \
-  --provenance source-grounded --source 12 \
-  --reason "来源 12 明确给出该约束" --confidence 0.95
-lwc graph relation list --from page:implementation
-lwc graph relation retract page:implementation DEPENDS_ON page:policy \
-  --reason "该依赖已被新证据取代"
-```
-
-关系说明会被长期保存，不得写入凭证、秘密或原始思维链。
-
-SQLite 文档仍是唯一权威数据。图默认禁用；需要图遍历时显式选择一个外部引擎。
-配置按内置、全局、项目三层解析，项目值可继承：
-
-```bash
-lwc config show
-lwc config set --graph grafeo
-lwc config set --graph surrealdb
-lwc config set --graph disabled
-lwc config unset --graph
-```
-
-Markdown 转换是独立的可选操作。`lwc init` 会返回同样的机器可读配置指引，但不会
-安装或启用转换器。安装并显式选择一个适配器，先转换为新的本地 Markdown 文件并
-检查内容，确认后再导入：
-
-```bash
-# 二选一；未配置时两者都不会启用。
-npm install --global @firecrawl/anydoc
-lwc config set --trans anydoc
-
-# 或：
-python3 -m pip install 'markitdown[all]'
-lwc config set --trans markitdown
-
-lwc trans INPUT --output OUTPUT.md
-lwc source add OUTPUT.md
-```
-
-配置支持 `--trans-timeout 1..900`，并可为当前适配器重复传入
-`--trans-arg=<value>`。LWC 只会直接执行已选择的固定适配器，不会自动回退到另一个
-适配器；仅接受本地文件，输入输出均限制为 64 MiB，且绝不覆盖已有输出。凭证应由
-适配器从环境变量读取，不得写入 LWC 配置。格式和可选参数以
-[Anydoc](https://github.com/firecrawl/anydoc) 与
-[MarkItDown](https://github.com/microsoft/markitdown) 官方文档为准。
-
-OfficeCLI 读取是另一项默认关闭的全局能力。确实需要读取 Office 文件时，先显式启用；
-首次调用会把锁定版本下载到 LWC 的全局版本化运行时缓存，并校验 SHA-256：
-
-```bash
-lwc --scope global config set --office officecli
-lwc office view report.docx text
-lwc office get workbook.xlsx /Sheet1/A1 --json
-lwc office query slides.pptx 'shape[fill=FF0000]'
-lwc --scope global config set --office disabled
-```
-
-`lwc office` 原样透传 OfficeCLI 的 `view`、`get`、`query`、`validate`、
-`dump`、`raw`、`help` 及其参数、输出和退出码；所有修改、安装、插件、常驻进程和
-服务命令都会被拒绝。LWC 会关闭 OfficeCLI 自动更新与 resident 模式，不会回退到
-`PATH` 中的二进制，禁用能力时也不会删除已有缓存。读取命令仍可通过 `--out` 或
-`--save` 生成明确指定的派生文件，或打开浏览器，但不会修改源 Office 文档。参见
-[OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) 与
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+[检索与索引 →](https://github.com/JanYork/llm-wiki-cli/wiki/Retrieval-and-Indexing-zh-CN) ·
+[文档知识图 →](https://github.com/JanYork/llm-wiki-cli/wiki/Document-Knowledge-Graph-zh-CN) ·
+[文档转换 →](https://github.com/JanYork/llm-wiki-cli/wiki/Document-Conversion-zh-CN)
 
 ## 可选 Learning Suite
 
-Tutor、Book、Practice 是三项固定的一方插件，彼此独立，且全局默认关闭：
+Tutor、Book 和 Practice 是三项相互独立、默认关闭的第一方能力，并分别使用私有存储：
 
-```bash
-lwc --scope global config set --tutor enabled
-lwc --scope global config set --book enabled
-lwc --scope global config set --practice enabled
-```
+- **Tutor** 保存教学回合、学习者证据、目标、计划以及私有 Soul/Wiki。
+- **Book** 按经过验证的来源顺序导入受支持的书籍，保证完整、有据可查的阅读。
+- **Practice** 保存版本化题库、试卷、作答、评分、闪卡和 FSRS 复习状态。
 
-首次执行需要 runtime 的 `lwc tutor`、`lwc book` 或 `lwc practice` 操作时，LWC
-才会把与当前 LWC
-同版本、适配当前 target 且通过校验和验证的 binary 下载到
-`~/.lwc/runtime/<plugin>/<version>/<target>/`。LWC 不从 `PATH` 发现插件，也不提供
-通用插件 ABI。三套 canonical store 分别位于
-`~/.lwc/plugins/{tutor,book,practice}/`；关闭能力或替换 runtime 都会保留数据。
-Sync 分别盘点三套 store，即使目标端缺少对应 runtime，也能保留验证通过的 canonical
-数据。
+各运行时按需下载，与 LWC 版本绑定并校验哈希；关闭能力不会删除规范数据。配套
+Agent Skill 负责恢复与持久化，不向学习者暴露例行控制面操作。
 
-- **Tutor** 保存持久教学 turn、学习者证据、目标、计划及其私有 Soul/Wiki。
-- **Book** 支持 EPUB、TXT、Markdown 与文本型 PDF；不支持 HTML、扫描件/OCR PDF、
-  MOBI、AZW3，须先在 Book 外部转换。
-- **Practice** 保存版本化题库/题目、不可变试卷、作答、即时 response、评分与 FSRS
-  复习状态。
-
-配套 `using-tutor`、`using-book`、`using-practice` Skills 会恢复 pending 工作，并在
-插件间传递精确 ID。明确学习意图会直接进入已启用的工作流；意图含糊时只直接询问
-一次；普通事实问答不进入 Tutor，也不记录。需要的插件尚未启用时，Agent 会先询问
-一次；若用户已明确要求启用，则无需重复确认。
-
-学习操作属于无感控制面：例行状态、持久化、书源和评测调用不会向用户播报。
-`lwc tutor status` 一次返回完整 Soul 与有界的活动会话恢复上下文；`$using-tutor`
-等控制调用永远不会被保存为学习 turn。
-
-Tutor 冷启动和恢复只运行一次 status；已绑定的热回合使用缓存的精确 binding，然后执行 begin → teach → commit → display。
-每个 mutation 使用各自独立的稳定 request_id，只在重试同一个 mutation 时复用。
-Practice 仅在创建或恢复持久试卷、作答、评分、闪卡、计划复习、错题历史或目标证据时进入。
-例行控制面保持静默；只在有意义的批次、阶段变化或明显等待前，用一句面向结果的话说明。
-
-插件根目录属于用户私有数据，不会投影到普通 LWC Wiki。v1 不提供
-forget/clear/purge 命令；关闭、替换 runtime、归档、纠正和 Sync 都会保留 canonical
-历史。未来任何破坏性 purge 都必须另行设计并获得明确授权。详见
-[Learning Suite 契约](docs/learning-suite-contracts.md) 与
-[Agent 工作流](docs/agent-workflow.md#optional-learning-suite)。
-
-Grafeo 与嵌入式 SurrealDB 使用 `.lwc/` 下可重建的 sidecar。每个
-`graph-project` Work 会先完整提交一篇当前 Source/Page 及其自有链接、引用和显式关系，
-确认可用后才开始下一篇。更新和删除只排入实际触及的文档；重建和恢复也使用相同的
-单文档单元。历史 source 版本保持不可变，永不重新分词或投影。使用
-`work list/status/watch` 查看进度，中断后使用 `work resume`；`graph status` 显示当前
-引擎与文档数，`graph verify` 对照 SQLite 的当前文档键。
+[查看 Learning Suite 契约 →](docs/learning-suite-contracts.md)
 
 ## 安装
 
-大多数用户应直接使用上面的 Agent 配置提示词。下面的手动命令主要用于维护、排障，
-或无法安装配套 Skill 的 Agent 环境。
+多数用户只需要一条包管理命令：
 
-使用 Homebrew 安装（提供 Apple 芯片 macOS 与 x86_64 Linux 预编译 Bottle）：
+    npm install --global @i-xor/lwc
 
-```bash
-brew install JanYork/tap/lwc
-```
+LWC 也支持 Homebrew、crates.io、经过校验和验证的 GitHub Release，以及本地
+Cargo 构建。
 
-使用 npm 安装（Node.js 22+）：
-
-```bash
-npm install --global @i-xor/lwc
-```
-
-从 crates.io 安装：
-
-```bash
-cargo install --locked lwc
-```
-
-从 GitHub 安装：
-
-```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://github.com/JanYork/llm-wiki-cli/releases/latest/download/install.sh | sh
-```
-
-安装脚本支持 x86_64/aarch64 的 macOS、glibc Linux 和 Windows Git Bash，校验
-Release 文件的 SHA-256 后安装或更新 `lwc`。默认安装到 `~/.local/bin`；
-如果 `~/.local/bin` 或 `~/.cargo/bin` 中已有 `lwc`，则会原地更新。也可以指定
-安装目录：
-
-```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://github.com/JanYork/llm-wiki-cli/releases/latest/download/install.sh | LWC_INSTALL_DIR="$HOME/bin" sh
-```
-
-也可以使用 Cargo 从 GitHub 源码构建并安装：
-
-```bash
-cargo install --locked --git https://github.com/JanYork/llm-wiki-cli
-```
-
-也可以安装本地检出的源码：
-
-```bash
-git clone https://github.com/JanYork/llm-wiki-cli.git
-cd llm-wiki-cli
-cargo install --locked --path .
-```
+[查看安装与升级指南 →](https://github.com/JanYork/llm-wiki-cli/wiki/Installation-and-Upgrades-zh-CN)
 
 ## 配套 Agent Skill
 
-仓库内置 [`skills/using-lwc`](skills/using-lwc) Agent Skill，让 `lwc` 在有长期
-价值的会话中主动承担外部记忆层。可从
-[skills.sh](https://skills.sh/JanYork/llm-wiki-cli) 安装：
+仓库内置的 [using-lwc Skill](skills/using-lwc) 会把 LWC 变成主动记忆层：召回有界
+上下文，区分项目与全局知识，整合来源、维护引用，并且只写回值得复用的已验证知识。
 
-```bash
-npx skills add JanYork/llm-wiki-cli --skill using-lwc -g
-```
+通过 [skills.sh](https://skills.sh/JanYork/llm-wiki-cli) 安装：
 
-也可以从本地检出复制到当前 Agent 运行时的用户级 Skill 目录。以 Codex 为例：
+    npx skills add JanYork/llm-wiki-cli --skill using-lwc -g
 
-```bash
-mkdir -p "$HOME/.agents/skills"
-cp -R skills/using-lwc "$HOME/.agents/skills/"
-```
-
-规范调用名是 `$using-lwc`。
-
-Skill 触发后会：
-
-- 查找兼容 CLI，缺失时安装经过校验的官方 Release；
-- 首次自动初始化 `~/.lwc/` 全局记忆；
-- 在重复调查前读取有界的全局与项目上下文；
-- 用户显式调用时初始化当前项目，否则创建项目级 `.lwc/` 前先询问；
-- 拒绝向当前授权工作区根目录之外写入项目内容；
-- 区分项目事实与可跨项目复用的全局知识；
-- 完整整合来源，并把值得保留的答案写回 Wiki。
-
-`SKILL.md` 只保留精简路由，不再充当一篇超长总手册。它会分别链接基础记忆、触发
-时机、主动记忆、物理文档图、有界词网图、CodeGraph、强标签、文档转换、Agent
-首次引导以及恢复维护十篇能力文档；每篇都明确说明何时使用、何时跳过、最小流程、
-授权边界与完成证据。
-
-Skill 默认从当前目录发现活动项目，并直接调用全局安装的 `lwc` 命令。
-`LWC_PROJECT_ROOT` 只用于明确指定项目边界，不是在已经位于当前项目时每条命令都要
-导出的前缀。
-
-设置 `LWC_AUTO_INSTALL=0` 可禁用自动安装。自动安装执行 Skill 随附、经过审查
-的本地安装器；其信任边界是当前仓库与 GitHub Release 发布权限，并使用
-`SHA256SUMS` 验证下载归档完整性。该校验不是发布者代码签名。Release 二进制覆盖
-x86_64/aarch64 的 macOS、glibc Linux，以及 Windows Git Bash。`SKILL.md` 遵循
-Agent Skills 的资源目录形式，`agents/openai.yaml` 提供 OpenAI/Codex 元数据。
-CLI 本身不绑定具体运行时：任何能够执行 CLI，并加载或适配 Skill 指令的 Agent 都能
-使用 LWC；Skill 命令、全局指令和 Hook 的注册方式由各运行时决定，因此上面的配置
-提示词会先识别并适配当前宿主。
+标准触发方式是 <code>$using-lwc</code>。Skill 不绑定具体 Agent，并为记忆、文档图、
+Word Graph、CodeGraph、强标签、文档转换、首次配置、恢复和维护提供聚焦指引。
 
 ### 原生 Agent 配置
 
-LWC 可以检测已安装的 Agent，并配置一个统一只读的 LWC MCP。全部 12 个已注册
-AgentTarget 都是强适配：针对每个宿主和全局/项目范围，安装官方支持的 MCP、Skill、
-Hook 与 Instructions；由 UI 管理、处于预览阶段或官方不支持的能力会被明确标记。
+LWC 能检测受支持的 Agent，并通过幂等 AgentTarget 适配器安装其可用的 MCP、Skill、
+Hook 和 Instructions：
 
-```bash
-lwc agent install --yes
-lwc agent status --target all --location global
-lwc agent install --print-config codex
-lwc agent refresh --target codex,claude
-lwc agent uninstall --target codex,claude --yes
-```
+    lwc agent install --yes
 
-`--yes` 默认选择检测到的 Agent、全局配置和各 Target 的默认生命周期/prompt Hook；使用
-`--no-prompt-hook` 可省略 Claude 的逐 prompt Hook。安装项固定为
-`lwc -> serve --mcp`；唯一的 `lwc_explore` 工具默认读取有界 Wiki
-记忆，并支持显式 `code`/`all` 模式；请求的 `projectPath` 必须位于 MCP 宿主启动 LWC
-时的工作区内，且绝不会在查询时下载或初始化 CodeGraph。重复安装
-和刷新逐字节幂等；卸载只恢复 LWC 拥有的状态，不删除项目索引。`integrations/` 提供
-可选的 Codex、Claude Code 和 Pi 原生包；安装包不等于授权或信任，也不要为同一个
-Agent 同时安装原生包和直接配置。每个原生包都内置完整的 `using-lwc` Skill，普通用户
-不依赖任何第三方 Skill 管理器或维护者本机环境。
+统一的只读 MCP 在不扩大工作区边界的前提下提供有界 Wiki 记忆和可选代码上下文。
+支持 Claude Code、Codex、Cursor、OpenCode、Gemini CLI、Kiro、Hermes、
+Antigravity 和 pi。
 
-Pi 因官方没有内置 MCP，使用原生扩展桥接 LWC MCP。其余 Target 只注册
-`lwc serve --mcp`；CodeGraph 是 LWC 内部的代码上下文能力，不会作为第二个 Agent MCP
-暴露。由宿主 UI 管理的信任与权限仍由用户决定；处于预览阶段的能力会明确标记。某个项目范围
-只支持部分能力时，安装器会安装这些能力，而不是把整个 Target 降级或拒绝。Kiro 全局
-路径遵循 `KIRO_HOME`。
+图能力始终先判断任务适用性和授权：文档关系任务使用物理图，代码结构任务使用
+CodeGraph，不能仅因运行时存在就自动启用。Office 读取遵循相同的明确授权边界。
 
-Target 接口、注册顺序、检测规则和 MCP 路径参考 CodeGraph 的 MIT 许可安装器适配设计；
-LWC 在其上增加统一 LWC MCP、逐能力状态、Skills、Hooks、共享文件所有权和精确回滚。
-许可证声明见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
-
-新项目执行 `lwc init` 后，以及会话开始/上下文压缩 Hook 中，都会输出有界的
-`LWC_READINESS`：包括 Wiki、物理文档图、CodeGraph 全局运行时与项目索引状态、可选
-Office 能力，以及 Agent 集成检查命令。物理图会区分“已经授权配置”和“投影仍在等待或失败”。
-检测过程只读，不会静默启用或初始化任何图。当两个图都需要授权时，最低兼容协议
-使用纯文本，因此不支持勾选框的 Agent 也能正常工作：
-
-两种图能力按任务与目录证据独立适用：物理文档图要求文档关系任务以及项目根目录中的文档或 Wiki 证据。
-CodeGraph 只在当前工作根目录存在代码证据且任务需要代码结构时适用。
-无代码学习绝不提示启用 CodeGraph。
-
-```text
-1. 同时启用物理文档图和 CodeGraph（推荐）
-2. 仅启用物理文档图
-3. 仅启用 CodeGraph
-4. 稍后
-```
-
-用户明确选择 `1` 后，Agent 才会按需初始化项目 Wiki、启用 Grafeo、等待并验证投影
-Work、初始化 CodeGraph，并分别核验两个结果。选择“稍后”不会修改任何状态，也不会
-阻塞当前任务。原生插件可以把相同编号渲染成自己的 UI，但绝不依赖勾选能力。
-
-当任务确实需要读取 Word、Excel 或 PowerPoint 时，Agent 会检查
-`LWC_READINESS.office`，并在全局启用 OfficeCLI 前主动询问。仅检测 readiness 不会
-启用或下载运行时。
-
-强标签用于绕过搜索，在明确上限内完整载入少量核心规则或手册：
-
-```bash
-lwc tag set "运维手册" incident-response --priority 100 --reason "主响应手册"
-lwc load tag "运维手册" --limit 3
-lwc tag autoload "运维手册" --enable --priority 100 --limit 3 \
-  --max-chars 50000 --reason "会话边界必须载入"
-```
-
-它不是由 token 自动推导的搜索机制；系统会先按数量和字符预算选页，再把完整页面
-放入 Agent 上下文。
+[查看 AgentTarget 集成 →](https://github.com/JanYork/llm-wiki-cli/wiki/AgentTarget-Installation-and-Integration-zh-CN)
 
 ## 快速开始
 
-本节记录的是 Agent 实际执行的 CLI 协议；正常使用时，人类不需要手工运行这些命令。
+正常使用时，人只需描述目标并审核结果，由 Agent 操作 CLI。完整流程见
+[快速开始 Wiki](https://github.com/JanYork/llm-wiki-cli/wiki/Quick-Start-zh-CN)。
 
 ### 1. 初始化项目 Wiki
 
-```bash
-cd your-project
-lwc init
-printf '# Schema\nEvery page declares provenance; source-grounded claims cite sources.\n' | lwc schema set -
-printf '# Purpose\nBuild a durable project Wiki.\n' | lwc purpose set -
-```
-
-初始化项目时，LWC 会按需把项目相对路径 `.lwc/` 加入 Git 的本地
-`info/exclude`，不会修改仓库 `.gitignore`。只有明确准备版本化 Wiki 时才使用
-`lwc init --no-git-exclude`。
+Agent 创建项目本地 Wiki，并定义用途与维护规则。除非明确选择版本化，项目状态只会
+加入 Git 的本地排除，不改动仓库的 .gitignore。
 
 ### 2. 加入来源材料
 
-```bash
-lwc source add-dir docs/
-```
-
-没有显式标题的文件会确定性地使用来源标识作为可读标题；内容相同的文件会通过
-SHA-256 去重。
-
-解析后位于当前项目 Wiki 根目录之外的来源必须显式传入
-`--allow-external-source`。检测到高置信度凭证特征时默认拒绝；只有确认不可变
-快照安全后，才能传入 `--acknowledge-sensitive-source`。
-
-每次成功加入来源时，LWC 还会记录本次观察到的文件路径及其当前不可变快照。
-依赖文件证据前，只检查本次任务真正相关的来源：
-
-```bash
-lwc source status 7 12
-```
-
-该只读命令会流式计算实时文件的 SHA-256，并分别返回路径版本状态（`current` 或
-`superseded`）与文件系统状态（`current`、`modified`、`missing`、`unreadable`、
-`oversized` 或 `unstable`）。`source status --all` 的成本与所有被跟踪文件的总字节数
-成正比，只应在明确的维护任务中使用。发现文件变化后先检查差异和直接引用者：
-
-```bash
-lwc source diff 7
-lwc source refs 7 --limit 1000
-```
-
-`source diff` 默认比较不可变来源与当前文件，也可用 `--to-source` 比较两个不可变
-版本。每侧最多 8 MiB、200,000 行；默认返回 20,000 个 Unicode 字符，
-`--max-chars` 最高 100,000。一个来源对应多个路径时必须用 `--path` 精确选择；
-`truncated=true` 只代表不完整预览。`source refs` 返回的是直接引用旧来源、需要复核
-的候选页面，不代表这些页面一定受到了语义影响。确认变化有实际含义后，才对同一路径
-再次执行 `source add`、完成 ingest，并按判断更新相关声明。即使内容从 A 变为 B 后
-又回到 A，LWC 仍保留三次路径观察，只复用 A 原有的 source ID。检查外部路径时必须
-再次传入 `--allow-external-source`；实时内容触发敏感信息检查时，还必须在人工检查后
-传入 `--acknowledge-sensitive-source`。
-
-旧版数据库迁移后，原有来源会明确显示为未跟踪；LWC 不会猜测历史路径。对目标文件
-重新执行一次 `source add`，即可建立第一条路径版本记录。如果检查期间文件或路径头
-版本发生变化，LWC 会返回 `source_status_unstable`；应重试，不要采信跨时点结果。
-
-需要原子导入经过筛选的一组来源时，可使用相对 manifest 所在目录解析的 JSON：
-
-```json
-{
-  "sources": [
-    {"path": "ARCHITECTURE.md", "title": "Architecture contract"},
-    {"path": "src/store.rs", "title": "SQLite store"}
-  ]
-}
-```
-
-```bash
-lwc source add-manifest lwc-sources.json
-```
+经过筛选的文件会成为不可变、去重的快照。LWC 跟踪其来源路径，并能判断当前文件是
+未变化、已修改、缺失还是已被新版本取代。
 
 ### 3. 分析并整合一个来源
 
-```bash
-lwc ingest next --context-limit 50 --source-max-chars 100000
-lwc ingest analyze 1 --file analysis.md
-```
-
-如果 manifest 或调度器已经选定明确的 pending source ID，使用
-`lwc ingest claim 7` 精确领取。
-
-如果返回的 `source_window.has_more` 为 true，就从
-`source_window.next_offset_chars` 继续读取：
-
-```bash
-lwc source show 1 --offset-chars 100000 --max-chars 100000
-```
-
-完成 ingest 之前，既要创建带引用的 source-summary 页面，也要把这个来源的贡献
-整合进至少一个非 source 页面：
-
-```bash
-lwc page put source-1 \
-  --title "Source 1 Summary" \
-  --kind source \
-  --summary "What this source contributes" \
-  --file source-summary.md \
-  --source 1
-
-lwc page put durable-concept \
-  --title "Durable Concept" \
-  --kind concept \
-  --summary "How this source changes shared knowledge" \
-  --file concept.md \
-  --source 1
-
-lwc ingest complete 1
-```
-
-两层都必需：source 页面负责导航和来源追溯，非 source 页面让知识真正持续积累。
-如果某个来源确实不应改变任何共享页面，需要记录一条具体且可审计的说明：
-
-```bash
-lwc ingest complete 1 \
-  --no-derived-pages-reason "Duplicate evidence; existing synthesis already covers every supported claim"
-```
-
-页面只要带 `--source` 引用，就会自动得到 `source-grounded`。如果长期知识来自
-用户陈述、Agent 观察或明确的假设，不要伪造来源；按需重复传入 `--provenance`：
-
-```bash
-lwc page put architecture-decision \
-  --title "Architecture decision" \
-  --kind query \
-  --summary "Accepted constraint and remaining uncertainty" \
-  --file decision.md \
-  --provenance user-provided \
-  --provenance hypothesis
-```
-
-`page put` 会整体替换引用集合和显式溯源信息集合。更新前先读取旧页面，再重复
-传入所有仍有效的 `--source`，以及不基于来源的 `--provenance`。不要显式传
-`source-grounded`，它由引用自动推导。页面读取、context、search、source refs 和
-Markdown 投影都会返回溯源信息，但溯源信息不参与搜索排序。
+Agent 读取完整的有界来源，写入带引用的来源摘要，更新共享知识，并只在两层内容保持
+一致后完成摄取。
 
 ### 4. 查询已沉淀的 Wiki
 
-```bash
-lwc context --limit 50
-lwc search "question keywords" --limit 20
-lwc search "question keywords" --limit 20 --explain
-lwc search "concept only" --type page --kind concept
-lwc search "exact evidence" --type source
-lwc page show source-1
-```
+搜索优先返回维护后的页面，并保留来源依据。需要核验声明时，Agent 再打开精确的
+原始证据。
 
 ## Agent 工作流
 
-标准工作流如下：
+日常循环只有四步：
 
-1. 收集不可变来源。
-2. 用有界的 `lwc ingest next` 领取任务；已经明确 source ID 时使用
-   `ingest claim <ID>`。
-3. 读完所有来源窗口，以及返回的 schema、purpose 和有界上下文。
-4. 先分析，再生成页面。
-5. 用显式 `--source` 引用写入或修订 source 摘要与共享知识页面。
-6. 只有两道整合门禁都通过，或明确记录无需更新共享页面的原因后，才能 complete。
-7. 多命令 ingest 或大范围修订放进一个 changeset；先验证草稿，再原子发布。
-8. 用 `search`、`context`、`graph` 和 `lint` 持续维护 Wiki 的一致性。
+1. 召回相关的已维护知识。
+2. 在时效性重要时检查当前来源或代码。
+3. 完成最小且经过验证的更新。
+4. 验证检索、链接和适用的图投影。
 
-完整操作约定见 [docs/agent-workflow.md](docs/agent-workflow.md)。
-运行 `lwc --help` 或 `lwc <command> --help`，可以查看面向 Agent 编写的前置条件、
-状态变化、副作用和下一步动作。
+大范围修订使用原子 changeset。完整的信任边界、前置条件、恢复方式和完成证据见
+[Agent 工作流](docs/agent-workflow.md)。
 
 ## 时序记忆
 
-当未来工作可能需要知道发生了什么变化、为什么改变、尝试过什么、结果如何或还有
-什么未决时，只记录一个紧凑事件：
+时序记忆用紧凑事件记录发生了什么、为何作出决策、尝试过什么、结果如何，以及还有
+哪些问题未解决。它与 Wiki 分工明确：时序召回解释历史，Wiki 表达当前稳定知识。
 
-```bash
-lwc remember --json '{"type":"决策","context":"部署策略","decision":["使用蓝绿发布"],"outcome":["仍可快速回滚"]}'
-lwc remember --json - < event.json
-lwc remember --json @event.json
+保留策略有明确上限，并保护置顶、未解决和仍然开放的矛盾事件。事件以结构化数据保存，
+不会存成原始聊天记录，也不会静默合并相似事件。
 
-lwc memory recall "为什么修改部署方式" --limit 5
-lwc memory recall "支付重试" --since 2026-08-01 --until 2026-08-31
-lwc memory show EVENT_ID
-lwc memory feedback EVENT_ID --signal useful --reason "避免重复失败"
-```
-
-事件至少包含 `type`、`context`，以及 `observed`、`decision`、`constraints`、
-`learned`、`unresolved`、`outcome`、`changes` 中的一项有效内容。LWC 将它拆成
-规范化关系行，而不是保存不透明的对话记录。三种输入都必须是 UTF-8 且不超过
-64 MiB；`@PATH` 从当前目录解析，project scope 下规范化路径必须位于项目根目录内。
-`request_id` 只保证同一次提交重试的
-幂等性；不传或换一个 key 时，即使内容相同也会创建独立事件。LWC 不会按相似文本
-合并事件，也不会自动生成 Wiki 综合。召回默认隐藏已被显式替代的事件，只有传入
-`--include-superseded` 才会返回；也只有召回支持 `--scope all`。所有时序记忆命令
-都拒绝 `--changeset`，非召回命令必须使用一个 project 或 global 存储。
-
-时序记忆默认启用，保留上限为 365 天和 256 MiB 逻辑内容；项目配置覆盖全局配置：
-
-```bash
-lwc config show
-lwc --scope global config set --memory enabled \
-  --memory-max-age-days 365 --memory-max-bytes 268435456
-lwc config unset --memory
-lwc memory status
-lwc memory maintain
-```
-
-每次成功记录都会在同一事务中执行时间和容量淘汰。`pinned=true`、含 `unresolved`
-片段，或参与尚未被 `resolves` 关闭的显式 `contradicts` 关系的事件受到保护；若受保护
-历史占满空间，新事件会失败，而不是删掉它们。返回
-的 hint 只是数量受限、规则明确的复核候选，不会自动关联或压缩。涉及历史、先前尝试和
-时间线时先查时序记忆；查询当前稳定知识时先查 Wiki；当前结论需要历史背景时两者都查。
-生命周期 Hook 只报告有界的就绪状态与命令元数据，不会记录、召回原始事件、消费
-hint、提交反馈或执行维护。
+[查看持久记忆指南 →](https://github.com/JanYork/llm-wiki-cli/wiki/Persistent-Memory-zh-CN)
 
 ## 多机器同步
 
-通过 SSH 同步项目 Wiki、全局 Wiki，或两者一起同步：
+Sync 通过 SSH 协调项目记忆、全局记忆或两者，同时把 Wiki 语义状态与 Git 发布分开。
+Merge 会保留两边的唯一对象，冲突则以有界数据包交给 Agent 明确解决。
 
-```bash
-lwc --scope project sync laptop /absolute/project/path --mode merge
-lwc --scope global sync laptop --mode pull
-lwc --scope all sync laptop /absolute/project/path --mode push
-```
+同步会话可持久恢复。LWC 不复制正在使用的 SQLite、WAL 或 SHM 文件，不重置工作树，
+并把权威数据发布与可重建的搜索、图投影分成独立阶段。
 
-`merge` 将协调后的结果发布到两台机器；`pull` 只发布到本机；`push`
-只发布到远端。方向只选择发布目的地，不授予覆盖权限：两边独有的语义对象都会保留。
-中断的会话是持久的，可用 `--resume SESSION_ID` 恢复，或用
-`--abort SESSION_ID` 中止。字段冲突返回有界语义数据包，由 Agent 使用
-`--resolve PACKET.json` 处理，不暴露原始 SQLite 行。每批最多返回 20 个冲突对象；
-candidate 与 preserve-both 决策都必须携带当前批次的 `conflict_id`。过期或未知 ID、
-重复字段/对象决策及畸形 packet 都会 fail closed。resolution packet 上限为 256 KiB；
-每次只处理当前批次，检查新响应，并循环直至 `action=completed`。
-
-第一次 Sync 传输经过验证的标准化语义快照；兼容的重复会话会在成本更低时发送
-更小的 SQLite Session changeset。Sync 不复制 `wiki.db`、WAL 或 SHM。
-存储身份、路径、配置、排队中/运行中的 Work、缓存与原始 Work 结果保持机器本地。
-暂停的稀疏 changeset 只以验证后的 detached intent 传输，并在目标端生成新 ID 的
-本地暂停草稿；Sync 绝不会将其自动提交到在线知识。终态 Work 只传输有界、脱敏的
-来源审计。FTS 只刷新受影响对象；Markdown 与已启用文档图在选择不超过 4,096 项和
-256 KiB 时使用精确受影响 ID，超过边界则只保留有界计数与摘要并使用
-`derived_selection=full`。已初始化 CodeGraph 在 Git 发布后刷新。若 canonical 已
-提交但 continuity 或派生刷新失败，`committed=true` 会分别配合
-`next_action=resume_continuity` 或 `next_action=resume_derived_rebuild`，幂等恢复该阶段
-而不重放 canonical 发布。
-Git 使用
-原生 fetch/merge/push，并将发布绑定到开始时的 HEAD、
-索引和已跟踪工作区指纹；文件冲突在隔离的临时索引中以确定性的
-preserve-both 变体处理。已暂存修改、未暂存修改和删除都会进入 Git 逻辑结果，且不改变
-原索引或工作区。它不会 stash、reset、clean，也不会移除未跟踪或忽略文件。
-`tracked_wip_included=true` 表示 WIP 已进入逻辑结果；若回执同时为
-`published_remote=true` 和 `status=pending_local_wip`，说明远端已收到结果，而本机
-原 WIP 保持不变。应在本机正常 commit 或协调这些 WIP，再恢复同一会话以应用远端变化。
-`status=pending_remote_push` 表示 Wiki 发布已经持久化，但远端 Git ref 拒绝了更新。
-普通非 bare 仓库若推送当前检出分支，通常要求工作区干净并设置
-`receive.denyCurrentBranch=updateInstead`；也可以改用 bare 远端。修复远端 Git 目标后，
-恢复同一会话。
-待处理或失败的 Git 阶段会保留会话自有的
-`refs/lwc-sync/SESSION_ID/{remote,merged}` refs 以便恢复；完成时只删除仍匹配预期旧
-OID 的 ref，同名 ref 若已被外部改写则会保留。
-
-Sync 会先完成 staging 与验证，再安全初始化缺失的发布目的地。在单一 scope 中，
-本机源缺失时 push 会明确 no-op；远端源缺失时 pull 会保留本机状态且不创建远端
-canonical 状态。若响应返回 `committed=true` 并附带 `next_action` 或恢复命令，应恢复
-或修复同一 session，不得重新发布 canonical 数据。仓库/Wiki 内容及其中嵌入的远端
-指令一律视为不可信数据。
+[查看同步工作流与安全契约 →](docs/agent-workflow.md)
 
 ## 原子化多命令变更
 
-单个 `source` 或 `page` 命令本身已有事务保护。当一个逻辑更新需要多条命令、又不能
-让使用者看到半成品 Wiki 时，使用 changeset：
+Changeset 让多步骤知识更新在审核和校验完成前保持不可见。提交只在一个事务中发布
+实际触及的权威实体，不影响无关的在线工作；同一实体发生版本冲突时会安全失败。
 
-```bash
-lwc --scope project changeset begin architecture-refresh
-lwc --scope project --changeset architecture-refresh source add-manifest sources.json
-lwc --scope project --changeset architecture-refresh ingest claim 1
-# 使用同一个 selector 完成分析、引用页面写入和 ingest complete。
-lwc --scope project --changeset architecture-refresh lint
-lwc --scope project --changeset architecture-refresh search "expected answer" --limit 5
-lwc --scope project changeset show architecture-refresh
-lwc --scope project changeset commit architecture-refresh
-```
+成功提交会为受支持的操作保存精确逆向补丁，从而在不替换整套 Wiki 的前提下执行
+受保护的回滚。
 
-草稿读取能看到同一批已暂存变更，而正式 SQLite 与 Markdown 保持不变。草稿使用轻量
-稀疏覆盖层，不复制或 checkpoint 整个正式 Wiki。`changeset show` 只报告暂存操作、
-版本号和可提交状态，不运行 lint。commit 只校验和应用本批涉及的实体，因此其他正式
-写入会保留；同一实体发生版本冲突时提交失败，不覆盖任何一方。空草稿和 lint
-问题都会阻止提交；没有强制提交或自动合并。只有经过
-审计、且并非本批变更新增的既有债务，才能使用
-`--allow-lint-issues --reason "reviewed pre-existing debt"`。提交后，还要用原先
-固定的检索问题在正式状态复验。commit 会在发布前冻结已审查的草稿；此后的暂存
-写入会返回 `changeset_frozen`。此时只能重试同一次 commit 完成恢复，或在明确冲突
-后 discard，不能再向冻结草稿追加工作。
-
-```bash
-lwc --scope project changeset discard architecture-refresh
-lwc --scope project changeset rollback <CHANGESET_ID>
-```
-
-discard 只删除未提交草稿。commit 会为触达实体写入带校验和的 inverse patch，并返回
-精确的回滚 ID；rollback 只恢复这些实体，某个实体后来再次变化时会拒绝覆盖。
-project 与 global changeset 相互独立；`--scope all` 无效；`init`、`maintenance`、
-`checkpoint` 和嵌套 changeset 命令都会拒绝 `--changeset`。草稿不会生成第二套
-Markdown 投影。如果结构化错误返回 `committed=true`，但仍有 cleanup 或
-materialization 工作，不要重复执行知识变更；应执行响应中给出的恢复动作。
-
-稀疏 commit 当前为 Source 新增/ingest、Page put/remove、schema、purpose 和记录型
-search 提供精确 patch。检索权重与显式语义关系暂未提供稀疏 inverse patch，会在创建
-checkpoint、获取正式库写锁或修改正式 Wiki 前返回 `changeset_sparse_unsupported`；
-当前应将它们作为直接的单实体事务执行。
+[查看 Changeset 指南 →](https://github.com/JanYork/llm-wiki-cli/wiki/Changesets-zh-CN)
 
 ## 作用域
 
-`lwc` 支持三种 scope：
+| 作用域 | 用途 |
+| --- | --- |
+| project | 最近项目 Wiki 拥有的项目知识 |
+| global | 可跨项目复用的知识 |
+| all | 合并只读召回和协调式 Sync |
 
-| Scope | Store | 用途 |
-| --- | --- | --- |
-| `project` | 最近祖先目录中的 `.lwc/wiki.db` | 默认使用，保存项目级知识 |
-| `global` | `~/.lwc/wiki.db` | 保存可跨项目复用的知识 |
-| `all` | project 与 global | 用于合并 `search`、`context`、`memory recall`，以及显式协调的 `sync` |
+写入始终明确指向一个存储，LWC 不会隐式创建跨项目引用或链接。
 
-示例：
-
-```bash
-lwc --scope global init
-lwc --scope global source add shared.md
-lwc --scope all search "shared term"
-lwc --scope all context
-lwc --scope all memory recall "之前的发布"
-```
-
-知识写入始终是显式的。除协调式 `sync` 外，变更命令都会拒绝 `all`。`all`
-不会隐式创建不同存储之间的引用或链接；`search --record` 只会向每个选中的存储追加
-查询操作记录。
+[查看作用域与项目发现 →](https://github.com/JanYork/llm-wiki-cli/wiki/Scopes-and-Project-Discovery-zh-CN)
 
 ## 搜索与 CJK 文本
 
-搜索是词法型（lexical）且确定性的。
+搜索是确定性的词法检索，并优先返回整理后的页面。标题、路径、摘要、正文、来源证明和
+图证据分别计分；支持页面、来源、类型筛选，也能解释完整的评分过程。
 
-- 搜索词是纯文本，不是原始 FTS 语法。
-- 默认的 `--type auto` 会优先返回已编译的 Wiki 页面、隐藏与其配对的 raw
-  source，并在页面不足时回退到 raw source。
-- 用 `--type page`、`--type source` 或 `--type all` 选择检索层；可重复传入
-  `--kind` 限定页面类型，例如 `--kind concept --kind synthesis`。
-- 多字 CJK 查询使用相邻 bigram；索引还会保留非停用单字，使单字查询仍可检索。
-- 拉丁文本会被切成小写的字母数字 token。
-- 排名会区分标题、来源文件名、路径/slug、摘要和正文；标题与路径的精确或部分匹配
-  使用有界加权。
-- README、index、overview 和明确的导航枢纽会按查询降权，让具体功能文档优先；
-  查询明确要求 README 或总览时不降权。
-- 页面候选可以获得有界的直接链接或共享来源加权。只有共同邻居、没有直接证据的
-  关系不会改变搜索顺序；宽泛导航枢纽会得到有界图惩罚。
-- `--explain` 返回可精确复算的词法、通用文档、图、人工权重与查询反馈信号。
-  它不会记录查询；只有显式 `--record` 才会写入搜索历史。
-- 固定系数和“数值越低越相关”的 rank 让 `--scope all` 中的 project/global 结果
-  保持可比。
-
-这里刻意不依赖词典分词，目的是让产品名、代号、混合语言术语和新词都能保持稳定的
-检索行为。
+CJK 文本使用相邻二元组并保留有用的一元词，拉丁文本使用小写字母数字词项。它不依赖
+词典，因此对产品名、代码符号、中英混排和新兴词汇保持稳定。
 
 ### 显式检索权重与反馈
 
-文档权重用于长期、与具体查询无关的页面/来源判断；反馈只作用于同一个有序 token
-查询指纹：
+可审计的文档权重表达长期重要性；查询反馈只对同一词序指纹的候选项重排，并只保存
+指纹而非原始查询。两者都不能让不相关内容进入结果。
 
-```bash
-lwc weight set page payment-rules \
-  --value 2 \
-  --reason "支付规则的权威规范" \
-  --provenance agent-observed
-lwc weight list page payment-rules
-
-lwc weight feedback page payment-rules \
-  --query "支付对账规则" \
-  --signal relevant \
-  --reason "已按预期答案核验" \
-  --provenance agent-observed
-
-lwc weight feedback-clear page payment-rules \
-  --query "支付对账规则" \
-  --provenance agent-observed
-lwc weight clear page payment-rules --provenance agent-observed
-```
-
-文档权重只能取 `-2`、`-1`、`1`、`2`，归零使用 `clear`。两种机制都只重排已经
-通过词法召回的候选，不会凭空召回不匹配文档。`user-provided` 优先于
-`agent-observed`，但两行都会保留供审计。反馈只保存 SHA-256 指纹，不保存原始
-查询，也不会泛化到 token 不同的改写。原因和操作记录会持久化，因此不要把敏感
-查询复制到 `--reason`。变更必须明确使用 `project` 或 `global`；`--scope all`
-会被拒绝。
+[查看搜索与上下文指南 →](https://github.com/JanYork/llm-wiki-cli/wiki/Search-and-Context-zh-CN)
 
 ## 只读预览与 CodeGraph
 
-`lwc view` 会以前台方式在本机回环地址启动项目预览并打开浏览器。Web
-应用使用 TS + Lit 构建并嵌入二进制，运行时不依赖 CDN 或 Node；服务只
-接受 GET/HEAD。页面、来源、Markdown、知识图以及可选代码图均从当前项目
-只读加载，不会触发迁移、刷新或建图：
-
-```bash
-lwc view
-lwc view --port 4173 --no-open
-```
-
-预览默认使用英文。通过页面内的 `中文` / `EN` 控件切换语言；浏览器会记住选择，
-但不会自动翻译 Wiki 正文。知识图和代码图统一使用受 Obsidian 启发的 3D 关系视图，
-采用小节点、常驻标签、细连线，并支持旋转与缩放。
+本地 Viewer 通过仅回环、仅 GET/HEAD 的接口展示页面、来源、Markdown、文档关系和
+代码结构，不会执行迁移、刷新或建图。
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-codegraph-zh.png" alt="LWC 代码图" width="100%">
 </p>
 
-代码索引只支持项目级，默认不启用。首次显式执行 `lwc cg init` 时，LWC
-会从 GitHub Release 下载锁定版本的 CodeGraph 分支包并校验 SHA-256。运行时只
-下载一次，缓存到 `~/.lwc/runtime/codegraph/<PIN>/<TARGET>/`；每个项目只保留自己
-的 `.lwc/codegraph` 索引。遥测始终关闭，也不创建 `.codegraph` 状态。
+CodeGraph 仅用于项目，并且必须显式初始化。它可以回答符号、调用方、被调用方、依赖、
+文件和影响范围，同时保持遥测关闭，并按所属文件原子更新图数据。
 
-```bash
-lwc cg status
-lwc cg init                 # 仅下载一次，随后逐个完整文件建立索引
-lwc cg sync
-lwc cg query UserService
-lwc cg node UserService
-lwc cg callers UserService
-lwc cg callees UserService
-lwc cg impact UserService
-lwc cg files
-```
+固定运行时识别 TypeScript、TSX、JavaScript、JSX、ArkTS、Python、Go、Rust、
+Java、C、C++、C#、Razor、PHP、Ruby、Swift、Kotlin、Dart、Svelte、Vue、
+Astro、Liquid、Pascal、Scala、Lua、Luau、Objective-C、R、Solidity、Nix、
+YAML、Twig、XML、.properties、CFML、CFScript、CFQuery、COBOL、VB.NET、
+Erlang 和 Terraform。
 
-LWC 固定版本的 CodeGraph 运行时目前可识别以下语言和代码相关格式：TypeScript、TSX、JavaScript、JSX、
-ArkTS、Python、Go、Rust、Java、C、C++、C#、Razor、PHP、Ruby、Swift、Kotlin、
-Dart、Svelte、Vue、Astro、Liquid、Pascal、Scala、Lua、Luau、Objective-C、R、
-Solidity、Nix、YAML、Twig、XML、`.properties`、CFML、CFScript、CFQuery、COBOL、
-VB.NET、Erlang 和 Terraform。YAML、Twig 和 `.properties` 仅以文件级方式跟踪，
-框架解析器仍可补充关系；XML 用于提取 MyBatis Mapper 映射。
-
-CodeGraph 的查询能力均可通过 `lwc cg` 使用。全局生命周期命令
-（`install`、`uninstall`、`upgrade`、`telemetry`、`daemon`、`daemons`）会被
-拒绝。精确命令 `lwc cg serve --mcp` 仅保留为旧版手工桥接兼容；新的 Agent 集成统一
-使用 `lwc serve --mcp`，通过一个只读工具提供有界的 Wiki 与 CodeGraph 探索。运行时仍由
-LWC 管理并保持项目边界。首次、增量、全量、更新、
-删除、引用解析和恢复写入都以归属文件为事务：一篇文件完全可用后才处理下一
-篇；当前图保持可读，历史文档版本永不刷新。
+[查看 Viewer 指南 →](https://github.com/JanYork/llm-wiki-cli/wiki/Read-Only-Viewer-zh-CN) ·
+[查看 CodeGraph 指南 →](https://github.com/JanYork/llm-wiki-cli/wiki/Code-Graph-zh-CN)
 
 ## 维护与投影
 
-常用维护命令：
+Lint、重建索引、Markdown 物化、压缩、checkpoint 和图投影都是显式操作。耗时工作
+可持久追踪、观察、恢复，并按有界的单文档单元执行。
 
-```bash
-lwc lint
-lwc maintenance reindex
-lwc maintenance materialize
-lwc maintenance compact
-lwc work list
-lwc work status <WORK_ID>
-lwc work watch <WORK_ID>
-lwc work cancel <WORK_ID>
-lwc work resume <WORK_ID>
-lwc checkpoint create before-large-update
-lwc checkpoint list
-lwc log --limit 20
-```
+SQLite 始终保持权威；搜索索引、Markdown 和图存储都可以重建，不会改写来源历史或
+当前 Wiki 知识。
 
-说明：
-
-- 维护命令会立即返回可持久追踪的 `work`。使用 `work status` 查看进度，或使用
-  `work watch` 等待完成并读取 `work.result`。v10 到 v11 的 schema 迁移也会
-  自动进入同一机制，普通命令不会再在前台执行迁移。
-- `lint` 默认完全只读；只有这次检查确实需要进入持久操作历史时才加 `--record`。
-- `maintenance reindex` 从 SQLite 重建派生搜索产物。
-- `maintenance materialize` 从 SQLite 重建投影出来的 Markdown 树。
-- `maintenance compact` 只尝试执行 WAL truncate checkpoint，不会顺带执行全量 FTS
-  优化。应在 Wiki 空闲时运行，并检查返回的 `busy` 与 `after_bytes`；存在活动读取进程
-  时会快速返回，不修改权威内容。
-- 搜索查询默认是私有的；只有需要把查询文本写入持久化操作日志时，才加 `--record`。
-
-`lwc checkpoint create <NAME>` 使用 SQLite 在线备份 API。执行
-`lwc checkpoint restore <NAME>` 时，LWC 会先创建 `pre-restore-*` 安全
-checkpoint，再恢复数据库并重建投影。受保护删除使用 `source remove <ID>` 和
-`page remove <SLUG>`：仍被页面引用的来源、仍有入链的页面都会被拒绝删除。删除某
-路径的当前来源时，该路径会明确停止跟踪，不会把旧版本悄悄恢复成“当前版本”。
-
-多来源 ingest 或大范围页面替换应优先使用 changeset，而不是手动 checkpoint：
-commit 使用稀疏 inverse patch，在短事务中只发布本批涉及的权威实体，并增量更新
-正式 Markdown；不会自动复制整库。发布后会尝试 WAL truncate；
-`wal_checkpointed=false` 表示活动读取进程阻止了立即截断，不表示权威数据提交
-失败。
-
-需要文件系统级外部备份时，应先停止正在运行的 `lwc` 命令并复制完整 `.lwc/`
-目录；写入进程可能仍在使用 WAL 文件时，不要只复制 `wiki.db`。
+[查看维护与诊断 →](https://github.com/JanYork/llm-wiki-cli/wiki/Maintenance-and-Diagnostics-zh-CN)
 
 ## 基准测试集
 
-可选基准会把本地 UTF-8 语料导入临时 Wiki，并报告导入耗时、搜索 P50/P95、
-Recall@5/10、MRR，以及 compact 前后的存储占用。基准答案使用 JSONL
-描述查询与期望命中的语料相对路径：
+可选基准在调用者提供的脱敏语料上测量导入时间、搜索延迟、Recall@5/10、MRR 和
+存储占用。公平比较需要固定机器、语料、查询集和运行条件，并比较多次运行的中位数。
 
-```bash
-cargo build --release
-LWC_BENCH_CORPUS=/path/to/sanitized-corpus \
-LWC_BENCH_QUERY_SET=/path/to/query-set.jsonl \
-LWC_BENCH_BINARY="$PWD/target/release/lwc" \
-cargo test --test search_benchmark -- --ignored --nocapture
-```
-
-常规 `cargo test --all-targets` 覆盖 page-first 搜索、type/kind 过滤、UTF-8
-来源窗口、ingest 完成门禁、图关系精度、迁移、lint 与 WAL compact。工作负载约定
-和公平前后对比规则见 [benchmarks/README.md](benchmarks/README.md)。
+[查看基准方法 →](benchmarks/README.md)
 
 ## 持久 Todo 与当前 Plan
 
-LWC 将延期事项与当前执行状态保存为两类彼此独立的持久记录：
+Todo 保存延后处理的工作；Plan 保存当前执行目标、步骤、进度和 revision。两项能力
+相互独立、按需启用，也不会自动互相转换。
 
-```bash
-lwc config set --todo enabled --plan enabled
-lwc todo add "发布前验证包" --tag release --cue "准备发布时" --target-at 2030-01-02T09:00:00+08:00
-lwc todo add "验证签名" --parent TODO_ID
-lwc todo list --limit 20
-lwc plan create "完成发布" --objective "安全发布" --done-when "发布检查通过" --step "运行检查" --step "发布"
-lwc plan current --limit 20
-lwc plan brief PLAN_ID
-```
+有界生命周期上下文让 Agent 在新会话或上下文压缩后恢复当前计划与到期提醒，同时
+避免暴露不必要的私密细节。
 
-两项能力均默认关闭，并且可以分别启用。启用前，命令会返回 `todo_disabled` 或
-`plan_disabled`；生命周期 Hook 也只会附带已启用能力的计数与发现命令。
-启用 Plan 后，Hook 还会有界追踪最近更新的 active Plan：进度、当前步骤、下一步骤、
-revision 和 `plan brief` 命令，让 Agent 在会话与上下文边界后继续意识到并遵循计划。
-启用 Todo 后，Hook 还会提醒 `target_at` 已到且仍为 open 的 Todo：按创建时间从早到晚
-最多 3 条，并返回精确省略数。提醒只含有界标题、ID、直接父 ID 与目标时间，不泄漏
-cue/detail。
-
-`--parent TODO_ID` 只建立一层直接子 Todo 关系，不级联状态、不创建依赖，也不会把子项
-转成 Plan 步骤。可用 `todo list/search --parent TODO_ID` 筛选直接子项；用
-`todo update --target-at ...` 改期，或用 `--clear-target-at` 清除时间。
-
-修改现有记录时，必须把 `show` 或 `brief` 返回的 revision 通过
-`--if-revision` 传回。Todo 与 Plan 不会自动相互转换。list/search 支持
-`--scope all`，精确读取与写入只支持 project/global。Agent 应分别遵循
-`using-todo` 与 `using-plan` Skill。
+[查看 Todo 与 Plan 工作流 →](docs/agent-workflow.md#todo-and-plan)
 
 ## 限制与非目标
 

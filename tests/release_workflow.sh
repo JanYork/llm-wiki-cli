@@ -63,7 +63,7 @@ grep -Fq 'cp README.md README.zh-CN.md LICENSE "dist/${archive}/"' "$workflow" |
   echo 'the core archive contract must remain unchanged' >&2
   exit 1
 }
-for document in README.md README.zh-CN.md docs/agent-workflow.md docs/learning-suite-contracts.md; do
+for document in docs/agent-workflow.md docs/learning-suite-contracts.md; do
   for plugin in tutor book practice; do
     grep -Fq -- "lwc --scope global config set --$plugin enabled" "$repo_root/$document" || {
       echo "$document must document global $plugin enablement" >&2
@@ -71,16 +71,12 @@ for document in README.md README.zh-CN.md docs/agent-workflow.md docs/learning-s
     }
   done
 done
-grep -Fq -- 'HTML, scanned/OCR PDFs, MOBI,' "$repo_root/README.md" || {
-  echo 'README must state the Book format boundary' >&2
+grep -Fq -- 'HTML, scanned/OCR PDF, MOBI, and AZW3 remain unsupported.' "$repo_root/docs/learning-suite-contracts.md" || {
+  echo 'Learning Suite contracts must state the Book format boundary' >&2
   exit 1
 }
-grep -Fq -- 'v1 provides no forget/clear/purge command' "$repo_root/README.md" || {
-  echo 'README must state the deferred purge boundary' >&2
-  exit 1
-}
-grep -Fq -- '意图含糊时只直接询问' "$repo_root/README.zh-CN.md" || {
-  echo 'Chinese README must state the Agent ask boundary' >&2
+grep -Fq -- 'V1 has no forget/clear/purge operation' "$repo_root/docs/learning-suite-contracts.md" || {
+  echo 'Learning Suite contracts must state the deferred purge boundary' >&2
   exit 1
 }
 if grep -Fq 'npm publish' "$workflow"; then
