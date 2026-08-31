@@ -49,6 +49,8 @@ fn hook_read_prefix<const N: usize>(path: &Path) -> Result<[u8; N]> {
     Ok(bytes)
 }
 
+// `as_chunks` would raise the implicit Rust 1.85 baseline to Rust 1.88.
+#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 fn hook_wal_index_header_is_valid(header: &[u8; WAL_INDEX_HEADER_BYTES]) -> bool {
     let checksum = header[..40]
         .chunks_exact(8)
