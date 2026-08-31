@@ -63,7 +63,7 @@ impl AgentTarget for OpenCodeTarget {
         "installed"
     }
     fn lifecycle_mode(&self, _location: AgentLocation) -> &'static str {
-        "installed"
+        "configured_preview"
     }
     fn permissions_mode(&self, _location: AgentLocation) -> &'static str {
         "not_applicable"

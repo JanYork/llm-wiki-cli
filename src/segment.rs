@@ -31,6 +31,7 @@ pub struct PassageSpan {
     pub kind: PassageKind,
     pub ordinal: usize,
     pub range: Range<usize>,
+    pub heading_path: Vec<String>,
     pub sentences: Vec<SentenceSpan>,
 }
 
@@ -48,6 +49,8 @@ pub enum SegmentError {
 
 pub fn segment_document(content: &str) -> Result<SegmentedDocument, SegmentError> {
     let mut candidates = Vec::new();
+    let mut headings = Vec::new();
+    let mut active_heading: Option<(usize, Range<usize>, String)> = None;
     let mut item_depth = 0usize;
     let mut quote_depth = 0usize;
     let mut code_depth = 0usize;
@@ -69,8 +72,9 @@ pub fn segment_document(content: &str) -> Result<SegmentedDocument, SegmentError
                 }
                 code_depth += 1;
             }
-            Event::Start(Tag::Heading { .. }) => {
-                candidates.push((PassageKind::Heading, range));
+            Event::Start(Tag::Heading { level, .. }) => {
+                candidates.push((PassageKind::Heading, range.clone()));
+                active_heading = Some((level as usize, range, String::new()));
             }
             Event::Start(Tag::TableHead | Tag::TableRow) => {
                 candidates.push((PassageKind::TableRow, range));
@@ -86,6 +90,24 @@ pub fn segment_document(content: &str) -> Result<SegmentedDocument, SegmentError
             Event::End(TagEnd::Item) => item_depth = item_depth.saturating_sub(1),
             Event::End(TagEnd::BlockQuote(_)) => quote_depth = quote_depth.saturating_sub(1),
             Event::End(TagEnd::CodeBlock) => code_depth = code_depth.saturating_sub(1),
+            Event::Text(text)
+            | Event::Code(text)
+            | Event::InlineMath(text)
+            | Event::DisplayMath(text) => {
+                if let Some((_, _, heading)) = active_heading.as_mut() {
+                    heading.push_str(&text);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, _, heading)) = active_heading.as_mut() {
+                    heading.push(' ');
+                }
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((level, range, text)) = active_heading.take() {
+                    headings.push((level, range, text.trim().to_string()));
+                }
+            }
             _ => {}
         }
     }
@@ -100,13 +122,35 @@ pub fn segment_document(content: &str) -> Result<SegmentedDocument, SegmentError
         .map(|(kind, range)| PassageSpan {
             kind,
             ordinal: 0,
+            heading_path: Vec::new(),
             sentences: sentence_spans(content, kind, &range),
             range,
         })
         .collect::<Vec<_>>();
     passages.sort_by_key(|passage| (passage.range.start, passage.range.end));
+    let mut heading_index = 0usize;
+    let mut heading_path: Vec<(usize, String)> = Vec::new();
     for (ordinal, passage) in passages.iter_mut().enumerate() {
+        while heading_index < headings.len()
+            && headings[heading_index].1.start <= passage.range.start
+        {
+            let (level, _, text) = &headings[heading_index];
+            while heading_path
+                .last()
+                .is_some_and(|(parent_level, _)| parent_level >= level)
+            {
+                heading_path.pop();
+            }
+            if *level > 1 && !text.is_empty() {
+                heading_path.push((*level, text.clone()));
+            }
+            heading_index += 1;
+        }
         passage.ordinal = ordinal;
+        passage.heading_path = heading_path
+            .iter()
+            .map(|(_, heading)| heading.clone())
+            .collect();
     }
     let span_count = passages.len()
         + passages
@@ -266,7 +310,9 @@ mod tests {
             &content[document.passages[0].sentences[0].range.clone()],
             "# 标题"
         );
+        assert!(document.passages[0].heading_path.is_empty());
         assert_eq!(document.passages[1].kind, PassageKind::Paragraph);
+        assert!(document.passages[1].heading_path.is_empty());
         assert_eq!(
             &content[document.passages[1].range.clone()],
             "First sentence. Second!"
@@ -278,6 +324,43 @@ mod tests {
                 .map(|sentence| &content[sentence.range.clone()])
                 .collect::<Vec<_>>(),
             vec!["First sentence.", "Second!"]
+        );
+    }
+
+    #[test]
+    fn derives_visible_nested_heading_paths_and_resets_siblings() {
+        let content = concat!(
+            "Before headings.\n\n",
+            "# Page title\n\n",
+            "Top body.\n\n",
+            "## Section *level*\n\n",
+            "Section body.\n\n",
+            "### Nested `code` [link](https://example.com)\n\n",
+            "Nested body.\n\n",
+            "## Sibling\n\n",
+            "Sibling body.\n",
+        );
+
+        let document = segment_document(content).unwrap();
+        let paths = document
+            .passages
+            .iter()
+            .map(|passage| passage.heading_path.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec![
+                vec![],
+                vec![],
+                vec![],
+                vec!["Section level"],
+                vec!["Section level"],
+                vec!["Section level", "Nested code link"],
+                vec!["Section level", "Nested code link"],
+                vec!["Sibling"],
+                vec!["Sibling"],
+            ]
         );
     }
 

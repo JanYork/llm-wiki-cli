@@ -440,6 +440,7 @@ fn rebuild_span_index(tx: &Transaction<'_>) -> Result<()> {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
+    let mut heading_paths = None;
     for (node_id, node_type, document_type, document_identifier, start, end, body, title, path) in
         rows
     {
@@ -450,11 +451,40 @@ fn rebuild_span_index(tx: &Transaction<'_>) -> Result<()> {
         let label = body.get(start..end).ok_or_else(|| {
             AppError::new("changeset_corrupt", "search span has an invalid byte range")
         })?;
+        let document_key = (document_type.clone(), document_identifier.clone());
+        if heading_paths
+            .as_ref()
+            .is_none_or(|(indexed_document, _)| indexed_document != &document_key)
+        {
+            let mut ranges = BTreeMap::new();
+            for passage in crate::segment::segment_document(&body)
+                .map_err(segment_error)?
+                .passages
+            {
+                let heading_path = passage.heading_path.join(" ");
+                ranges.insert(
+                    (passage.range.start, passage.range.end),
+                    heading_path.clone(),
+                );
+                for sentence in passage.sentences {
+                    ranges.insert(
+                        (sentence.range.start, sentence.range.end),
+                        heading_path.clone(),
+                    );
+                }
+            }
+            heading_paths = Some((document_key, ranges));
+        }
+        let heading_path = heading_paths
+            .as_ref()
+            .and_then(|(_, ranges)| ranges.get(&(start, end)))
+            .cloned()
+            .unwrap_or_default();
         tx.execute(
             "INSERT INTO span_fts(
                 span_id, span_type, document_type, document_identifier,
-                title_terms, path_terms, body_terms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                title_terms, path_terms, heading_terms, body_terms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 node_id,
                 node_type,
@@ -462,6 +492,7 @@ fn rebuild_span_index(tx: &Transaction<'_>) -> Result<()> {
                 document_identifier,
                 joined_terms(&title),
                 joined_terms(&path),
+                joined_terms(&heading_path),
                 joined_terms(label),
             ],
         )?;

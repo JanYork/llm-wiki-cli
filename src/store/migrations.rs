@@ -136,6 +136,10 @@ fn prepare_store(
         migrate_todo_features_v16(conn)?;
         version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     }
+    if version == TODO_FEATURES_VERSION {
+        migrate_structured_span_index_v17(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
     if version != USER_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
@@ -151,7 +155,10 @@ fn prepare_store(
 fn migrate_agent_state_v15(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current == AGENT_STATE_VERSION { tx.commit()?; return Ok(()); }
+    if (AGENT_STATE_VERSION..=USER_VERSION).contains(&current) {
+        tx.commit()?;
+        return Ok(());
+    }
     if current != TEMPORAL_MEMORY_VERSION {
         return Err(AppError::new("unsupported_store_version", format!("cannot migrate wiki database version {current} to {USER_VERSION}")));
     }
@@ -165,14 +172,14 @@ fn migrate_agent_state_v15(conn: &mut Connection) -> Result<()> {
 fn migrate_todo_features_v16(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current == USER_VERSION {
+    if (TODO_FEATURES_VERSION..=USER_VERSION).contains(&current) {
         tx.commit()?;
         return Ok(());
     }
     if current != AGENT_STATE_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
-            format!("cannot migrate wiki database version {current} to {USER_VERSION}"),
+            format!("cannot migrate wiki database version {current} to {TODO_FEATURES_VERSION}"),
         ));
     }
     let has_parent: bool = tx.query_row(
@@ -197,12 +204,73 @@ fn migrate_todo_features_v16(conn: &mut Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS todo_items_parent ON todo_items(parent_id,created_at,id);
          CREATE INDEX IF NOT EXISTS todo_items_reminder ON todo_items(state,target_at,created_at,id);",
     )?;
-    tx.execute("INSERT INTO meta(key,value) VALUES ('format_version',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [USER_VERSION.to_string()])?;
-    tx.pragma_update(None, "user_version", USER_VERSION)?;
+    tx.execute("INSERT INTO meta(key,value) VALUES ('format_version',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [TODO_FEATURES_VERSION.to_string()])?;
+    tx.pragma_update(None, "user_version", TODO_FEATURES_VERSION)?;
     tx.commit().map_err(|error| {
         AppError::new(
             "store_migration_failed",
-            format!("failed to commit v{USER_VERSION} Todo migration: {error}"),
+            format!("failed to commit v{TODO_FEATURES_VERSION} Todo migration: {error}"),
+        )
+    })
+}
+
+fn migrate_structured_span_index_v17(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if current == STRUCTURED_SPAN_INDEX_VERSION {
+        tx.commit()?;
+        return Ok(());
+    }
+    if current != TODO_FEATURES_VERSION {
+        return Err(AppError::new(
+            "unsupported_store_version",
+            format!(
+                "cannot migrate wiki database version {current} to {STRUCTURED_SPAN_INDEX_VERSION}"
+            ),
+        ));
+    }
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS span_fts;
+         DROP TABLE IF EXISTS span_fts_data;
+         DROP TABLE IF EXISTS span_fts_idx;
+         DROP TABLE IF EXISTS span_fts_content;
+         DROP TABLE IF EXISTS span_fts_docsize;
+         DROP TABLE IF EXISTS span_fts_config;
+         CREATE VIRTUAL TABLE span_fts USING fts5(
+            span_id UNINDEXED, span_type UNINDEXED,
+            document_type UNINDEXED, document_identifier UNINDEXED,
+            title_terms, path_terms, heading_terms, body_terms,
+            content='', contentless_delete=1, contentless_unindexed=1
+         );",
+    )
+    .map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!(
+                "failed to prepare v{STRUCTURED_SPAN_INDEX_VERSION} structured span index: {error}"
+            ),
+        )
+    })?;
+    rebuild_search_index(&tx).map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!(
+                "failed to rebuild v{STRUCTURED_SPAN_INDEX_VERSION} structured span index: {error}"
+            ),
+        )
+    })?;
+    tx.execute(
+        "INSERT INTO meta(key,value) VALUES ('format_version',?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [STRUCTURED_SPAN_INDEX_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", STRUCTURED_SPAN_INDEX_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!(
+                "failed to commit v{STRUCTURED_SPAN_INDEX_VERSION} structured span migration: {error}"
+            ),
         )
     })
 }
@@ -623,7 +691,7 @@ fn migrate_external_graph_schema(conn: &mut Connection) -> Result<()> {
          CREATE VIRTUAL TABLE span_fts USING fts5(
             span_id UNINDEXED, span_type UNINDEXED,
             document_type UNINDEXED, document_identifier UNINDEXED,
-            title_terms, path_terms, body_terms,
+            title_terms, path_terms, heading_terms, body_terms,
             content='', contentless_delete=1, contentless_unindexed=1
          );",
     )?;

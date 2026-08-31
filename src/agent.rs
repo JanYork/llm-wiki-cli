@@ -12,15 +12,22 @@ use std::{
     fs,
     io::{self, Read},
     path::Path,
+    time::{Duration, Instant},
 };
 
 mod install;
+mod intent;
+mod signals;
 mod targets;
+mod tool_protocol;
 pub(crate) use install::{AgentLocation, install, refresh, status, uninstall};
 
 const MAX_INPUT_BYTES: u64 = 64 * 1024;
 const MAX_CONTEXT_CHARS: usize = 100_000;
 const MAX_SYNC_STATE_BYTES: u64 = 64 * 1024;
+const MAX_SYNC_RAW_ENTRIES: usize = 64;
+const HOOK_WALL_BUDGET: Duration = Duration::from_millis(1_600);
+const HOOK_RENDER_RESERVE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AgentKind {
@@ -33,13 +40,9 @@ pub(crate) enum AgentKind {
     CopilotCli,
     CopilotVscode,
     Kiro,
+    OpenCode,
     Pi,
     Generic,
-}
-
-enum HookEvent {
-    Boundary,
-    Prompt,
 }
 
 #[derive(Serialize)]
@@ -76,55 +79,466 @@ pub(crate) fn hook(agent: AgentKind, event: &str, scope: Scope, cwd: &Path) -> V
 }
 
 fn compile_hook(agent: AgentKind, event: &str, scope: Scope, cwd: &Path) -> Result<Value> {
+    let hook_deadline = Instant::now() + HOOK_WALL_BUDGET;
     let input = read_input()?;
-    let payload: Value = serde_json::from_slice(&input)
-        .map_err(|_| AppError::new("invalid_hook_input", "hook input must be JSON"))?;
-    match normalize_event(event)? {
-        HookEvent::Prompt if matches!(agent, AgentKind::Claude) => {
-            let prompt = payload
-                .get("prompt")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let context = codegraph::prompt_hook(cwd, prompt)?;
-            if context.trim().is_empty() {
+    let input_was_empty = input.is_empty();
+    let environment_prompt = input_was_empty
+        .then(|| targets::prompt_environment(agent, event))
+        .flatten();
+    let payload: Value = if environment_prompt.is_some() {
+        json!({})
+    } else {
+        serde_json::from_slice(&input)
+            .map_err(|_| AppError::new("invalid_hook_input", "hook input must be JSON"))?
+    };
+    let Some(capability) = targets::hook_capability(agent, event) else {
+        return Ok(json!({}));
+    };
+    let event = signals::parse_event(capability.event, capability.semantic_event, &payload)?;
+    if event.kind == signals::EventKind::Stop
+        && payload
+            .get("stop_hook_active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Ok(json!({}));
+    }
+    let has_effect = |effect| capability.effects.contains(&effect);
+    match event.kind {
+        kind @ (signals::EventKind::Prompt | signals::EventKind::TurnStart)
+            if has_effect("context") =>
+        {
+            let prompt = targets::exact_current_prompt(agent, &event.native, &payload)
+                .map(|input| input.text.to_owned())
+                .or_else(|| {
+                    environment_prompt
+                        .and_then(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+                });
+            let Some(prompt) = prompt else {
+                return Ok(json!({}));
+            };
+            let prompt = prompt.chars().take(4_096).collect::<String>();
+            if prompt.is_empty() {
+                return Ok(json!({}));
+            }
+
+            let mut contexts = Vec::new();
+            if matches!(agent, AgentKind::Claude) && kind == signals::EventKind::Prompt {
+                let budget = hook_deadline
+                    .saturating_duration_since(Instant::now())
+                    .saturating_sub(HOOK_RENDER_RESERVE);
+                if !budget.is_zero()
+                    && let Ok(context) = codegraph::prompt_hook_with_budget(cwd, &prompt, budget)
+                    && !context.trim().is_empty()
+                {
+                    contexts.push(context);
+                }
+            }
+            let evidence = prompt_project_evidence(cwd);
+            let intents = intent::classify(&prompt, evidence);
+            if intents != intent::IntentSet::default() && Instant::now() < hook_deadline {
+                let readiness = prompt_readiness(cwd, &intents, hook_deadline);
+                if Instant::now() < hook_deadline
+                    && let Ok(Some(rendered)) =
+                        signals::prompt(kind, cwd, &readiness, &intents, hook_deadline)
+                {
+                    contexts.push(rendered.line);
+                }
+            }
+            if contexts.is_empty() {
                 Ok(json!({}))
             } else {
-                Ok(envelope(agent, "UserPromptSubmit", context))
+                Ok(envelope(agent, &event.native, contexts.join("\n")))
             }
         }
-        HookEvent::Prompt | HookEvent::Boundary => {
-            let readiness = readiness(cwd)?;
-            let context = match strong_context(scope, cwd, &readiness) {
+        kind @ (signals::EventKind::SessionStart
+        | signals::EventKind::SessionResume
+        | signals::EventKind::SessionClear
+        | signals::EventKind::CompactAfter
+        | signals::EventKind::SubagentStart)
+            if has_effect("context") =>
+        {
+            let readiness = readiness_for_hook(cwd, hook_deadline)?;
+            let rendered = signals::lifecycle(kind, cwd, &readiness, hook_deadline)?;
+            let signal = rendered.as_ref().map(|rendered| rendered.line.as_str());
+            let context = match strong_context(scope, cwd, &readiness, signal, hook_deadline) {
                 Ok(context) => context,
-                Err(error) if error.code == "store_not_found" => {
-                    render_context(&readiness, &[], &[], false, 0)?
+                Err(error) if matches!(error.code, "store_not_found" | "agent_hook_timeout") => {
+                    render_context(&readiness, signal, &[], &[], false, 0)?
                 }
                 Err(error) => return Err(error),
             };
-            Ok(envelope(agent, "SessionStart", context))
+            Ok(envelope(agent, &event.native, context))
         }
+        kind @ (signals::EventKind::ToolAfter | signals::EventKind::ToolFailure)
+            if has_effect("context") =>
+        {
+            let host = tool_host(agent);
+            let Some(invocation) = tool_protocol::recognize_invocation(host, &payload, None) else {
+                return Ok(json!({}));
+            };
+            let rendered = if kind == signals::EventKind::ToolFailure {
+                signals::tool_failure(kind, &invocation)?
+            } else {
+                let Some(receipt) = tool_protocol::parse_receipt(host, &payload, &invocation)
+                else {
+                    return Ok(json!({}));
+                };
+                signals::tool_receipt(kind, &invocation, &receipt)?
+            };
+            match rendered {
+                Some(rendered) => Ok(envelope(agent, &event.native, rendered.line)),
+                None => Ok(json!({})),
+            }
+        }
+        signals::EventKind::ToolBefore if capability.tool_consent_mode != "none" => {
+            let Some(invocation) =
+                tool_protocol::recognize_invocation(tool_host(agent), &payload, None)
+            else {
+                return Ok(json!({}));
+            };
+            let Some(advice) = invocation.consent_advice else {
+                return Ok(json!({}));
+            };
+            Ok(targets::tool_consent_output(agent, &event.native, advice)
+                .unwrap_or_else(|| json!({})))
+        }
+        signals::EventKind::Stop
+            if has_effect("guard")
+                && has_effect("continue")
+                && capability.loop_guard == "stop_hook_active" =>
+        {
+            match signals::stop_plan(cwd, hook_deadline)? {
+                Some(rendered) if rendered.continues => {
+                    Ok(stop_envelope(agent, &event.native, rendered.line))
+                }
+                Some(_) | None => Ok(json!({})),
+            }
+        }
+        signals::EventKind::Prompt
+        | signals::EventKind::TurnStart
+        | signals::EventKind::ToolBefore
+        | signals::EventKind::ToolAfter
+        | signals::EventKind::ToolFailure
+        | signals::EventKind::SubagentStop
+        | signals::EventKind::SessionEnd
+        | signals::EventKind::Stop
+        | signals::EventKind::SessionStart
+        | signals::EventKind::SessionResume
+        | signals::EventKind::SessionClear
+        | signals::EventKind::CompactBefore
+        | signals::EventKind::CompactAfter
+        | signals::EventKind::SubagentStart => Ok(json!({})),
     }
 }
 
+fn prompt_project_evidence(cwd: &Path) -> intent::ProjectEvidence {
+    fn real_entry(path: &Path) -> bool {
+        fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| !metadata.file_type().is_symlink())
+    }
+
+    let has_code = [
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "src",
+    ]
+    .into_iter()
+    .any(|marker| real_entry(&cwd.join(marker)));
+    let wiki_initialized = init_store_path(Scope::Project, cwd)
+        .ok()
+        .is_some_and(|store| real_entry(&store.path));
+    let has_documents = wiki_initialized
+        || ["README.md", "README", "docs", "doc", "wiki"]
+            .into_iter()
+            .any(|marker| real_entry(&cwd.join(marker)));
+    intent::ProjectEvidence {
+        has_code,
+        has_documents,
+    }
+}
+
+fn prompt_readiness(cwd: &Path, intents: &intent::IntentSet, deadline: Instant) -> Value {
+    let store = init_store_path(Scope::Project, cwd).ok();
+    let wiki_initialized = store.as_ref().is_some_and(|store| store.path.is_file());
+    let mut value = json!({
+        "wiki": {
+            "initialized": wiki_initialized,
+            "initialize": "lwc --scope project init",
+        }
+    });
+
+    if Instant::now() >= deadline {
+        return value;
+    }
+    if intents.document_graph {
+        value["document_graph"] = match store
+            .as_ref()
+            .ok_or_else(|| AppError::new("store_path_unavailable", "store path is unavailable"))
+            .and_then(|store| config::resolve_graph("project", &store.path))
+        {
+            Ok(graph) => {
+                let enabled = graph.setting != GraphSetting::Disabled;
+                let projection = if !enabled {
+                    json!({"status": "disabled", "documents": 0})
+                } else if !wiki_initialized {
+                    json!({"status": "missing-wiki", "documents": 0})
+                } else {
+                    crate::external_graph::hook_status(
+                        "project",
+                        &store.as_ref().unwrap().path,
+                        deadline,
+                    )
+                    .unwrap_or_else(|error| json!({"status": "error", "error_code": error.code}))
+                };
+                json!({
+                    "setting": graph.setting,
+                    "origin": graph.origin,
+                    "enabled": enabled,
+                    "ready": projection["status"] == "ready",
+                    "projection": projection,
+                    "requires_consent": !enabled,
+                })
+            }
+            Err(error) => json!({
+                "ready": false,
+                "requires_consent": false,
+                "error_code": error.code,
+            }),
+        };
+    }
+
+    if Instant::now() >= deadline {
+        return value;
+    }
+    if intents.code_graph {
+        value["code_graph"] = match store
+            .as_ref()
+            .ok_or_else(|| AppError::new("store_path_unavailable", "store path is unavailable"))
+            .and_then(codegraph::status)
+        {
+            Ok(status) => {
+                let runtime_installed = status["installed"].as_bool().unwrap_or(false);
+                let initialized = status["initialized"].as_bool().unwrap_or(false);
+                json!({
+                    "runtime_installed": runtime_installed,
+                    "runtime_health": status["runtime_health"],
+                    "initialized": initialized,
+                    "ready": runtime_installed && initialized,
+                    "requires_consent": !initialized,
+                })
+            }
+            Err(error) => json!({
+                "ready": false,
+                "requires_consent": false,
+                "error_code": error.code,
+            }),
+        };
+    }
+
+    if Instant::now() >= deadline {
+        return value;
+    }
+    if intents.trans {
+        value["md_trans"] = match store
+            .as_ref()
+            .ok_or_else(|| AppError::new("store_path_unavailable", "store path is unavailable"))
+            .and_then(|store| config::resolve_trans("project", &store.path))
+        {
+            Ok(trans) => {
+                let engine = match trans.setting {
+                    TransSetting::Anydoc => Some("anydoc"),
+                    TransSetting::Markitdown => Some("markitdown"),
+                    TransSetting::Disabled | TransSetting::Inherit => None,
+                };
+                json!({
+                    "setting": trans.setting,
+                    "origin": trans.origin,
+                    "enabled": engine.is_some(),
+                    "executable_available": engine.is_some_and(install::command_exists),
+                })
+            }
+            Err(error) => json!({"ready": false, "error_code": error.code}),
+        };
+    }
+
+    if Instant::now() >= deadline {
+        return value;
+    }
+    if intents.memory {
+        value["memory"] = match store
+            .as_ref()
+            .ok_or_else(|| AppError::new("store_path_unavailable", "store path is unavailable"))
+            .and_then(|store| config::resolve_memory("project", &store.path))
+        {
+            Ok(memory) => {
+                let enabled = memory.setting == MemorySetting::Enabled;
+                json!({
+                    "setting": memory.setting,
+                    "origin": memory.origin,
+                    "enabled": enabled,
+                    "ready": enabled && wiki_initialized,
+                })
+            }
+            Err(error) => json!({"ready": false, "error_code": error.code}),
+        };
+    }
+
+    if Instant::now() >= deadline {
+        return value;
+    }
+    if intents.office && !intents.trans {
+        value["office"] = match (config::resolve_office(), crate::office::status()) {
+            (Ok(office), Ok(status)) => {
+                let enabled = office.setting == OfficeSetting::Officecli;
+                json!({
+                    "setting": office.setting,
+                    "origin": office.origin,
+                    "enabled": enabled,
+                    "runtime_installed": status["installed"],
+                    "ready": enabled && status["installed"].as_bool().unwrap_or(false),
+                    "requires_consent": !enabled,
+                })
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                json!({"ready": false, "error_code": error.code})
+            }
+        };
+    }
+
+    for (requested, plugin) in [
+        (intents.tutor, crate::learning_runtime::Plugin::Tutor),
+        (intents.book, crate::learning_runtime::Plugin::Book),
+        (intents.practice, crate::learning_runtime::Plugin::Practice),
+    ] {
+        if requested {
+            if Instant::now() >= deadline {
+                return value;
+            }
+            value[plugin.id()] = learning_readiness(plugin)
+                .unwrap_or_else(|error| json!({"ready": false, "error_code": error.code}));
+        }
+    }
+
+    let todo_enabled = if intents.todo {
+        if Instant::now() >= deadline {
+            return value;
+        }
+        match store
+            .as_ref()
+            .ok_or_else(|| AppError::new("store_path_unavailable", "store path is unavailable"))
+            .and_then(|store| config::resolve_todo("project", &store.path))
+        {
+            Ok(config) => config.setting == config::CapabilitySetting::Enabled,
+            Err(error) => {
+                value["todo"] = json!({"ready": false, "error_code": error.code});
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let plan_enabled = if intents.plan {
+        if Instant::now() >= deadline {
+            return value;
+        }
+        match store
+            .as_ref()
+            .ok_or_else(|| AppError::new("store_path_unavailable", "store path is unavailable"))
+            .and_then(|store| config::resolve_plan("project", &store.path))
+        {
+            Ok(config) => config.setting == config::CapabilitySetting::Enabled,
+            Err(error) => {
+                value["plan"] = json!({"ready": false, "error_code": error.code});
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let hook_store = if wiki_initialized && (todo_enabled || plan_enabled) {
+        store
+            .as_ref()
+            .map(|store| open_store_for_hook_until("project", &store.path, deadline))
+    } else {
+        None
+    };
+    if todo_enabled {
+        value["todo"] = match &hook_store {
+            Some(Ok(store)) => match (store.open_todo_count(), store.due_todo_reminders(3)) {
+                (Ok(open), Ok((reminders, omitted))) => {
+                    let mut state = json!({"ready": true, "open": open});
+                    if !reminders.is_empty() {
+                        state["reminders"] = json!(reminders);
+                        state["omitted_reminders"] = json!(omitted);
+                    }
+                    state
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    json!({"ready": false, "error_code": error.code})
+                }
+            },
+            Some(Err(error)) => json!({"ready": false, "error_code": error.code}),
+            None => json!({"ready": false}),
+        };
+    }
+    if plan_enabled {
+        value["plan"] = match &hook_store {
+            Some(Ok(store)) => plan_hook_readiness(store, false)
+                .unwrap_or_else(|error| json!({"ready": false, "error_code": error.code})),
+            Some(Err(error)) => json!({"ready": false, "error_code": error.code}),
+            None => json!({"ready": false}),
+        };
+    }
+    if intents.sync
+        && let Some(sync) = store
+            .as_ref()
+            .and_then(|store| sync_readiness(&store.path, Some(deadline)))
+    {
+        value["sync"] = sync;
+    }
+    value
+}
+
 pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
+    readiness_until(cwd, None)
+}
+
+fn readiness_for_hook(cwd: &Path, deadline: Instant) -> Result<Value> {
+    readiness_until(cwd, Some(deadline))
+}
+
+fn readiness_until(cwd: &Path, deadline: Option<Instant>) -> Result<Value> {
+    ensure_hook_deadline(deadline)?;
     let store = init_store_path(Scope::Project, cwd)?;
     let wiki_initialized = store.path.is_file();
     let graph = config::resolve_graph("project", &store.path)?;
+    ensure_hook_deadline(deadline)?;
     let document_graph_enabled = graph.setting != GraphSetting::Disabled;
     let document_graph_projection = if !document_graph_enabled {
         json!({"status": "disabled", "documents": 0})
     } else if !wiki_initialized {
         json!({"status": "missing-wiki", "documents": 0})
     } else {
-        crate::external_graph::status("project", &store.path)
-            .unwrap_or_else(|error| json!({"status": "error", "error_code": error.code}))
+        match deadline {
+            Some(deadline) => crate::external_graph::hook_status("project", &store.path, deadline),
+            None => crate::external_graph::status("project", &store.path),
+        }
+        .unwrap_or_else(|error| json!({"status": "error", "error_code": error.code}))
     };
     let document_graph_ready = document_graph_projection["status"] == "ready";
     let code_graph = codegraph::status(&store)?;
+    ensure_hook_deadline(deadline)?;
     let code_graph_runtime_installed = code_graph["installed"].as_bool().unwrap_or(false);
     let code_graph_initialized = code_graph["initialized"].as_bool().unwrap_or(false);
     let code_graph_ready = code_graph_runtime_installed && code_graph_initialized;
     let trans = config::resolve_trans("project", &store.path)?;
+    ensure_hook_deadline(deadline)?;
     let trans_engine = match trans.setting {
         TransSetting::Anydoc => Some("anydoc"),
         TransSetting::Markitdown => Some("markitdown"),
@@ -136,22 +550,33 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
         .filter(|engine| install::command_exists(engine))
         .collect::<Vec<_>>();
     let memory = config::resolve_memory("project", &store.path)?;
+    ensure_hook_deadline(deadline)?;
     let memory_enabled = memory.setting == MemorySetting::Enabled;
     let document_graph_needs_consent = !document_graph_enabled;
     let code_graph_needs_consent = !code_graph_initialized;
     let office = config::resolve_office()?;
     let office_status = crate::office::status()?;
+    ensure_hook_deadline(deadline)?;
     let office_enabled = office.setting == OfficeSetting::Officecli;
     let office_runtime_installed = office_status["installed"].as_bool().unwrap_or(false);
     let tutor = learning_readiness(crate::learning_runtime::Plugin::Tutor)?;
+    ensure_hook_deadline(deadline)?;
     let book = learning_readiness(crate::learning_runtime::Plugin::Book)?;
+    ensure_hook_deadline(deadline)?;
     let practice = learning_readiness(crate::learning_runtime::Plugin::Practice)?;
+    ensure_hook_deadline(deadline)?;
     let todo_enabled =
         config::resolve_todo("project", &store.path)?.setting == config::CapabilitySetting::Enabled;
     let plan_enabled =
         config::resolve_plan("project", &store.path)?.setting == config::CapabilitySetting::Enabled;
     let hook_store = if wiki_initialized && (todo_enabled || plan_enabled) {
-        Some(Store::open_for_hook("project", &store.path))
+        Some(match deadline {
+            Some(deadline) => open_store_for_hook_until("project", &store.path, deadline),
+            None => Store::open_for_hook("project", &store.path).and_then(|store| {
+                store.begin_hook_snapshot()?;
+                Ok(store)
+            }),
+        })
     } else {
         None
     };
@@ -226,7 +651,7 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
             "install": "lwc agent install",
         },
     });
-    if let Some(sync) = sync_readiness(&store.path) {
+    if let Some(sync) = sync_readiness(&store.path, deadline) {
         value["sync"] = sync;
     }
     if todo_enabled {
@@ -254,22 +679,8 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
     }
     if plan_enabled {
         value["plan"] = match &hook_store {
-            Some(Ok(store)) => match (store.active_plan_count(), store.plan_tracking()) {
-                (Ok(active), Ok(tracking)) => {
-                    let mut state = json!({
-                        "ready": true,
-                        "active": active,
-                        "current": "lwc plan current --limit 20",
-                    });
-                    if let Some(tracking) = tracking {
-                        state["tracking"] = tracking;
-                    }
-                    state
-                }
-                (Err(error), _) | (_, Err(error)) => {
-                    json!({"ready":false,"error_code":error.code})
-                }
-            },
+            Some(Ok(store)) => plan_hook_readiness(store, true)
+                .unwrap_or_else(|error| json!({"ready":false,"error_code":error.code})),
             Some(Err(error)) => json!({"ready":false,"error_code":error.code}),
             None => json!({"ready":false}),
         };
@@ -282,6 +693,52 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
         value["authorization"] = authorization;
     }
     Ok(value)
+}
+
+fn ensure_hook_deadline(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(AppError::new(
+            "agent_hook_timeout",
+            "Agent Hook exceeded its internal wall budget",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn open_store_for_hook_until(scope: &str, path: &Path, deadline: Instant) -> Result<Store> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(AppError::new(
+            "agent_hook_timeout",
+            "Agent Hook exceeded its internal wall budget",
+        ));
+    }
+    let store = Store::open_for_hook_with_timeout(scope, path, remaining)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(AppError::new(
+            "agent_hook_timeout",
+            "Agent Hook exceeded its internal wall budget",
+        ));
+    }
+    store.begin_hook_snapshot_with_timeout(remaining)?;
+    ensure_hook_deadline(Some(deadline))?;
+    Ok(store)
+}
+
+fn plan_hook_readiness(store: &Store, include_current: bool) -> Result<Value> {
+    let active = store.active_plan_count()?;
+    let mut state = json!({"ready": true, "active": active});
+    if include_current {
+        state["current"] = json!("lwc plan current --limit 20");
+    }
+    if active == 1
+        && let Some(tracking) = store.plan_tracking()?
+    {
+        state["tracking"] = tracking;
+    }
+    Ok(state)
 }
 
 fn learning_readiness(plugin: crate::learning_runtime::Plugin) -> Result<Value> {
@@ -305,12 +762,36 @@ fn learning_readiness(plugin: crate::learning_runtime::Plugin) -> Result<Value> 
     }))
 }
 
-fn sync_readiness(store_path: &Path) -> Option<Value> {
+fn sync_readiness(store_path: &Path, deadline: Option<Instant>) -> Option<Value> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return None;
+    }
     let root = store_path.parent()?.join("sync");
+    let metadata = fs::symlink_metadata(&root).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return None;
+    }
     let entries = fs::read_dir(root).ok()?;
+    let mut bounded_entries = Vec::with_capacity(MAX_SYNC_RAW_ENTRIES);
+    let mut raw_entries = 0_usize;
+    for entry in entries {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return None;
+        }
+        raw_entries = raw_entries.saturating_add(1);
+        if raw_entries > MAX_SYNC_RAW_ENTRIES {
+            return None;
+        }
+        if let Ok(entry) = entry {
+            bounded_entries.push(entry);
+        }
+    }
     let mut pending = 0_u64;
     let mut latest: Option<(u64, String, Value)> = None;
-    for entry in entries.flatten() {
+    for entry in bounded_entries {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return None;
+        }
         let file_name = entry.file_name();
         let Some(session_id) = file_name.to_str().map(str::to_owned) else {
             continue;
@@ -510,43 +991,20 @@ fn read_input() -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn normalize_event(event: &str) -> Result<HookEvent> {
-    let event = event
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    match event.as_str() {
-        "sessionstart"
-        | "startup"
-        | "resume"
-        | "clear"
-        | "compact"
-        | "sessioncompact"
-        | "precompact"
-        | "sessionbeforecompact"
-        | "prellmcall"
-        | "preinvocation"
-        | "agentspawn" => Ok(HookEvent::Boundary),
-        "userpromptsubmit" | "userpromptsubmitted" => Ok(HookEvent::Prompt),
-        _ => Err(AppError::new(
-            "unsupported_hook_event",
-            "unsupported Agent hook event",
-        )),
-    }
-}
-
 fn envelope(agent: AgentKind, event: &str, context: String) -> Value {
     match agent {
         AgentKind::Cursor => json!({"additional_context": context}),
         AgentKind::Hermes => json!({"context": context}),
         AgentKind::Antigravity => json!({"injectSteps": [{"ephemeralMessage": context}]}),
         AgentKind::Kiro => Value::String(context),
-        AgentKind::CopilotCli | AgentKind::Pi | AgentKind::Generic => {
+        AgentKind::CopilotCli | AgentKind::OpenCode | AgentKind::Pi | AgentKind::Generic => {
             json!({"additionalContext": context})
         }
         AgentKind::Gemini => json!({
-            "hookSpecificOutput": {"additionalContext": context}
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "additionalContext": context,
+            }
         }),
         AgentKind::Codex | AgentKind::Claude | AgentKind::CopilotVscode => json!({
             "hookSpecificOutput": {
@@ -557,19 +1015,63 @@ fn envelope(agent: AgentKind, event: &str, context: String) -> Value {
     }
 }
 
-fn strong_context(scope: Scope, cwd: &Path, readiness: &Value) -> Result<String> {
+fn tool_host(agent: AgentKind) -> tool_protocol::ToolHost {
+    match agent {
+        AgentKind::Claude => tool_protocol::ToolHost::Claude,
+        AgentKind::Codex => tool_protocol::ToolHost::Codex,
+        AgentKind::Cursor => tool_protocol::ToolHost::Cursor,
+        AgentKind::OpenCode => tool_protocol::ToolHost::OpenCode,
+        AgentKind::Hermes => tool_protocol::ToolHost::Hermes,
+        AgentKind::Gemini => tool_protocol::ToolHost::Gemini,
+        AgentKind::Antigravity => tool_protocol::ToolHost::Antigravity,
+        AgentKind::Kiro => tool_protocol::ToolHost::Kiro,
+        AgentKind::Pi => tool_protocol::ToolHost::Pi,
+        AgentKind::CopilotCli => tool_protocol::ToolHost::CopilotCli,
+        AgentKind::CopilotVscode => tool_protocol::ToolHost::CopilotVscode,
+        AgentKind::Generic => tool_protocol::ToolHost::Generic,
+    }
+}
+
+fn stop_envelope(agent: AgentKind, event: &str, context: String) -> Value {
+    match agent {
+        AgentKind::Claude | AgentKind::Codex => json!({
+            "decision": "block",
+            "reason": context,
+        }),
+        _ => envelope(agent, event, context),
+    }
+}
+
+fn strong_context(
+    scope: Scope,
+    cwd: &Path,
+    readiness: &Value,
+    signal: Option<&str>,
+    deadline: Instant,
+) -> Result<String> {
+    ensure_hook_deadline(Some(deadline))?;
     let paths = resolve_read_store_paths(scope, cwd, true)?;
-    let stores = paths
-        .into_iter()
-        .map(|path| Store::open_for_hook(scope_name(path.scope), &path.path))
-        .collect::<Result<Vec<_>>>()?;
-    for store in &stores {
-        store.begin_hook_snapshot()?;
+    let mut stores = Vec::with_capacity(paths.len());
+    let mut first_error = None;
+    for path in paths {
+        match open_store_for_hook_until(scope_name(path.scope), &path.path, deadline) {
+            Ok(store) => stores.push(store),
+            Err(error) if scope == Scope::All => {
+                first_error.get_or_insert(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if stores.is_empty()
+        && let Some(error) = first_error
+    {
+        return Err(error);
     }
 
     let mut policies = Vec::new();
     let mut policies_have_more = false;
     for (index, store) in stores.iter().enumerate() {
+        ensure_hook_deadline(Some(deadline))?;
         let (store_policies, has_more) = store.tag_autoload_policies()?;
         policies_have_more |= has_more;
         policies.extend(store_policies.into_iter().map(|policy| (index, policy)));
@@ -588,6 +1090,7 @@ fn strong_context(scope: Scope, cwd: &Path, readiness: &Value) -> Result<String>
     let mut body_chars = 0_usize;
     let mut omitted_by_global_budget = 0_usize;
     for (store_index, policy) in policies {
+        ensure_hook_deadline(Some(deadline))?;
         let diagnostic_index = diagnostics.len();
         let mut identities =
             stores[store_index].tag_page_identities(&policy.name, policy.limit + 1)?;
@@ -604,6 +1107,7 @@ fn strong_context(scope: Scope, cwd: &Path, readiness: &Value) -> Result<String>
         };
         let mut policy_chars = 0_usize;
         for identity in identities {
+            ensure_hook_deadline(Some(deadline))?;
             let key = format!("{}\0{}", identity.scope, identity.page_slug);
             if let Some(index) = positions.get(&key).copied() {
                 let chars = pages[index].page.body.chars().count();
@@ -643,8 +1147,10 @@ fn strong_context(scope: Scope, cwd: &Path, readiness: &Value) -> Result<String>
     }
 
     loop {
+        ensure_hook_deadline(Some(deadline))?;
         let rendered = render_context(
             readiness,
+            signal,
             &pages,
             &diagnostics,
             policies_have_more,
@@ -680,6 +1186,7 @@ fn tag_label(
 
 fn render_context(
     readiness: &Value,
+    signal: Option<&str>,
     pages: &[StrongPage],
     diagnostics: &[PolicyDiagnostic],
     policies_have_more: bool,
@@ -691,6 +1198,10 @@ fn render_context(
     context.push_str("LWC_READINESS ");
     context.push_str(&serde_json::to_string(readiness).map_err(hook_json_error)?);
     context.push('\n');
+    if let Some(signal) = signal {
+        context.push_str(signal);
+        context.push('\n');
+    }
     for page in pages {
         context.push_str("LWC_PAGE ");
         context.push_str(&serde_json::to_string(page).map_err(hook_json_error)?);
@@ -733,22 +1244,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_native_boundary_names() {
-        for event in [
-            "SessionStart",
-            "session_start",
-            "session-before-compact",
-            "PreCompact",
-        ] {
-            assert!(matches!(
-                normalize_event(event).unwrap(),
-                HookEvent::Boundary
-            ));
-        }
-        assert!(matches!(
-            normalize_event("UserPromptSubmit").unwrap(),
-            HookEvent::Prompt
-        ));
+    fn normalizes_native_event_names() {
+        assert_eq!(
+            signals::parse_event("session_start", "session_start", &json!({}))
+                .unwrap()
+                .kind,
+            signals::EventKind::SessionStart
+        );
+        assert_eq!(
+            signals::parse_event("session-before-compact", "compact_before", &json!({}),)
+                .unwrap()
+                .kind,
+            signals::EventKind::CompactBefore
+        );
+        assert_eq!(
+            signals::parse_event("UserPromptSubmit", "prompt", &json!({}))
+                .unwrap()
+                .kind,
+            signals::EventKind::Prompt
+        );
     }
 
     #[test]

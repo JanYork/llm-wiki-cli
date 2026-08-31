@@ -105,6 +105,26 @@ impl WorkState {
     }
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct WorkHookSummary {
+    pub(crate) works: Vec<WorkHookSummaryItem>,
+    pub(crate) omitted: usize,
+    pub(crate) has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct WorkHookSummaryItem {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) state: String,
+    pub(crate) phase: String,
+    pub(crate) completed: u64,
+    pub(crate) total: Option<u64>,
+    pub(crate) sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error_code: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct TerminalSyncAudit {
     pub(crate) audit_key: String,

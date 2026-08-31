@@ -92,7 +92,9 @@ impl AgentTarget for KiroTarget {
 {{\"mcpServers\":{{\"lwc\":{{\"type\":\"stdio\",\"command\":\"lwc\",\"args\":[\"serve\",\"--mcp\"]}}}}}}\n\
 Skill: <kiro-root>/skills/using-lwc\n\
 Hook: <kiro-root>/hooks/lwc.json SessionStart\n\
-Instructions: <kiro-root>/steering/lwc.md\n"
+Hook events: {}\n\
+Instructions: <kiro-root>/steering/lwc.md\n",
+            install::hook_events_summary(self.id(), location)
         )
     }
     fn describe_paths(&self, environment: &TargetEnvironment<'_>) -> Vec<PathBuf> {

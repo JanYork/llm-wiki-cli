@@ -9,9 +9,9 @@ use sha2::{Digest, Sha256};
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -19,6 +19,9 @@ const VERSION: &str = "v1.5.0-lwc.1";
 const RELEASE_ROOT: &str = "https://github.com/JanYork/codegraph/releases/download";
 const RUNTIME_MANIFEST: &str = "runtime.json";
 const INSTALL_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const PROMPT_HOOK_TIMEOUT: Duration = Duration::from_secs(2);
+const PROMPT_HOOK_CLEANUP_RESERVE: Duration = Duration::from_millis(100);
+const PROMPT_HOOK_MAX_OUTPUT_BYTES: u64 = 20 * 1024;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -337,55 +340,88 @@ impl Paths {
     }
 }
 
+#[allow(dead_code)] // Compatibility entry point; Agent hooks pass the remaining wall budget.
 pub fn prompt_hook(project: &Path, prompt: &str) -> Result<String> {
-    const MAX_OUTPUT_BYTES: u64 = 20 * 1024;
-    const TIMEOUT: Duration = Duration::from_secs(2);
+    prompt_hook_with_budget(project, prompt, PROMPT_HOOK_TIMEOUT)
+}
 
+pub fn prompt_hook_with_budget(project: &Path, prompt: &str, budget: Duration) -> Result<String> {
+    let budget = budget.min(PROMPT_HOOK_TIMEOUT);
+    if budget.is_zero() {
+        return Err(prompt_hook_timeout(budget));
+    }
+    let deadline = Instant::now() + budget;
     let project = fs::canonicalize(project)?;
     let paths = Paths::from_project(project.clone())?;
-    let mut command = configured_command(&paths, &[OsString::from("prompt-hook")])?;
+    let command = configured_prompt_hook_command(&paths, &[OsString::from("prompt-hook")])?;
+    run_prompt_hook_until(command, &project, prompt, deadline, budget)
+}
+
+fn run_prompt_hook_until(
+    mut command: Command,
+    project: &Path,
+    prompt: &str,
+    deadline: Instant,
+    budget: Duration,
+) -> Result<String> {
+    if Instant::now() >= deadline {
+        return Err(prompt_hook_timeout(budget));
+    }
+    let payload =
+        serde_json::to_vec(&json!({"prompt": prompt, "cwd": project})).map_err(|error| {
+            AppError::new(
+                "codegraph_prompt_hook_failed",
+                format!("failed to encode CodeGraph prompt input: {error}"),
+            )
+        })?;
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command.spawn()?;
     let stdout = child.stdout.take().expect("piped CodeGraph stdout");
-    let reader = std::thread::spawn(move || {
+    let (reader_sender, reader_receiver) = std::sync::mpsc::sync_channel(1);
+    let _reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        stdout
-            .take(MAX_OUTPUT_BYTES + 1)
+        let result = stdout
+            .take(PROMPT_HOOK_MAX_OUTPUT_BYTES + 1)
             .read_to_end(&mut bytes)
-            .map(|_| bytes)
+            .map(|_| bytes);
+        let _ = reader_sender.send(result);
     });
-    if let Some(mut stdin) = child.stdin.take() {
-        serde_json::to_writer(&mut stdin, &json!({"prompt": prompt, "cwd": project})).map_err(
-            |error| {
-                AppError::new(
-                    "codegraph_prompt_hook_failed",
-                    format!("failed to write CodeGraph prompt input: {error}"),
-                )
-            },
-        )?;
-    }
-    let deadline = Instant::now() + TIMEOUT;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AppError::new(
-                "codegraph_prompt_hook_timeout",
-                "CodeGraph prompt hook exceeded 2 seconds",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let bytes = reader
-        .join()
-        .map_err(|_| AppError::new("codegraph_prompt_hook_failed", "output reader failed"))??;
-    if !status.success() || bytes.len() > MAX_OUTPUT_BYTES as usize {
+    let (writer_sender, writer_receiver) = std::sync::mpsc::sync_channel(1);
+    let _writer = child.stdin.take().map(|mut stdin| {
+        std::thread::spawn(move || {
+            let result = stdin.write_all(&payload);
+            let _ = writer_sender.send(result);
+        })
+    });
+    let status = wait_for_prompt_hook_exit(&mut child, deadline, budget)?;
+
+    let writer_result =
+        receive_prompt_hook_result(&writer_receiver, deadline).ok_or_else(|| {
+            terminate_prompt_hook(&mut child, deadline);
+            prompt_hook_timeout(budget)
+        })?;
+    writer_result.map_err(|error| {
+        AppError::new(
+            "codegraph_prompt_hook_failed",
+            format!("failed to write CodeGraph prompt input: {error}"),
+        )
+    })?;
+    let reader_result =
+        receive_prompt_hook_result(&reader_receiver, deadline).ok_or_else(|| {
+            terminate_prompt_hook(&mut child, deadline);
+            prompt_hook_timeout(budget)
+        })?;
+    let bytes = reader_result
+        .map_err(|_| AppError::new("codegraph_prompt_hook_failed", "output reader failed"))?;
+    if !status.success() || bytes.len() > PROMPT_HOOK_MAX_OUTPUT_BYTES as usize {
         return Err(AppError::new(
             "codegraph_prompt_hook_failed",
             "CodeGraph prompt hook failed or exceeded its output budget",
@@ -397,6 +433,129 @@ pub fn prompt_hook(project: &Path, prompt: &str) -> Result<String> {
             "CodeGraph prompt hook returned invalid UTF-8",
         )
     })
+}
+
+fn wait_for_prompt_hook_exit(
+    child: &mut Child,
+    deadline: Instant,
+    budget: Duration,
+) -> Result<std::process::ExitStatus> {
+    let cleanup_reserve = deadline
+        .saturating_duration_since(Instant::now())
+        .min(PROMPT_HOOK_CLEANUP_RESERVE);
+    let work_deadline = deadline.checked_sub(cleanup_reserve).unwrap_or(deadline);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                terminate_prompt_hook(child, deadline);
+                return Err(error.into());
+            }
+        }
+        let remaining = work_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            terminate_prompt_hook(child, deadline);
+            return Err(prompt_hook_timeout(budget));
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+fn receive_prompt_hook_result<T>(
+    receiver: &std::sync::mpsc::Receiver<T>,
+    deadline: Instant,
+) -> Option<T> {
+    receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+}
+
+fn prompt_hook_timeout(budget: Duration) -> AppError {
+    AppError::new(
+        "codegraph_prompt_hook_timeout",
+        format!(
+            "CodeGraph prompt hook exceeded its {} millisecond time budget",
+            budget.as_millis()
+        ),
+    )
+}
+
+fn terminate_prompt_hook(child: &mut Child, deadline: Instant) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    let _ = terminate_prompt_hook_process_group(child, deadline);
+    let _ = wait_for_child_until(child, deadline);
+}
+
+fn wait_for_child_until(
+    child: &mut Child,
+    deadline: Instant,
+) -> io::Result<Option<std::process::ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
+}
+
+#[cfg(unix)]
+fn terminate_prompt_hook_process_group(child: &mut Child, _deadline: Instant) -> io::Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    if unsafe { kill(-(child.id() as i32), 9) } == 0 {
+        return Ok(());
+    }
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(_error) if child.try_wait()?.is_some() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn terminate_prompt_hook_process_group(child: &mut Child, deadline: Instant) -> io::Result<()> {
+    let started = Instant::now();
+    let remaining = deadline.saturating_duration_since(started);
+    let taskkill_deadline = started + remaining / 3;
+    let taskkill_reap_deadline = started + remaining.saturating_mul(2) / 3;
+    let mut taskkill = Command::new("taskkill.exe")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(taskkill) = taskkill.as_mut() {
+        match wait_for_child_until(taskkill, taskkill_deadline) {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = taskkill.kill();
+                let _ = wait_for_child_until(taskkill, taskkill_reap_deadline);
+            }
+        }
+    }
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(_error) if child.try_wait()?.is_some() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn terminate_prompt_hook_process_group(child: &mut Child, _deadline: Instant) -> io::Result<()> {
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(_error) if child.try_wait()?.is_some() => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn execute(paths: &Paths, args: &[OsString], stream: bool) -> Result<Value> {
@@ -441,7 +600,38 @@ fn configured_command(paths: &Paths, args: &[OsString]) -> Result<Command> {
         .ok_or_else(|| AppError::new("codegraph_runtime_missing", "run `lwc cg init` first"))?;
     let home = paths.runtime.join("home");
     fs::create_dir_all(&home)?;
-    let mut command = Command::new(&executable);
+    Ok(build_configured_command(paths, args, &executable, &home))
+}
+
+fn configured_prompt_hook_command(paths: &Paths, args: &[OsString]) -> Result<Command> {
+    require_prompt_hook_directory(&paths.runtime)?;
+    let home = paths.runtime.join("home");
+    require_prompt_hook_directory(&home)?;
+    let executable = binary(paths).ok_or_else(prompt_hook_unavailable)?;
+    Ok(build_configured_command(paths, args, &executable, &home))
+}
+
+fn require_prompt_hook_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) | Err(_) => Err(prompt_hook_unavailable()),
+    }
+}
+
+fn prompt_hook_unavailable() -> AppError {
+    AppError::new(
+        "codegraph_prompt_hook_unavailable",
+        "CodeGraph prompt Hook runtime is unavailable",
+    )
+}
+
+fn build_configured_command(
+    paths: &Paths,
+    args: &[OsString],
+    executable: &Path,
+    home: &Path,
+) -> Command {
+    let mut command = Command::new(executable);
     command
         .args(args)
         .current_dir(&paths.project)
@@ -449,9 +639,9 @@ fn configured_command(paths: &Paths, args: &[OsString]) -> Result<Command> {
         .env("CODEGRAPH_TELEMETRY", "0")
         .env("DO_NOT_TRACK", "1")
         .env("NO_COLOR", "1")
-        .env("HOME", &home)
-        .env("USERPROFILE", &home);
-    Ok(command)
+        .env("HOME", home)
+        .env("USERPROFILE", home);
+    command
 }
 
 pub(crate) fn mcp_command(project: &Path) -> Result<Command> {
@@ -877,5 +1067,224 @@ fn target_name() -> Result<&'static str> {
             "unsupported_codegraph_platform",
             format!("unsupported platform {os}-{arch}"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn runtime_fixture(temp: &tempfile::TempDir) -> Paths {
+        let target = target_name().unwrap();
+        let extension = if cfg!(windows) { "zip" } else { "tar.gz" };
+        let project = temp.path().join("project");
+        let runtime = temp.path().join("global-runtime");
+        let executable = runtime.join("bin").join("codegraph");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"fixture").unwrap();
+        let asset = format!("codegraph-{target}.{extension}");
+        fs::write(
+            runtime.join(RUNTIME_MANIFEST),
+            serde_json::to_vec(&RuntimeManifest {
+                version: VERSION.to_owned(),
+                target: target.to_owned(),
+                asset: asset.clone(),
+                archive_sha256: "0".repeat(64),
+                binary: PathBuf::from("bin/codegraph"),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        Paths {
+            legacy_runtime: project.join(".lwc/runtime/codegraph"),
+            index: project.join(".lwc/codegraph"),
+            project,
+            runtime,
+            target,
+            asset,
+        }
+    }
+
+    fn snapshot_tree(root: &Path) -> BTreeSet<PathBuf> {
+        fn visit(root: &Path, path: &Path, entries: &mut BTreeSet<PathBuf>) {
+            let Ok(metadata) = fs::symlink_metadata(path) else {
+                return;
+            };
+            entries.insert(path.strip_prefix(root).unwrap().to_path_buf());
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                for entry in fs::read_dir(path).unwrap() {
+                    visit(root, &entry.unwrap().path(), entries);
+                }
+            }
+        }
+
+        let mut entries = BTreeSet::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    #[test]
+    fn prompt_hook_exposes_a_bounded_budget_companion() {
+        let _api: fn(&Path, &str, Duration) -> Result<String> = prompt_hook_with_budget;
+    }
+
+    #[test]
+    fn prompt_hook_command_requires_existing_real_runtime_home_without_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = runtime_fixture(&temp);
+        let before = snapshot_tree(temp.path());
+
+        let error =
+            configured_prompt_hook_command(&paths, &[OsString::from("prompt-hook")]).unwrap_err();
+
+        assert_eq!(error.code, "codegraph_prompt_hook_unavailable");
+        assert!(!error.to_string().contains(temp.path().to_str().unwrap()));
+        assert_eq!(snapshot_tree(temp.path()), before);
+        assert!(!paths.runtime.join("home").exists());
+
+        fs::write(paths.runtime.join("home"), b"not a directory").unwrap();
+        let invalid_before = snapshot_tree(temp.path());
+        let error =
+            configured_prompt_hook_command(&paths, &[OsString::from("prompt-hook")]).unwrap_err();
+        assert_eq!(error.code, "codegraph_prompt_hook_unavailable");
+        assert!(!error.to_string().contains(temp.path().to_str().unwrap()));
+        assert_eq!(snapshot_tree(temp.path()), invalid_before);
+
+        fs::remove_file(paths.runtime.join("home")).unwrap();
+        configured_command(&paths, &[OsString::from("status")]).unwrap();
+        let metadata = fs::symlink_metadata(paths.runtime.join("home")).unwrap();
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+    }
+
+    #[test]
+    fn prompt_hook_command_does_not_create_a_missing_runtime_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = runtime_fixture(&temp);
+        paths.runtime = temp.path().join("missing/runtime/codegraph");
+        let before = snapshot_tree(temp.path());
+
+        let error =
+            configured_prompt_hook_command(&paths, &[OsString::from("prompt-hook")]).unwrap_err();
+
+        assert_eq!(error.code, "codegraph_prompt_hook_unavailable");
+        assert!(!error.to_string().contains(temp.path().to_str().unwrap()));
+        assert_eq!(snapshot_tree(temp.path()), before);
+        assert!(!paths.runtime.exists());
+    }
+
+    #[test]
+    fn prompt_hook_cleanup_wait_is_deadline_bounded_and_reaps() {
+        let temp = tempfile::tempdir().unwrap();
+        let ready = temp.path().join("ready");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "codegraph::tests::prompt_hook_cleanup_child_fixture",
+            ])
+            .env("LWC_PROMPT_HOOK_CLEANUP_FIXTURE", &ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().unwrap();
+        let ready_by = Instant::now() + Duration::from_secs(5);
+        while !ready.is_file() && Instant::now() < ready_by {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.is_file(), "cleanup child never became ready");
+
+        let started = Instant::now();
+        assert!(wait_for_child_until(&mut child, started).unwrap().is_none());
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        terminate_prompt_hook(&mut child, Instant::now() + Duration::from_millis(500));
+        assert!(
+            wait_for_child_until(&mut child, Instant::now() + Duration::from_millis(100))
+                .unwrap()
+                .is_some(),
+            "cleanup did not reap the child"
+        );
+    }
+
+    #[test]
+    fn prompt_hook_cleanup_child_fixture() {
+        let Some(ready) = std::env::var_os("LWC_PROMPT_HOOK_CLEANUP_FIXTURE") else {
+            return;
+        };
+        fs::write(ready, b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_hook_budget_times_out_fail_open_and_reaps_the_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let executable = temp.path().join("fake-codegraph");
+        let pid_file = temp.path().join("pids");
+        fs::create_dir(&project).unwrap();
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s ' \"$$\" > \"$PID_FILE\"\nsleep 30 &\ndescendant=$!\nprintf '%s\\n' \"$descendant\" >> \"$PID_FILE\"\nwait\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut command = Command::new(&executable);
+        command.current_dir(&project).env("PID_FILE", &pid_file);
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        let ready_by = Instant::now() + Duration::from_secs(5);
+        while !pid_file.is_file() && Instant::now() < ready_by {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            pid_file.is_file(),
+            "fake CodeGraph child never became ready"
+        );
+
+        let budget = Duration::from_millis(1_500);
+        let started = Instant::now();
+        let result = wait_for_prompt_hook_exit(&mut child, started + budget, budget);
+        let elapsed = started.elapsed();
+
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "codegraph_prompt_hook_timeout");
+        assert!(
+            elapsed < Duration::from_millis(1_900),
+            "1500ms budget took {elapsed:?}"
+        );
+        let pids = fs::read_to_string(&pid_file)
+            .unwrap()
+            .split_whitespace()
+            .map(|pid| pid.parse::<i32>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 2);
+        let reaped_by = Instant::now() + Duration::from_millis(500);
+        while pids.iter().any(|pid| process_exists(*pid)) && Instant::now() < reaped_by {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            pids.iter().all(|pid| !process_exists(*pid)),
+            "timed-out prompt hook leaked child processes: {pids:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        unsafe { kill(pid, 0) == 0 }
     }
 }

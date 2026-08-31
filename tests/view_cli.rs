@@ -68,6 +68,12 @@ fn view_serves_get_only_without_mutating_the_project() {
     let script = request(address, "GET", "/assets/app.js");
     assert!(script.starts_with("HTTP/1.1 200"));
     assert!(script.contains("content-type: application/javascript"));
+    assert!(script.contains("page-summary"));
+    assert!(script.contains("page-toc"));
+    let stylesheet = request(address, "GET", "/assets/index.css");
+    assert!(stylesheet.starts_with("HTTP/1.1 200"));
+    assert!(stylesheet.contains("content-type: text/css"));
+    assert!(stylesheet.contains(".page-metadata"));
     assert!(request(address, "GET", "/api/status").starts_with("HTTP/1.1 200"));
     assert!(request(address, "POST", "/api/status").starts_with("HTTP/1.1 405"));
     child.kill().unwrap();

@@ -12,6 +12,67 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lwc --scope all agent hook --agent codex --event UserPromptSubmit",
+            "timeout": 2,
+            "statusMessage": "Loading bounded LWC context..."
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lwc --scope all agent hook --agent codex --event PreToolUse",
+            "timeout": 2,
+            "statusMessage": "Loading bounded LWC context..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lwc --scope all agent hook --agent codex --event PostToolUse",
+            "timeout": 2,
+            "statusMessage": "Refreshing bounded LWC context..."
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lwc --scope all agent hook --agent codex --event SubagentStart",
+            "timeout": 2,
+            "statusMessage": "Loading bounded LWC context..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lwc --scope all agent hook --agent codex --event Stop",
+            "timeout": 2,
+            "statusMessage": "Checking the active LWC Plan..."
+          }
+        ]
+      }
     ]
   }
 }

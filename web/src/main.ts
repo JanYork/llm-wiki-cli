@@ -4,12 +4,22 @@ import { customElement, state } from 'lit/decorators.js'
 import SpriteText from 'three-spritetext'
 import { boundedGraph, graphDegrees, wordGraphPath, type GraphEdge, type GraphNode } from './graph'
 import { DEFAULT_LOCALE, graphCount, messages, pageCount, type Locale } from './i18n'
-import { renderMarkdown } from './markdown'
+import { projectMarkdown } from './markdown'
 import './styles.css'
 
 type Section = 'overview' | 'pages' | 'sources' | 'knowledge' | 'code' | 'words'
 interface ApiStatus { database: string; revision: string; operation_id: string; read_only: boolean }
-interface Page { slug: string; title?: string; updated_at?: string; body?: string }
+interface Page {
+  slug: string
+  title?: string
+  summary?: string
+  kind?: string
+  provenance?: string[]
+  source_ids?: number[]
+  created_at?: string
+  updated_at?: string
+  body?: string
+}
 interface Source { id: number; origin: string; title?: string; bytes?: number }
 interface GraphPayload { nodes: GraphNode[]; edges: GraphEdge[]; available?: boolean; message?: string; has_more?: boolean; truncated?: boolean }
 
@@ -230,12 +240,29 @@ class LwcView extends LitElement {
   }
   private heading() {
     const copy = messages[this.locale]
+    if (this.section === 'pages' && this.selectedPage)
+      return this.selectedPage.title ?? this.selectedPage.slug
     return ({ overview: copy.projectCondition, pages: copy.wikiPages, sources: copy.groundedSources, knowledge: copy.knowledgeGraph, code: copy.codeGraph, words: copy.wordGraph })[this.section]
   }
   private content() {
     const copy = messages[this.locale]
     if (this.section === 'overview') return html`<section class="split overview-grid"><article class="panel"><header class="panel-head"><h2>${copy.store}</h2></header><dl class="metrics"><div class="metric metric-wide"><dt>${copy.database}</dt><dd class="path-value">${this.status?.database ?? copy.loadingDatabase}</dd></div><div class="metric"><dt>${copy.operation}</dt><dd>${this.status?.operation_id ?? '—'}</dd></div><div class="metric"><dt>${copy.pages}</dt><dd>${this.pages.length}</dd></div><div class="metric"><dt>${copy.sources}</dt><dd>${this.sources.length}</dd></div></dl></article><article class="panel panel-dark"><header class="panel-head"><h2>${copy.boundaries}</h2></header><div class="document"><p>${copy.frozenBoundary}</p></div></article></section>`
-    if (this.section === 'pages') return html`<section class="split pages-grid"><article class="panel"><header class="panel-head"><h2>${pageCount(this.locale, this.pages.length)}</h2></header><ul class="list">${this.pages.map(page => html`<li><button class="list-button" aria-current=${this.selectedPage?.slug === page.slug ? 'page' : nothing} @click=${() => this.showPage(page.slug)}><strong>${page.title ?? page.slug}</strong><span class="muted">${page.slug}</span></button></li>`)}</ul></article><article class="panel document">${this.selectedPage ? html`<div .innerHTML=${renderMarkdown(this.selectedPage.body ?? '')}></div>` : html`<p class="muted">${copy.selectPage}</p>`}</article></section>`
+    if (this.section === 'pages') {
+      const page = this.selectedPage
+      const projection = page ? projectMarkdown(page.body ?? '', page.title ?? page.slug) : undefined
+      return html`<section class="split pages-grid"><article class="panel"><header class="panel-head"><h2>${pageCount(this.locale, this.pages.length)}</h2></header><ul class="list">${this.pages.map(page => html`<li><button class="list-button" aria-current=${this.selectedPage?.slug === page.slug ? 'page' : nothing} @click=${() => this.showPage(page.slug)}><strong>${page.title ?? page.slug}</strong><span class="muted">${page.slug}</span></button></li>`)}</ul></article><article class="panel document page-document">${page && projection ? html`
+        ${page.summary?.trim() ? html`<p class="page-summary">${page.summary}</p>` : nothing}
+        <dl class="page-metadata">
+          ${page.kind ? html`<div><dt>${copy.kind}</dt><dd>${page.kind}</dd></div>` : nothing}
+          ${page.created_at ? html`<div><dt>${copy.created}</dt><dd>${page.created_at}</dd></div>` : nothing}
+          ${page.updated_at ? html`<div><dt>${copy.updated}</dt><dd>${page.updated_at}</dd></div>` : nothing}
+          ${page.provenance?.length ? html`<div><dt>${copy.provenance}</dt><dd>${page.provenance.join(', ')}</dd></div>` : nothing}
+          ${page.source_ids?.length ? html`<div><dt>${copy.citedSources}</dt><dd>${page.source_ids.join(', ')}</dd></div>` : nothing}
+        </dl>
+        ${projection.toc.length ? html`<nav class="page-toc" aria-label=${copy.contents}><strong>${copy.contents}</strong><ol>${projection.toc.map(heading => html`<li class=${`toc-depth-${heading.depth}`}><a href=${`#${heading.id}`}>${heading.text}</a></li>`)}</ol></nav>` : nothing}
+        <div class="document-body" .innerHTML=${projection.html}></div>
+      ` : html`<p class="muted">${copy.selectPage}</p>`}</article></section>`
+    }
     if (this.section === 'sources') return html`<section class="panel table-wrap"><table><thead><tr><th>${copy.id}</th><th>${copy.source}</th><th>${copy.bytes}</th></tr></thead><tbody>${this.sources.map(source => html`<tr><td>${source.id}</td><td>${source.title ?? source.origin}</td><td>${source.bytes ?? '—'}</td></tr>`)}</tbody></table></section>`
     if (this.section === 'words') return html`<section class="panel graph-panel"><header class="panel-head"><h2>${copy.wordGraph}</h2><form class="word-search" @submit=${this.searchWords}><label for="word-query">${copy.wordQuery}</label><input id="word-query" .value=${this.wordQuery} @input=${(event: InputEvent) => { this.wordQuery = (event.target as HTMLInputElement).value }} placeholder=${copy.wordQueryPlaceholder} required><button type="submit">${copy.search}</button></form></header>${this.wordPath ? html`<lwc-graph .path=${this.wordPath} .locale=${this.locale} @graph-loaded=${(event: CustomEvent<GraphPayload>) => { this.wordHasMore = event.detail.has_more === true }}></lwc-graph><div class="word-pagination"><button ?disabled=${this.wordOffset === 0} @click=${() => this.pageWords(this.wordOffset - 25)}>${copy.previous}</button><span>${copy.samplePage} ${Math.floor(this.wordOffset / 25) + 1}</span><button ?disabled=${!this.wordHasMore} @click=${() => this.pageWords(this.wordOffset + 25)}>${copy.next}</button></div>` : html`<p class="word-prompt muted">${copy.wordPrompt}</p>`}</section>`
     const path = this.section === 'knowledge' ? '/api/graphs/knowledge' : '/api/graphs/code'

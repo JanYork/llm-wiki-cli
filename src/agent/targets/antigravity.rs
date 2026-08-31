@@ -33,7 +33,7 @@ impl AgentTarget for AntigravityTarget {
         "installed"
     }
     fn lifecycle_mode(&self, _location: AgentLocation) -> &'static str {
-        "installed"
+        "unsupported"
     }
     fn permissions_mode(&self, _location: AgentLocation) -> &'static str {
         "not_applicable"

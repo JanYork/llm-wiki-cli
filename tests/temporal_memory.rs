@@ -290,7 +290,7 @@ fn version_13_store_migrates_temporal_tables_transactionally() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!((version, format.as_str()), (16, "16"));
+    assert_eq!((version, format.as_str()), (17, "17"));
 
     let mut statement = conn
         .prepare(

@@ -29,7 +29,7 @@
 演进持久化、来源可追溯的知识。
 
 **兼容 Claude Code、Codex、Cursor、OpenCode、Gemini CLI、Kiro、Hermes、
-Antigravity 和 pi。**
+Antigravity、GitHub Copilot VS Code、Copilot CLI、Copilot JetBrains 和 pi。**
 
 LWC 把经过筛选的文档转化为可长期维护的 Wiki。Agent 负责理解与综合，`lwc` 负责
 保存来源、页面、引用、链接、索引和历史，让知识持续积累，而不是每次查询都重新拼接
@@ -160,6 +160,10 @@ Grafeo 或 SurrealDB 只负责可重建的图遍历。显式关系保留理由�
 再交给 LWC 摄取。OfficeCLI 则为 Word、Excel 和 PowerPoint 提供独立、需授权、
 只读的读取路径。两项能力都不会被静默安装或启用，也不会修改源 Office 文件。
 
+段落检索还会把其所属 H2-H6 标题路径作为独立字段建立索引。标题上下文可以改善
+匹配，但不会被拼进返回片段，也不会进入其字节范围，因此引用和 span locator 仍然
+精确指向权威正文。存储迁移 17 只重建这份派生的段落/检索索引。
+
 [检索与索引 →](https://github.com/JanYork/llm-wiki-cli/wiki/Retrieval-and-Indexing-zh-CN) ·
 [文档知识图 →](https://github.com/JanYork/llm-wiki-cli/wiki/Document-Knowledge-Graph-zh-CN) ·
 [文档转换 →](https://github.com/JanYork/llm-wiki-cli/wiki/Document-Conversion-zh-CN)
@@ -208,8 +212,16 @@ Hook 和 Instructions：
     lwc agent install --yes
 
 统一的只读 MCP 在不扩大工作区边界的前提下提供有界 Wiki 记忆和可选代码上下文。
-支持 Claude Code、Codex、Cursor、OpenCode、Gemini CLI、Kiro、Hermes、
-Antigravity 和 pi。
+12 个已注册 Target 是 Claude Code、Cursor、Codex、OpenCode、Hermes、Gemini CLI、
+Antigravity、Kiro、GitHub Copilot VS Code、Copilot CLI、Copilot JetBrains 和 pi。
+
+`agent status` 会把已验证的 `hook_capabilities` 与当前作用域实际写入的原生事件
+`installed_hook_events` 分开报告。窄范围 shell consent 仅在 Claude Code、Cursor、
+Hermes 全局配置和 Antigravity 中强制请求人工确认；Codex 只能注入 advisory
+additional context，不能强制 ask。不支持的 consent 事件不会安装，并返回精确 no-op。
+只有 Claude Code 与 Codex 能在 `Stop` 时为仍可执行的 active Plan 续跑，并通过宿主
+原生 loop guard 保证一次性；其他 Stop 能力不会被模拟。refresh 与 uninstall 只移除
+LWC-owned Hook entry（包括 shared group 内的 entry），保留 sibling 与用户配置。
 
 图能力始终先判断任务适用性和授权：文档关系任务使用物理图，代码结构任务使用
 CodeGraph，不能仅因运行时存在就自动启用。Office 读取遵循相同的明确授权边界。
@@ -281,6 +293,35 @@ Changeset 让多步骤知识更新在审核和校验完成前保持不可见。�
 成功提交会为受支持的操作保存精确逆向补丁，从而在不替换整套 Wiki 的前提下执行
 受保护的回滚。
 
+草稿读取能看到同一批已暂存变更，而正式 SQLite 与 Markdown 保持不变。草稿使用轻量
+稀疏覆盖层，不复制或 checkpoint 整个正式 Wiki。`changeset show` 只报告暂存操作、
+版本号和可提交状态，不运行 lint。commit 只校验和应用本批涉及的实体，因此其他正式
+写入会保留；同一实体发生版本冲突时提交失败，不覆盖任何一方。空草稿和阻塞级
+lint error 会阻止提交；warning 和 info 只供审查，不阻塞发布。没有强制提交或自动
+合并。只有经过
+审计、且并非本批变更新增的既有债务，才能使用
+`--allow-lint-issues --reason "reviewed pre-existing debt"`。提交后，还要用原先
+固定的检索问题在正式状态复验。commit 会在发布前冻结已审查的草稿；此后的暂存
+写入会返回 `changeset_frozen`。此时只能重试同一次 commit 完成恢复，或在明确冲突
+后 discard，不能再向冻结草稿追加工作。
+
+```bash
+lwc --scope project changeset discard architecture-refresh
+lwc --scope project changeset rollback <CHANGESET_ID>
+```
+
+discard 只删除未提交草稿。commit 会为触达实体写入带校验和的 inverse patch，并返回
+精确的回滚 ID；rollback 只恢复这些实体，某个实体后来再次变化时会拒绝覆盖。
+project 与 global changeset 相互独立；`--scope all` 无效；`init`、`maintenance`、
+`checkpoint` 和嵌套 changeset 命令都会拒绝 `--changeset`。草稿不会生成第二套
+Markdown 投影。如果结构化错误返回 `committed=true`，但仍有 cleanup 或
+materialization 工作，不要重复执行知识变更；应执行响应中给出的恢复动作。
+
+稀疏 commit 当前为 Source 新增/ingest、Page put/remove、schema、purpose 和记录型
+search 提供精确 patch。检索权重与显式语义关系暂未提供稀疏 inverse patch，会在创建
+checkpoint、获取正式库写锁或修改正式 Wiki 前返回 `changeset_sparse_unsupported`；
+当前应将它们作为直接的单实体事务执行。
+
 [查看 Changeset 指南 →](https://github.com/JanYork/llm-wiki-cli/wiki/Changesets-zh-CN)
 
 ## 作用域
@@ -312,8 +353,23 @@ CJK 文本使用相邻二元组并保留有用的一元词，拉丁文本使用�
 
 ## 只读预览与 CodeGraph
 
-本地 Viewer 通过仅回环、仅 GET/HEAD 的接口展示页面、来源、Markdown、文档关系和
-代码结构，不会执行迁移、刷新或建图。
+`lwc view` 会以前台方式在本机回环地址启动项目预览并打开浏览器。Web
+应用使用 TS + Lit 构建并嵌入二进制，运行时不依赖 CDN 或 Node；服务只
+接受 GET/HEAD。页面、来源、Markdown、知识图以及可选代码图均从当前项目
+只读加载，不会触发迁移、刷新或建图：
+
+```bash
+lwc view
+lwc view --port 4173 --no-open
+```
+
+页面详情统一使用权威标题、摘要、类型、provenance、引用来源和时间戳。只有正文
+开头 H1 与权威标题一致时，预览才会在展示层去重；正文含有至少三个 H2-H4 标题时，
+预览会派生本地目录。这些展示规则不会改写权威正文或 Markdown 投影。
+
+预览默认使用英文。通过页面内的 `中文` / `EN` 控件切换语言；浏览器会记住选择，
+但不会自动翻译 Wiki 正文。知识图和代码图统一使用受 Obsidian 启发的 3D 关系视图，
+采用小节点、常驻标签、细连线，并支持旋转与缩放。
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-codegraph-zh.png" alt="LWC 代码图" width="100%">
@@ -338,6 +394,39 @@ Lint、重建索引、Markdown 物化、压缩、checkpoint 和图投影都是�
 
 SQLite 始终保持权威；搜索索引、Markdown 和图存储都可以重建，不会改写来源历史或
 当前 Wiki 知识。
+
+`lwc lint` 保留 `total` 与 `counts` 作为统计全部问题的兼容字段，并增加只统计 error
+的 `blocking_total`，以及统计 warning 和 info 的 `advisory_total`。当前确定性的
+Markdown 建议包括正文 H1 冲突或重复、首次标题层级跳跃、以及过长的无分节正文；
+只有完整性 error 会阻止 changeset commit。
+
+说明：
+
+- 维护命令会立即返回可持久追踪的 `work`。使用 `work status` 查看进度，或使用
+  `work watch` 等待完成并读取 `work.result`。v10 到 v11 的 schema 迁移也会
+  自动进入同一机制，普通命令不会再在前台执行迁移。
+- `lint` 默认完全只读；只有这次检查确实需要进入持久操作历史时才加 `--record`。
+- `maintenance reindex` 从 SQLite 重建派生搜索产物。
+- `maintenance materialize` 从 SQLite 重建投影出来的 Markdown 树。
+- `maintenance compact` 只尝试执行 WAL truncate checkpoint，不会顺带执行全量 FTS
+  优化。应在 Wiki 空闲时运行，并检查返回的 `busy` 与 `after_bytes`；存在活动读取进程
+  时会快速返回，不修改权威内容。
+- 搜索查询默认是私有的；只有需要把查询文本写入持久化操作日志时，才加 `--record`。
+
+`lwc checkpoint create <NAME>` 使用 SQLite 在线备份 API。执行
+`lwc checkpoint restore <NAME>` 时，LWC 会先创建 `pre-restore-*` 安全
+checkpoint，再恢复数据库并重建投影。受保护删除使用 `source remove <ID>` 和
+`page remove <SLUG>`：仍被页面引用的来源、仍有入链的页面都会被拒绝删除。删除某
+路径的当前来源时，该路径会明确停止跟踪，不会把旧版本悄悄恢复成“当前版本”。
+
+多来源 ingest 或大范围页面替换应优先使用 changeset，而不是手动 checkpoint：
+commit 使用稀疏 inverse patch，在短事务中只发布本批涉及的权威实体，并增量更新
+正式 Markdown；不会自动复制整库。发布后会尝试 WAL truncate；
+`wal_checkpointed=false` 表示活动读取进程阻止了立即截断，不表示权威数据提交
+失败。
+
+需要文件系统级外部备份时，应先停止正在运行的 `lwc` 命令并复制完整 `.lwc/`
+目录；写入进程可能仍在使用 WAL 文件时，不要只复制 `wiki.db`。
 
 [查看维护与诊断 →](https://github.com/JanYork/llm-wiki-cli/wiki/Maintenance-and-Diagnostics-zh-CN)
 

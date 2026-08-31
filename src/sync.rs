@@ -5204,7 +5204,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    #[link(name = "Kernel32")]
+    #[link(name = "kernel32")]
     unsafe extern "system" {
         fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
     }

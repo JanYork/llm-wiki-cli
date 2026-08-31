@@ -25,7 +25,7 @@ test('npm, Cargo, and README discovery metadata stay aligned', () => {
   const description =
     'Agent-driven proactive memory CLI for AI agents — autonomously recall, maintain, and evolve persistent, source-grounded knowledge across sessions.'
   const compatibility =
-    /Works with Claude Code, Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes,\s+Antigravity, and pi\./
+    'Claude Code, Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes, Antigravity, GitHub Copilot in VS Code, Copilot CLI, Copilot for JetBrains, and pi'
 
   assert.equal(cargoDescription, description)
   assert.equal(packageJson.description, description)
@@ -34,7 +34,8 @@ test('npm, Cargo, and README discovery metadata stay aligned', () => {
   for (const readme of ['README.md', 'npm/README.md']) {
     const contents = readFileSync(readme, 'utf8')
     assert.match(contents, /agent-driven proactive memory CLI for AI agents/i)
-    assert.match(contents, compatibility)
+    const advertised = /\*\*Works with ([\s\S]*?)\.\*\*/.exec(contents)?.[1]
+    assert.equal(advertised?.replace(/\s+/g, ' ').trim(), compatibility)
   }
 })
 

@@ -13,7 +13,7 @@ struct World {
 }
 
 #[test]
-fn version_14_store_migrates_todo_and_plan_schemas_through_v16() {
+fn version_14_store_migrates_todo_and_plan_schemas_through_v17() {
     let w = World::new();
     let db = w.project.join(".lwc/wiki.db");
     let conn = Connection::open(&db).unwrap();
@@ -24,7 +24,7 @@ fn version_14_store_migrates_todo_and_plan_schemas_through_v16() {
     assert_eq!(
         conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        16
+        17
     );
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('todo_items','plans','plan_steps')",[],|r|r.get::<_,i64>(0)).unwrap(),3);
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_table_info('todo_items') WHERE name IN ('parent_id','target_at')",[],|r|r.get::<_,i64>(0)).unwrap(),2);
@@ -82,7 +82,7 @@ fn version_15_store_adds_todo_parent_and_target_columns() {
     assert_eq!(
         conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        16
+        17
     );
     assert_eq!(
         conn.query_row(

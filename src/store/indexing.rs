@@ -295,11 +295,12 @@ fn index_spans(
     let mut insert_fts = tx.prepare(
         "INSERT INTO span_fts(
             span_id, span_type, document_type, document_identifier,
-            title_terms, path_terms, body_terms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            title_terms, path_terms, heading_terms, body_terms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     let document_key = format!("{document_type}:{document_identifier}");
     for passage in segmented.passages {
+        let heading_path = passage.heading_path.join(" ");
         let passage_id = format!(
             "span:{}",
             hash_content(&format!(
@@ -320,6 +321,7 @@ fn index_spans(
             &fingerprint,
             title,
             path,
+            &heading_path,
             content,
         )?;
         for sentence in passage.sentences {
@@ -343,6 +345,7 @@ fn index_spans(
                 &fingerprint,
                 title,
                 path,
+                &heading_path,
                 content,
             )?;
         }
@@ -384,6 +387,7 @@ fn insert_search_span(
     fingerprint: &str,
     title: &str,
     path: &str,
+    heading_path: &str,
     content: &str,
 ) -> Result<()> {
     let text = content
@@ -408,6 +412,7 @@ fn insert_search_span(
         document_identifier,
         joined_terms(title),
         joined_terms(path),
+        joined_terms(heading_path),
         joined_terms(text),
     ])?;
     Ok(())

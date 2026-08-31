@@ -531,6 +531,351 @@ mod tests {
         );
     }
 
+    fn hook_sidecar(database: &Path, suffix: &str) -> PathBuf {
+        let mut path = database.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    }
+
+    fn hook_tree_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(root: &Path, current: &Path, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let mut entries = fs::read_dir(current)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                if metadata.file_type().is_symlink() {
+                    let mut marker = b"symlink\0".to_vec();
+                    marker.extend_from_slice(
+                        fs::read_link(&path).unwrap().to_string_lossy().as_bytes(),
+                    );
+                    snapshot.insert(relative, marker);
+                } else if metadata.is_dir() {
+                    snapshot.insert(relative, b"directory".to_vec());
+                    walk(root, &path, snapshot);
+                } else {
+                    snapshot.insert(relative, fs::read(path).unwrap());
+                }
+            }
+        }
+
+        let mut snapshot = BTreeMap::new();
+        walk(root, root, &mut snapshot);
+        snapshot
+    }
+
+    fn create_blocked_hook_plan(store: &mut Store) {
+        store
+            .conn
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        let created = store
+            .plan_create(PlanCreateInput {
+                title: "Hook plan".to_string(),
+                objective: "Prove the Hook snapshot".to_string(),
+                done_when: "The snapshot is exact".to_string(),
+                tags: Vec::new(),
+                constraints: Vec::new(),
+                steps: vec![PlanStepInput {
+                    title: "Wait for a human".to_string(),
+                    verify: None,
+                }],
+                request_id: None,
+            })
+            .unwrap();
+        let id = created["plan"]["id"].as_str().unwrap();
+        let step = created["plan"]["steps"][0]["id"].as_str().unwrap();
+        store
+            .plan_block(id, 1, step, "waiting for explicit input")
+            .unwrap();
+    }
+
+    fn copy_database_with_live_wal(target: &Path, copy_shm: bool) -> (tempfile::TempDir, Store) {
+        let source = tempdir().unwrap();
+        let database = source.path().join("source/wiki.db");
+        let (mut writer, _) = Store::initialize("project", &database).unwrap();
+        create_blocked_hook_plan(&mut writer);
+        let wal = hook_sidecar(&database, "-wal");
+        assert!(fs::metadata(&wal).unwrap().len() > 32);
+
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(&database, target).unwrap();
+        fs::copy(wal, hook_sidecar(target, "-wal")).unwrap();
+        if copy_shm {
+            fs::copy(
+                hook_sidecar(&database, "-shm"),
+                hook_sidecar(target, "-shm"),
+            )
+            .unwrap();
+        }
+        (source, writer)
+    }
+
+    fn assert_hook_store_unavailable(error: AppError, private_path: &Path) {
+        assert_eq!(error.code, "store_hook_unavailable");
+        assert_eq!(error.message, "Hook store snapshot is unavailable");
+        assert!(!error.message.contains(&private_path.to_string_lossy()[..]));
+        assert!(error.details.is_none());
+    }
+
+    #[test]
+    fn windows_hook_verbatim_drive_parser_accepts_only_local_drives() {
+        assert_eq!(
+            strip_windows_hook_verbatim_drive(r"\\?\C:\project space\中文\.lwc\wiki.db"),
+            Some(r"C:\project space\中文\.lwc\wiki.db")
+        );
+        assert_eq!(
+            strip_windows_hook_verbatim_drive(r"\\?\z:/project/.lwc/wiki.db"),
+            Some(r"z:/project/.lwc/wiki.db")
+        );
+        for rejected in [
+            r"\\?\UNC\server\share\wiki.db",
+            r"\\server\share\wiki.db",
+            r"\\?\Volume{1234}\wiki.db",
+            r"C:\project\.lwc\wiki.db",
+            r"\\?\C:",
+        ] {
+            assert_eq!(
+                strip_windows_hook_verbatim_drive(rejected),
+                None,
+                "accepted non-local-verbatim path {rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn hook_open_without_sidecars_reads_checkpointed_main_without_creating_files() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join(if cfg!(windows) {
+            "project space 中文/.lwc/wiki.db"
+        } else {
+            "project ?#% 中文/.lwc/wiki.db"
+        });
+        let (store, _) = Store::initialize("project", &database).unwrap();
+        drop(store);
+        let checkpoint = Connection::open(&database).unwrap();
+        checkpoint
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(checkpoint);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = hook_sidecar(&database, suffix);
+            if sidecar.exists() {
+                fs::remove_file(sidecar).unwrap();
+            }
+        }
+
+        let before = hook_tree_snapshot(temp.path());
+        let hook = Store::open_for_hook_with_timeout("project", &database, Duration::ZERO).unwrap();
+        hook.begin_hook_snapshot_with_timeout(Duration::ZERO)
+            .unwrap();
+        assert_eq!(hook.active_plan_count().unwrap(), 0);
+        assert_eq!(hook.plan_tracking().unwrap(), None);
+        drop(hook);
+
+        assert_eq!(hook_tree_snapshot(temp.path()), before);
+    }
+
+    #[test]
+    fn hook_open_with_empty_wal_reads_main_without_creating_an_index() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("project/.lwc/wiki.db");
+        let (store, _) = Store::initialize("project", &database).unwrap();
+        drop(store);
+        let checkpoint = Connection::open(&database).unwrap();
+        checkpoint
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(checkpoint);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = hook_sidecar(&database, suffix);
+            if sidecar.exists() {
+                fs::remove_file(sidecar).unwrap();
+            }
+        }
+        fs::write(hook_sidecar(&database, "-wal"), []).unwrap();
+
+        let before = hook_tree_snapshot(temp.path());
+        let hook = Store::open_for_hook_with_timeout("project", &database, Duration::ZERO).unwrap();
+        hook.begin_hook_snapshot_with_timeout(Duration::ZERO)
+            .unwrap();
+        assert_eq!(hook.active_plan_count().unwrap(), 0);
+        drop(hook);
+
+        assert_eq!(hook_tree_snapshot(temp.path()), before);
+    }
+
+    #[test]
+    fn hook_open_rejects_a_corrupt_store_quickly_without_changing_it() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("PRIVATE_PROJECT/.lwc/wiki.db");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"PRIVATE CORRUPT DATABASE").unwrap();
+        let before = hook_tree_snapshot(temp.path());
+
+        let started = Instant::now();
+        let error =
+            Store::open_for_hook_with_timeout("project", &database, Duration::ZERO).unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "corrupt Hook store exceeded its zero-wait boundary"
+        );
+        assert_hook_store_unavailable(error, temp.path());
+        assert_eq!(hook_tree_snapshot(temp.path()), before);
+    }
+
+    #[test]
+    fn hook_open_reads_blocked_plan_from_live_wal_without_changing_sidecars() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("project/.lwc/wiki.db");
+        let (_source, writer) = copy_database_with_live_wal(&database, true);
+        assert!(fs::metadata(hook_sidecar(&database, "-wal")).unwrap().len() > 32);
+        assert!(fs::metadata(hook_sidecar(&database, "-shm")).unwrap().len() > 0);
+
+        let before = hook_tree_snapshot(temp.path());
+        let hook =
+            Store::open_for_hook_with_timeout("project", &database, Duration::from_millis(250))
+                .unwrap();
+        hook.begin_hook_snapshot_with_timeout(Duration::from_millis(250))
+            .unwrap();
+        assert_eq!(hook.active_plan_count().unwrap(), 1);
+        let tracking = hook.plan_tracking().unwrap().unwrap();
+        assert_eq!(tracking["current_step"]["status"], "blocked");
+        drop(hook);
+
+        assert_eq!(hook_tree_snapshot(temp.path()), before);
+        drop(writer);
+    }
+
+    #[test]
+    fn hook_open_fails_closed_on_nonempty_wal_without_a_valid_index() {
+        for invalid_index in ["missing", "short", "corrupt"] {
+            let temp = tempdir().unwrap();
+            let database = temp.path().join("PRIVATE_PROJECT/.lwc/wiki.db");
+            let (_source, _writer) =
+                copy_database_with_live_wal(&database, invalid_index == "corrupt");
+            match invalid_index {
+                "missing" => {}
+                "short" => {
+                    fs::write(hook_sidecar(&database, "-shm"), b"not a wal index").unwrap();
+                }
+                "corrupt" => {
+                    let shm = hook_sidecar(&database, "-shm");
+                    let mut bytes = fs::read(&shm).unwrap();
+                    bytes[0] ^= 1;
+                    fs::write(shm, bytes).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = hook_tree_snapshot(temp.path());
+
+            let error =
+                Store::open_for_hook_with_timeout("project", &database, Duration::from_millis(250))
+                    .unwrap_err();
+
+            assert_hook_store_unavailable(error, temp.path());
+            assert_eq!(hook_tree_snapshot(temp.path()), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_open_rejects_symlinked_wal_or_shm_without_touching_the_target() {
+        use std::os::unix::fs::symlink;
+
+        for suffix in ["-wal", "-shm"] {
+            let temp = tempdir().unwrap();
+            let database = temp.path().join("PRIVATE_PROJECT/.lwc/wiki.db");
+            let (_source, _writer) = copy_database_with_live_wal(&database, true);
+            let attacked = hook_sidecar(&database, suffix);
+            fs::remove_file(&attacked).unwrap();
+            let outside = temp.path().join(format!("outside{suffix}"));
+            fs::write(&outside, b"PRIVATE OUTSIDE BYTES").unwrap();
+            symlink(&outside, &attacked).unwrap();
+            let before = hook_tree_snapshot(temp.path());
+            let outside_before = fs::read(&outside).unwrap();
+
+            let error =
+                Store::open_for_hook_with_timeout("project", &database, Duration::from_millis(250))
+                    .unwrap_err();
+
+            assert_hook_store_unavailable(error, temp.path());
+            assert_eq!(hook_tree_snapshot(temp.path()), before);
+            assert_eq!(fs::read(outside).unwrap(), outside_before);
+        }
+    }
+
+    #[test]
+    #[ignore = "invoked in a separate process by the writer-held regression"]
+    fn hook_open_writer_held_child() {
+        let database = PathBuf::from(std::env::var_os("LWC_HOOK_WRITER_DATABASE").unwrap());
+        let hook =
+            Store::open_for_hook_with_timeout("project", &database, Duration::from_millis(250))
+                .unwrap();
+        hook.begin_hook_snapshot_with_timeout(Duration::from_millis(250))
+            .unwrap();
+        assert_eq!(hook.active_plan_count().unwrap(), 1);
+        let tracking = hook.plan_tracking().unwrap().unwrap();
+        assert_eq!(tracking["current_step"]["status"], "blocked");
+    }
+
+    #[test]
+    fn hook_open_reads_writer_held_uncheckpointed_wal_without_changing_tree() {
+        use std::process::Command;
+
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("project space 中文/.lwc/wiki.db");
+        let (mut writer, _) = Store::initialize("project", &database).unwrap();
+        writer
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        let main_before = fs::read(&database).unwrap();
+        create_blocked_hook_plan(&mut writer);
+        assert_eq!(fs::read(&database).unwrap(), main_before);
+        assert!(fs::metadata(hook_sidecar(&database, "-wal")).unwrap().len() > 32);
+        writer.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let before = hook_tree_snapshot(temp.path());
+
+        #[cfg(windows)]
+        let hook_database = {
+            let canonical = database.canonicalize().unwrap();
+            assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
+            canonical
+        };
+        #[cfg(not(windows))]
+        let hook_database = database.clone();
+
+        let started = Instant::now();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "store::tests::hook_open_writer_held_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("LWC_HOOK_WRITER_DATABASE", hook_database)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "writer-held Hook child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "writer-held Hook accumulated a busy wait: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(hook_tree_snapshot(temp.path()), before);
+        writer.conn.execute_batch("ROLLBACK;").unwrap();
+    }
+
     #[test]
     fn concurrent_open_migrates_v1_once_and_preserves_searchable_data() {
         let temp = tempdir().unwrap();
@@ -619,6 +964,56 @@ mod tests {
             .unwrap();
         assert_eq!(version, USER_VERSION);
         assert_eq!(journal_mode, "wal");
+    }
+
+    #[test]
+    fn agent_state_migration_rechecks_version_after_competing_upgrade() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("wiki.db");
+        let mut seed = Connection::open(&database).unwrap();
+        configure_connection(&seed).unwrap();
+        bootstrap_schema(&mut seed).unwrap();
+        seed.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'format_version'",
+            [TEMPORAL_MEMORY_VERSION.to_string()],
+        )
+        .unwrap();
+        seed.pragma_update(None, "user_version", TEMPORAL_MEMORY_VERSION)
+            .unwrap();
+        drop(seed);
+
+        let mut winner = Connection::open(&database).unwrap();
+        configure_connection(&winner).unwrap();
+        let mut waiter = Connection::open(&database).unwrap();
+        configure_connection(&waiter).unwrap();
+        let winning_tx = winner
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        let (started_tx, waiter_started) = std::sync::mpsc::channel();
+        let waiting_migration = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            migrate_agent_state_v15(&mut waiter)
+        });
+        waiter_started.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        winning_tx
+            .execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'format_version'",
+                [USER_VERSION.to_string()],
+            )
+            .unwrap();
+        winning_tx
+            .pragma_update(None, "user_version", USER_VERSION)
+            .unwrap();
+        winning_tx.commit().unwrap();
+
+        waiting_migration.join().unwrap().unwrap();
+        let version: i32 = winner
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, USER_VERSION);
     }
 
     #[test]

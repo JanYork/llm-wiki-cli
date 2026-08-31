@@ -107,7 +107,7 @@ impl AgentTarget for CodexTarget {
     }
 
     fn print_config(&self, location: AgentLocation) -> String {
-        let (config, hooks) = if location == AgentLocation::Global {
+        let (config, hook_path) = if location == AgentLocation::Global {
             (
                 "${CODEX_HOME:-~/.codex}/config.toml",
                 "${CODEX_HOME:-~/.codex}/hooks.json",
@@ -115,12 +115,33 @@ impl AgentTarget for CodexTarget {
         } else {
             ("<repo>/.codex/config.toml", "<repo>/.codex/hooks.json")
         };
+        let hooks = self
+            .configured_hook_events(location, InstallOptions { prompt_hook: true })
+            .into_iter()
+            .map(|event| {
+                let command = format!("lwc --scope all agent hook --agent codex --event {event}");
+                let entry = if event == "PreToolUse" {
+                    serde_json::json!([{
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": command, "timeout": 2}]
+                    }])
+                } else {
+                    serde_json::json!([{
+                        "hooks": [{"type": "command", "command": command}]
+                    }])
+                };
+                (event.to_owned(), entry)
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let hooks_config = serde_json::json!({"hooks": hooks});
         format!(
-            "# Codex: add MCP to {config} and hooks to {hooks}.\n\
+            "# Codex: add MCP to {config} and hooks to {hook_path}.\n\
 [mcp_servers.lwc]\ncommand = \"lwc\"\nargs = [\"serve\", \"--mcp\"]\n\n\
 {}\n\n\
-{{\"hooks\":{{\"SessionStart\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"lwc --scope all agent hook --agent codex --event SessionStart\"}}]}}]}}}}\n",
-            install::guidance()
+{hooks_config}\n\
+Hook events: {}\n",
+            install::guidance(),
+            install::hook_events_summary(self.id(), location),
         )
     }
 

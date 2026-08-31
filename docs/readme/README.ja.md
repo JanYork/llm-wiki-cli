@@ -30,7 +30,8 @@
 保守し、発展させられます。
 
 **Claude Code、Codex、Cursor、OpenCode、Gemini CLI、Kiro、Hermes、
-Antigravity、pi に対応しています。**
+Antigravity、GitHub Copilot in VS Code、Copilot CLI、Copilot for JetBrains、
+pi に対応しています。**
 
 LWC は、選別した文書を長期運用できる Wiki に変換します。推論と統合はエージェントが
 担い、`lwc` は出典、ページ、引用、リンク、インデックス、履歴を保存します。
@@ -210,7 +211,8 @@ Skill、Hook、Instructions を冪等に設定します。
 
 統合された読み取り専用 MCP は、ワークスペース境界を広げずに Wiki メモリと任意の
 コードコンテキストを提供します。Claude Code、Codex、Cursor、OpenCode、
-Gemini CLI、Kiro、Hermes、Antigravity、pi に対応します。
+Gemini CLI、Kiro、Hermes、Antigravity、GitHub Copilot in VS Code、Copilot CLI、
+Copilot for JetBrains、pi に対応します。
 
 [AgentTarget 連携 →](https://github.com/JanYork/llm-wiki-cli/wiki/AgentTarget-Installation-and-Integration)
 

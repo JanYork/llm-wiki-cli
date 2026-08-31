@@ -403,7 +403,7 @@ fn search_span_index(
             CASE f.document_type WHEN 'page' THEN p.slug ELSE s.origin END,
             '', n.parent_identifier, n.ordinal, n.byte_start, n.byte_end,
             n.content_fingerprint, n.segmenter_version,
-            bm25(span_fts, 0.0, 0.0, 0.0, 0.0, 4.0, 2.0, 1.0),
+            bm25(span_fts, 0.0, 0.0, 0.0, 0.0, 4.0, 2.0, 1.0, 1.0),
             CASE f.document_type
                 WHEN 'page' THEN p.structural_navigation
                 ELSE s.structural_navigation

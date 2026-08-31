@@ -32,6 +32,23 @@ Use `lwc` as durable external memory. The database stores evidence and compiled 
 14. Lifecycle Hooks may report memory readiness and commands, but must not
     record, rate, maintain, or inject raw temporal events automatically.
 
+## Agent Hook capability boundary
+
+The AgentTarget registry has 12 targets: Claude Code, Cursor, Codex, OpenCode,
+Hermes, Gemini CLI, Antigravity, Kiro, GitHub Copilot in VS Code, Copilot CLI,
+Copilot for JetBrains, and pi. Read `hook_capabilities` as verified host support
+and `installed_hook_events` as the smaller set actually materialized for the
+selected scope; never infer installation from capability alone.
+
+For recognized LWC shell mutations, Claude Code, Cursor, global Hermes, and
+Antigravity can enforce a native ask. Codex can provide advisory additional
+context only. Every other consent/event pair is an exact no-op and must remain
+uninstalled. Active actionable Plans may use a one-shot `Stop` continuation only
+on Claude Code and Codex, whose native `stop_hook_active` guard prevents
+recursion; do not simulate this on other hosts. Install, refresh, and uninstall
+operate on exact LWC-owned entries inside a hook group or named hook while
+preserving user siblings and unrelated shared-target entries.
+
 ## Graph capability routing
 
 Graph applicability is independent: the physical document graph requires a document-relationship task plus document or Wiki evidence in the project root.
@@ -206,10 +223,12 @@ not materialize Markdown. `changeset show` reports the base and draft revisions,
 staged operations by action, lint total, empty and conflict state, and whether
 commit is currently allowed.
 
-Commit rejects an empty draft, a live/draft revision conflict, and lint issues.
-Repair new lint issues in the draft. Use
+Commit rejects an empty draft, a live/draft revision conflict, and blocking lint
+errors. Warnings and information remain review guidance and do not block
+publication. Repair new blocking errors in the draft. Use
 `--allow-lint-issues --reason "specific reviewed pre-existing debt"` only when
-the remaining issues existed before this changeset and the reason is auditable.
+the remaining blocking errors existed before this changeset and the reason is
+auditable.
 On `changeset_conflict` or `changeset_changed`, do not force or merge: preserve
 live work, inspect or discard the stale draft, begin a fresh changeset, and
 reapply the reviewed update. Unrelated live mutations do not conflict; commit
@@ -342,6 +361,37 @@ replaces its previous source IDs, explicit provenance, and extracted links, so
 read the page first and pass the complete current sets. Source IDs derive
 `source-grounded`; do not pass that value through `--provenance`.
 
+### Elastic page-writing contract
+
+The Wiki schema governs meaning and maintenance, not a fixed Markdown template.
+Page kinds provide optional prompts; they do not require named sections or a
+particular order.
+
+- **MUST:** keep one logical title, a standalone summary, a valid kind,
+  provenance, citations, and links. Preserve still-valid evidence when
+  replacing a page.
+- **SHOULD:** answer one primary reader question, put the current conclusion,
+  definition, or state early, use descriptive headings when headings help, and
+  separate current knowledge from chronological history.
+- **MAY:** choose any section names and order and use any suitable Markdown
+  construct. A short page may have no second-level heading.
+- **MUST NOT:** add empty or repetitive sections merely to resemble a template.
+
+Use these questions as prompts, not as required headings:
+
+- `entity` / `concept`: What is it, where are its boundaries, what is true now,
+  and why does it matter?
+- `source`: What does the source contribute, how strong is the evidence, and
+  which maintained pages use it?
+- `query`: What is the current answer, its evidence, and the remaining unknown?
+- `comparison` / `synthesis`: What is the conclusion, where does evidence agree
+  or conflict, and what decision follows?
+
+Keep canonical topic pages focused on what is true now. Move release-by-release
+evidence and dated evolution to a linked history or evidence page when they
+begin to obscure the current answer. This is a semantic editing judgment, not
+a blocking formatting rule.
+
 For durable non-source knowledge, repeat the explicit flag for mixed pages:
 
 ```bash
@@ -395,6 +445,11 @@ lwc span expand <SPAN_ID> --before 1 --after 1 --children 20
 Treat returned span IDs as exact locators, not semantic identities. On
 `stale_span`, inspect the prior/current fingerprint metadata and search the
 current document deliberately; never silently substitute similar text.
+
+Passage search indexes the enclosing H2-H6 heading path as an independent field.
+Use that context for discovery, but quote only the returned snippet: headings
+are never prepended to passage text or included in its byte range, and migration
+17 rebuilds only the derived span/search index.
 
 Use the graph after lexical recall—or without keywords when mapping an unknown
 knowledge area:
@@ -483,9 +538,15 @@ lwc lint
 ```
 
 Use `--limit` and `--offset` to walk the issue list. `counts` and `total`
-always describe the complete wiki, even when the returned `issues` page is
-small. Fix deterministic issues first. Then use the returned context for the
-semantic pass the CLI cannot perform:
+always describe all issues in the complete wiki, even when the returned
+`issues` page is small. `blocking_total` counts integrity errors;
+`advisory_total` counts warnings and information. Errors sort first and block
+changeset commit. Advisories do not block publication. Current Markdown
+advisories cover a body H1 that conflicts with the canonical title, duplicate
+body H1s, the first heading-level jump, and a long unsectioned prose region.
+
+Fix deterministic errors first and review advisories deliberately. Then use the
+returned context for the semantic pass the CLI cannot perform:
 
 - claims contradicted by newer sources;
 - stale conclusions;

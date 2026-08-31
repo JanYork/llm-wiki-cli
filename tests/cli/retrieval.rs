@@ -641,6 +641,156 @@ fn same_changeset_name_is_isolated_between_project_and_global_scopes() {
     );
 }
 
+#[test]
+fn span_search_uses_heading_context_without_changing_exact_snippets() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let body = concat!(
+        "# Operations\n\n",
+        "## RareSectionNeedle\n\n",
+        "Procedure body with no section keyword.\n\n",
+        "## Other section\n\n",
+        "Unrelated body.\n",
+    );
+    put_page(&world, "heading-context", "Heading context", body);
+
+    let found = world.ok(
+        &world.project,
+        &[
+            "search",
+            "RareSectionNeedle",
+            "--type",
+            "page",
+            "--granularity",
+            "sentence",
+            "--limit",
+            "10",
+        ],
+    );
+    let sentence = found["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["snippet"] == "Procedure body with no section keyword.")
+        .unwrap_or_else(|| panic!("missing section-context sentence: {found}"));
+    let start = sentence["span"]["byte_start"].as_u64().unwrap() as usize;
+    let end = sentence["span"]["byte_end"].as_u64().unwrap() as usize;
+    assert_eq!(&body[start..end], sentence["snippet"].as_str().unwrap());
+    assert!(
+        !sentence["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("RareSectionNeedle")
+    );
+    assert!(
+        found["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|result| result["snippet"] != "Unrelated body.")
+    );
+
+    let h1 = world.ok(
+        &world.project,
+        &[
+            "search",
+            "Operations",
+            "--type",
+            "page",
+            "--granularity",
+            "sentence",
+            "--limit",
+            "10",
+        ],
+    );
+    assert!(
+        h1["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|result| result["snippet"] != "Procedure body with no section keyword.")
+    );
+}
+
+#[test]
+fn v16_migration_rebuilds_heading_context_and_preserves_span_locators() {
+    let world = TestWorld::new();
+    world.ok(&world.project, &["init"]);
+    let body = "# Page title\n\n## MigrationHeadingNeedle\n\nExactBodyNeedle stays byte exact.\n";
+    put_page(&world, "migrated-heading", "Migrated heading", body);
+
+    let before = world.ok(
+        &world.project,
+        &[
+            "search",
+            "ExactBodyNeedle",
+            "--type",
+            "page",
+            "--granularity",
+            "sentence",
+        ],
+    );
+    let before = before["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["snippet"] == "ExactBodyNeedle stays byte exact.")
+        .unwrap();
+    let before_id = before["identifier"].clone();
+    let before_span = before["span"].clone();
+
+    let database = world.project.join(".lwc/wiki.db");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "DROP TABLE span_fts;
+         DROP TABLE IF EXISTS span_fts_data;
+         DROP TABLE IF EXISTS span_fts_idx;
+         DROP TABLE IF EXISTS span_fts_content;
+         DROP TABLE IF EXISTS span_fts_docsize;
+         DROP TABLE IF EXISTS span_fts_config;
+         CREATE VIRTUAL TABLE span_fts USING fts5(
+            span_id UNINDEXED, span_type UNINDEXED,
+            document_type UNINDEXED, document_identifier UNINDEXED,
+            title_terms, path_terms, body_terms,
+            content='', contentless_delete=1, contentless_unindexed=1
+         );
+         UPDATE meta SET value = '16' WHERE key = 'format_version';
+         PRAGMA user_version = 16;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let migrated = world.ok(
+        &world.project,
+        &[
+            "search",
+            "MigrationHeadingNeedle",
+            "--type",
+            "page",
+            "--granularity",
+            "sentence",
+            "--limit",
+            "10",
+        ],
+    );
+    let migrated = migrated["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["snippet"] == "ExactBodyNeedle stays byte exact.")
+        .unwrap_or_else(|| panic!("migration did not restore heading context: {migrated}"));
+    assert_eq!(migrated["identifier"], before_id);
+    assert_eq!(migrated["span"], before_span);
+
+    let conn = Connection::open(database).unwrap();
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 17);
+    conn.prepare("SELECT heading_terms FROM span_fts LIMIT 0")
+        .unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn changeset_keeps_live_source_authority_and_rejects_symlinked_draft_storage() {

@@ -1,6 +1,6 @@
 [package]
 name = "lwc"
-version = "0.17.7"
+version = "0.17.8"
 edition = "2024"
 description = "Agent-driven proactive memory CLI for AI agents — autonomously recall, maintain, and evolve persistent, source-grounded knowledge across sessions."
 license = "Apache-2.0"
@@ -9,7 +9,7 @@ homepage = "https://github.com/JanYork/llm-wiki-cli"
 readme = "README.md"
 keywords = ["agent-memory-system", "ai-agents", "proactive-memory", "knowledge-bases", "context-engineering"]
 categories = ["command-line-utilities", "database"]
-exclude = [".agent/**", ".local-benchmarks/**", ".pi-subagents/**", "docs/images/**", "docs/superpowers/**"]
+exclude = [".agent/**", ".agents/**", ".local-benchmarks/**", ".pi-subagents/**", ".superpowers/**", "**/__pycache__/**", "**/*.pyc", "AGENTS.md", "docs/images/**", "docs/superpowers/**"]
 
 [dependencies]
 axum = "0.8.9"

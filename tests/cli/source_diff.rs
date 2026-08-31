@@ -52,7 +52,7 @@ fn read_commands_migrate_v6_store_to_structured_provenance() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     conn.prepare("SELECT page_slug, provenance FROM page_provenance LIMIT 0")
         .unwrap();
 }
@@ -93,7 +93,7 @@ fn read_commands_migrate_v7_without_guessing_source_path_history() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     assert_eq!(tracked, 0, "migration must not guess a legacy path head");
 
     let source_id = added["source"]["id"].as_i64().unwrap().to_string();
@@ -143,7 +143,7 @@ fn read_commands_atomically_migrate_a_v8_store_to_weighted_retrieval() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     conn.prepare("SELECT path_terms FROM search_fts LIMIT 0")
         .unwrap();
     conn.prepare("SELECT weight FROM retrieval_weights LIMIT 0")
@@ -248,7 +248,7 @@ fn read_commands_atomically_migrate_a_v9_store_to_changeset_metadata() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     for key in ["store_id", "store_revision"] {
         let value: String = conn
             .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {

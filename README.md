@@ -30,7 +30,8 @@ autonomously recall, maintain, and evolve persistent, source-grounded knowledge
 across sessions.
 
 **Works with Claude Code, Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes,
-Antigravity, and pi.**
+Antigravity, GitHub Copilot in VS Code, Copilot CLI, Copilot for JetBrains, and
+pi.**
 
 LWC turns curated documents into a durable Wiki. Agents reason and synthesize;
 `lwc` preserves sources, pages, citations, links, indexes, and history so
@@ -177,6 +178,12 @@ consent-based, read-only path for Word, Excel, and PowerPoint files. Neither
 capability is silently installed or enabled, and source Office files are never
 modified.
 
+Passage search also indexes the enclosing H2-H6 heading path as an independent
+field. Heading context can improve matching, but it is never prepended to the
+returned snippet or included in its byte range, so citations and span locators
+still point to exact canonical body text. Store migration 17 rebuilds only this
+derived span/search index.
+
 [Explore retrieval and indexing →](https://github.com/JanYork/llm-wiki-cli/wiki/Retrieval-and-Indexing) ·
 [Document graph →](https://github.com/JanYork/llm-wiki-cli/wiki/Document-Knowledge-Graph) ·
 [Document conversion →](https://github.com/JanYork/llm-wiki-cli/wiki/Document-Conversion)
@@ -234,8 +241,19 @@ Instructions surfaces through idempotent AgentTarget adapters:
     lwc agent install --yes
 
 The unified read-only MCP exposes bounded Wiki memory and optional code context
-without widening the active workspace. Supported hosts include Claude Code,
-Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes, Antigravity, and pi.
+without widening the active workspace. The 12 registered targets are Claude
+Code, Cursor, Codex, OpenCode, Hermes, Gemini CLI, Antigravity, Kiro, GitHub
+Copilot in VS Code, Copilot CLI, Copilot for JetBrains, and pi.
+
+`agent status` reports verified `hook_capabilities` separately from the native
+events actually written as `installed_hook_events` for that scope. Narrow shell
+consent is enforced as an ask only for Claude Code, Cursor, global Hermes, and
+Antigravity; Codex receives advisory additional context and cannot enforce the
+ask. Unsupported consent events are not installed and return an exact no-op.
+Only Claude Code and Codex may continue an actionable active Plan from `Stop`,
+once per native loop guard; other Stop surfaces are not simulated. Refresh and
+uninstall remove only LWC-owned hook entries, including entries inside shared
+groups, while preserving sibling and user configuration.
 
 Graph capabilities remain consent-aware: document relationships require the
 physical graph, code-structure tasks require CodeGraph, and neither is enabled
@@ -322,6 +340,41 @@ fail closed.
 A successful commit records an exact inverse patch for supported operations,
 enabling guarded rollback without replacing the whole Wiki.
 
+Draft reads see staged writes, while live SQLite and Markdown stay unchanged.
+The draft database starts as a small sparse overlay; it does not copy or
+checkpoint the live Wiki. `changeset show` reports staged operations, revisions,
+and readiness without running lint. Commit validates and applies only
+touched entities, so unrelated live writes survive; a same-entity revision conflict
+fails without overwriting either side. Commit rejects empty drafts and blocking
+lint errors; warnings and information remain review guidance and do not block
+publication. There is no force or automatic merge. Use
+`--allow-lint-issues --reason "reviewed pre-existing debt"` only for audited
+debt that the changeset did not introduce. After commit, rerun the same fixed
+retrieval checks against live state. Commit freezes the reviewed draft before
+publication; `changeset_frozen` blocks any later staged write. Retry the same
+commit for recovery, or discard after a reported conflict—never add more work
+to a frozen draft.
+
+```bash
+lwc --scope project changeset discard architecture-refresh
+lwc --scope project changeset rollback <CHANGESET_ID>
+```
+
+Discard touches only an uncommitted draft. Commit writes a checksummed inverse
+patch containing only touched entities and returns the exact rollback ID;
+rollback restores only those entities and refuses if one changed again. Project
+and global changesets are separate, `--scope all` is invalid, and `init`,
+`maintenance`, `checkpoint`, and nested changeset commands reject
+`--changeset`. Drafts never create a second Markdown projection. If a structured
+error reports `committed=true` with cleanup or materialization work remaining,
+do not repeat the knowledge changes; run the returned recovery action.
+
+Sparse commit currently has exact patches for Source add/ingest, Page
+put/remove, schema, purpose, and recorded search operations. Retrieval-weight
+and explicit semantic-relation mutations fail before checkpointing or taking a
+live write lock with `changeset_sparse_unsupported`; apply those as direct
+single-entity transactions until their sparse inverse patches are available.
+
 [Changesets guide →](https://github.com/JanYork/llm-wiki-cli/wiki/Changesets)
 
 ## Scopes
@@ -357,9 +410,27 @@ query. Neither mechanism can make unrelated content appear.
 
 ## Read-only Viewer and CodeGraph
 
-The local Viewer presents pages, sources, Markdown, document relationships, and
-code structure through a loopback-only, GET/HEAD interface. It performs no
-migration, refresh, or graph construction.
+`lwc view` starts a foreground, loopback-only project inspector and opens the
+browser. It serves one embedded TS + Lit application—no CDN and no Node runtime
+at use time—and exposes GET/HEAD APIs only. Pages, sources, Markdown, the
+knowledge graph, and the optional code graph are read from the current project
+without migration, refresh, or graph construction:
+
+```bash
+lwc view
+lwc view --port 4173 --no-open
+```
+
+Page detail uses the canonical title, summary, kind, provenance, citations, and
+timestamps. The viewer suppresses only a leading body H1 that matches the
+canonical title and derives a local table of contents from three or more H2-H4
+headings. These presentation rules never rewrite canonical content or projected
+Markdown.
+
+The viewer starts in English. Use the `中文` / `EN` control to switch languages;
+the browser remembers the selection while Wiki content remains in its authored
+language. Graphs use a single Obsidian-inspired 3D relationship view with small
+nodes, persistent labels, thin links, rotation, and zoom.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-codegraph-en.png" alt="LWC CodeGraph code intelligence" width="100%">
@@ -386,6 +457,47 @@ resumable, and applied in bounded document units.
 
 SQLite remains canonical throughout. Search indexes, Markdown, and graph stores
 can be rebuilt without rewriting source history or current Wiki knowledge.
+
+`lwc lint` keeps `total` and `counts` as all-issue compatibility fields and
+adds `blocking_total` for errors plus `advisory_total` for warnings and
+information. Deterministic Markdown guidance currently reports conflicting or
+duplicate body H1s, the first heading-level jump, and a long unsectioned prose
+region; only integrity errors block changeset commit.
+
+Notes:
+
+- Maintenance commands return a durable `work` immediately. Read progress with
+  `work status`, or use `work watch` and inspect `work.result` after success.
+  Schema v10 to v11 migration uses the same mechanism automatically, so normal
+  commands never perform that migration inline.
+- `lint` is read-only by default. Add `--record` only when the lint pass belongs
+  in durable operation history.
+- `maintenance reindex` rebuilds derived search artifacts from SQLite.
+- `maintenance materialize` rebuilds the projected Markdown tree from SQLite.
+- `maintenance compact` only attempts a WAL truncate checkpoint; it does not
+  hide a full FTS optimization. Run it while the Wiki is idle and inspect
+  `busy` plus `after_bytes`. A busy reader returns promptly without changing
+  canonical content.
+- Search queries are private by default; add `--record` only when you want the query wording stored in the durable operation log.
+
+`lwc checkpoint create <NAME>` uses SQLite's online backup API. Restore with
+`lwc checkpoint restore <NAME>`; LWC first creates a `pre-restore-*` safety
+checkpoint and then rebuilds the projection. Use `source remove <ID>` and
+`page remove <SLUG>` for guarded deletion: sources with citations and pages
+with inbound links are refused. Removing the current source for a tracked path
+stops tracking that path instead of silently exposing an older revision as
+current.
+
+For a multi-source ingest or broad page replacement, prefer a changeset over a
+manual checkpoint: successful commit writes a sparse inverse patch, publishes
+only touched canonical entities in one transaction, and incrementally
+materializes changed Markdown. Commit attempts a WAL truncate after publication;
+`wal_checkpointed=false` means an active reader prevented it and does not mean
+the canonical commit failed.
+
+For an external filesystem backup, stop active `lwc` commands and copy the
+complete `.lwc/` directory. Do not copy only `wiki.db` while a writer may still
+be using its WAL files.
 
 [Maintenance and diagnostics →](https://github.com/JanYork/llm-wiki-cli/wiki/Maintenance-and-Diagnostics)
 

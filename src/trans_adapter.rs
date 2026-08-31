@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::{
     fs,
     io::{self, Read},
@@ -12,6 +14,7 @@ use std::{
 };
 
 const STDERR_PREVIEW_BYTES: u64 = 8192;
+const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(unix)]
 const ESRCH: i32 = 3;
 
@@ -140,7 +143,14 @@ pub(crate) fn run(config: &Config, input: &Path, output: &Path) -> Result<(), Er
             });
         }
     };
-    let result = wait_with_timeout(&config.engine, &mut child, config.timeout_seconds, &stderr);
+    let process_tree = ProcessTree::attach(&child).ok();
+    let result = wait_with_timeout(
+        &config.engine,
+        &mut child,
+        process_tree.as_ref(),
+        config.timeout_seconds,
+        &stderr,
+    );
     let _ = fs::remove_file(stderr);
     result
 }
@@ -228,6 +238,7 @@ fn engine_command(engine: &str) -> Command {
 fn wait_with_timeout(
     engine: &str,
     child: &mut Child,
+    process_tree: Option<&ProcessTree>,
     timeout_seconds: u16,
     stderr_path: &Path,
 ) -> Result<(), Error> {
@@ -237,8 +248,9 @@ fn wait_with_timeout(
             break status;
         }
         if Instant::now() >= deadline {
-            terminate_process_tree(child)?;
-            child.wait()?;
+            let cleanup_deadline = Instant::now() + PROCESS_CLEANUP_TIMEOUT;
+            terminate_process_tree(child, process_tree, cleanup_deadline)?;
+            let _ = wait_for_child_until(child, cleanup_deadline)?;
             let stderr = read_bounded(stderr_path)?;
             return Err(Error {
                 code: "trans_timeout",
@@ -262,8 +274,25 @@ fn wait_with_timeout(
     }
 }
 
+fn wait_for_child_until(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
+}
+
 #[cfg(unix)]
-fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
+fn terminate_process_tree(
+    child: &mut Child,
+    _process_tree: Option<&ProcessTree>,
+    _deadline: Instant,
+) -> io::Result<()> {
     if let Err(error) = kill_process_group(child.id())
         && error.raw_os_error() != Some(ESRCH)
     {
@@ -273,20 +302,107 @@ fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
-    let status = Command::new("taskkill.exe")
-        .args(["/PID", &child.id().to_string(), "/T", "/F"])
-        .status();
-    if matches!(status, Ok(status) if status.success()) {
-        Ok(())
-    } else {
-        child.kill()
+fn terminate_process_tree(
+    child: &mut Child,
+    process_tree: Option<&ProcessTree>,
+    deadline: Instant,
+) -> io::Result<()> {
+    if let Some(process_tree) = process_tree
+        && process_tree.terminate().is_ok()
+    {
+        return Ok(());
     }
+    let started = Instant::now();
+    let remaining = deadline.saturating_duration_since(started);
+    let taskkill_deadline = started + remaining / 3;
+    let taskkill_reap_deadline = started + remaining.saturating_mul(2) / 3;
+    let mut taskkill = Command::new("taskkill.exe")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(taskkill) = taskkill.as_mut() {
+        match wait_for_child_until(taskkill, taskkill_deadline) {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = taskkill.kill();
+                let _ = wait_for_child_until(taskkill, taskkill_reap_deadline);
+            }
+        }
+    }
+    child.kill()
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
+fn terminate_process_tree(
+    child: &mut Child,
+    _process_tree: Option<&ProcessTree>,
+    _deadline: Instant,
+) -> io::Result<()> {
     child.kill()
+}
+
+#[cfg(not(windows))]
+struct ProcessTree;
+
+#[cfg(not(windows))]
+impl ProcessTree {
+    fn attach(_child: &Child) -> io::Result<Self> {
+        Ok(Self)
+    }
+}
+
+#[cfg(windows)]
+struct ProcessTree {
+    job: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+impl ProcessTree {
+    fn attach(child: &Child) -> io::Result<Self> {
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { AssignProcessToJobObject(job, child.as_raw_handle().cast()) } == 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                CloseHandle(job);
+            }
+            return Err(error);
+        }
+        Ok(Self { job })
+    }
+
+    fn terminate(&self) -> io::Result<()> {
+        if unsafe { TerminateJobObject(self.job, 1) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.job);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateJobObjectW(
+        job_attributes: *const std::ffi::c_void,
+        name: *const u16,
+    ) -> *mut std::ffi::c_void;
+    fn AssignProcessToJobObject(job: *mut std::ffi::c_void, process: *mut std::ffi::c_void) -> i32;
+    fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
+    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
 }
 
 #[cfg(unix)]

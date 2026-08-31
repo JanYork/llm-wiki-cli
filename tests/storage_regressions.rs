@@ -92,7 +92,7 @@ fn new_store_has_v15_tag_schema_constraints_and_cascades() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     let indexes = {
         let mut statement = conn
             .prepare(
@@ -202,7 +202,7 @@ fn v12_store_migrates_to_v15_with_existing_pages_untagged() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!((version, format.as_str()), (16, "16"));
+    assert_eq!((version, format.as_str()), (17, "17"));
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM page_tags", [], |row| row
             .get::<_, i64>(0))
@@ -248,7 +248,7 @@ fn failed_v13_migration_leaves_v12_unchanged_and_can_retry() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
 }
 
 #[test]
@@ -301,11 +301,24 @@ fn new_store_uses_contentless_search_fts_and_keeps_identifiers_readable() {
         normalized.contains("path_terms"),
         "search_fts should index canonical paths separately\n{create_sql}"
     );
+    let span_create_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'span_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        span_create_sql
+            .to_ascii_lowercase()
+            .contains("heading_terms"),
+        "span_fts should index heading context separately\n{span_create_sql}"
+    );
 
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     for table in [
         "retrieval_weights",
         "retrieval_feedback",

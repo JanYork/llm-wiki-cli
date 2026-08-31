@@ -114,9 +114,11 @@ impl AgentTarget for CursorTarget {
             return format!(
                 "# cursor local AgentTarget integration (print-only)\n\
 MCP: {mcp}\n\
-Hook: lwc --scope all agent hook --agent cursor --event session_start\n\
+Hook: lwc --scope all agent hook --agent cursor --event sessionStart\n\
+Hook events: {}\n\
 Skill: using-lwc\n\
 Instructions:\n{}\n",
+                install::hook_events_summary(self.id(), location),
                 install::guidance()
             );
         }
@@ -125,7 +127,9 @@ Instructions:\n{}\n",
 MCP: {mcp}\n\
 Skill: ~/.cursor/skills/using-lwc\n\
 Hook: ~/.cursor/hooks.json\n\
+Hook events: {}\n\
 Instructions: user_managed (Cursor Settings > Rules)\n{}\n",
+            install::hook_events_summary(self.id(), location),
             install::guidance()
         )
     }

@@ -45,6 +45,13 @@ impl AgentTarget for HermesTarget {
             "unsupported"
         }
     }
+    fn hook_capabilities(&self, location: AgentLocation) -> &'static [HookCapability] {
+        if location == AgentLocation::Global {
+            hook_capabilities(self.id())
+        } else {
+            &[]
+        }
+    }
     fn permissions_mode(&self, _location: AgentLocation) -> &'static str {
         "not_applicable"
     }
@@ -107,7 +114,8 @@ impl AgentTarget for HermesTarget {
 mcp_servers:\n  lwc:\n    command: lwc\n    args:\n      - serve\n      - --mcp\n\
 platform_toolsets:\n  cli:\n    - mcp-lwc\n\
 Skill: ~/.hermes/skills/using-lwc\n\
-Hook: config.yaml hooks.pre_llm_call\n\
+Hook: config.yaml hooks.pre_llm_call and hooks.pre_tool_call\n\
+Hook events: pre_llm_call, pre_tool_call (matcher: terminal, timeout: 2, fail_closed: false)\n\
 Instructions: ~/.hermes/SOUL.md marker\n"
             .into()
     }

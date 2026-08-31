@@ -19,6 +19,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -31,6 +32,8 @@ const LWC_INSTRUCTION_FRONTMATTER: &str = "---\n# LWC_AGENT_FRONTMATTER\napplyTo
 const LWC_CURSOR_FRONTMATTER: &str = "---\n# LWC_AGENT_FRONTMATTER\ndescription: LWC usage and memory guidance\nalwaysApply: true\n---\n";
 const LWC_COMMAND: &str = "lwc";
 const LWC_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const LWC_PROBE_CLEANUP_RESERVE: Duration = Duration::from_millis(100);
+const LWC_PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
 const ANTIGRAVITY_PLUGIN: &[u8] = b"{\n  \"name\": \"lwc\"\n}\n";
 const SKILL_FILES: &[(&str, &[u8])] = &[
     (
@@ -205,11 +208,18 @@ struct Manifest {
     files: Vec<FileSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prompt_hook: Option<bool>,
+    #[serde(default)]
+    hook_contract_version: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    installed_hook_events: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mcp: Option<McpOwnership>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     created_directories: Vec<PathBuf>,
 }
+
+const MANIFEST_VERSION: u8 = 8;
+const HOOK_CONTRACT_VERSION: u8 = 4;
 
 #[derive(Serialize, Deserialize)]
 struct McpOwnership {
@@ -323,7 +333,7 @@ pub(crate) fn refresh(
             ));
             continue;
         }
-        let prompt_hook = if target.id() == "claude" {
+        let prompt_hook = if matches!(target.id(), "claude" | "codex") {
             read_manifest(&manifest_path(&home, cwd, target.id(), location))?
                 .and_then(|manifest| manifest.prompt_hook)
                 .unwrap_or(true)
@@ -363,13 +373,17 @@ pub(crate) fn status(
             let supported = target.supports_location(location);
             let detection = supported.then(|| target.detect(&environment));
             let manifest = manifest_path(&home, cwd, target.id(), location);
+            let installed_manifest = if supported {
+                read_manifest(&manifest).ok().flatten()
+            } else {
+                None
+            };
             let state = if supported {
-                read_manifest(&manifest)
-                    .ok()
-                    .flatten()
+                installed_manifest
+                    .as_ref()
                     .map(|manifest| {
                         if manifest_current_for_target(
-                            &manifest,
+                            manifest,
                             target,
                             &target.describe_paths(&environment),
                         ) {
@@ -394,6 +408,11 @@ pub(crate) fn status(
                 "skills": if supported { target.skills_mode(location) } else { "unsupported" },
                 "lifecycle_hook": supported && target.lifecycle_hook(location),
                 "lifecycle_hook_mode": if supported { target.lifecycle_mode(location) } else { "unsupported" },
+                "hook_capabilities": target.hook_capabilities(location),
+                "installed_hook_events": installed_manifest
+                    .as_ref()
+                    .map(|manifest| manifest.installed_hook_events.clone())
+                    .unwrap_or_default(),
                 "permissions": if supported { target.permissions_mode(location) } else { "unsupported" },
                 "detected": detection.as_ref().is_some_and(|result| result.installed),
                 "already_configured": detection.as_ref().is_some_and(|result| result.already_configured),
@@ -463,15 +482,24 @@ pub(super) fn install_native(
         ));
     }
     let manifest_path = manifest_path(environment.home, environment.cwd, id, location);
+    let installed_hook_events = target
+        .configured_hook_events(location, options)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     let old_manifest = read_manifest(&manifest_path)?;
     if old_manifest.as_ref().is_some_and(|manifest| {
         manifest_current_for_target(manifest, target, &all_paths(&paths))
-            && (id != "claude" || manifest.prompt_hook == Some(options.prompt_hook))
+            && (!matches!(id, "claude" | "codex")
+                || manifest.prompt_hook == Some(options.prompt_hook))
+            && manifest.hook_contract_version == HOOK_CONTRACT_VERSION
+            && manifest.installed_hook_events == installed_hook_events
     }) {
         return Ok(WriteResult {
             status: "unchanged",
             files: all_paths(&paths),
             notes: Vec::new(),
+            installed_hook_events,
         });
     }
     let other_manifests = other_manifests(environment.home, &manifest_path)?;
@@ -511,6 +539,8 @@ pub(super) fn install_native(
                 location,
                 files: current,
                 prompt_hook: None,
+                hook_contract_version: 0,
+                installed_hook_events: Vec::new(),
                 mcp: None,
                 created_directories: Vec::new(),
             });
@@ -532,6 +562,8 @@ pub(super) fn install_native(
                 location,
                 files: current,
                 prompt_hook: None,
+                hook_contract_version: 0,
+                installed_hook_events: Vec::new(),
                 mcp: None,
                 created_directories: Vec::new(),
             });
@@ -549,6 +581,8 @@ pub(super) fn install_native(
                 location,
                 files: current,
                 prompt_hook: None,
+                hook_contract_version: 0,
+                installed_hook_events: Vec::new(),
                 mcp: None,
                 created_directories: Vec::new(),
             });
@@ -564,6 +598,8 @@ pub(super) fn install_native(
                 location,
                 files: current,
                 prompt_hook: None,
+                hook_contract_version: 0,
+                installed_hook_events: Vec::new(),
                 mcp: None,
                 created_directories: Vec::new(),
             });
@@ -579,6 +615,8 @@ pub(super) fn install_native(
                     location,
                     files: current,
                     prompt_hook: None,
+                    hook_contract_version: 0,
+                    installed_hook_events: Vec::new(),
                     mcp: None,
                     created_directories: Vec::new(),
                 });
@@ -589,6 +627,19 @@ pub(super) fn install_native(
         current.clone()
     };
     inherit_original_snapshots(&mut snapshots, &other_manifests)?;
+    if id == "opencode"
+        && let Some(path) = paths.hook.as_deref()
+        && let Some(snapshot) = snapshots.iter_mut().find(|snapshot| snapshot.path == path)
+        && snapshot
+            .original
+            .as_deref()
+            .is_some_and(|original| original.as_bytes() == OPENCODE_V1_PLUGIN)
+    {
+        // The exact retired v1 file is an LWC-owned artifact, not a user
+        // baseline. Migrating it must not make uninstall resurrect it.
+        snapshot.original = None;
+        snapshot.original_mode = None;
+    }
     let executable = agent_command(id);
     let mut created_directories = old_manifest
         .as_ref()
@@ -630,12 +681,14 @@ pub(super) fn install_native(
         write_json(
             &manifest_path,
             &Manifest {
-                version: 7,
+                version: MANIFEST_VERSION,
                 lwc_version: Some(env!("CARGO_PKG_VERSION").into()),
                 target: id.to_owned(),
                 location,
                 files,
-                prompt_hook: (id == "claude").then_some(options.prompt_hook),
+                prompt_hook: matches!(id, "claude" | "codex").then_some(options.prompt_hook),
+                hook_contract_version: HOOK_CONTRACT_VERSION,
+                installed_hook_events: installed_hook_events.clone(),
                 mcp: (target.mcp_mode(location) == "installed").then(|| McpOwnership {
                     name: "lwc".into(),
                     command: executable.clone(),
@@ -663,6 +716,8 @@ pub(super) fn install_native(
             location,
             files: current,
             prompt_hook: None,
+            hook_contract_version: 0,
+            installed_hook_events: Vec::new(),
             mcp: None,
             created_directories: Vec::new(),
         };
@@ -674,6 +729,7 @@ pub(super) fn install_native(
         status: "installed",
         files: all_paths(&paths),
         notes: Vec::new(),
+        installed_hook_events,
     })
 }
 
@@ -701,17 +757,36 @@ pub(super) fn uninstall_native(
         .flat_map(|manifest| manifest.files.into_iter().map(|file| file.path))
         .collect::<std::collections::BTreeSet<_>>();
     let result = (|| {
-        if post_matches(&manifest) {
+        let exact_post_install_state = post_matches(&manifest);
+        let executable = manifest
+            .mcp
+            .as_ref()
+            .map(|mcp| mcp.command.to_string_lossy().into_owned())
+            .unwrap_or_else(|| LWC_COMMAND.to_owned());
+        let shared_hook = paths
+            .hook
+            .as_ref()
+            .filter(|path| shared.contains(*path))
+            .cloned();
+        if let Some(hook) = shared_hook {
+            target.unconfigure(
+                &TargetPaths {
+                    mcp: None,
+                    instruction: None,
+                    hook: Some(hook),
+                    skill_dir: None,
+                    aux: Vec::new(),
+                },
+                &executable,
+            )?;
+        }
+        if exact_post_install_state {
             restore_excluding(&manifest, &shared)?;
         } else {
-            let executable = manifest
-                .mcp
-                .as_ref()
-                .map(|mcp| mcp.command.to_string_lossy().into_owned())
-                .unwrap_or_else(|| LWC_COMMAND.to_owned());
             let cleanup_paths = excluding_paths(paths.clone(), &shared);
             target.unconfigure(&cleanup_paths, &executable)?;
             restore_preexisting_content(target.id(), &cleanup_paths, &manifest)?;
+            restore_copilot_hook_baseline_if_equivalent(target.id(), &cleanup_paths, &manifest)?;
             restore_matching_excluding(&manifest, &current, &shared)?;
         }
         if let Some(skill_dir) = &paths.skill_dir
@@ -735,6 +810,8 @@ pub(super) fn uninstall_native(
             location: environment.location,
             files: current,
             prompt_hook: None,
+            hook_contract_version: 0,
+            installed_hook_events: Vec::new(),
             mcp: None,
             created_directories: Vec::new(),
         });
@@ -745,7 +822,54 @@ pub(super) fn uninstall_native(
         status: "removed",
         files: all_paths(&paths),
         notes: Vec::new(),
+        installed_hook_events: Vec::new(),
     })
+}
+
+fn restore_copilot_hook_baseline_if_equivalent(
+    target: &str,
+    paths: &TargetPaths,
+    manifest: &Manifest,
+) -> Result<()> {
+    if !matches!(target, "copilot-vscode" | "copilot-cli") {
+        return Ok(());
+    }
+    let Some(path) = paths.hook.as_deref() else {
+        return Ok(());
+    };
+    let original = manifest.files.iter().find(|file| file.path == path);
+    let Some(snapshot) = original else {
+        return Ok(());
+    };
+    let Ok(current_text) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let Ok(current) = serde_json::from_str::<Value>(&current_text) else {
+        return Ok(());
+    };
+    if let Some(original) = snapshot.original.as_deref() {
+        if serde_json::from_str::<Value>(original).ok().as_ref() == Some(&current) {
+            atomic_write(path, original.as_bytes(), snapshot.original_mode)?;
+        }
+        return Ok(());
+    }
+    let removable = current.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .all(|key| matches!(key.as_str(), "hooks" | "version"))
+            && object
+                .get("hooks")
+                .and_then(Value::as_object)
+                .is_none_or(Map::is_empty)
+    });
+    if removable {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn remove_empty_tree(root: &Path) -> Result<()> {
@@ -1055,6 +1179,8 @@ fn receipt(target: &dyn AgentTarget, location: AgentLocation, result: WriteResul
         "instructions": if unsupported { "unsupported" } else { target.instructions_mode(location) },
         "lifecycle_hook": matches!(lifecycle_mode, "installed" | "configured_preview"),
         "lifecycle_hook_mode": lifecycle_mode,
+        "hook_capabilities": target.hook_capabilities(location),
+        "installed_hook_events": result.installed_hook_events,
         "permissions": if unsupported { "unsupported" } else { target.permissions_mode(location) },
         "writes": result.files,
         "notes": result.notes,
@@ -1073,6 +1199,8 @@ fn failed_receipt(target: &dyn AgentTarget, location: AgentLocation, error: AppE
         "instructions": target.instructions_mode(location),
         "lifecycle_hook": matches!(lifecycle_mode, "installed" | "configured_preview"),
         "lifecycle_hook_mode": lifecycle_mode,
+        "hook_capabilities": target.hook_capabilities(location),
+        "installed_hook_events": [],
         "permissions": target.permissions_mode(location),
         "writes": [],
         "notes": [],
@@ -1152,12 +1280,16 @@ fn preflight_exclusive_files(
     }
     if let Some(path) = &paths.hook {
         let expected = match target {
-            "opencode" => Some(OPENCODE_PLUGIN),
+            "opencode" => Some(OPENCODE_V2_PLUGIN),
             "pi" => Some(PI_EXTENSION),
             _ => None,
         };
         if let Some(expected) = expected {
-            reject_foreign_exclusive_file(path, expected, manifest, other_manifests, "plugin")?;
+            let exact_legacy_opencode = target == "opencode"
+                && fs::read(path).is_ok_and(|current| current == OPENCODE_V1_PLUGIN);
+            if !exact_legacy_opencode {
+                reject_foreign_exclusive_file(path, expected, manifest, other_manifests, "plugin")?;
+            }
         }
     }
     if target == "antigravity"
@@ -1564,7 +1696,13 @@ fn install_hermes_mcp(text: &str, executable: &str) -> Result<String> {
     let block = hermes_mcp_child(executable);
     if let Some(parent) = yaml_top_level_range(&lines, "mcp_servers") {
         if let Some(child) = yaml_child_range(&lines, parent, "lwc") {
-            if lines[child.0..child.1] != block {
+            let canonical_end = child.0 + block.len();
+            if canonical_end > child.1
+                || lines[child.0..canonical_end] != block
+                || lines[canonical_end..child.1]
+                    .iter()
+                    .any(|line| !line.trim().is_empty())
+            {
                 return Err(AppError::new(
                     "agent_mcp_conflict",
                     "an unowned Hermes MCP entry named lwc already exists",
@@ -1716,10 +1854,18 @@ fn remove_hermes_mcp(text: &str, executable: &str) -> String {
     let mut removed = false;
     if let Some(parent) = yaml_top_level_range(&lines, "mcp_servers")
         && let Some(child) = yaml_child_range(&lines, parent, "lwc")
-        && lines[child.0..child.1] == hermes_mcp_child(executable)
     {
-        lines.drain(child.0..child.1);
-        removed = true;
+        let block = hermes_mcp_child(executable);
+        let canonical_end = child.0 + block.len();
+        if canonical_end <= child.1
+            && lines[child.0..canonical_end] == block
+            && lines[canonical_end..child.1]
+                .iter()
+                .all(|line| line.trim().is_empty())
+        {
+            lines.drain(child.0..canonical_end);
+            removed = true;
+        }
     }
     if removed
         && let Some(parent) = yaml_top_level_range(&lines, "platform_toolsets")
@@ -2023,15 +2169,17 @@ pub(super) fn ensure_cursor_frontmatter(paths: &TargetPaths) -> Result<()> {
 
 pub(super) fn standard_config(target: &str, location: AgentLocation) -> String {
     let executable = agent_command(target).to_string_lossy().into_owned();
-    let hook = match target {
-        "cursor" => "lwc --scope all agent hook --agent cursor --event session_start".into(),
+    let hook: String = match target {
+        "cursor" => "lwc --scope all agent hook --agent cursor --event sessionStart".into(),
         "gemini" => "lwc --scope all agent hook --agent gemini --event SessionStart".into(),
-        "opencode" => "lwc --scope all agent hook --agent generic --event session_start".into(),
+        "opencode" => {
+            "OpenCode v2 Plugin API is beta: lwc --scope all agent hook --agent opencode --event context"
+                .into()
+        }
         "hermes" => "lwc --scope all agent hook --agent hermes --event pre_llm_call".into(),
-        "antigravity" => format!(
-            "{} --scope all agent hook --agent antigravity --event pre_invocation",
-            hook_executable(&executable)
-        ),
+        "antigravity" => {
+            "lwc --scope all agent hook --agent antigravity --event PreToolUse".into()
+        }
         "kiro" => "lwc --scope all agent hook --agent kiro --event SessionStart --raw".into(),
         _ => "lwc --scope all agent hook --agent generic --event session_start".into(),
     };
@@ -2048,11 +2196,24 @@ pub(super) fn standard_config(target: &str, location: AgentLocation) -> String {
         "# {target} {location} AgentTarget integration (print-only)\n\
 MCP: {mcp}\n\
 Hook: {hook}\n\
+Hook events: {}\n\
 Skill: using-lwc\n\
 Instructions:\n{}\n",
+        hook_events_summary(target, location),
         guidance(),
         location = location.as_str(),
     )
+}
+
+pub(super) fn hook_events_summary(target: &str, location: AgentLocation) -> String {
+    let events = targets::get_target(target)
+        .map(|target| target.configured_hook_events(location, InstallOptions { prompt_hook: true }))
+        .unwrap_or_default();
+    if events.is_empty() {
+        "none (unsupported)".into()
+    } else {
+        events.join(", ")
+    }
 }
 
 fn replace_marker(text: &str, block: &str) -> Result<String> {
@@ -2087,7 +2248,7 @@ fn replace_marker(text: &str, block: &str) -> Result<String> {
     }
 }
 
-const OPENCODE_PLUGIN: &[u8] = br#"async function context() {
+const OPENCODE_V1_PLUGIN: &[u8] = br#"async function context() {
   try {
     const process = Bun.spawn(
       ["lwc", "--scope", "all", "agent", "hook", "--agent", "generic", "--event", "session_start"],
@@ -2109,6 +2270,71 @@ export const Lwc = async () => ({
   },
 })
 "#;
+
+const OPENCODE_V2_PLUGIN: &[u8] = br#"import { Plugin } from "@opencode-ai/plugin"
+
+const MAX_OUTPUT_BYTES = 64 * 1024
+const MAX_INITIALIZED_SESSIONS = 256
+const TIMEOUT_MS = 2000
+
+async function readBounded(stream) {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let total = 0
+  let text = ""
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) return text + decoder.decode()
+    total += value.byteLength
+    if (total > MAX_OUTPUT_BYTES) {
+      await reader.cancel()
+      return undefined
+    }
+    text += decoder.decode(value, { stream: true })
+  }
+}
+
+async function loadContext() {
+  let process
+  let timeout
+  try {
+    process = Bun.spawn(
+      ["lwc", "--scope", "all", "agent", "hook", "--agent", "opencode", "--event", "context"],
+      { stdin: new Blob(["{}"]), stdout: "pipe", stderr: "ignore" },
+    )
+    timeout = setTimeout(() => {
+      try { process.kill() } catch {}
+    }, TIMEOUT_MS)
+    const [stdout, exitCode] = await Promise.all([readBounded(process.stdout), process.exited])
+    if (exitCode !== 0 || stdout === undefined) return ""
+    const value = JSON.parse(stdout)
+    return typeof value.additionalContext === "string" ? value.additionalContext : ""
+  } catch {
+    return ""
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout)
+  }
+}
+
+export default Plugin.define({
+  id: "lwc.context",
+  async setup(ctx) {
+    const initializedSessions = new Set()
+    await ctx.session.hook("context", async (event) => {
+      const sessionID = event.sessionID
+      if (typeof sessionID !== "string" || sessionID.length === 0) return
+      if (initializedSessions.has(sessionID)) return
+      initializedSessions.add(sessionID)
+      if (initializedSessions.size > MAX_INITIALIZED_SESSIONS) {
+        initializedSessions.delete(initializedSessions.values().next().value)
+      }
+      const text = await loadContext()
+      if (text) event.system.push({ text })
+    })
+  },
+})
+"#;
+
 const PI_EXTENSION: &[u8] = include_bytes!("../../integrations/pi-lwc/extensions/lwc.js");
 
 fn install_hook(
@@ -2121,6 +2347,7 @@ fn install_hook(
         return Ok(());
     };
     match target {
+        "opencode" => atomic_write(path, OPENCODE_V2_PLUGIN, None),
         "claude" => {
             let mut root: Value = fs::read(path)
                 .ok()
@@ -2142,17 +2369,22 @@ fn install_hook(
                 AppError::new("agent_config_invalid", "Claude hooks must be an object")
             })?;
             let command = |event: &str| {
-                let scope = if event == "SessionStart" {
-                    " --scope all"
-                } else {
-                    ""
-                };
-                format!("\"{executable}\"{scope} agent hook --agent claude --event {event}")
+                format!("\"{executable}\" --scope all agent hook --agent claude --event {event}")
             };
-            set_hook(
-                hooks,
+            for event in [
                 "SessionStart",
-                &command("SessionStart"),
+                "PostToolUse",
+                "PostToolUseFailure",
+                "SubagentStart",
+                "Stop",
+            ] {
+                set_hook(hooks, event, &command(event), "claude", |_| false)?;
+            }
+            set_matched_hook(
+                hooks,
+                "PreToolUse",
+                "Bash",
+                &command("PreToolUse"),
                 "claude",
                 |_| false,
             )?;
@@ -2160,9 +2392,8 @@ fn install_hook(
                 .get_mut("UserPromptSubmit")
                 .and_then(Value::as_array_mut)
             {
-                groups.retain(|group| {
-                    !group.to_string().contains("codegraph prompt-hook")
-                        && !group.to_string().contains("agent hook --agent claude")
+                remove_group_hook_entries(groups, "agent hook --agent claude", |hook| {
+                    hook.to_string().contains("codegraph prompt-hook")
                 });
                 groups.is_empty()
             } else {
@@ -2232,13 +2463,42 @@ fn install_hook(
             let command = |event: &str| {
                 format!("\"{executable}\" --scope all agent hook --agent codex --event {event}")
             };
-            set_hook(
+            for event in ["SessionStart", "PostToolUse", "SubagentStart", "Stop"] {
+                set_hook(hooks, event, &command(event), "codex", |_| false)?;
+            }
+            set_matched_hook(
                 hooks,
-                "SessionStart",
-                &command("SessionStart"),
+                "PreToolUse",
+                "Bash",
+                &command("PreToolUse"),
                 "codex",
                 |_| false,
             )?;
+            let remove_prompt_event = if let Some(groups) = hooks
+                .get_mut("UserPromptSubmit")
+                .and_then(Value::as_array_mut)
+            {
+                remove_group_hook_entries(
+                    groups,
+                    "agent hook --agent codex --event UserPromptSubmit",
+                    |_| false,
+                );
+                groups.is_empty()
+            } else {
+                false
+            };
+            if remove_prompt_event {
+                hooks.remove("UserPromptSubmit");
+            }
+            if prompt_hook {
+                set_hook(
+                    hooks,
+                    "UserPromptSubmit",
+                    &command("UserPromptSubmit"),
+                    "codex",
+                    |_| false,
+                )?;
+            }
             atomic_write(path, pretty_json(&root)?.as_bytes(), None)
         }
         "cursor" => {
@@ -2248,13 +2508,27 @@ fn install_hook(
             set_direct_hook(
                 hooks,
                 "sessionStart",
-                "lwc --scope all agent hook --agent cursor --event session_start",
+                "lwc --scope all agent hook --agent cursor --event sessionStart",
                 "agent hook --agent cursor",
             )?;
             set_direct_hook(
                 hooks,
                 "preCompact",
                 "lwc --scope all agent hook --agent cursor --event preCompact",
+                "agent hook --agent cursor",
+            )?;
+            set_direct_hook(
+                hooks,
+                "postToolUse",
+                "lwc --scope all agent hook --agent cursor --event postToolUse",
+                "agent hook --agent cursor",
+            )?;
+            remove_direct_hook(hooks, "preToolUse", "agent hook --agent cursor")?;
+            set_direct_consent_hook(
+                hooks,
+                "beforeShellExecution",
+                "lwc",
+                "lwc --scope all agent hook --agent cursor --event beforeShellExecution",
                 "agent hook --agent cursor",
             )?;
             atomic_write(path, pretty_json(&root)?.as_bytes(), None)
@@ -2269,60 +2543,73 @@ fn install_hook(
                 "gemini",
                 |_| false,
             )?;
+            set_hook(
+                hooks,
+                "BeforeAgent",
+                "lwc --scope all agent hook --agent gemini --event BeforeAgent",
+                "gemini",
+                |_| false,
+            )?;
+            set_hook(
+                hooks,
+                "AfterTool",
+                "lwc --scope all agent hook --agent gemini --event AfterTool",
+                "gemini",
+                |_| false,
+            )?;
             atomic_write(path, pretty_json(&root)?.as_bytes(), None)
         }
         "hermes" => {
             let text = fs::read_to_string(path).unwrap_or_default();
-            let command = "lwc --scope all agent hook --agent hermes --event pre_llm_call";
-            if text.contains(command) {
-                return Ok(());
-            }
             let mut lines = yaml_lines(&text);
-            if let Some(parent) = yaml_top_level_range(&lines, "hooks") {
-                if let Some(child) = yaml_child_range(&lines, parent, "pre_llm_call") {
-                    lines.insert(
-                        child.1,
-                        format!("    - command: {}", serde_json::to_string(command).unwrap()),
-                    );
+            for (event, command, entry) in [
+                (
+                    "pre_llm_call",
+                    "lwc --scope all agent hook --agent hermes --event pre_llm_call",
+                    vec![format!(
+                        "    - command: {}",
+                        serde_json::to_string(
+                            "lwc --scope all agent hook --agent hermes --event pre_llm_call"
+                        )
+                        .unwrap()
+                    )],
+                ),
+                (
+                    "pre_tool_call",
+                    "lwc --scope all agent hook --agent hermes --event pre_tool_call",
+                    vec![
+                        "    - matcher: \"terminal\"".into(),
+                        format!(
+                            "      command: {}",
+                            serde_json::to_string(
+                                "lwc --scope all agent hook --agent hermes --event pre_tool_call"
+                            )
+                            .unwrap()
+                        ),
+                        "      timeout: 2".into(),
+                        "      fail_closed: false".into(),
+                    ],
+                ),
+            ] {
+                remove_hermes_hook_entries(&mut lines, event, command);
+                if let Some(parent) = yaml_top_level_range(&lines, "hooks") {
+                    if let Some(child) = yaml_child_range(&lines, parent, event) {
+                        lines.splice(child.1..child.1, entry);
+                    } else {
+                        lines.splice(
+                            parent.1..parent.1,
+                            std::iter::once(format!("  {event}:")).chain(entry),
+                        );
+                    }
                 } else {
-                    lines.splice(
-                        parent.1..parent.1,
-                        [
-                            "  pre_llm_call:".into(),
-                            format!("    - command: {}", serde_json::to_string(command).unwrap()),
-                        ],
-                    );
+                    trim_yaml_tail(&mut lines);
+                    lines.extend([String::new(), "hooks:".into(), format!("  {event}:")]);
+                    lines.extend(entry);
                 }
-            } else {
-                trim_yaml_tail(&mut lines);
-                lines.extend([
-                    String::new(),
-                    "hooks:".into(),
-                    "  pre_llm_call:".into(),
-                    format!("    - command: {}", serde_json::to_string(command).unwrap()),
-                ]);
             }
             atomic_write(path, join_yaml_lines(lines).as_bytes(), None)
         }
-        "antigravity" => {
-            let mut root = read_json_object(path, "Antigravity hooks")?;
-            let object = root.as_object_mut().expect("validated JSON object");
-            if object
-                .get("lwc")
-                .is_some_and(|value| !value.to_string().contains("agent hook --agent antigravity"))
-            {
-                return Err(AppError::new(
-                    "agent_config_conflict",
-                    "Antigravity hooks already contain a foreign top-level lwc entry",
-                ));
-            }
-            let executable = hook_executable(executable);
-            object.insert(
-                "lwc".into(),
-                json!({"PreInvocation": [{"type": "command", "command": format!("{executable} --scope all agent hook --agent antigravity --event pre_invocation")}]}),
-            );
-            atomic_write(path, pretty_json(&root)?.as_bytes(), None)
-        }
+        "antigravity" => install_antigravity_hook(path),
         "kiro" => {
             let mut root = read_json_object(path, "Kiro hooks")?;
             root.as_object_mut()
@@ -2341,11 +2628,22 @@ fn install_hook(
                 !hook.to_string().contains("agent hook --agent generic")
                     && !hook.to_string().contains("agent hook --agent kiro")
             });
-            hooks.push(json!({
-                "name": "LWC readiness",
-                "trigger": "SessionStart",
-                "action": {"type": "command", "command": "lwc --scope all agent hook --agent kiro --event SessionStart --raw"}
-            }));
+            for (event, name) in [
+                ("SessionStart", "LWC readiness"),
+                ("UserPromptSubmit", "LWC prompt context"),
+                ("PostToolUse", "LWC post-tool context"),
+            ] {
+                hooks.push(json!({
+                    "name": name,
+                    "trigger": event,
+                    "action": {
+                        "type": "command",
+                        "command": format!(
+                            "lwc --scope all agent hook --agent kiro --event {event} --raw"
+                        )
+                    }
+                }));
+            }
             atomic_write(path, pretty_json(&root)?.as_bytes(), None)
         }
         "copilot-vscode" | "copilot-cli" => {
@@ -2370,44 +2668,57 @@ fn install_hook(
                 if remove_legacy {
                     hooks.remove("sessionStart");
                 }
+                let remove_broad_pretool = hooks
+                    .get_mut("PreToolUse")
+                    .and_then(Value::as_array_mut)
+                    .is_some_and(|entries| {
+                        entries.retain(|entry| {
+                            !entry
+                                .to_string()
+                                .contains("agent hook --agent copilot-vscode")
+                        });
+                        entries.is_empty()
+                    });
+                if remove_broad_pretool {
+                    hooks.remove("PreToolUse");
+                }
             }
-            let (event, command_key, platform_key) = if target == "copilot-vscode" {
-                ("SessionStart", "command", "windows")
-            } else {
-                ("sessionStart", "bash", "powershell")
-            };
-            let entries = hooks.entry(event).or_insert_with(|| json!([]));
-            let entries = entries.as_array_mut().ok_or_else(|| {
-                AppError::new(
-                    "agent_config_invalid",
-                    "Copilot sessionStart hooks must be an array",
+            let (events, command_key, platform_key): (&[&str], _, _) = if target == "copilot-vscode"
+            {
+                (
+                    &["SessionStart", "PostToolUse", "SubagentStart"],
+                    "command",
+                    "windows",
                 )
-            })?;
-            let owned = format!("agent hook --agent {target}");
-            entries.retain(|entry| !entry.to_string().contains(&owned));
-            let command = format!("lwc --scope all agent hook --agent {target} --event {event}");
-            entries.push(json!({
-                "type": "command",
-                command_key: command,
-                platform_key: command,
-            }));
+            } else {
+                (
+                    &["sessionStart", "postToolUse", "subagentStart"],
+                    "bash",
+                    "powershell",
+                )
+            };
+            for event in events {
+                let entries = hooks.entry(*event).or_insert_with(|| json!([]));
+                let entries = entries.as_array_mut().ok_or_else(|| {
+                    AppError::new(
+                        "agent_config_invalid",
+                        format!("Copilot {event} hooks must be an array"),
+                    )
+                })?;
+                let owned = format!("agent hook --agent {target}");
+                entries.retain(|entry| !entry.to_string().contains(&owned));
+                let command =
+                    format!("lwc --scope all agent hook --agent {target} --event {event}");
+                entries.push(json!({
+                    "type": "command",
+                    command_key: command,
+                    platform_key: command,
+                }));
+            }
             atomic_write(path, pretty_json(&root)?.as_bytes(), None)
         }
-        "opencode" => atomic_write(path, OPENCODE_PLUGIN, None),
         "pi" => atomic_write(path, PI_EXTENSION, None),
         _ => Ok(()),
-    }
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn hook_executable(value: &str) -> String {
-    if value == LWC_COMMAND {
-        value.into()
-    } else {
-        shell_quote(value)
     }
 }
 
@@ -2461,10 +2772,87 @@ fn set_direct_hook(
     Ok(())
 }
 
+fn set_direct_consent_hook(
+    hooks: &mut Map<String, Value>,
+    event: &str,
+    matcher: &str,
+    command: &str,
+    owned: &str,
+) -> Result<()> {
+    remove_direct_hook(hooks, event, owned)?;
+    hooks
+        .entry(event)
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .expect("remove_direct_hook validated the array")
+        .push(json!({
+            "command": command,
+            "matcher": matcher,
+            "timeout": 2,
+            "failClosed": false,
+        }));
+    Ok(())
+}
+
+fn remove_direct_hook(hooks: &mut Map<String, Value>, event: &str, owned: &str) -> Result<()> {
+    let remove_event = if let Some(entries) = hooks.get_mut(event) {
+        let entries = entries.as_array_mut().ok_or_else(|| {
+            AppError::new(
+                "agent_config_invalid",
+                format!("Cursor {event} hooks must be an array"),
+            )
+        })?;
+        entries.retain(|entry| !entry.to_string().contains(owned));
+        entries.is_empty()
+    } else {
+        false
+    };
+    if remove_event {
+        hooks.remove(event);
+    }
+    Ok(())
+}
+
 fn set_hook(
     hooks: &mut Map<String, Value>,
     event: &str,
     command: &str,
+    agent: &str,
+    remove: impl Fn(&Value) -> bool,
+) -> Result<()> {
+    set_hook_group(
+        hooks,
+        event,
+        json!({"hooks": [{"type": "command", "command": command}]}),
+        agent,
+        remove,
+    )
+}
+
+fn set_matched_hook(
+    hooks: &mut Map<String, Value>,
+    event: &str,
+    matcher: &str,
+    command: &str,
+    agent: &str,
+    remove: impl Fn(&Value) -> bool,
+) -> Result<()> {
+    set_hook_group(
+        hooks,
+        event,
+        json!({
+            "matcher": matcher,
+            "hooks": [{"type": "command", "command": command, "timeout": 2}]
+        }),
+        agent,
+        remove,
+    )
+}
+
+fn set_hook_group(
+    hooks: &mut Map<String, Value>,
+    event: &str,
+    group: Value,
     agent: &str,
     remove: impl Fn(&Value) -> bool,
 ) -> Result<()> {
@@ -2476,9 +2864,23 @@ fn set_hook(
         )
     })?;
     let owned = format!("agent hook --agent {agent}");
-    groups.retain(|group| !remove(group) && !group.to_string().contains(&owned));
-    groups.push(json!({"hooks": [{"type": "command", "command": command}]}));
+    remove_group_hook_entries(groups, &owned, remove);
+    groups.push(group);
     Ok(())
+}
+
+fn remove_group_hook_entries(
+    groups: &mut Vec<Value>,
+    owned: &str,
+    remove: impl Fn(&Value) -> bool,
+) {
+    groups.retain_mut(|group| {
+        let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+            return !remove(group) && !group.to_string().contains(owned);
+        };
+        entries.retain(|entry| !remove(entry) && !entry.to_string().contains(owned));
+        !entries.is_empty()
+    });
 }
 
 pub(super) fn configure_standard(
@@ -2534,18 +2936,39 @@ pub(super) fn unconfigure_standard(
             if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
                 let owned = format!("agent hook --agent {target}");
                 let mut empty = Vec::new();
-                for (event, groups) in hooks.iter_mut() {
-                    let Some(groups) = groups.as_array_mut() else {
+                let events: &[&str] = match target {
+                    "claude" => &[
+                        "SessionStart",
+                        "UserPromptSubmit",
+                        "PreToolUse",
+                        "PostToolUse",
+                        "PostToolUseFailure",
+                        "SubagentStart",
+                        "Stop",
+                    ],
+                    "codex" => &[
+                        "SessionStart",
+                        "UserPromptSubmit",
+                        "PreToolUse",
+                        "PostToolUse",
+                        "SubagentStart",
+                        "Stop",
+                    ],
+                    "gemini" => &["SessionStart", "BeforeAgent", "AfterTool"],
+                    _ => &[],
+                };
+                for event in events {
+                    let Some(groups) = hooks.get_mut(*event).and_then(Value::as_array_mut) else {
                         continue;
                     };
                     let before = groups.len();
-                    groups.retain(|group| !group.to_string().contains(&owned));
+                    remove_group_hook_entries(groups, &owned, |_| false);
                     if before > 0 && groups.is_empty() {
-                        empty.push(event.clone());
+                        empty.push(*event);
                     }
                 }
                 for event in empty {
-                    hooks.remove(&event);
+                    hooks.remove(event);
                 }
             }
             if target == "claude" {
@@ -2558,6 +2981,8 @@ pub(super) fn unconfigure_standard(
             atomic_write(hook, pretty_json(&root)?.as_bytes(), None)?;
         } else if target == "cursor" {
             remove_cursor_hook(hook)?;
+        } else if target == "opencode" {
+            remove_opencode_plugin(hook)?;
         } else if target == "hermes" {
             remove_hermes_hook(hook)?;
         } else if target == "antigravity" {
@@ -2674,7 +3099,13 @@ fn remove_cursor_hook(path: &Path) -> Result<()> {
     let mut root: Value = serde_json::from_slice(&bytes)
         .map_err(|error| AppError::new("agent_config_invalid", error.to_string()))?;
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
-        for event in ["sessionStart", "preCompact"] {
+        for event in [
+            "sessionStart",
+            "preCompact",
+            "postToolUse",
+            "preToolUse",
+            "beforeShellExecution",
+        ] {
             if let Some(entries) = hooks.get_mut(event).and_then(Value::as_array_mut) {
                 entries.retain(|entry| !entry.to_string().contains("agent hook --agent cursor"));
                 if entries.is_empty() {
@@ -2686,28 +3117,98 @@ fn remove_cursor_hook(path: &Path) -> Result<()> {
     atomic_write(path, pretty_json(&root)?.as_bytes(), None)
 }
 
+fn remove_opencode_plugin(path: &Path) -> Result<()> {
+    let Ok(current) = fs::read(path) else {
+        return Ok(());
+    };
+    if current != OPENCODE_V2_PLUGIN && current != OPENCODE_V1_PLUGIN {
+        return Ok(());
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn remove_hermes_hook(path: &Path) -> Result<()> {
     let Ok(text) = fs::read_to_string(path) else {
         return Ok(());
     };
-    let updated = [
-        "lwc --scope all agent hook --agent hermes --event pre_llm_call",
-        "lwc agent hook --agent hermes --event pre_llm_call",
-    ]
-    .into_iter()
-    .fold(text.clone(), |text, command| {
-        text.replace(
-            &format!(
-                "    - command: {}\n",
-                serde_json::to_string(command).unwrap()
-            ),
-            "",
-        )
-    });
+    let mut lines = yaml_lines(&text);
+    for (event, commands) in [
+        (
+            "pre_llm_call",
+            [
+                "lwc --scope all agent hook --agent hermes --event pre_llm_call",
+                "lwc agent hook --agent hermes --event pre_llm_call",
+            ],
+        ),
+        (
+            "pre_tool_call",
+            [
+                "lwc --scope all agent hook --agent hermes --event pre_tool_call",
+                "lwc agent hook --agent hermes --event pre_tool_call",
+            ],
+        ),
+    ] {
+        for command in commands {
+            remove_hermes_hook_entries(&mut lines, event, command);
+        }
+    }
+    for event in ["pre_tool_call", "pre_llm_call"] {
+        let Some(parent) = yaml_top_level_range(&lines, "hooks") else {
+            break;
+        };
+        let Some(child) = yaml_child_range(&lines, parent, event) else {
+            continue;
+        };
+        if lines[child.0 + 1..child.1]
+            .iter()
+            .all(|line| line.trim().is_empty())
+        {
+            lines.drain(child.0..child.1);
+        }
+    }
+    if let Some(parent) = yaml_top_level_range(&lines, "hooks")
+        && lines[parent.0 + 1..parent.1]
+            .iter()
+            .all(|line| line.trim().is_empty())
+    {
+        lines.drain(parent.0..parent.1);
+    }
+    let updated = join_yaml_lines(lines);
     if updated != text {
         atomic_write(path, updated.as_bytes(), None)?;
     }
     Ok(())
+}
+
+fn remove_hermes_hook_entries(lines: &mut Vec<String>, event: &str, command: &str) {
+    let Some(parent) = yaml_top_level_range(lines, "hooks") else {
+        return;
+    };
+    let Some(child) = yaml_child_range(lines, parent, event) else {
+        return;
+    };
+    let starts = (child.0 + 1..child.1)
+        .filter(|index| {
+            yaml_indent(&lines[*index]) == 4 && lines[*index].trim_start().starts_with("- ")
+        })
+        .collect::<Vec<_>>();
+    for (position, start) in starts.iter().copied().enumerate().rev() {
+        let end = starts.get(position + 1).copied().unwrap_or(child.1);
+        if lines[start..end].iter().any(|line| {
+            let line = line.trim().strip_prefix("- ").unwrap_or(line.trim());
+            let Some(value) = line.strip_prefix("command:") else {
+                return false;
+            };
+            let value = value.trim();
+            value == command || value == serde_json::to_string(command).unwrap()
+        }) {
+            lines.drain(start..end);
+        }
+    }
 }
 
 fn remove_antigravity_hook(path: &Path) -> Result<()> {
@@ -2716,14 +3217,96 @@ fn remove_antigravity_hook(path: &Path) -> Result<()> {
     };
     let mut root: Value = serde_json::from_slice(&bytes)
         .map_err(|error| AppError::new("agent_config_invalid", error.to_string()))?;
-    if root
-        .get("lwc")
-        .is_some_and(|value| value.to_string().contains("agent hook --agent antigravity"))
+    let Some(named_hook) = root.get_mut("lwc").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    let (mut removed_owned, remove_event) = if let Some(groups) = named_hook
+        .get_mut("PreToolUse")
+        .and_then(Value::as_array_mut)
     {
+        let before = groups.len();
+        remove_group_hook_entries(groups, "agent hook --agent antigravity", |_| false);
+        (groups.len() != before, groups.is_empty())
+    } else {
+        (false, false)
+    };
+    if remove_event {
+        named_hook.remove("PreToolUse");
+    }
+    let remove_retired = if let Some(entries) = named_hook
+        .get_mut("PreInvocation")
+        .and_then(Value::as_array_mut)
+    {
+        let before = entries.len();
+        entries.retain(|entry| {
+            !entry
+                .to_string()
+                .contains("agent hook --agent antigravity --event PreInvocation")
+        });
+        removed_owned |= entries.len() != before;
+        entries.is_empty()
+    } else {
+        false
+    };
+    if remove_retired {
+        named_hook.remove("PreInvocation");
+    }
+    let remove_named_hook = named_hook.is_empty();
+    if remove_named_hook {
         root.as_object_mut().expect("JSON object").remove("lwc");
+    }
+    if removed_owned || remove_event || remove_named_hook {
         atomic_write(path, pretty_json(&root)?.as_bytes(), None)?;
     }
     Ok(())
+}
+
+fn install_antigravity_hook(path: &Path) -> Result<()> {
+    let mut root = read_json_object(path, "Antigravity hooks")?;
+    let hooks = root.as_object_mut().expect("validated JSON object");
+    let named_hook = hooks.entry("lwc").or_insert_with(|| json!({}));
+    let named_hook = named_hook.as_object_mut().ok_or_else(|| {
+        AppError::new(
+            "agent_config_invalid",
+            "Antigravity lwc hook must be an object",
+        )
+    })?;
+    let remove_retired = if let Some(entries) = named_hook
+        .get_mut("PreInvocation")
+        .and_then(Value::as_array_mut)
+    {
+        entries.retain(|entry| {
+            !entry
+                .to_string()
+                .contains("agent hook --agent antigravity --event PreInvocation")
+        });
+        entries.is_empty()
+    } else {
+        false
+    };
+    if remove_retired {
+        named_hook.remove("PreInvocation");
+    }
+    let groups = named_hook
+        .entry("PreToolUse")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| {
+            AppError::new(
+                "agent_config_invalid",
+                "Antigravity PreToolUse hooks must be an array",
+            )
+        })?;
+    remove_group_hook_entries(groups, "agent hook --agent antigravity", |_| false);
+    groups.push(json!({
+        "matcher": "run_command",
+        "hooks": [{
+            "type": "command",
+            "command": "lwc --scope all agent hook --agent antigravity --event PreToolUse",
+            "timeout": 2,
+        }]
+    }));
+    atomic_write(path, pretty_json(&root)?.as_bytes(), None)
 }
 
 fn remove_kiro_hook(path: &Path) -> Result<()> {
@@ -2747,18 +3330,20 @@ fn remove_copilot_hook(path: &Path, target: &str) -> Result<()> {
     };
     let mut root: Value = serde_json::from_slice(&bytes)
         .map_err(|error| AppError::new("agent_config_invalid", error.to_string()))?;
-    let event = if target == "copilot-vscode" {
-        "SessionStart"
+    let events: &[&str] = if target == "copilot-vscode" {
+        &["SessionStart", "PreToolUse", "PostToolUse", "SubagentStart"]
     } else {
-        "sessionStart"
+        &["sessionStart", "postToolUse", "subagentStart"]
     };
-    if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut)
-        && let Some(entries) = hooks.get_mut(event).and_then(Value::as_array_mut)
-    {
-        let owned = format!("agent hook --agent {target}");
-        entries.retain(|entry| !entry.to_string().contains(&owned));
-        if entries.is_empty() {
-            hooks.remove(event);
+    if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
+        for event in events {
+            if let Some(entries) = hooks.get_mut(*event).and_then(Value::as_array_mut) {
+                let owned = format!("agent hook --agent {target}");
+                entries.retain(|entry| !entry.to_string().contains(&owned));
+                if entries.is_empty() {
+                    hooks.remove(*event);
+                }
+            }
         }
     }
     atomic_write(path, pretty_json(&root)?.as_bytes(), None)
@@ -2937,8 +3522,9 @@ fn post_matches(manifest: &Manifest) -> bool {
 }
 
 fn manifest_current(manifest: &Manifest, expected_paths: &[PathBuf]) -> bool {
-    manifest.version >= 7
+    manifest.version >= MANIFEST_VERSION
         && manifest.lwc_version.as_deref() == Some(env!("CARGO_PKG_VERSION"))
+        && manifest.hook_contract_version == HOOK_CONTRACT_VERSION
         && expected_paths
             .iter()
             .all(|path| manifest.files.iter().any(|file| &file.path == path))
@@ -2950,11 +3536,76 @@ fn manifest_current_for_target(
     target: &dyn AgentTarget,
     expected_paths: &[PathBuf],
 ) -> bool {
-    manifest_current(manifest, expected_paths)
+    let expected_hook_events = target
+        .configured_hook_events(
+            manifest.location,
+            InstallOptions {
+                prompt_hook: manifest.prompt_hook.unwrap_or(true),
+            },
+        )
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let shared_copilot_hook = if matches!(target.id(), "copilot-vscode" | "copilot-cli") {
+        expected_paths.iter().find(|path| {
+            path.ends_with(Path::new(".copilot/hooks/lwc.json"))
+                || path.ends_with(Path::new(".github/hooks/lwc.json"))
+        })
+    } else {
+        None
+    };
+    let content_current = if let Some(hook) = shared_copilot_hook {
+        manifest.version >= MANIFEST_VERSION
+            && manifest.lwc_version.as_deref() == Some(env!("CARGO_PKG_VERSION"))
+            && manifest.hook_contract_version == HOOK_CONTRACT_VERSION
+            && expected_paths
+                .iter()
+                .all(|path| manifest.files.iter().any(|file| &file.path == path))
+            && manifest.files.iter().all(|file| {
+                &file.path == hook || hash_file(&file.path).ok().flatten() == file.post_hash
+            })
+            && copilot_hook_events_current(hook, target.id(), &expected_hook_events)
+    } else {
+        manifest_current(manifest, expected_paths)
+    };
+    content_current
+        && manifest.installed_hook_events == expected_hook_events
         && manifest
             .mcp
             .as_ref()
             .is_none_or(|mcp| mcp.command == agent_command(target.id()))
+}
+
+fn copilot_hook_events_current(path: &Path, target: &str, expected: &[String]) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return expected.is_empty();
+    };
+    let Ok(root) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
+        return expected.is_empty();
+    };
+    let owned = format!("agent hook --agent {target}");
+    let mut actual = Vec::new();
+    for (event, entries) in hooks {
+        let count = entries
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.to_string().contains(&owned))
+            .count();
+        if count > 1 {
+            return false;
+        }
+        if count == 1 {
+            actual.push(event.clone());
+        }
+    }
+    actual.sort();
+    let mut expected = expected.to_vec();
+    expected.sort();
+    actual == expected
 }
 
 fn hash_file(path: &Path) -> Result<Option<String>> {
@@ -3115,34 +3766,86 @@ fn command_output_with_timeout(
     command.process_group(0);
     let mut child = command.spawn()?;
     let deadline = Instant::now() + timeout;
+    let work_deadline = deadline
+        .checked_sub(timeout.min(LWC_PROBE_CLEANUP_RESERVE))
+        .unwrap_or(deadline);
+    let stdout = child.stdout.take().map(spawn_probe_reader);
+    let stderr = child.stderr.take().map(spawn_probe_reader);
     let status = loop {
         if let Some(status) = child.try_wait()? {
-            break Some(status);
+            break status;
         }
-        if Instant::now() >= deadline {
-            terminate_child_tree(&mut child)?;
-            child.wait()?;
-            break None;
+        let remaining = work_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            terminate_child_tree(&mut child, deadline)?;
+            let _ = wait_for_child_until(&mut child, deadline)?;
+            return Ok(None);
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(remaining.min(Duration::from_millis(25)));
     };
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        pipe.read_to_end(&mut stdout)?;
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        pipe.read_to_end(&mut stderr)?;
-    }
-    Ok(status.map(|status| Output {
+    let stdout = stdout.and_then(|reader| receive_probe_output(reader, work_deadline));
+    let stderr = stderr.and_then(|reader| receive_probe_output(reader, work_deadline));
+    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+        terminate_child_tree(&mut child, deadline)?;
+        let _ = wait_for_child_until(&mut child, deadline)?;
+        return Ok(None);
+    };
+    Ok(Some(Output {
         status,
         stdout,
         stderr,
     }))
 }
 
+fn spawn_probe_reader<R>(pipe: R) -> mpsc::Receiver<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut pipe = pipe.take(LWC_PROBE_OUTPUT_LIMIT + 1);
+        let result = pipe.read_to_end(&mut bytes).and_then(|_| {
+            if bytes.len() as u64 > LWC_PROBE_OUTPUT_LIMIT {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Agent compatibility probe output exceeds 64 KiB",
+                ))
+            } else {
+                Ok(bytes)
+            }
+        });
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn receive_probe_output(
+    receiver: mpsc::Receiver<io::Result<Vec<u8>>>,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    receiver.recv_timeout(remaining).ok()?.ok()
+}
+
+fn wait_for_child_until(
+    child: &mut Child,
+    deadline: Instant,
+) -> io::Result<Option<std::process::ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
+}
+
 #[cfg(unix)]
-fn terminate_child_tree(child: &mut Child) -> io::Result<()> {
+fn terminate_child_tree(child: &mut Child, _deadline: Instant) -> io::Result<()> {
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
     }
@@ -3157,15 +3860,26 @@ fn terminate_child_tree(child: &mut Child) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn terminate_child_tree(child: &mut Child) -> io::Result<()> {
-    let status = Command::new("taskkill.exe")
+fn terminate_child_tree(child: &mut Child, deadline: Instant) -> io::Result<()> {
+    let started = Instant::now();
+    let remaining = deadline.saturating_duration_since(started);
+    let taskkill_deadline = started + remaining / 3;
+    let taskkill_reap_deadline = started + remaining.saturating_mul(2) / 3;
+    let mut taskkill = Command::new("taskkill.exe")
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
-    if status.is_ok_and(|status| status.success()) {
-        return Ok(());
+        .spawn();
+    if let Ok(taskkill) = taskkill.as_mut() {
+        match wait_for_child_until(taskkill, taskkill_deadline) {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = taskkill.kill();
+                let _ = wait_for_child_until(taskkill, taskkill_reap_deadline);
+            }
+        }
     }
     match child.kill() {
         Ok(()) => Ok(()),
@@ -3175,7 +3889,7 @@ fn terminate_child_tree(child: &mut Child) -> io::Result<()> {
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn terminate_child_tree(child: &mut Child) -> io::Result<()> {
+fn terminate_child_tree(child: &mut Child, _deadline: Instant) -> io::Result<()> {
     match child.kill() {
         Ok(()) => Ok(()),
         Err(error) if child.try_wait()?.is_some() => Ok(()),
@@ -3360,7 +4074,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    #[link(name = "Kernel32")]
+    #[link(name = "kernel32")]
     unsafe extern "system" {
         fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
     }
@@ -3470,5 +4184,159 @@ mod tests {
         );
 
         assert_eq!(resolved.as_deref(), Some(command.as_path()));
+    }
+
+    #[test]
+    fn command_probe_timeout_is_deadline_bounded_and_reaps() {
+        let executable = std::env::current_exe().unwrap();
+        let started = Instant::now();
+        let output = command_output_with_timeout(
+            &executable,
+            &[
+                "--exact",
+                "agent::install::tests::command_probe_child_fixture",
+                "--ignored",
+            ],
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        assert!(output.is_none());
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn command_probe_descendant_held_pipes_are_deadline_bounded() {
+        let executable = std::env::current_exe().unwrap();
+        for fixture in [
+            "agent::install::tests::command_probe_stdout_descendant_fixture",
+            "agent::install::tests::command_probe_stderr_descendant_fixture",
+        ] {
+            let started = Instant::now();
+            let output = command_output_with_timeout(
+                &executable,
+                &["--exact", fixture, "--ignored"],
+                Duration::from_millis(500),
+            )
+            .unwrap();
+
+            assert!(output.is_none(), "fixture {fixture} unexpectedly completed");
+            assert!(
+                started.elapsed() < Duration::from_millis(900),
+                "fixture {fixture} exceeded its deadline: {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn command_probe_rejects_oversized_stdout_and_stderr() {
+        let executable = std::env::current_exe().unwrap();
+        for fixture in [
+            "agent::install::tests::command_probe_oversized_stdout_fixture",
+            "agent::install::tests::command_probe_oversized_stderr_fixture",
+        ] {
+            let output = command_output_with_timeout(
+                &executable,
+                &["--exact", fixture, "--ignored"],
+                Duration::from_millis(500),
+            )
+            .unwrap();
+
+            assert!(
+                output.is_none(),
+                "fixture {fixture} bypassed the output cap"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_probe_cleanup_avoids_blocking_process_waits() {
+        let source = include_str!("install.rs");
+        let probe = source
+            .split_once("fn command_output_with_timeout")
+            .unwrap()
+            .1
+            .split_once("#[cfg(unix)]\nfn terminate_child_tree")
+            .unwrap()
+            .0;
+        let windows = source
+            .split_once("#[cfg(windows)]\nfn terminate_child_tree")
+            .unwrap()
+            .1
+            .split_once("#[cfg(all(not(unix), not(windows)))]")
+            .unwrap()
+            .0;
+
+        assert!(!probe.contains("child.wait()"));
+        assert!(!probe.contains(".join()"));
+        assert!(!windows.contains(".status()"));
+        assert!(probe.contains("wait_for_child_until"));
+        assert!(probe.contains("recv_timeout"));
+        assert!(windows.contains("wait_for_child_until"));
+    }
+
+    #[test]
+    fn windows_ffi_links_use_gnu_compatible_library_case() {
+        for source in [include_str!("install.rs"), include_str!("../sync.rs")] {
+            assert!(!source.contains("#[link(name = \"Kernel32\")]"));
+            assert!(source.contains("#[link(name = \"kernel32\")]"));
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn command_probe_child_fixture() {
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    #[ignore]
+    #[allow(clippy::zombie_processes)]
+    fn command_probe_stdout_descendant_fixture() {
+        let _child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent::install::tests::command_probe_descendant_sleep_fixture",
+                "--ignored",
+            ])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    #[allow(clippy::zombie_processes)]
+    fn command_probe_stderr_descendant_fixture() {
+        let _child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent::install::tests::command_probe_descendant_sleep_fixture",
+                "--ignored",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn command_probe_descendant_sleep_fixture() {
+        thread::sleep(Duration::from_secs(2));
+    }
+
+    #[test]
+    #[ignore]
+    fn command_probe_oversized_stdout_fixture() {
+        io::stdout().write_all(&vec![b'x'; 70 * 1024]).unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn command_probe_oversized_stderr_fixture() {
+        io::stderr().write_all(&vec![b'x'; 70 * 1024]).unwrap();
     }
 }

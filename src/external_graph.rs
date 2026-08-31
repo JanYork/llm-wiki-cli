@@ -2,14 +2,16 @@ use crate::{
     config::{self, GraphSetting},
     error::{AppError, Result},
 };
-use grafeo::{GrafeoDB, Value as GrafeoValue};
+use grafeo::{Config as GrafeoConfig, GrafeoDB, Value as GrafeoValue};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    fs,
     path::Path,
+    time::Instant,
 };
 use surrealdb::{Surreal, engine::local::SurrealKv, types::SurrealValue};
 
@@ -191,6 +193,108 @@ pub fn status(scope: &str, database: &Path) -> Result<Value> {
         "status": "ready",
         "documents": documents,
     }))
+}
+
+pub(crate) fn hook_status(scope: &str, database: &Path, deadline: Instant) -> Result<Value> {
+    ensure_graph_hook_deadline(deadline)?;
+    let setting = config::resolve(scope, database);
+    ensure_graph_hook_deadline(deadline)?;
+    let setting = setting.map_err(|_| graph_hook_unavailable())?.setting;
+    if setting == GraphSetting::Disabled {
+        return Ok(json!({"engine": "disabled", "status": "disabled", "documents": 0}));
+    }
+
+    let path = sidecar(database, setting);
+    ensure_graph_hook_deadline(deadline)?;
+    let path = path.map_err(|_| graph_hook_unavailable())?;
+    let metadata = fs::symlink_metadata(&path);
+    ensure_graph_hook_deadline(deadline)?;
+    let metadata = match metadata {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({
+                "engine": setting_name(setting),
+                "status": "pending",
+                "documents": 0,
+            }));
+        }
+        Err(_) => return Err(graph_hook_unavailable()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(graph_hook_unavailable());
+    }
+
+    match setting {
+        GraphSetting::Grafeo => {
+            if metadata.is_dir() {
+                return Ok(json!({
+                    "engine": "grafeo",
+                    "status": "ready",
+                    "verification": "passive",
+                }));
+            }
+            if !metadata.is_file() {
+                return Err(graph_hook_unavailable());
+            }
+            let config = grafeo_hook_config(&path, deadline)?;
+            let graph = GrafeoDB::with_config(config);
+            ensure_graph_hook_deadline(deadline)?;
+            let graph = graph.map_err(|_| graph_hook_unavailable())?;
+            let count = graph
+                .session()
+                .execute("MATCH (d:Document) RETURN count(d)")
+                .and_then(|result| result.scalar::<i64>());
+            ensure_graph_hook_deadline(deadline)?;
+            let count = count.map_err(|_| graph_hook_unavailable())?;
+            let closed = graph.close();
+            ensure_graph_hook_deadline(deadline)?;
+            closed.map_err(|_| graph_hook_unavailable())?;
+            let documents = usize::try_from(count).map_err(|_| graph_hook_unavailable())?;
+            Ok(json!({
+                "engine": "grafeo",
+                "status": "ready",
+                "documents": documents,
+            }))
+        }
+        GraphSetting::Surrealdb => {
+            if !metadata.is_dir() {
+                return Err(graph_hook_unavailable());
+            }
+            Ok(json!({"engine": "surrealdb", "status": "unverified"}))
+        }
+        GraphSetting::Disabled | GraphSetting::Inherit => unreachable!("effective graph setting"),
+    }
+}
+
+fn grafeo_hook_config(path: &Path, deadline: Instant) -> Result<GrafeoConfig> {
+    ensure_graph_hook_deadline(deadline)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(graph_hook_timeout());
+    }
+    Ok(GrafeoConfig::read_only(path).with_query_timeout(remaining))
+}
+
+fn ensure_graph_hook_deadline(deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        Err(graph_hook_timeout())
+    } else {
+        Ok(())
+    }
+}
+
+fn graph_hook_timeout() -> AppError {
+    AppError::new(
+        "graph_hook_timeout",
+        "graph Hook status exceeded its fixed deadline",
+    )
+}
+
+fn graph_hook_unavailable() -> AppError {
+    AppError::new(
+        "graph_hook_unavailable",
+        "graph Hook status could not verify read-only state",
+    )
 }
 
 pub fn passive_status(scope: &str, database: &Path) -> Result<Value> {
@@ -821,4 +925,281 @@ fn surreal_error(error: surrealdb::Error) -> AppError {
 #[derive(Deserialize, SurrealValue)]
 struct CountRow {
     count: usize,
+}
+
+#[cfg(test)]
+mod hook_status_tests {
+    use super::*;
+    use crate::{config::ConfigPatch, store::Store};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+        time::{Duration, Instant},
+    };
+    use tempfile::TempDir;
+
+    fn configured_database(setting: GraphSetting) -> (TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".lwc");
+        let database = root.join("wiki.db");
+        fs::create_dir(&root).unwrap();
+        config::update(
+            &database,
+            ConfigPatch {
+                graph: Some(GraphSetting::Disabled),
+                ..ConfigPatch::default()
+            },
+        )
+        .unwrap();
+        drop(Store::initialize("project", &database).unwrap());
+        config::update(
+            &database,
+            ConfigPatch {
+                graph: Some(setting),
+                ..ConfigPatch::default()
+            },
+        )
+        .unwrap();
+        (temp, database)
+    }
+
+    fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(root: &Path, path: &Path, snapshot: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                snapshot.insert(relative, None);
+                let mut entries = fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                entries.sort();
+                for entry in entries {
+                    visit(root, &entry, snapshot);
+                }
+            } else if metadata.is_file() && !metadata.file_type().is_symlink() {
+                snapshot.insert(relative, Some(fs::read(path).unwrap()));
+            }
+        }
+
+        let mut snapshot = BTreeMap::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
+    fn create_single_file_grafeo(database: &Path, temp: &TempDir) -> PathBuf {
+        let staging = temp.path().join("fixture.grafeo");
+        let graph = GrafeoDB::open(&staging).unwrap();
+        let document = ProjectionDocument {
+            key: "page:hook-fixture".to_owned(),
+            kind: "page".to_owned(),
+            identifier: "hook-fixture".to_owned(),
+            title: "PRIVATE GRAPH TITLE".to_owned(),
+            fingerprint: "f".repeat(64),
+            links: Vec::new(),
+            source_ids: Vec::new(),
+            relations: Vec::new(),
+        };
+        replace_grafeo(&graph, "page", "hook-fixture", Some(&document)).unwrap();
+        graph.close().unwrap();
+        let target = sidecar(database, GraphSetting::Grafeo).unwrap();
+        fs::rename(staging, &target).unwrap();
+        target
+    }
+
+    #[test]
+    fn hook_status_reads_single_file_grafeo_without_changing_the_runtime_tree() {
+        let (temp, database) = configured_database(GraphSetting::Grafeo);
+        let sidecar = create_single_file_grafeo(&database, &temp);
+        let runtime = database.parent().unwrap();
+        let before = snapshot_tree(runtime);
+
+        let status = hook_status(
+            "project",
+            &database,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+
+        assert_eq!(
+            status,
+            json!({"engine":"grafeo","status":"ready","documents":1})
+        );
+        assert_eq!(snapshot_tree(runtime), before);
+        assert!(sidecar.is_file());
+    }
+
+    #[test]
+    fn hook_status_keeps_surreal_passive_and_does_not_invent_a_count() {
+        let (_temp, database) = configured_database(GraphSetting::Surrealdb);
+        let sidecar = sidecar(&database, GraphSetting::Surrealdb).unwrap();
+        fs::create_dir(&sidecar).unwrap();
+        fs::write(
+            sidecar.join("PRIVATE-SURREAL-DATA"),
+            b"PRIVATE SURREAL BODY",
+        )
+        .unwrap();
+        let runtime = database.parent().unwrap();
+        let before = snapshot_tree(runtime);
+
+        let status = hook_status(
+            "project",
+            &database,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+
+        assert_eq!(status, json!({"engine":"surrealdb","status":"unverified"}));
+        assert!(status.get("documents").is_none());
+        assert_eq!(snapshot_tree(runtime), before);
+    }
+
+    #[test]
+    fn hook_status_keeps_a_legacy_grafeo_directory_passive_and_unchanged() {
+        let (temp, database) = configured_database(GraphSetting::Grafeo);
+        let sidecar = sidecar(&database, GraphSetting::Grafeo).unwrap();
+        let graph = GrafeoDB::open(&sidecar).unwrap();
+        let document = ProjectionDocument {
+            key: "page:legacy-hook-fixture".to_owned(),
+            kind: "page".to_owned(),
+            identifier: "legacy-hook-fixture".to_owned(),
+            title: "PRIVATE LEGACY GRAPH TITLE".to_owned(),
+            fingerprint: "f".repeat(64),
+            links: Vec::new(),
+            source_ids: Vec::new(),
+            relations: Vec::new(),
+        };
+        replace_grafeo(&graph, "page", "legacy-hook-fixture", Some(&document)).unwrap();
+        graph.close().unwrap();
+        assert!(sidecar.is_dir());
+        let runtime = database.parent().unwrap();
+        let before = snapshot_tree(runtime);
+
+        let status = hook_status(
+            "project",
+            &database,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+
+        assert_eq!(
+            status,
+            json!({"engine":"grafeo","status":"ready","verification":"passive"})
+        );
+        assert!(status.get("documents").is_none());
+        assert!(!serde_json::to_string(&status).unwrap().contains("PRIVATE"));
+        assert_eq!(snapshot_tree(runtime), before);
+        assert!(!status.to_string().contains(temp.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn hook_status_corrupt_grafeo_fails_open_without_paths_or_writes() {
+        let (temp, database) = configured_database(GraphSetting::Grafeo);
+        let sidecar = sidecar(&database, GraphSetting::Grafeo).unwrap();
+        fs::write(&sidecar, b"PRIVATE CORRUPT GRAFEO").unwrap();
+        let runtime = database.parent().unwrap();
+        let before = snapshot_tree(runtime);
+
+        let error = hook_status(
+            "project",
+            &database,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "graph_hook_unavailable");
+        let rendered = error.to_string();
+        assert!(!rendered.contains(temp.path().to_str().unwrap()));
+        assert!(!rendered.contains("PRIVATE CORRUPT GRAFEO"));
+        assert_eq!(snapshot_tree(runtime), before);
+    }
+
+    #[test]
+    fn hook_status_rejects_a_surreal_sidecar_with_the_wrong_filesystem_type() {
+        let (surreal_temp, surreal_database) = configured_database(GraphSetting::Surrealdb);
+        let surreal_sidecar = sidecar(&surreal_database, GraphSetting::Surrealdb).unwrap();
+        fs::write(&surreal_sidecar, b"PRIVATE WRONG SURREAL TYPE").unwrap();
+        let surreal_before = snapshot_tree(surreal_database.parent().unwrap());
+
+        let surreal_error = hook_status(
+            "project",
+            &surreal_database,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_err();
+
+        assert_eq!(surreal_error.code, "graph_hook_unavailable");
+        let rendered = surreal_error.to_string();
+        assert!(!rendered.contains(surreal_temp.path().to_str().unwrap()));
+        assert!(!rendered.contains("PRIVATE WRONG SURREAL TYPE"));
+        assert_eq!(
+            snapshot_tree(surreal_database.parent().unwrap()),
+            surreal_before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_status_rejects_a_symlinked_sidecar_without_reading_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, database) = configured_database(GraphSetting::Grafeo);
+        let outside = temp.path().join("PRIVATE-OUTSIDE-GRAPH");
+        fs::write(&outside, b"PRIVATE OUTSIDE GRAPH BODY").unwrap();
+        let before = fs::read(&outside).unwrap();
+        symlink(&outside, sidecar(&database, GraphSetting::Grafeo).unwrap()).unwrap();
+
+        let error = hook_status(
+            "project",
+            &database,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "graph_hook_unavailable");
+        let rendered = error.to_string();
+        assert!(!rendered.contains(temp.path().to_str().unwrap()));
+        assert!(!rendered.contains("PRIVATE OUTSIDE GRAPH"));
+        assert_eq!(fs::read(outside).unwrap(), before);
+    }
+
+    #[test]
+    fn hook_status_has_truthful_missing_and_expired_states() {
+        let (_temp, database) = configured_database(GraphSetting::Grafeo);
+        assert_eq!(
+            hook_status(
+                "project",
+                &database,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap(),
+            json!({"engine":"grafeo","status":"pending","documents":0})
+        );
+        assert_eq!(
+            hook_status("project", &database, Instant::now())
+                .unwrap_err()
+                .code,
+            "graph_hook_timeout"
+        );
+    }
+
+    #[test]
+    fn grafeo_hook_config_is_read_only_and_uses_only_the_remaining_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fixture.grafeo");
+        let budget = Duration::from_millis(25);
+        let config = grafeo_hook_config(&path, Instant::now() + budget).unwrap();
+
+        assert_eq!(config.path.as_deref(), Some(path.as_path()));
+        assert_eq!(config.access_mode, grafeo::AccessMode::ReadOnly);
+        assert!(!config.wal_enabled);
+        let timeout = config.query_timeout.unwrap();
+        assert!(!timeout.is_zero());
+        assert!(timeout <= budget);
+        assert_eq!(
+            grafeo_hook_config(&path, Instant::now()).unwrap_err().code,
+            "graph_hook_timeout"
+        );
+    }
 }

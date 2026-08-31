@@ -99,11 +99,36 @@ impl AgentTarget for ClaudeTarget {
         install::unconfigure_standard(self.id(), paths, executable)
     }
 
-    fn print_config(&self, _location: AgentLocation) -> String {
+    fn print_config(&self, location: AgentLocation) -> String {
+        let hooks = self
+            .configured_hook_events(location, InstallOptions { prompt_hook: true })
+            .into_iter()
+            .map(|event| {
+                let command = format!("lwc --scope all agent hook --agent claude --event {event}");
+                let entry = if event == "PreToolUse" {
+                    serde_json::json!([{
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": command, "timeout": 2}]
+                    }])
+                } else {
+                    serde_json::json!([{
+                        "hooks": [{"type": "command", "command": command}]
+                    }])
+                };
+                (event.to_owned(), entry)
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let config = serde_json::json!({
+            "mcpServers": {
+                "lwc": {"type": "stdio", "command": "lwc", "args": ["serve", "--mcp"]}
+            },
+            "hooks": hooks,
+        });
         format!(
             "# Claude Code: merge these entries into the selected official scope.\n\
-{{\"mcpServers\":{{\"lwc\":{{\"type\":\"stdio\",\"command\":\"lwc\",\"args\":[\"serve\",\"--mcp\"]}}}},\
-\"hooks\":{{\"SessionStart\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"lwc --scope all agent hook --agent claude --event SessionStart\"}}]}}]}}}}\n\n{}\n",
+{config}\n\
+Hook events: {}\n\n{}\n",
+            install::hook_events_summary(self.id(), location),
             install::guidance()
         )
     }

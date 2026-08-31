@@ -19,6 +19,29 @@ use std::{
 #[path = "sync_continuity_tests.rs"]
 mod sync_continuity_tests;
 
+#[cfg(test)]
+#[path = "changeset_hook_summary_tests.rs"]
+mod hook_summary_tests;
+
+const CHANGESET_HOOK_MAX_ITEMS: usize = 3;
+const CHANGESET_HOOK_MAX_SCAN_ITEMS: usize = 64;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ChangesetHookSummary {
+    pub(crate) changesets: Vec<ChangesetHookSummaryItem>,
+    pub(crate) omitted: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ChangesetHookSummaryItem {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) status: String,
+    pub(crate) staged_operation_count: usize,
+    pub(crate) empty: bool,
+    pub(crate) conflict: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ChangesetBeginResponse {
     pub scope: &'static str,
@@ -258,6 +281,147 @@ pub fn list(live: &StorePath, limit: usize) -> Result<ChangesetListResponse> {
         database: live.path.clone(),
         changesets,
     })
+}
+
+pub(crate) fn hook_summary(live: &StorePath, deadline: Instant) -> Result<ChangesetHookSummary> {
+    ensure_hook_deadline(deadline)?;
+    let directory = changeset_directory(live, false);
+    ensure_hook_deadline(deadline)?;
+    let directory = directory.map_err(|_| changeset_hook_unavailable())?;
+    if !directory.exists() {
+        ensure_hook_deadline(deadline)?;
+        return Ok(ChangesetHookSummary {
+            changesets: Vec::new(),
+            omitted: 0,
+        });
+    }
+
+    let entries = fs::read_dir(&directory);
+    ensure_hook_deadline(deadline)?;
+    let mut entries = entries.map_err(|_| changeset_hook_unavailable())?;
+    let mut drafts = Vec::new();
+    for _ in 0..CHANGESET_HOOK_MAX_SCAN_ITEMS {
+        ensure_hook_deadline(deadline)?;
+        let Some(entry) = entries.next() else { break };
+        ensure_hook_deadline(deadline)?;
+        let entry = entry.map_err(|_| changeset_hook_unavailable())?;
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(changeset_hook_unavailable()),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || path.extension().and_then(|value| value.to_str()) != Some("db")
+        {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if validate_name(name).is_err() {
+            continue;
+        }
+        drafts.push((name.to_owned(), path));
+    }
+    ensure_hook_deadline(deadline)?;
+    let exceeds_scan_limit = entries.next().is_some();
+    ensure_hook_deadline(deadline)?;
+    if exceeds_scan_limit {
+        return Err(AppError::new(
+            "changeset_hook_limit",
+            "changeset directory exceeds the fixed Hook scan limit",
+        ));
+    }
+    drafts.sort_by(|left, right| left.0.cmp(&right.0));
+
+    ensure_hook_deadline(deadline)?;
+    let live_store = Store::open_for_hook_with_timeout(
+        scope_name(live.scope),
+        &live.path,
+        std::time::Duration::ZERO,
+    );
+    ensure_hook_deadline(deadline)?;
+    let live_store = live_store.map_err(|_| changeset_hook_unavailable())?;
+    let snapshot = live_store.begin_hook_snapshot_with_timeout(std::time::Duration::ZERO);
+    ensure_hook_deadline(deadline)?;
+    snapshot.map_err(|_| changeset_hook_unavailable())?;
+    let live_identity = live_store.identity();
+    ensure_hook_deadline(deadline)?;
+    let live_identity = live_identity.map_err(|_| changeset_hook_unavailable())?;
+    ensure_hook_deadline(deadline)?;
+    let mut candidates = Vec::new();
+    for (name, path) in drafts {
+        ensure_hook_deadline(deadline)?;
+        let candidate = (|| -> Result<ChangesetHookSummaryItem> {
+            require_regular_file(&path)?;
+            let draft = Store::open_for_hook_with_timeout(
+                scope_name(live.scope),
+                &path,
+                std::time::Duration::ZERO,
+            )?;
+            draft.begin_hook_snapshot_with_timeout(std::time::Duration::ZERO)?;
+            let state = draft.changeset_draft(&name, 0)?;
+            let draft_identity = draft.identity()?;
+            if state.name != name || state.status != "draft" {
+                return Err(AppError::new(
+                    "changeset_hook_invalid",
+                    "changeset draft metadata is inconsistent",
+                ));
+            }
+            validate_id(&state.id)?;
+            let sparse = draft.changeset_storage_kind()?.as_deref() == Some("sparse-v1");
+            let conflict = live_identity.store_id != draft_identity.store_id
+                || (!sparse && live_identity.revision != state.base_revision);
+            Ok(ChangesetHookSummaryItem {
+                id: state.id,
+                name: state.name,
+                status: state.status,
+                staged_operation_count: state.staged_operation_count,
+                empty: state.staged_operation_count == 0,
+                conflict,
+            })
+        })();
+        ensure_hook_deadline(deadline)?;
+        match candidate {
+            Ok(candidate) if candidate.conflict || !candidate.empty => {
+                candidates.push(candidate);
+            }
+            Ok(_) => {}
+            Err(_) => return Err(changeset_hook_unavailable()),
+        }
+    }
+    ensure_hook_deadline(deadline)?;
+    candidates.sort_by(|left, right| {
+        right
+            .conflict
+            .cmp(&left.conflict)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let omitted = candidates.len().saturating_sub(CHANGESET_HOOK_MAX_ITEMS);
+    candidates.truncate(CHANGESET_HOOK_MAX_ITEMS);
+    Ok(ChangesetHookSummary {
+        changesets: candidates,
+        omitted,
+    })
+}
+
+fn changeset_hook_unavailable() -> AppError {
+    AppError::new(
+        "changeset_hook_unavailable",
+        "changeset Hook state could not be verified",
+    )
+}
+
+fn ensure_hook_deadline(deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        return Err(AppError::new(
+            "changeset_hook_timeout",
+            "changeset Hook summary exceeded its fixed deadline",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn export_detached_intents(live: &StorePath) -> Result<Vec<DetachedChangesetExport>> {
@@ -1086,14 +1250,14 @@ pub fn commit(
     let lint_issues = if sparse {
         Store::open(scope_name(live.scope), &live.path)?
             .changeset_sparse_lint(&path, 1, 0)?
-            .total
+            .blocking_total
     } else {
-        draft.lint(1, 0)?.total
+        draft.lint(1, 0)?.blocking_total
     };
     if lint_issues > 0 && !allow_lint_issues {
         return Err(AppError::new(
             "changeset_lint_failed",
-            format!("changeset has {lint_issues} lint issue(s); repair it before commit"),
+            format!("changeset has {lint_issues} blocking lint error(s); repair it before commit"),
         ));
     }
     let mut graph_documents = draft.changeset_graph_documents()?;

@@ -4,6 +4,22 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workflow="$repo_root/.github/workflows/release.yml"
 
+for excluded in '.agent/**' '.agents/**' '.superpowers/**' '**/__pycache__/**' '**/*.pyc' 'AGENTS.md'; do
+  grep -Fq "\"$excluded\"" "$repo_root/Cargo.toml" || {
+    echo "Cargo package must exclude local Agent harness path: $excluded" >&2
+    exit 1
+  }
+done
+
+for document in docs/readme/README.{es,fr,ja,pt-BR,ru}.md; do
+  for target in 'GitHub Copilot in VS Code' 'Copilot CLI' 'Copilot for JetBrains'; do
+    test "$(grep -Fc "$target" "$repo_root/$document")" -ge 2 || {
+      echo "$document must list all registered Copilot targets" >&2
+      exit 1
+    }
+  done
+done
+
 if ! grep -Fq 'printf '\''%s\n'\'' "$notes" > "${RUNNER_TEMP}/release-notes.md"' "$workflow"; then
   echo 'release workflow must persist the validated annotation' >&2
   exit 1

@@ -33,7 +33,7 @@ impl CopilotVscodeTarget {
             TargetPaths {
                 mcp: Some(self.user_dir(environment).join("mcp.json")),
                 instruction: None,
-                hook: None,
+                hook: Some(environment.home.join(".copilot/hooks/lwc.json")),
                 skill_dir: Some(environment.home.join(".copilot/skills/using-lwc")),
                 aux: Vec::new(),
             }
@@ -56,12 +56,8 @@ impl AgentTarget for CopilotVscodeTarget {
     fn display_name(&self) -> &'static str {
         "VS Code (GitHub Copilot Chat)"
     }
-    fn lifecycle_mode(&self, location: AgentLocation) -> &'static str {
-        if location == AgentLocation::Local {
-            "configured_preview"
-        } else {
-            "unsupported"
-        }
+    fn lifecycle_mode(&self, _location: AgentLocation) -> &'static str {
+        "configured_preview"
     }
     fn permissions_mode(&self, _location: AgentLocation) -> &'static str {
         "user_managed"
@@ -135,7 +131,8 @@ impl AgentTarget for CopilotVscodeTarget {
             "<repo>/.vscode/mcp.json"
         };
         format!(
-            "# VS Code Copilot: add to {path}.\n{{\"servers\":{{\"lwc\":{{\"type\":\"stdio\",\"command\":\"lwc\",\"args\":[\"serve\",\"--mcp\"]}}}}}}\n\n{}\n",
+            "# VS Code Copilot: add to {path}.\n{{\"servers\":{{\"lwc\":{{\"type\":\"stdio\",\"command\":\"lwc\",\"args\":[\"serve\",\"--mcp\"]}}}}}}\nHook events (Preview): {}\n\n{}\n",
+            install::hook_events_summary(self.id(), location),
             install::guidance()
         )
     }

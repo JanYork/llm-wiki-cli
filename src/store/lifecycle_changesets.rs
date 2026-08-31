@@ -16,6 +16,159 @@ fn changeset_sync_replay_expected_key(target: &str) -> String {
     format!("changeset_sync_replay_expected:{target}")
 }
 
+const WAL_INDEX_HEADER_BYTES: usize = 48;
+const WAL_INDEX_REGION_BYTES: u64 = 32 * 1024;
+const WAL_INDEX_VERSION: u32 = 3_007_000;
+
+fn store_hook_unavailable() -> AppError {
+    AppError::new(
+        "store_hook_unavailable",
+        "Hook store snapshot is unavailable",
+    )
+}
+
+fn hook_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn hook_regular_file_size(path: &Path, allow_missing: bool) -> Result<Option<u64>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata.len())),
+        Ok(_) => Err(store_hook_unavailable()),
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(store_hook_unavailable()),
+    }
+}
+
+fn hook_read_prefix<const N: usize>(path: &Path) -> Result<[u8; N]> {
+    let mut bytes = [0_u8; N];
+    let mut file = fs::File::open(path).map_err(|_| store_hook_unavailable())?;
+    std::io::Read::read_exact(&mut file, &mut bytes).map_err(|_| store_hook_unavailable())?;
+    Ok(bytes)
+}
+
+fn hook_wal_index_header_is_valid(header: &[u8; WAL_INDEX_HEADER_BYTES]) -> bool {
+    let checksum = header[..40]
+        .chunks_exact(8)
+        .fold((0_u32, 0_u32), |(first, second), chunk| {
+            let left = u32::from_ne_bytes(chunk[..4].try_into().unwrap());
+            let right = u32::from_ne_bytes(chunk[4..].try_into().unwrap());
+            let first = first.wrapping_add(left).wrapping_add(second);
+            let second = second.wrapping_add(right).wrapping_add(first);
+            (first, second)
+        });
+    let expected = (
+        u32::from_ne_bytes(header[40..44].try_into().unwrap()),
+        u32::from_ne_bytes(header[44..48].try_into().unwrap()),
+    );
+    let encoded_page_size = u16::from_ne_bytes(header[14..16].try_into().unwrap()) as u32;
+    let page_size = (encoded_page_size & 0xfe00) + ((encoded_page_size & 1) << 16);
+
+    u32::from_ne_bytes(header[..4].try_into().unwrap()) == WAL_INDEX_VERSION
+        && header[12] == 1
+        && (512..=65_536).contains(&page_size)
+        && page_size.is_power_of_two()
+        && u32::from_ne_bytes(header[16..20].try_into().unwrap()) > 0
+        && checksum == expected
+}
+
+fn validate_hook_wal_index(wal: &Path, wal_size: u64, shm: &Path, shm_size: u64) -> Result<()> {
+    const WAL_HEADER_BYTES: usize = 32;
+    const SHM_HEADER_BYTES: usize = WAL_INDEX_HEADER_BYTES * 2;
+
+    if wal_size < WAL_HEADER_BYTES as u64
+        || shm_size < WAL_INDEX_REGION_BYTES
+        || !shm_size.is_multiple_of(WAL_INDEX_REGION_BYTES)
+    {
+        return Err(store_hook_unavailable());
+    }
+    let wal_header = hook_read_prefix::<WAL_HEADER_BYTES>(wal)?;
+    let shm_header = hook_read_prefix::<SHM_HEADER_BYTES>(shm)?;
+    let first: &[u8; WAL_INDEX_HEADER_BYTES] = shm_header[..WAL_INDEX_HEADER_BYTES]
+        .try_into()
+        .expect("fixed-size WAL-index header");
+    let second = &shm_header[WAL_INDEX_HEADER_BYTES..];
+    let magic = u32::from_be_bytes(wal_header[..4].try_into().unwrap());
+    let wal_version = u32::from_be_bytes(wal_header[4..8].try_into().unwrap());
+    let page_size = u32::from_be_bytes(wal_header[8..12].try_into().unwrap());
+    let max_frame = u32::from_ne_bytes(first[16..20].try_into().unwrap()) as u64;
+    let minimum_wal_size = (WAL_HEADER_BYTES as u64)
+        .checked_add(
+            max_frame
+                .checked_mul(u64::from(page_size) + 24)
+                .ok_or_else(store_hook_unavailable)?,
+        )
+        .ok_or_else(store_hook_unavailable)?;
+
+    if !matches!(magic, 0x377f_0682 | 0x377f_0683)
+        || wal_version != WAL_INDEX_VERSION
+        || !(512..=65_536).contains(&page_size)
+        || !page_size.is_power_of_two()
+        || first.as_slice() != second
+        || !hook_wal_index_header_is_valid(first)
+        || first[32..40] != wal_header[16..24]
+        || wal_size < minimum_wal_size
+    {
+        return Err(store_hook_unavailable());
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn strip_windows_hook_verbatim_drive(path: &str) -> Option<&str> {
+    let local = path.strip_prefix(r"\\?\")?;
+    let bytes = local.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/'))
+    .then_some(local)
+}
+
+fn hook_database_uri(database: &Path, query: &str) -> Result<String> {
+    if !database.is_absolute() {
+        return Err(store_hook_unavailable());
+    }
+    let raw = database.to_str().ok_or_else(store_hook_unavailable)?;
+    #[cfg(windows)]
+    let raw = if raw.starts_with(r"\\?\") {
+        strip_windows_hook_verbatim_drive(raw).ok_or_else(store_hook_unavailable)?
+    } else {
+        raw
+    };
+    let mut normalized = raw.replace('\\', "/");
+    if normalized.starts_with("//") {
+        return Err(store_hook_unavailable());
+    }
+    if normalized.as_bytes().get(1) == Some(&b':') {
+        normalized.insert(0, '/');
+    }
+    let mut encoded = String::with_capacity(normalized.len());
+    for byte in normalized.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/' | b':') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    Ok(format!("file:{encoded}?mode=ro&{query}"))
+}
+
+fn open_hook_connection(database: &Path, query: &str, timeout: Duration) -> Result<Connection> {
+    let uri = hook_database_uri(database, query)?;
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let connection =
+        Connection::open_with_flags(uri, flags).map_err(|_| store_hook_unavailable())?;
+    configure_read_only_connection(&connection, timeout).map_err(|_| store_hook_unavailable())?;
+    prepare_store_read_only(&connection).map_err(|_| store_hook_unavailable())?;
+    Ok(connection)
+}
+
 fn validate_changeset_sync_replay_item(item_key: &str, item_digest: &str) -> Result<()> {
     let valid_key = (1..=512).contains(&item_key.len())
         && item_key.matches('\0').count() == 1
@@ -137,7 +290,36 @@ impl Store {
     }
 
     pub fn open_for_hook(scope: impl Into<String>, database: impl AsRef<Path>) -> Result<Self> {
-        Self::open_read_only_with_timeout(scope, database, Duration::from_millis(250))
+        Self::open_for_hook_with_timeout(scope, database, Duration::from_millis(250))
+    }
+
+    pub(crate) fn open_for_hook_with_timeout(
+        scope: impl Into<String>,
+        database: impl AsRef<Path>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let scope = scope.into();
+        let database = database.as_ref().to_path_buf();
+        hook_regular_file_size(&database, false)?;
+
+        let wal = hook_sidecar_path(&database, "-wal");
+        let shm = hook_sidecar_path(&database, "-shm");
+        let wal_size = hook_regular_file_size(&wal, true)?;
+        let shm_size = hook_regular_file_size(&shm, true)?;
+        let connection = match wal_size {
+            None | Some(0) => open_hook_connection(&database, "immutable=1", timeout)?,
+            Some(wal_size) => {
+                let shm_size = shm_size.ok_or_else(store_hook_unavailable)?;
+                validate_hook_wal_index(&wal, wal_size, &shm, shm_size)?;
+                open_hook_connection(&database, "readonly_shm=1", timeout)?
+            }
+        };
+
+        Ok(Self {
+            scope,
+            database,
+            conn: connection,
+        })
     }
 
     fn open_read_only_with_timeout(

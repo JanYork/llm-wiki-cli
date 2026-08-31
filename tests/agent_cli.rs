@@ -307,7 +307,7 @@ fn detected_yes_install_is_idempotent_and_uninstall_restores_exact_user_bytes() 
     assert!(codex_hook_text.contains("--scope all agent hook --agent codex --event SessionStart"));
     assert!(settings_text.contains("--scope all agent hook --agent claude --event SessionStart"));
     assert!(
-        !settings_text.contains("--scope all agent hook --agent claude --event UserPromptSubmit")
+        settings_text.contains("--scope all agent hook --agent claude --event UserPromptSubmit")
     );
     let codex_guidance = fs::read_to_string(&codex_agents).unwrap();
     let claude_guidance = fs::read_to_string(&claude_md).unwrap();
@@ -1100,7 +1100,19 @@ fn refresh_upgrades_a_matching_v1_manifest_and_keeps_original_uninstall_snapshot
     assert!(refreshed.contains("[mcp_servers.lwc]"));
     assert!(!refreshed.contains("[mcp_servers.codegraph]"));
     let upgraded: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    assert_eq!(upgraded["version"], 7);
+    assert_eq!(upgraded["version"], 8);
+    assert_eq!(upgraded["hook_contract_version"], 4);
+    assert_eq!(
+        upgraded["installed_hook_events"],
+        serde_json::json!([
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "SubagentStart",
+            "Stop"
+        ])
+    );
     assert_eq!(upgraded["mcp"]["name"], "lwc");
 
     world.ok(&["agent", "uninstall", "--target", "codex", "--yes"]);
@@ -1133,6 +1145,39 @@ fn refresh_upgrades_a_v1_manifest_that_did_not_track_new_accessories() {
             .unwrap()
             .ends_with("skills/using-lwc/SKILL.md")
     }));
+}
+
+#[cfg(unix)]
+#[test]
+fn refresh_repairs_a_stale_hook_contract_fingerprint_once() {
+    let world = World::new();
+    world.ok(&["agent", "install", "--target", "codex", "--yes"]);
+    let manifest_path = world
+        .home
+        .join(".lwc/agent-installs/codex-global-global.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["installed_hook_events"] = serde_json::json!(["SessionStart"]);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let status = world.ok(&["agent", "status", "--target", "codex"]);
+    assert_eq!(status["targets"][0]["status"], "modified");
+    let refreshed = world.ok(&["agent", "refresh", "--target", "codex"]);
+    assert_eq!(refreshed["targets"][0]["status"], "installed");
+    assert!(
+        refreshed["targets"][0]["installed_hook_events"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("Stop"))
+    );
+    let hook = fs::read_to_string(world.home.join(".codex/hooks.json")).unwrap();
+    assert_eq!(hook.matches("--agent codex --event Stop").count(), 1);
+
+    let unchanged = world.ok(&["agent", "refresh", "--target", "codex"]);
+    assert_eq!(unchanged["targets"][0]["status"], "unchanged");
 }
 
 #[cfg(unix)]
@@ -1777,14 +1822,14 @@ fn codex_uninstall_preserves_preexisting_lwc_content_after_unrelated_user_edit()
 
 #[cfg(unix)]
 #[test]
-fn antigravity_foreign_lwc_hook_conflicts_before_any_write() {
+fn antigravity_installs_owned_pretool_and_preserves_foreign_hooks() {
     let world = World::new();
     let hook = world.home.join(".gemini/config/plugins/lwc/hooks.json");
     fs::create_dir_all(hook.parent().unwrap()).unwrap();
-    fs::write(&hook, r#"{"keep":true,"lwc":{"owner":"user"}}"#).unwrap();
-    let before = directory_snapshot(&world.home);
+    let original = r#"{"keep":true,"foreign":{"owner":"user"}}"#;
+    fs::write(&hook, original).unwrap();
 
-    let output = world.output(&[
+    let installed = world.ok(&[
         "agent",
         "install",
         "--target",
@@ -1793,10 +1838,181 @@ fn antigravity_foreign_lwc_hook_conflicts_before_any_write() {
         "global",
         "--yes",
     ]);
+    assert_eq!(
+        installed["targets"][0]["installed_hook_events"],
+        serde_json::json!(["PreToolUse"])
+    );
+    let configured: Value = serde_json::from_slice(&fs::read(&hook).unwrap()).unwrap();
+    assert_eq!(configured["foreign"]["owner"], "user");
+    assert_eq!(configured["lwc"]["PreToolUse"][0]["matcher"], "run_command");
 
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("agent_config_conflict"));
-    assert_eq!(directory_snapshot(&world.home), before);
+    world.ok(&[
+        "agent",
+        "uninstall",
+        "--target",
+        "antigravity",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    assert_eq!(fs::read_to_string(&hook).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn antigravity_refresh_removes_the_retired_owned_preinvocation_and_preserves_siblings() {
+    let world = World::new();
+    world.ok(&[
+        "agent",
+        "install",
+        "--target",
+        "antigravity",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    let hook = world.home.join(".gemini/config/plugins/lwc/hooks.json");
+    let retired_owned = serde_json::json!({
+        "lwc": {
+            "PreInvocation": [{
+                "type": "command",
+                "command": "lwc --scope all agent hook --agent antigravity --event PreInvocation"
+            }]
+        }
+    });
+    let retired_owned = serde_json::to_vec_pretty(&retired_owned).unwrap();
+    let retired_with_sibling = serde_json::json!({
+        "foreign": {"keep": true},
+        "lwc": {
+            "PreInvocation": [{
+                "type": "command",
+                "command": "lwc --scope all agent hook --agent antigravity --event PreInvocation"
+            }]
+        }
+    });
+    fs::write(
+        &hook,
+        serde_json::to_vec_pretty(&retired_with_sibling).unwrap(),
+    )
+    .unwrap();
+
+    let manifest_path = world
+        .home
+        .join(".lwc/agent-installs/antigravity-global-global.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["hook_contract_version"] = 2.into();
+    manifest["installed_hook_events"] = serde_json::json!(["PreInvocation"]);
+    let digest = Sha256::digest(&retired_owned)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let file = manifest["files"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|file| file["path"] == hook.to_string_lossy().as_ref())
+        .unwrap();
+    file["post_hash"] = digest.into();
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let refreshed = world.ok(&[
+        "agent",
+        "refresh",
+        "--target",
+        "antigravity",
+        "--location",
+        "global",
+    ]);
+    assert_eq!(refreshed["targets"][0]["status"], "installed");
+    assert_eq!(
+        refreshed["targets"][0]["installed_hook_events"],
+        serde_json::json!(["PreToolUse"])
+    );
+    let value: Value = serde_json::from_slice(&fs::read(&hook).unwrap()).unwrap();
+    assert_eq!(value["foreign"], serde_json::json!({"keep": true}));
+    assert_eq!(value["lwc"]["PreToolUse"][0]["matcher"], "run_command");
+
+    let unchanged = world.ok(&[
+        "agent",
+        "refresh",
+        "--target",
+        "antigravity",
+        "--location",
+        "global",
+    ]);
+    assert_eq!(unchanged["targets"][0]["status"], "unchanged");
+
+    world.ok(&[
+        "agent",
+        "uninstall",
+        "--target",
+        "antigravity",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    let value: Value = serde_json::from_slice(&fs::read(&hook).unwrap()).unwrap();
+    assert_eq!(value, serde_json::json!({"foreign": {"keep": true}}));
+}
+
+#[cfg(unix)]
+#[test]
+fn antigravity_refresh_and_uninstall_preserve_siblings_inside_the_owned_hook_name() {
+    let world = World::new();
+    world.ok(&[
+        "agent",
+        "install",
+        "--target",
+        "antigravity",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    let hook = world.home.join(".gemini/config/plugins/lwc/hooks.json");
+    let mut edited: Value = serde_json::from_slice(&fs::read(&hook).unwrap()).unwrap();
+    edited["lwc"]["PostToolUse"] = serde_json::json!([{
+        "matcher": "run_command",
+        "hooks": [{"type": "command", "command": "keep-user-posttool"}]
+    }]);
+    edited["lwc"]["userMetadata"] = serde_json::json!("keep");
+    fs::write(&hook, serde_json::to_vec_pretty(&edited).unwrap()).unwrap();
+
+    world.ok(&[
+        "agent",
+        "refresh",
+        "--target",
+        "antigravity",
+        "--location",
+        "global",
+    ]);
+    let refreshed: Value = serde_json::from_slice(&fs::read(&hook).unwrap()).unwrap();
+    assert_eq!(refreshed["lwc"]["userMetadata"], "keep");
+    assert_eq!(
+        refreshed["lwc"]["PostToolUse"][0]["hooks"][0]["command"],
+        "keep-user-posttool"
+    );
+    assert_eq!(refreshed["lwc"]["PreToolUse"][0]["matcher"], "run_command");
+
+    world.ok(&[
+        "agent",
+        "uninstall",
+        "--target",
+        "antigravity",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    let uninstalled: Value = serde_json::from_slice(&fs::read(&hook).unwrap()).unwrap();
+    assert_eq!(uninstalled["lwc"]["userMetadata"], "keep");
+    assert_eq!(
+        uninstalled["lwc"]["PostToolUse"][0]["hooks"][0]["command"],
+        "keep-user-posttool"
+    );
+    assert!(uninstalled["lwc"].get("PreToolUse").is_none());
 }
 
 #[cfg(unix)]
@@ -1879,13 +2095,11 @@ fn shared_skill_owned_by_another_manifest_can_upgrade() {
 
 #[cfg(unix)]
 #[test]
-fn foreign_dedicated_plugin_conflicts_before_any_write() {
+fn opencode_refuses_to_replace_a_foreign_plugin_at_the_owned_path() {
     let world = World::new();
     let plugin = world.home.join(".config/opencode/plugins/lwc.js");
     fs::create_dir_all(plugin.parent().unwrap()).unwrap();
     fs::write(&plugin, "export const Lwc = 'user-owned'\n").unwrap();
-    let before = directory_snapshot(&world.home);
-
     let output = world.output(&[
         "agent",
         "install",
@@ -1895,10 +2109,459 @@ fn foreign_dedicated_plugin_conflicts_before_any_write() {
         "global",
         "--yes",
     ]);
-
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("agent_config_conflict"));
-    assert_eq!(directory_snapshot(&world.home), before);
+    assert_eq!(
+        fs::read_to_string(plugin).unwrap(),
+        "export const Lwc = 'user-owned'\n"
+    );
+    assert!(!world.home.join(".config/opencode/opencode.jsonc").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_migrates_the_exact_legacy_v1_plugin_without_restoring_it_on_uninstall() {
+    let world = World::new();
+    let directory = world.home.join(".config/opencode/plugins");
+    let plugin = directory.join("lwc.js");
+    let sibling = directory.join("keep.js");
+    fs::create_dir_all(&directory).unwrap();
+    let legacy = r#"async function context() {
+  try {
+    const process = Bun.spawn(
+      ["lwc", "--scope", "all", "agent", "hook", "--agent", "generic", "--event", "session_start"],
+      { stdin: new Blob(["{}"]), stdout: "pipe", stderr: "ignore" },
+    )
+    const value = JSON.parse(await new Response(process.stdout).text())
+    return (await process.exited) === 0 ? value.additionalContext ?? "" : ""
+  } catch { return "" }
+}
+
+export const Lwc = async () => ({
+  "experimental.chat.system.transform": async (_input, output) => {
+    const value = await context()
+    if (value) output.system.push(value)
+  },
+  "experimental.session.compacting": async (_input, output) => {
+    const value = await context()
+    if (value) output.context.push(value)
+  },
+})
+"#;
+    fs::write(&plugin, legacy).unwrap();
+    fs::write(&sibling, "export default { id: 'keep' }\n").unwrap();
+
+    let installed = world.ok(&[
+        "agent",
+        "install",
+        "--target",
+        "opencode",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    assert_eq!(
+        installed["targets"][0]["lifecycle_hook_mode"],
+        "configured_preview"
+    );
+    assert_eq!(
+        installed["targets"][0]["installed_hook_events"],
+        serde_json::json!(["context"])
+    );
+    let current = fs::read_to_string(&plugin).unwrap();
+    assert!(current.contains("Plugin.define"));
+    assert!(current.contains("session.hook(\"context\""));
+    assert!(!current.contains("experimental.chat.system.transform"));
+    assert_eq!(
+        fs::read_to_string(&sibling).unwrap(),
+        "export default { id: 'keep' }\n"
+    );
+
+    let refreshed = world.ok(&[
+        "agent",
+        "refresh",
+        "--target",
+        "opencode",
+        "--location",
+        "global",
+    ]);
+    assert_eq!(refreshed["targets"][0]["status"], "unchanged");
+
+    world.ok(&[
+        "agent",
+        "uninstall",
+        "--target",
+        "opencode",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    assert!(
+        !plugin.exists(),
+        "uninstall resurrected the removed v1 plugin"
+    );
+    assert_eq!(
+        fs::read_to_string(&sibling).unwrap(),
+        "export default { id: 'keep' }\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_v2_context_plugin_matches_the_official_runtime_contract_and_fails_open() {
+    let world = World::new();
+    world.ok(&[
+        "agent",
+        "install",
+        "--target",
+        "opencode",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    let plugin = world.home.join(".config/opencode/plugins/lwc.js");
+    let fixture = r###"
+import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
+
+const path = process.argv[1]
+let source = readFileSync(path, "utf8")
+const officialImport = 'import { Plugin } from "@opencode-ai/plugin"'
+assert.ok(source.includes(officialImport))
+assert.ok(!source.includes("transcript"))
+assert.ok(!source.includes('session.hook("prompt"'))
+assert.ok(!source.includes("experimental.chat.system.transform"))
+assert.ok(!source.includes('from "node:fs"'))
+assert.ok(!source.includes("Bun.file("))
+assert.ok(!source.includes("writeFile"))
+source = source.replace(officialImport, "const Plugin = { define: (definition) => definition }")
+const module = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`)
+assert.equal(module.default.id, "lwc.context")
+
+let hookName
+let hook
+await module.default.setup({
+  session: {
+    hook: async (name, callback) => {
+      hookName = name
+      hook = callback
+      return { dispose: async () => {} }
+    },
+  },
+})
+assert.equal(hookName, "context")
+
+const stream = (body) => new ReadableStream({
+  start(controller) {
+    controller.enqueue(new TextEncoder().encode(body))
+    controller.close()
+  },
+})
+let spawnCount = 0
+const invoke = async (sessionID, spawn) => {
+  globalThis.Bun = {
+    spawn: (...args) => {
+      spawnCount += 1
+      return spawn(...args)
+    },
+  }
+  const event = { sessionID, system: [] }
+  await hook(event)
+  return event.system
+}
+
+let argv
+let options
+for (const invalid of [undefined, null, "", 0, {}]) {
+  assert.deepEqual(await invoke(invalid, () => { throw new Error("invalid session spawned") }), [])
+}
+assert.equal(spawnCount, 0)
+
+assert.deepEqual(
+  await invoke("session-a", (nextArgv, nextOptions) => {
+    argv = nextArgv
+    options = nextOptions
+    return {
+      stdout: stream('{"additionalContext":"READY"}'),
+      exited: Promise.resolve(0),
+      kill() {},
+    }
+  }),
+  [{ text: "READY" }],
+)
+assert.deepEqual(argv, [
+  "lwc", "--scope", "all", "agent", "hook", "--agent", "opencode", "--event", "context",
+])
+assert.equal(await options.stdin.text(), "{}")
+assert.equal(options.stdout, "pipe")
+assert.equal(options.stderr, "ignore")
+assert.equal(spawnCount, 1)
+
+assert.deepEqual(await invoke("session-a", () => ({
+  stdout: stream('{"additionalContext":"DUPLICATE"}'),
+  exited: Promise.resolve(0),
+  kill() {},
+})), [])
+assert.equal(spawnCount, 1)
+
+assert.deepEqual(await invoke("session-b", () => ({
+  stdout: stream('{"additionalContext":"NEXT"}'),
+  exited: Promise.resolve(0),
+  kill() {},
+})), [{ text: "NEXT" }])
+assert.equal(spawnCount, 2)
+
+const beforeBoundedSessions = spawnCount
+for (let index = 0; index < 257; index += 1) {
+  assert.deepEqual(await invoke(`bounded-${index}`, () => ({
+    stdout: stream('{"additionalContext":""}'),
+    exited: Promise.resolve(0),
+    kill() {},
+  })), [])
+}
+assert.equal(spawnCount, beforeBoundedSessions + 257)
+assert.deepEqual(await invoke("bounded-0", () => ({
+  stdout: stream('{"additionalContext":"EVICTED"}'),
+  exited: Promise.resolve(0),
+  kill() {},
+})), [{ text: "EVICTED" }])
+assert.equal(spawnCount, beforeBoundedSessions + 258)
+assert.deepEqual(await invoke("bounded-256", () => ({
+  stdout: stream('{"additionalContext":"DUPLICATE"}'),
+  exited: Promise.resolve(0),
+  kill() {},
+})), [])
+assert.equal(spawnCount, beforeBoundedSessions + 258)
+assert.ok(source.includes("const MAX_INITIALIZED_SESSIONS = 256"))
+
+assert.deepEqual(await invoke("session-nonzero", () => ({
+  stdout: stream('{"additionalContext":"NO"}'),
+  exited: Promise.resolve(1),
+  kill() {},
+})), [])
+assert.deepEqual(await invoke("session-malformed", () => ({
+  stdout: stream("not-json"),
+  exited: Promise.resolve(0),
+  kill() {},
+})), [])
+assert.deepEqual(await invoke("session-oversize", () => ({
+  stdout: stream("x".repeat(64 * 1024 + 1)),
+  exited: Promise.resolve(0),
+  kill() {},
+})), [])
+assert.deepEqual(await invoke("session-spawn-error", () => { throw new Error("spawn failed") }), [])
+
+let close
+let finish
+let killed = false
+const hanging = {
+  stdout: new ReadableStream({ start(controller) { close = () => controller.close() } }),
+  exited: new Promise((resolve) => { finish = resolve }),
+  kill() {
+    killed = true
+    close()
+    finish(143)
+  },
+}
+const realSetTimeout = globalThis.setTimeout
+const realClearTimeout = globalThis.clearTimeout
+globalThis.setTimeout = (callback, milliseconds) => {
+  assert.equal(milliseconds, 2000)
+  queueMicrotask(callback)
+  return 1
+}
+globalThis.clearTimeout = () => {}
+try {
+  assert.deepEqual(await invoke("session-timeout", () => hanging), [])
+  assert.equal(killed, true)
+} finally {
+  globalThis.setTimeout = realSetTimeout
+  globalThis.clearTimeout = realClearTimeout
+}
+"###;
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", fixture])
+        .arg(&plugin)
+        .limited_output();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_refresh_upgrades_the_per_turn_plugin_to_one_shot_per_session() {
+    let world = World::new();
+    world.ok(&[
+        "agent",
+        "install",
+        "--target",
+        "opencode",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    let plugin = world.home.join(".config/opencode/plugins/lwc.js");
+    let current = fs::read_to_string(&plugin).unwrap();
+    let previous = current
+        .replace("const MAX_INITIALIZED_SESSIONS = 256\n", "")
+        .replace(
+            r#"    const initializedSessions = new Set()
+    await ctx.session.hook("context", async (event) => {
+      const sessionID = event.sessionID
+      if (typeof sessionID !== "string" || sessionID.length === 0) return
+      if (initializedSessions.has(sessionID)) return
+      initializedSessions.add(sessionID)
+      if (initializedSessions.size > MAX_INITIALIZED_SESSIONS) {
+        initializedSessions.delete(initializedSessions.values().next().value)
+      }
+"#,
+            r#"    await ctx.session.hook("context", async (event) => {
+"#,
+        );
+    assert_ne!(previous, current, "fixture must model the per-turn plugin");
+    fs::write(&plugin, &previous).unwrap();
+
+    let manifest_path = world
+        .home
+        .join(".lwc/agent-installs/opencode-global-global.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["hook_contract_version"] = 1.into();
+    let digest = Sha256::digest(previous.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let file = manifest["files"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|file| {
+            file["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("opencode/plugins/lwc.js"))
+        })
+        .unwrap();
+    file["post_hash"] = digest.into();
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let status = world.ok(&[
+        "agent",
+        "status",
+        "--target",
+        "opencode",
+        "--location",
+        "global",
+    ]);
+    assert_eq!(status["targets"][0]["status"], "modified");
+
+    let refreshed = world.ok(&[
+        "agent",
+        "refresh",
+        "--target",
+        "opencode",
+        "--location",
+        "global",
+    ]);
+    assert_eq!(refreshed["targets"][0]["status"], "installed");
+    assert!(
+        fs::read_to_string(&plugin)
+            .unwrap()
+            .contains("initializedSessions")
+    );
+    let upgraded: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(upgraded["hook_contract_version"], 4);
+
+    let unchanged = world.ok(&[
+        "agent",
+        "refresh",
+        "--target",
+        "opencode",
+        "--location",
+        "global",
+    ]);
+    assert_eq!(unchanged["targets"][0]["status"], "unchanged");
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_local_plugin_is_idempotent_and_round_trips_exactly() {
+    let world = World::new();
+    let before = directory_snapshot(&world.project);
+    let plugin = world.project.join(".opencode/plugins/lwc.js");
+    let installed = world.ok(&[
+        "agent",
+        "install",
+        "--target",
+        "opencode",
+        "--location",
+        "local",
+        "--yes",
+    ]);
+    assert_eq!(
+        installed["targets"][0]["installed_hook_events"],
+        serde_json::json!(["context"])
+    );
+    assert!(plugin.is_file());
+    let once = directory_snapshot(&world.project);
+
+    let refreshed = world.ok(&[
+        "agent",
+        "refresh",
+        "--target",
+        "opencode",
+        "--location",
+        "local",
+    ]);
+    assert_eq!(refreshed["targets"][0]["status"], "unchanged");
+    assert_eq!(directory_snapshot(&world.project), once);
+
+    world.ok(&[
+        "agent",
+        "uninstall",
+        "--target",
+        "opencode",
+        "--location",
+        "local",
+        "--yes",
+    ]);
+    assert_eq!(directory_snapshot(&world.project), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_uninstall_preserves_a_user_modified_plugin() {
+    let world = World::new();
+    let plugin = world.home.join(".config/opencode/plugins/lwc.js");
+    world.ok(&[
+        "agent",
+        "install",
+        "--target",
+        "opencode",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    let mut modified = fs::read_to_string(&plugin).unwrap();
+    modified.push_str("// keep-user-modification\n");
+    fs::write(&plugin, &modified).unwrap();
+
+    world.ok(&[
+        "agent",
+        "uninstall",
+        "--target",
+        "opencode",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    assert_eq!(fs::read_to_string(plugin).unwrap(), modified);
 }
 
 #[cfg(unix)]
@@ -2045,7 +2708,7 @@ fn kiro_install_preserves_entries_already_in_its_hook_file() {
     fs::create_dir_all(hook.parent().unwrap()).unwrap();
     fs::write(
         &hook,
-        r#"{"version":"v1","description":"keep","hooks":[{"name":"User hook","trigger":"SessionEnd","action":{"type":"command","command":"user-command"}}]}"#,
+        r#"{"version":"v1","description":"keep","hooks":[{"name":"User hook","trigger":"SessionEnd","action":{"type":"command","command":"user-command"}},{"name":"Retired LWC broad guard","trigger":"PreToolUse","action":{"type":"command","command":"lwc --scope all agent hook --agent kiro --event PreToolUse --raw"}}]}"#,
     )
     .unwrap();
 
@@ -2072,6 +2735,9 @@ fn kiro_install_preserves_entries_already_in_its_hook_file() {
         entry["action"]["command"]
             .as_str()
             .is_some_and(|command| command.contains("--scope all agent hook"))
+    }));
+    assert!(!installed["hooks"].as_array().unwrap().iter().any(|entry| {
+        entry["trigger"] == "PreToolUse" && entry.to_string().contains("agent hook --agent kiro")
     }));
 }
 
@@ -2183,7 +2849,7 @@ fn every_advertised_global_target_round_trips_and_capability_gaps_are_explicit()
             "strong",
             ".gemini/config/plugins/lwc/mcp_config.json",
             Some(".gemini/config/plugins/lwc/rules/lwc.md"),
-            Some(".gemini/config/plugins/lwc/hooks.json"),
+            None,
             Some(".gemini/config/plugins/lwc/skills/using-lwc"),
         ),
         (
@@ -2199,7 +2865,7 @@ fn every_advertised_global_target_round_trips_and_capability_gaps_are_explicit()
             "strong",
             copilot_vscode_mcp,
             None,
-            None,
+            Some(".copilot/hooks/lwc.json"),
             Some(".copilot/skills/using-lwc"),
         ),
         (
@@ -2267,7 +2933,7 @@ fn every_advertised_global_target_round_trips_and_capability_gaps_are_explicit()
         );
         assert_eq!(
             result["targets"][0]["lifecycle_hook_mode"],
-            if target == "kiro" {
+            if matches!(target, "kiro" | "copilot-vscode" | "opencode") {
                 "configured_preview"
             } else if hook_path.is_some() {
                 "installed"
@@ -2412,10 +3078,13 @@ fn every_registered_target_is_strong_and_has_no_self_managed_gap() {
 #[test]
 fn target_hooks_use_each_hosts_official_schema() {
     let cases = [
+        ("claude", ".claude/settings.json"),
+        ("codex", ".codex/hooks.json"),
         ("cursor", ".cursor/hooks.json"),
         ("gemini", ".gemini/settings.json"),
         ("antigravity", ".gemini/config/plugins/lwc/hooks.json"),
         ("kiro", ".kiro/hooks/lwc.json"),
+        ("copilot-vscode", ".copilot/hooks/lwc.json"),
         ("copilot-cli", ".copilot/hooks/lwc.json"),
     ];
     for (target, path) in cases {
@@ -2424,19 +3093,39 @@ fn target_hooks_use_each_hosts_official_schema() {
         let value: Value =
             serde_json::from_slice(&fs::read(world.home.join(path)).unwrap()).unwrap();
         match target {
+            "claude" | "codex" => {
+                let entry = &value["hooks"]["PreToolUse"][0];
+                assert_eq!(entry["matcher"], "Bash");
+                assert_eq!(entry["hooks"][0]["timeout"], 2);
+                assert!(
+                    entry["hooks"][0]["command"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("--agent {target} --event PreToolUse"))
+                );
+            }
             "cursor" => {
                 assert_eq!(value["version"], 1);
                 assert!(
                     value["hooks"]["sessionStart"][0]["command"]
                         .as_str()
                         .unwrap()
-                        .contains("--agent cursor")
+                        .contains("--agent cursor --event sessionStart")
                 );
                 assert!(
                     value["hooks"]["preCompact"][0]["command"]
                         .as_str()
                         .unwrap()
                         .contains("preCompact")
+                );
+                let consent = &value["hooks"]["beforeShellExecution"][0];
+                assert_eq!(consent["matcher"], "lwc");
+                assert_eq!(consent["failClosed"], false);
+                assert!(
+                    consent["command"]
+                        .as_str()
+                        .unwrap()
+                        .contains("--agent cursor --event beforeShellExecution")
                 );
             }
             "gemini" => assert!(
@@ -2445,12 +3134,17 @@ fn target_hooks_use_each_hosts_official_schema() {
                     .unwrap()
                     .contains("--agent gemini")
             ),
-            "antigravity" => assert!(
-                value["lwc"]["PreInvocation"][0]["command"]
-                    .as_str()
-                    .unwrap()
-                    .contains("--agent antigravity")
-            ),
+            "antigravity" => {
+                let entry = &value["lwc"]["PreToolUse"][0];
+                assert_eq!(entry["matcher"], "run_command");
+                assert_eq!(entry["hooks"][0]["timeout"], 2);
+                assert!(
+                    entry["hooks"][0]["command"]
+                        .as_str()
+                        .unwrap()
+                        .contains("--agent antigravity --event PreToolUse")
+                );
+            }
             "kiro" => {
                 assert_eq!(value["version"], "v1");
                 assert_eq!(value["hooks"][0]["trigger"], "SessionStart");
@@ -2460,10 +3154,19 @@ fn target_hooks_use_each_hosts_official_schema() {
                         .unwrap()
                         .contains("--event SessionStart")
                 );
+                assert!(!value["hooks"].as_array().unwrap().iter().any(|entry| {
+                    entry["trigger"] == "PreToolUse"
+                        && entry.to_string().contains("agent hook --agent kiro")
+                }));
+            }
+            "copilot-vscode" => {
+                assert_eq!(value["version"], 1);
+                assert!(value["hooks"].get("PreToolUse").is_none());
             }
             "copilot-cli" => {
                 assert_eq!(value["version"], 1);
                 assert_eq!(value["hooks"]["sessionStart"][0]["type"], "command");
+                assert!(value["hooks"].get("preToolUse").is_none());
             }
             _ => unreachable!(),
         }
@@ -2473,14 +3176,37 @@ fn target_hooks_use_each_hosts_official_schema() {
     hermes.ok(&["agent", "install", "--target", "hermes", "--yes"]);
     let yaml = fs::read_to_string(hermes.home.join(".hermes/config.yaml")).unwrap();
     assert!(yaml.contains("hooks:\n  pre_llm_call:\n    - command:"));
+    assert!(yaml.contains("  pre_tool_call:\n"));
+    assert!(yaml.contains("matcher: \"terminal\""));
+    assert!(yaml.contains("timeout: 2"));
+    assert!(yaml.contains("fail_closed: false"));
+    assert!(yaml.contains("--agent hermes --event pre_tool_call"));
 
     let opencode = World::new();
-    opencode.ok(&["agent", "install", "--target", "opencode", "--yes"]);
-    let plugin = fs::read_to_string(opencode.home.join(".config/opencode/plugins/lwc.js")).unwrap();
-    assert!(plugin.contains("experimental.chat.system.transform"));
-    assert!(plugin.contains("experimental.session.compacting"));
-    assert!(plugin.contains("output.system.push"));
-    assert!(plugin.contains("output.context.push"));
+    let installed = opencode.ok(&["agent", "install", "--target", "opencode", "--yes"]);
+    assert_eq!(
+        installed["targets"][0]["lifecycle_hook_mode"],
+        "configured_preview"
+    );
+    assert_eq!(
+        installed["targets"][0]["installed_hook_events"],
+        serde_json::json!(["context"])
+    );
+    assert!(
+        opencode
+            .home
+            .join(".config/opencode/plugins/lwc.js")
+            .exists()
+    );
+    assert!(
+        installed["targets"][0]["hook_capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| {
+                capability["event"] == "context" && capability["stability"] == "beta"
+            })
+    );
 }
 
 #[cfg(unix)]
@@ -2520,6 +3246,11 @@ fn antigravity_installs_an_official_plugin_and_preserves_legacy_config() {
         serde_json::from_slice::<Value>(&fs::read(plugin.join("plugin.json")).unwrap()).unwrap()["name"],
         "lwc"
     );
+    assert_eq!(result["targets"][0]["lifecycle_hook_mode"], "unsupported");
+    assert_eq!(
+        result["targets"][0]["installed_hook_events"],
+        serde_json::json!(["PreToolUse"])
+    );
     let unified_config: Value = serde_json::from_slice(&fs::read(&unified).unwrap()).unwrap();
     #[cfg(target_os = "macos")]
     assert_eq!(
@@ -2528,15 +3259,11 @@ fn antigravity_installs_an_official_plugin_and_preserves_legacy_config() {
     );
     #[cfg(not(target_os = "macos"))]
     assert_eq!(unified_config["mcpServers"]["lwc"]["command"], "lwc");
-    #[cfg(target_os = "macos")]
-    let hooks: Value =
-        serde_json::from_slice(&fs::read(plugin.join("hooks.json")).unwrap()).unwrap();
-    #[cfg(target_os = "macos")]
+    let hooks = fs::read_to_string(plugin.join("hooks.json")).unwrap();
+    assert!(hooks.contains("--event PreToolUse"));
     assert!(
-        hooks["lwc"]["PreInvocation"][0]["command"]
-            .as_str()
-            .unwrap()
-            .contains(world.home.join("bin/lwc").to_str().unwrap())
+        !hooks.contains("PreInvocation"),
+        "Antigravity PreInvocation has no exact current prompt and must stay uninstalled"
     );
     let legacy_config: Value = serde_json::from_slice(&fs::read(&legacy).unwrap()).unwrap();
     assert_eq!(legacy_config["mcpServers"]["lwc"]["command"], "lwc");
@@ -2568,7 +3295,7 @@ fn antigravity_installs_an_official_plugin_and_preserves_legacy_config() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn antigravity_hook_shell_quotes_the_resolved_lwc_path() {
+fn antigravity_resolved_lwc_path_is_used_only_for_mcp() {
     let world = World::new();
     let bin = world.home.join("bin$gui's tools");
     fs::create_dir(&bin).unwrap();
@@ -2594,20 +3321,31 @@ fn antigravity_hook_shell_quotes_the_resolved_lwc_path() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let hook: Value = serde_json::from_slice(
+    let config: Value = serde_json::from_slice(
+        &fs::read(
+            world
+                .home
+                .join(".gemini/config/plugins/lwc/mcp_config.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        config["mcpServers"]["lwc"]["command"],
+        executable.to_string_lossy().as_ref()
+    );
+    let hooks: Value = serde_json::from_slice(
         &fs::read(world.home.join(".gemini/config/plugins/lwc/hooks.json")).unwrap(),
     )
     .unwrap();
-    let command = hook["lwc"]["PreInvocation"][0]["command"].as_str().unwrap();
-    assert!(
-        Command::new("/bin/sh")
-            .args(["-c", command])
-            .env("PATH", "/usr/bin:/bin")
-            .status()
-            .unwrap()
-            .success(),
-        "generated hook was not shell-safe: {command}"
+    let hook_command = hooks["lwc"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        hook_command,
+        "lwc --scope all agent hook --agent antigravity --event PreToolUse"
     );
+    assert!(!hook_command.contains(executable.to_string_lossy().as_ref()));
 }
 
 #[cfg(target_os = "macos")]
@@ -2963,7 +3701,7 @@ fn copilot_vscode_replaces_its_legacy_camel_case_hook() {
     fs::create_dir_all(hook.parent().unwrap()).unwrap();
     fs::write(
         &hook,
-        r#"{"version":1,"hooks":{"sessionStart":[{"type":"command","bash":"lwc --scope all agent hook --agent copilot-vscode --event sessionStart"}],"SessionEnd":[{"type":"command","command":"keep"}]}}"#,
+        r#"{"version":1,"hooks":{"sessionStart":[{"type":"command","bash":"lwc --scope all agent hook --agent copilot-vscode --event sessionStart"}],"PreToolUse":[{"type":"command","command":"lwc --scope all agent hook --agent copilot-vscode --event PreToolUse"},{"type":"command","command":"keep-user-pretool"}],"SessionEnd":[{"type":"command","command":"keep"}]}}"#,
     )
     .unwrap();
 
@@ -2986,6 +3724,107 @@ fn copilot_vscode_replaces_its_legacy_camel_case_hook() {
             .unwrap()
             .contains("--agent copilot-vscode")
     );
+    assert_eq!(
+        value["hooks"]["PreToolUse"],
+        serde_json::json!([{"type": "command", "command": "keep-user-pretool"}])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_copilot_hooks_refresh_and_uninstall_additively_in_both_orders() {
+    for uninstall_order in [
+        ["copilot-vscode", "copilot-cli"],
+        ["copilot-cli", "copilot-vscode"],
+    ] {
+        let world = World::new();
+        let hook = world.home.join(".copilot/hooks/lwc.json");
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        let original = b"{\n  \"version\": 1,\n  \"hooks\": {\n    \"PreToolUse\": [{\"type\": \"command\", \"command\": \"keep-user-pretool\"}],\n    \"SessionEnd\": [{\"type\": \"command\", \"command\": \"keep-user-hook\"}]\n  }\n}\n";
+        fs::write(&hook, original).unwrap();
+
+        for target in ["copilot-vscode", "copilot-cli"] {
+            world.ok(&[
+                "agent",
+                "install",
+                "--target",
+                target,
+                "--location",
+                "global",
+                "--yes",
+            ]);
+        }
+
+        let mut stale: Value = serde_json::from_slice(&fs::read(&hook).unwrap()).unwrap();
+        stale["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "command",
+                "command": "lwc --scope all agent hook --agent copilot-vscode --event PreToolUse"
+            }));
+        fs::write(&hook, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+
+        let migrated = world.ok(&[
+            "agent",
+            "refresh",
+            "--target",
+            "copilot-vscode",
+            "--location",
+            "global",
+        ]);
+        assert_eq!(migrated["targets"][0]["status"], "installed");
+        let migrated: Value = serde_json::from_slice(&fs::read(&hook).unwrap()).unwrap();
+        assert_eq!(
+            migrated["hooks"]["PreToolUse"],
+            serde_json::json!([{"type": "command", "command": "keep-user-pretool"}])
+        );
+
+        for target in ["copilot-vscode", "copilot-cli", "copilot-vscode"] {
+            let refreshed = world.ok(&[
+                "agent",
+                "refresh",
+                "--target",
+                target,
+                "--location",
+                "global",
+            ]);
+            assert_eq!(
+                refreshed["targets"][0]["status"], "unchanged",
+                "{target} must ignore additive sibling hook entries"
+            );
+        }
+
+        let installed = fs::read_to_string(&hook).unwrap();
+        assert!(installed.contains("keep-user-hook"));
+        assert!(installed.contains("--agent copilot-vscode"));
+        assert!(installed.contains("--agent copilot-cli"));
+
+        world.ok(&[
+            "agent",
+            "uninstall",
+            "--target",
+            uninstall_order[0],
+            "--location",
+            "global",
+            "--yes",
+        ]);
+        let remaining = fs::read_to_string(&hook).unwrap();
+        assert!(remaining.contains("keep-user-hook"));
+        assert!(!remaining.contains(&format!("--agent {}", uninstall_order[0])));
+        assert!(remaining.contains(&format!("--agent {}", uninstall_order[1])));
+
+        world.ok(&[
+            "agent",
+            "uninstall",
+            "--target",
+            uninstall_order[1],
+            "--location",
+            "global",
+            "--yes",
+        ]);
+        assert_eq!(fs::read(&hook).unwrap(), original);
+    }
 }
 
 #[cfg(unix)]
@@ -3256,6 +4095,95 @@ fn hermes_enables_the_lwc_toolset_and_preserves_user_yaml() {
 
 #[cfg(unix)]
 #[test]
+fn hermes_refresh_normalizes_only_its_stale_pretool_node() {
+    let world = World::new();
+    world.ok(&[
+        "agent",
+        "install",
+        "--target",
+        "hermes",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    let config = world.home.join(".hermes/config.yaml");
+    let canonical = "    - matcher: \"terminal\"\n      command: \"lwc --scope all agent hook --agent hermes --event pre_tool_call\"\n      timeout: 2\n      fail_closed: false\n";
+    let stale = "    - matcher: \".*\"\n      command: \"lwc --scope all agent hook --agent hermes --event pre_tool_call\"\n      timeout: 99\n      fail_closed: true\n    - matcher: \"keep-user-tool\"\n      command: \"keep-user-pretool\"\n      timeout: 7\n";
+    let installed = fs::read_to_string(&config).unwrap();
+    assert!(installed.contains(canonical));
+    fs::write(&config, installed.replacen(canonical, stale, 1)).unwrap();
+
+    let refreshed = world.ok(&[
+        "agent",
+        "refresh",
+        "--target",
+        "hermes",
+        "--location",
+        "global",
+    ]);
+    assert_eq!(refreshed["targets"][0]["status"], "installed");
+    let refreshed = fs::read_to_string(&config).unwrap();
+    assert_eq!(refreshed.matches(canonical).count(), 1);
+    assert!(!refreshed.contains("matcher: \".*\""));
+    assert!(!refreshed.contains("fail_closed: true"));
+    assert!(refreshed.contains("keep-user-pretool"));
+
+    world.ok(&[
+        "agent",
+        "uninstall",
+        "--target",
+        "hermes",
+        "--location",
+        "global",
+        "--yes",
+    ]);
+    let uninstalled = fs::read_to_string(&config).unwrap();
+    assert!(uninstalled.contains("keep-user-pretool"));
+    assert!(!uninstalled.contains("agent hook --agent hermes --event pre_tool_call"));
+}
+
+#[cfg(unix)]
+#[test]
+fn hermes_local_receipts_do_not_advertise_uninstalled_global_hooks() {
+    let world = World::new();
+    let installed = world.ok(&[
+        "agent",
+        "install",
+        "--target",
+        "hermes",
+        "--location",
+        "local",
+        "--yes",
+    ]);
+    assert_eq!(
+        installed["targets"][0]["installed_hook_events"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        installed["targets"][0]["hook_capabilities"],
+        serde_json::json!([])
+    );
+
+    let status = world.ok(&[
+        "agent",
+        "status",
+        "--target",
+        "hermes",
+        "--location",
+        "local",
+    ]);
+    assert_eq!(
+        status["targets"][0]["installed_hook_events"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        status["targets"][0]["hook_capabilities"],
+        serde_json::json!([])
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn opencode_global_install_uses_the_official_xdg_config_home() {
     let world = World::new();
     let xdg = world.home.join("custom-xdg");
@@ -3280,7 +4208,10 @@ fn opencode_global_install_uses_the_official_xdg_config_home() {
     for relative in ["opencode.jsonc", "AGENTS.md"] {
         assert!(xdg.join("opencode").join(relative).is_file(), "{relative}");
     }
-    assert!(xdg.join("opencode/plugins/lwc.js").is_file());
+    let plugin = fs::read_to_string(xdg.join("opencode/plugins/lwc.js")).unwrap();
+    assert!(plugin.contains("Plugin.define"));
+    assert!(plugin.contains("session.hook(\"context\""));
+    assert!(!plugin.contains("experimental.chat.system.transform"));
     assert!(xdg.join("opencode/skills/using-lwc/SKILL.md").is_file());
     assert!(!world.home.join(".config/opencode/opencode.jsonc").exists());
 }
@@ -3404,14 +4335,11 @@ fn every_print_config_is_pure_and_global_lwc_is_required_before_writes() {
     let antigravity = String::from_utf8(antigravity.stdout).unwrap();
     assert!(antigravity.contains("mcp_config.json"));
     assert!(!antigravity.contains("\"type\":\"stdio\""));
-    #[cfg(target_os = "macos")]
     assert!(
         antigravity
-            .lines()
-            .find(|line| line.starts_with("Hook: "))
-            .unwrap()
-            .contains(world.home.join("bin/lwc").to_str().unwrap())
+            .contains("Hook: lwc --scope all agent hook --agent antigravity --event PreToolUse")
     );
+    assert!(antigravity.contains("Hook events: PreToolUse"));
     let gemini = world.output(&["agent", "install", "--print-config", "gemini"]);
     let gemini = String::from_utf8(gemini.stdout).unwrap();
     assert!(!gemini.contains("\"type\":\"stdio\""));
@@ -3421,6 +4349,9 @@ fn every_print_config_is_pure_and_global_lwc_is_required_before_writes() {
     let opencode = String::from_utf8(opencode.stdout).unwrap();
     assert!(opencode.contains("MCP: {\"mcp\":{\"lwc\":"));
     assert!(opencode.contains("\"command\":[\"lwc\",\"serve\",\"--mcp\"]"));
+    assert!(opencode.contains("OpenCode v2 Plugin API is beta"));
+    assert!(opencode.contains("--agent opencode --event context"));
+    assert!(!opencode.contains("experimental.chat.system.transform"));
     assert_eq!(directory_snapshot(&world.home), before);
 
     let output = world
@@ -3600,68 +4531,924 @@ fn prompt_hook_opt_out_and_unsafe_marker_paths_fail_closed() {
 
 #[cfg(unix)]
 #[test]
-fn claude_prompt_hook_option_updates_an_existing_install() {
-    let world = World::new();
-    let settings = world.home.join(".claude/settings.json");
+fn prompt_hook_option_updates_and_refreshes_claude_and_codex() {
+    for (target, relative) in [
+        ("claude", ".claude/settings.json"),
+        ("codex", ".codex/hooks.json"),
+    ] {
+        let world = World::new();
+        let settings = world.home.join(relative);
 
-    world.ok(&[
+        world.ok(&[
+            "agent",
+            "install",
+            "--target",
+            target,
+            "--location",
+            "global",
+            "--yes",
+        ]);
+        assert!(
+            fs::read_to_string(&settings)
+                .unwrap()
+                .contains("UserPromptSubmit"),
+            "{target} default prompt hook"
+        );
+
+        let opted_out = world.ok(&[
+            "agent",
+            "install",
+            "--target",
+            target,
+            "--location",
+            "global",
+            "--yes",
+            "--no-prompt-hook",
+        ]);
+        assert!(
+            !fs::read_to_string(&settings)
+                .unwrap()
+                .contains(&format!("--agent {target} --event UserPromptSubmit")),
+            "{target} prompt hook opt-out"
+        );
+        assert!(
+            !opted_out["targets"][0]["installed_hook_events"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("UserPromptSubmit"))
+        );
+
+        let refreshed = world.ok(&[
+            "agent",
+            "refresh",
+            "--target",
+            target,
+            "--location",
+            "global",
+        ]);
+        assert_eq!(refreshed["targets"][0]["status"], "unchanged");
+        assert!(
+            !fs::read_to_string(&settings)
+                .unwrap()
+                .contains(&format!("--agent {target} --event UserPromptSubmit"))
+        );
+
+        world.ok(&[
+            "agent",
+            "install",
+            "--target",
+            target,
+            "--location",
+            "global",
+            "--yes",
+        ]);
+        assert!(
+            fs::read_to_string(settings)
+                .unwrap()
+                .contains(&format!("--agent {target} --event UserPromptSubmit")),
+            "{target} prompt hook re-enable"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
+    #[derive(Clone, Copy)]
+    struct ExpectedCapability {
+        event: &'static str,
+        semantic_event: &'static str,
+        effects: &'static [&'static str],
+        stability: &'static str,
+        loop_guard: &'static str,
+    }
+
+    struct Case {
+        target: &'static str,
+        lifecycle_mode: &'static str,
+        installed_events: &'static [&'static str],
+        capabilities: &'static [ExpectedCapability],
+    }
+
+    const CONTEXT: &[&str] = &["context"];
+    const CONTEXT_GUARD: &[&str] = &["context", "guard"];
+    const CONTINUE: &[&str] = &["guard", "continue"];
+    const OBSERVE: &[&str] = &["observe"];
+    const CASES: &[Case] = &[
+        Case {
+            target: "claude",
+            lifecycle_mode: "installed",
+            installed_events: &[
+                "SessionStart",
+                "UserPromptSubmit",
+                "PreToolUse",
+                "PostToolUse",
+                "PostToolUseFailure",
+                "SubagentStart",
+                "Stop",
+            ],
+            capabilities: &[
+                ExpectedCapability {
+                    event: "SessionStart",
+                    semantic_event: "session_start",
+                    effects: CONTEXT,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "Stop",
+                    semantic_event: "stop",
+                    effects: CONTINUE,
+                    stability: "stable",
+                    loop_guard: "stop_hook_active",
+                },
+                ExpectedCapability {
+                    event: "SubagentStop",
+                    semantic_event: "subagent_stop",
+                    effects: OBSERVE,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+            ],
+        },
+        Case {
+            target: "cursor",
+            lifecycle_mode: "installed",
+            installed_events: &[
+                "sessionStart",
+                "preCompact",
+                "postToolUse",
+                "beforeShellExecution",
+            ],
+            capabilities: &[
+                ExpectedCapability {
+                    event: "sessionStart",
+                    semantic_event: "session_start",
+                    effects: CONTEXT,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "preCompact",
+                    semantic_event: "compact_before",
+                    effects: OBSERVE,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "stop",
+                    semantic_event: "stop",
+                    effects: OBSERVE,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "subagentStop",
+                    semantic_event: "subagent_stop",
+                    effects: OBSERVE,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+            ],
+        },
+        Case {
+            target: "codex",
+            lifecycle_mode: "installed",
+            installed_events: &[
+                "SessionStart",
+                "UserPromptSubmit",
+                "PreToolUse",
+                "PostToolUse",
+                "SubagentStart",
+                "Stop",
+            ],
+            capabilities: &[
+                ExpectedCapability {
+                    event: "SessionStart",
+                    semantic_event: "session_start",
+                    effects: CONTEXT,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "Stop",
+                    semantic_event: "stop",
+                    effects: CONTINUE,
+                    stability: "stable",
+                    loop_guard: "stop_hook_active",
+                },
+                ExpectedCapability {
+                    event: "SubagentStop",
+                    semantic_event: "subagent_stop",
+                    effects: OBSERVE,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+            ],
+        },
+        Case {
+            target: "opencode",
+            lifecycle_mode: "configured_preview",
+            installed_events: &["context"],
+            capabilities: &[ExpectedCapability {
+                event: "context",
+                semantic_event: "session_start",
+                effects: CONTEXT,
+                stability: "beta",
+                loop_guard: "none",
+            }],
+        },
+        Case {
+            target: "hermes",
+            lifecycle_mode: "installed",
+            installed_events: &["pre_llm_call", "pre_tool_call"],
+            capabilities: &[
+                ExpectedCapability {
+                    event: "pre_llm_call",
+                    semantic_event: "prompt",
+                    effects: CONTEXT,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "post_llm_call",
+                    semantic_event: "stop",
+                    effects: OBSERVE,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "subagent_stop",
+                    semantic_event: "subagent_stop",
+                    effects: OBSERVE,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+            ],
+        },
+        Case {
+            target: "gemini",
+            lifecycle_mode: "installed",
+            installed_events: &["SessionStart", "BeforeAgent", "AfterTool"],
+            capabilities: &[
+                ExpectedCapability {
+                    event: "BeforeAgent",
+                    semantic_event: "turn_start",
+                    effects: CONTEXT_GUARD,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "AfterAgent",
+                    semantic_event: "stop",
+                    effects: OBSERVE,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+            ],
+        },
+        Case {
+            target: "antigravity",
+            lifecycle_mode: "unsupported",
+            installed_events: &["PreToolUse"],
+            capabilities: &[
+                ExpectedCapability {
+                    event: "PreInvocation",
+                    semantic_event: "turn_start",
+                    effects: OBSERVE,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "Stop",
+                    semantic_event: "stop",
+                    effects: OBSERVE,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+            ],
+        },
+        Case {
+            target: "kiro",
+            lifecycle_mode: "configured_preview",
+            installed_events: &["SessionStart", "UserPromptSubmit", "PostToolUse"],
+            capabilities: &[
+                ExpectedCapability {
+                    event: "UserPromptSubmit",
+                    semantic_event: "prompt",
+                    effects: CONTEXT_GUARD,
+                    stability: "preview",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "Stop",
+                    semantic_event: "stop",
+                    effects: OBSERVE,
+                    stability: "preview",
+                    loop_guard: "none",
+                },
+            ],
+        },
+        Case {
+            target: "copilot-vscode",
+            lifecycle_mode: "configured_preview",
+            installed_events: &["SessionStart", "PostToolUse", "SubagentStart"],
+            capabilities: &[
+                ExpectedCapability {
+                    event: "SessionStart",
+                    semantic_event: "session_start",
+                    effects: CONTEXT,
+                    stability: "preview",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "Stop",
+                    semantic_event: "stop",
+                    effects: OBSERVE,
+                    stability: "preview",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "SubagentStop",
+                    semantic_event: "subagent_stop",
+                    effects: OBSERVE,
+                    stability: "preview",
+                    loop_guard: "none",
+                },
+            ],
+        },
+        Case {
+            target: "copilot-cli",
+            lifecycle_mode: "installed",
+            installed_events: &["sessionStart", "postToolUse", "subagentStart"],
+            capabilities: &[
+                ExpectedCapability {
+                    event: "sessionStart",
+                    semantic_event: "session_start",
+                    effects: CONTEXT,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "userPromptTransformed",
+                    semantic_event: "prompt",
+                    effects: OBSERVE,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "agentStop",
+                    semantic_event: "stop",
+                    effects: OBSERVE,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "subagentStop",
+                    semantic_event: "subagent_stop",
+                    effects: OBSERVE,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+            ],
+        },
+        Case {
+            target: "copilot-jetbrains",
+            lifecycle_mode: "unsupported",
+            installed_events: &[],
+            capabilities: &[],
+        },
+        Case {
+            target: "pi",
+            lifecycle_mode: "installed",
+            installed_events: &[
+                "session_start",
+                "session_before_compact",
+                "session_compact",
+                "before_agent_start",
+                "session_shutdown",
+            ],
+            capabilities: &[
+                ExpectedCapability {
+                    event: "before_agent_start",
+                    semantic_event: "turn_start",
+                    effects: CONTEXT,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "agent_settled",
+                    semantic_event: "stop",
+                    effects: OBSERVE,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+                ExpectedCapability {
+                    event: "session_compact",
+                    semantic_event: "compact_after",
+                    effects: CONTEXT,
+                    stability: "stable",
+                    loop_guard: "none",
+                },
+            ],
+        },
+    ];
+
+    struct ToolConsentExpectation {
+        target: &'static str,
+        event: &'static str,
+        mode: &'static str,
+        failure: &'static str,
+        coverage: &'static str,
+    }
+    const TOOL_CONSENT: &[ToolConsentExpectation] = &[
+        ToolConsentExpectation {
+            target: "claude",
+            event: "PreToolUse",
+            mode: "enforced_ask",
+            failure: "fail_open",
+            coverage: "recognized_lwc_shell",
+        },
+        ToolConsentExpectation {
+            target: "codex",
+            event: "PreToolUse",
+            mode: "advisory",
+            failure: "fail_open",
+            coverage: "recognized_lwc_shell",
+        },
+        ToolConsentExpectation {
+            target: "cursor",
+            event: "beforeShellExecution",
+            mode: "enforced_ask",
+            failure: "fail_open",
+            coverage: "recognized_lwc_shell",
+        },
+        ToolConsentExpectation {
+            target: "hermes",
+            event: "pre_tool_call",
+            mode: "enforced_ask",
+            failure: "fail_open",
+            coverage: "recognized_lwc_shell",
+        },
+        ToolConsentExpectation {
+            target: "antigravity",
+            event: "PreToolUse",
+            mode: "enforced_ask",
+            failure: "fail_open",
+            coverage: "recognized_lwc_shell",
+        },
+        ToolConsentExpectation {
+            target: "gemini",
+            event: "BeforeTool",
+            mode: "none",
+            failure: "not_applicable",
+            coverage: "none",
+        },
+        ToolConsentExpectation {
+            target: "kiro",
+            event: "PreToolUse",
+            mode: "none",
+            failure: "not_applicable",
+            coverage: "none",
+        },
+        ToolConsentExpectation {
+            target: "copilot-vscode",
+            event: "PreToolUse",
+            mode: "none",
+            failure: "not_applicable",
+            coverage: "none",
+        },
+        ToolConsentExpectation {
+            target: "copilot-cli",
+            event: "preToolUse",
+            mode: "none",
+            failure: "not_applicable",
+            coverage: "none",
+        },
+        ToolConsentExpectation {
+            target: "pi",
+            event: "tool_call",
+            mode: "none",
+            failure: "not_applicable",
+            coverage: "none",
+        },
+    ];
+
+    for case in CASES {
+        let world = World::new();
+        let installed = world.ok(&[
+            "agent",
+            "install",
+            "--target",
+            case.target,
+            "--location",
+            "global",
+            "--yes",
+        ]);
+        let receipt = &installed["targets"][0];
+        assert_eq!(
+            receipt["lifecycle_hook_mode"], case.lifecycle_mode,
+            "{} lifecycle stability",
+            case.target
+        );
+        assert_hook_contract(
+            receipt,
+            case.target,
+            case.installed_events,
+            case.capabilities,
+        );
+
+        let status = world.ok(&[
+            "agent",
+            "status",
+            "--target",
+            case.target,
+            "--location",
+            "global",
+        ]);
+        assert_hook_contract(
+            &status["targets"][0],
+            case.target,
+            case.installed_events,
+            case.capabilities,
+        );
+        for expected in TOOL_CONSENT
+            .iter()
+            .filter(|expected| expected.target == case.target)
+        {
+            let capability = status["targets"][0]["hook_capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|capability| capability["event"] == expected.event)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} missing {} tool consent capability",
+                        case.target, expected.event
+                    )
+                });
+            assert_eq!(
+                capability["tool_consent_mode"], expected.mode,
+                "{} {} consent mode",
+                case.target, expected.event
+            );
+            assert_eq!(
+                capability["tool_consent_failure"], expected.failure,
+                "{} {} failure mode",
+                case.target, expected.event
+            );
+            assert_eq!(
+                capability["tool_consent_coverage"], expected.coverage,
+                "{} {} coverage",
+                case.target, expected.event
+            );
+        }
+    }
+
+    fn assert_hook_contract(
+        target: &Value,
+        target_name: &str,
+        expected_installed: &[&str],
+        expected_capabilities: &[ExpectedCapability],
+    ) {
+        let capabilities = target["hook_capabilities"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{target_name} must expose hook_capabilities"));
+        let mut installed = target["installed_hook_events"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{target_name} must expose installed_hook_events"))
+            .iter()
+            .map(|event| event.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        installed.sort();
+        let mut expected_installed = expected_installed
+            .iter()
+            .map(|event| (*event).to_owned())
+            .collect::<Vec<_>>();
+        expected_installed.sort();
+        assert_eq!(
+            installed, expected_installed,
+            "{target_name} installed events"
+        );
+        if target_name == "opencode" {
+            assert_eq!(
+                capabilities.len(),
+                expected_capabilities.len(),
+                "OpenCode v2 exposes only the verified context hook"
+            );
+        }
+
+        for event in &installed {
+            assert!(
+                capabilities
+                    .iter()
+                    .any(|capability| capability["event"] == event.as_str()),
+                "{target_name} installed unsupported event {event}"
+            );
+        }
+        for expected in expected_capabilities {
+            let capability = capabilities
+                .iter()
+                .find(|capability| capability["event"] == expected.event)
+                .unwrap_or_else(|| panic!("{target_name} missing {} capability", expected.event));
+            assert_eq!(
+                capability["semantic_event"], expected.semantic_event,
+                "{target_name} {} semantic event",
+                expected.event
+            );
+            assert_eq!(
+                capability["stability"], expected.stability,
+                "{target_name} {} stability",
+                expected.event
+            );
+            assert_eq!(
+                capability["loop_guard"], expected.loop_guard,
+                "{target_name} {} loop guard",
+                expected.event
+            );
+            let mut effects = capability["effects"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!("{target_name} {} effects must be an array", expected.event)
+                })
+                .iter()
+                .map(|effect| effect.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            effects.sort();
+            let mut expected_effects = expected
+                .effects
+                .iter()
+                .map(|effect| (*effect).to_owned())
+                .collect::<Vec<_>>();
+            expected_effects.sort();
+            assert_eq!(
+                effects, expected_effects,
+                "{target_name} {} effects",
+                expected.event
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_and_codex_stop_hooks_refresh_idempotently_and_preserve_siblings() {
+    for (target, relative) in [
+        ("claude", ".claude/settings.json"),
+        ("codex", ".codex/hooks.json"),
+    ] {
+        let world = World::new();
+        world.ok(&[
+            "agent",
+            "install",
+            "--target",
+            target,
+            "--location",
+            "global",
+            "--yes",
+        ]);
+        let hook = world.home.join(relative);
+        let mut value: Value = serde_json::from_slice(&fs::read(&hook).unwrap()).unwrap();
+        let stop = value["hooks"]["Stop"]
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("{target} must install its official Stop hook"));
+        assert_eq!(
+            stop.iter()
+                .filter(|entry| entry.to_string().contains(&format!("--agent {target}")))
+                .count(),
+            1,
+            "{target} must install one owned Stop hook"
+        );
+        stop.push(serde_json::json!({
+            "hooks": [{"type": "command", "command": "keep-stop-sibling"}]
+        }));
+        fs::write(&hook, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        world.ok(&[
+            "agent",
+            "refresh",
+            "--target",
+            target,
+            "--location",
+            "global",
+        ]);
+        let refreshed: Value = serde_json::from_slice(&fs::read(&hook).unwrap()).unwrap();
+        assert!(
+            refreshed["hooks"]["Stop"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.to_string().contains("keep-stop-sibling")),
+            "{target} refresh removed a sibling Stop hook"
+        );
+        assert_eq!(
+            refreshed["hooks"]["Stop"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.to_string().contains(&format!("--agent {target}")))
+                .count(),
+            1,
+            "{target} refresh duplicated the owned Stop hook"
+        );
+        let once = directory_snapshot(&world.home);
+        world.ok(&[
+            "agent",
+            "refresh",
+            "--target",
+            target,
+            "--location",
+            "global",
+        ]);
+        assert_eq!(directory_snapshot(&world.home), once, "{target} refresh");
+
+        world.ok(&[
+            "agent",
+            "uninstall",
+            "--target",
+            target,
+            "--location",
+            "global",
+            "--yes",
+        ]);
+        let uninstalled: Value = serde_json::from_slice(&fs::read(&hook).unwrap()).unwrap();
+        assert!(
+            uninstalled["hooks"]["Stop"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.to_string().contains("keep-stop-sibling")),
+            "{target} uninstall removed a sibling Stop hook"
+        );
+        assert!(
+            !uninstalled
+                .to_string()
+                .contains(&format!("--agent {target}")),
+            "{target} uninstall retained an owned hook"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn official_hook_same_group_siblings_survive_refresh_and_uninstall() {
+    for (target, relative, event) in [
+        ("claude", ".claude/settings.json", "Stop"),
+        ("codex", ".codex/hooks.json", "Stop"),
+        ("gemini", ".gemini/settings.json", "AfterTool"),
+    ] {
+        let world = World::new();
+        world.ok(&[
+            "agent",
+            "install",
+            "--target",
+            target,
+            "--location",
+            "global",
+            "--yes",
+        ]);
+        let hook = world.home.join(relative);
+        let mut edited: Value = serde_json::from_slice(&fs::read(&hook).unwrap()).unwrap();
+        let group = edited["hooks"][event]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|group| group.to_string().contains(&format!("--agent {target}")))
+            .unwrap();
+        group["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "command",
+                "command": "keep-user-same-group"
+            }));
+        fs::write(&hook, serde_json::to_vec_pretty(&edited).unwrap()).unwrap();
+
+        world.ok(&[
+            "agent",
+            "refresh",
+            "--target",
+            target,
+            "--location",
+            "global",
+        ]);
+        let refreshed: Value = serde_json::from_slice(&fs::read(&hook).unwrap()).unwrap();
+        assert!(
+            refreshed["hooks"][event]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|group| group.to_string().contains("keep-user-same-group")),
+            "{target} refresh removed a same-group user hook"
+        );
+        assert_eq!(
+            refreshed["hooks"][event]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|group| group.to_string().contains(&format!("--agent {target}")))
+                .count(),
+            1,
+            "{target} refresh must leave one owned hook"
+        );
+
+        world.ok(&[
+            "agent",
+            "uninstall",
+            "--target",
+            target,
+            "--location",
+            "global",
+            "--yes",
+        ]);
+        let uninstalled: Value = serde_json::from_slice(&fs::read(&hook).unwrap()).unwrap();
+        assert!(
+            uninstalled["hooks"][event]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|group| group.to_string().contains("keep-user-same-group")),
+            "{target} uninstall removed a same-group user hook"
+        );
+        assert!(
+            !uninstalled
+                .to_string()
+                .contains(&format!("--agent {target}")),
+            "{target} uninstall retained an owned hook"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn advisory_and_unsupported_stop_events_are_not_installed_as_continuations() {
+    let cases = [
+        ("cursor", ".cursor/hooks.json", "stop"),
+        ("gemini", ".gemini/settings.json", "AfterAgent"),
+        ("kiro", ".kiro/hooks/lwc.json", "Stop"),
+        ("hermes", ".hermes/config.yaml", "Stop"),
+        ("pi", ".pi/agent/extensions/lwc.js", "stop"),
+    ];
+    for (target, relative, event) in cases {
+        let world = World::new();
+        world.ok(&[
+            "agent",
+            "install",
+            "--target",
+            target,
+            "--location",
+            "global",
+            "--yes",
+        ]);
+        let hook = fs::read_to_string(world.home.join(relative)).unwrap();
+        assert!(
+            !hook.contains(&format!("--event {event}"))
+                && !hook.contains(&format!("\"{event}\":"))
+                && !hook.contains(&format!("\"trigger\": \"{event}\"")),
+            "{target} must not install an unguarded {event} continuation hook: {hook}"
+        );
+    }
+
+    let antigravity = World::new();
+    antigravity.ok(&[
         "agent",
         "install",
         "--target",
-        "claude",
+        "antigravity",
         "--location",
         "global",
         "--yes",
     ]);
-    assert!(
-        fs::read_to_string(&settings)
-            .unwrap()
-            .contains("UserPromptSubmit")
-    );
+    let hook = fs::read_to_string(
+        antigravity
+            .home
+            .join(".gemini/config/plugins/lwc/hooks.json"),
+    )
+    .unwrap();
+    assert!(!hook.contains("PreInvocation"));
+    assert!(!hook.contains("--event Stop"));
 
-    world.ok(&[
+    let jetbrains = World::new();
+    let installed = jetbrains.ok(&[
         "agent",
         "install",
         "--target",
-        "claude",
-        "--location",
-        "global",
-        "--yes",
-        "--no-prompt-hook",
-    ]);
-    assert!(
-        !fs::read_to_string(&settings)
-            .unwrap()
-            .contains("UserPromptSubmit")
-    );
-
-    world.ok(&[
-        "agent",
-        "refresh",
-        "--target",
-        "claude",
-        "--location",
-        "global",
-    ]);
-    assert!(
-        !fs::read_to_string(&settings)
-            .unwrap()
-            .contains("UserPromptSubmit")
-    );
-
-    world.ok(&[
-        "agent",
-        "install",
-        "--target",
-        "claude",
+        "copilot-jetbrains",
         "--location",
         "global",
         "--yes",
     ]);
-    assert!(
-        fs::read_to_string(settings)
-            .unwrap()
-            .contains("UserPromptSubmit")
+    assert_eq!(
+        installed["targets"][0]["lifecycle_hook_mode"],
+        "unsupported"
+    );
+    assert_eq!(
+        installed["targets"][0]["hook_capabilities"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        installed["targets"][0]["installed_hook_events"],
+        serde_json::json!([])
     );
 }
 

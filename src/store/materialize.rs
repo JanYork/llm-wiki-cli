@@ -403,6 +403,7 @@ impl Store {
         let mut all_issues = statement
             .query_map([], |row| {
                 Ok(LintIssue {
+                    severity: LintSeverity::Error,
                     code: row.get(0)?,
                     page: row.get(1)?,
                     target: row.get(2)?,
@@ -410,9 +411,11 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        all_issues.extend(markdown_structure_issues(conn)?);
         all_issues.sort_by(|left, right| {
-            left.code
-                .cmp(&right.code)
+            left.severity
+                .cmp(&right.severity)
+                .then_with(|| left.code.cmp(&right.code))
                 .then_with(|| left.page.cmp(&right.page))
                 .then_with(|| left.target.cmp(&right.target))
         });
@@ -421,6 +424,11 @@ impl Store {
             *counts.entry(issue.code.clone()).or_insert(0usize) += 1;
         }
         let total = all_issues.len();
+        let blocking_total = all_issues
+            .iter()
+            .filter(|issue| issue.severity.is_blocking())
+            .count();
+        let advisory_total = total - blocking_total;
         let issues = all_issues
             .into_iter()
             .skip(offset)
@@ -433,6 +441,8 @@ impl Store {
             issues,
             counts,
             total,
+            blocking_total,
+            advisory_total,
             limit,
             offset,
             has_more,
@@ -848,5 +858,157 @@ impl Store {
 
     fn database_string(&self) -> String {
         self.database.to_string_lossy().into_owned()
+    }
+}
+
+// Info only: keep this conservative until corpus benchmarks justify a different threshold.
+const LONG_UNSECTIONED_PROSE_CHARS: usize = 4_000;
+
+fn markdown_structure_issues(conn: &Connection) -> Result<Vec<LintIssue>> {
+    let mut statement = conn.prepare("SELECT slug, title, body FROM pages ORDER BY slug")?;
+    let pages = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut issues = Vec::new();
+
+    for page in pages {
+        let (slug, title, body) = page?;
+        let mut headings = Vec::new();
+        let mut current_heading: Option<(u8, String)> = None;
+        let mut code_block_depth = 0usize;
+        let mut region_chars = 0usize;
+        let mut region_heading = None;
+
+        for event in Parser::new_ext(&body, Options::all()) {
+            match event {
+                Event::Start(Tag::Heading { level, .. }) => {
+                    push_long_unsectioned_issue(
+                        &mut issues,
+                        &slug,
+                        region_heading.take(),
+                        region_chars,
+                    );
+                    region_chars = 0;
+                    current_heading = Some((heading_level_number(level), String::new()));
+                }
+                Event::End(TagEnd::Heading(_)) => {
+                    if let Some((level, text)) = current_heading.take() {
+                        let text = normalize_heading(&text);
+                        region_heading = (!text.is_empty()).then(|| text.clone());
+                        headings.push((level, text));
+                    }
+                }
+                Event::Start(Tag::CodeBlock(_)) => code_block_depth += 1,
+                Event::End(TagEnd::CodeBlock) => {
+                    code_block_depth = code_block_depth.saturating_sub(1)
+                }
+                Event::Text(text) | Event::Code(text) => {
+                    if let Some((_, heading)) = current_heading.as_mut() {
+                        if !heading.is_empty() {
+                            heading.push(' ');
+                        }
+                        heading.push_str(&text);
+                    } else if code_block_depth == 0 {
+                        region_chars += text.chars().count();
+                    }
+                }
+                Event::SoftBreak | Event::HardBreak if current_heading.is_some() => {
+                    current_heading.as_mut().unwrap().1.push(' ');
+                }
+                Event::SoftBreak | Event::HardBreak if code_block_depth == 0 => {
+                    region_chars += 1;
+                }
+                _ => {}
+            }
+        }
+        push_long_unsectioned_issue(&mut issues, &slug, region_heading, region_chars);
+
+        let canonical_title = normalize_heading(&title);
+        let body_h1s = headings
+            .iter()
+            .filter(|(level, _)| *level == 1)
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>();
+        if let Some(mismatch) = body_h1s
+            .iter()
+            .find(|heading| heading.as_str() != canonical_title)
+        {
+            issues.push(LintIssue {
+                severity: LintSeverity::Warning,
+                code: "body_h1_title_mismatch".into(),
+                page: Some(slug.clone()),
+                target: Some((*mismatch).clone()),
+                message: "body H1 differs from the canonical page title".into(),
+            });
+        }
+        if body_h1s.len() > 1 {
+            issues.push(LintIssue {
+                severity: LintSeverity::Warning,
+                code: "duplicate_body_h1".into(),
+                page: Some(slug.clone()),
+                target: None,
+                message: format!("body contains {} H1 headings", body_h1s.len()),
+            });
+        }
+
+        let mut previous_level = 1u8;
+        for (level, heading) in headings {
+            if level > previous_level + 1 {
+                issues.push(LintIssue {
+                    severity: LintSeverity::Warning,
+                    code: "heading_level_jump".into(),
+                    page: Some(slug.clone()),
+                    target: (!heading.is_empty()).then_some(heading),
+                    message: format!("heading level jumps from H{previous_level} to H{level}"),
+                });
+                break;
+            }
+            previous_level = level;
+        }
+    }
+
+    Ok(issues)
+}
+
+fn push_long_unsectioned_issue(
+    issues: &mut Vec<LintIssue>,
+    slug: &str,
+    heading: Option<String>,
+    chars: usize,
+) {
+    if chars <= LONG_UNSECTIONED_PROSE_CHARS {
+        return;
+    }
+    issues.push(LintIssue {
+        severity: LintSeverity::Info,
+        code: "long_unsectioned_region".into(),
+        page: Some(slug.into()),
+        target: heading,
+        message: format!(
+            "prose region has {chars} characters without a subheading; consider splitting it"
+        ),
+    });
+}
+
+fn normalize_heading(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn heading_level_number(level: pulldown_cmark::HeadingLevel) -> u8 {
+    match level {
+        pulldown_cmark::HeadingLevel::H1 => 1,
+        pulldown_cmark::HeadingLevel::H2 => 2,
+        pulldown_cmark::HeadingLevel::H3 => 3,
+        pulldown_cmark::HeadingLevel::H4 => 4,
+        pulldown_cmark::HeadingLevel::H5 => 5,
+        pulldown_cmark::HeadingLevel::H6 => 6,
     }
 }

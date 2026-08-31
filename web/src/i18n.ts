@@ -14,6 +14,7 @@ export const messages = {
     limited: 'limited to 1,000 nodes / 5,000 edges', sampleLimited: 'bounded sample', graph3dControls: 'drag to rotate · scroll to zoom',
     projectLocal: 'Project-local', loopbackOnly: 'loopback only', loadingDatabase: 'loading database', switchLanguage: '中文', switchLanguageLabel: 'Switch to Chinese',
     wordQuery: 'Search terms', wordQueryPlaceholder: 'Enter up to 8 terms', search: 'Search', previous: 'Previous', next: 'Next', samplePage: 'Sample page', wordPrompt: 'Search first to load a bounded term-document sample.',
+    kind: 'Type', created: 'Created', updated: 'Updated', provenance: 'Provenance', citedSources: 'Sources', contents: 'Contents',
   },
   'zh-CN': {
     overview: '概览', pages: '页面', sources: '来源', knowledgeGraph: '知识图谱', codeGraph: '代码图谱', wordGraph: '词网图',
@@ -26,6 +27,7 @@ export const messages = {
     limited: '最多显示 1,000 个节点 / 5,000 条边', sampleLimited: '局部样本已达上限', graph3dControls: '拖动旋转 · 滚轮缩放',
     projectLocal: '项目本地', loopbackOnly: '仅限回环地址', loadingDatabase: '正在加载数据库', switchLanguage: 'EN', switchLanguageLabel: 'Switch to English',
     wordQuery: '检索词', wordQueryPlaceholder: '最多输入 8 个词', search: '检索', previous: '上一页', next: '下一页', samplePage: '样本页', wordPrompt: '先检索，再按上限加载词与文档的局部样本。',
+    kind: '类型', created: '创建时间', updated: '更新时间', provenance: '来源性质', citedSources: '引用来源', contents: '目录',
   },
 } as const
 

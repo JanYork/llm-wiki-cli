@@ -36,7 +36,9 @@ const EXTERNAL_GRAPH_VERSION: i32 = 12;
 const TAGS_VERSION: i32 = 13;
 const TEMPORAL_MEMORY_VERSION: i32 = 14;
 const AGENT_STATE_VERSION: i32 = 15;
-const USER_VERSION: i32 = 16;
+const TODO_FEATURES_VERSION: i32 = 16;
+const STRUCTURED_SPAN_INDEX_VERSION: i32 = 17;
+const USER_VERSION: i32 = STRUCTURED_SPAN_INDEX_VERSION;
 const CHANGESET_FREEZE_KEY: &str = "changeset_frozen";
 const SEARCH_INDEX_VERSION: i32 = 4;
 const INGEST_WORKFLOW_VERSION: i32 = 5;
@@ -65,16 +67,32 @@ pub const DEFAULT_SCHEMA: &str = r#"# Wiki Schema
 - `comparison`: side-by-side analysis.
 - `synthesis`: cross-cutting conclusions.
 
-## Rules
+## Content contract (MUST)
 
-- Every page declares provenance. Source-grounded pages cite source IDs;
-  user-provided facts, Agent observations, and hypotheses use explicit
-  provenance classes.
+- Preserve the semantic integrity of `title`, `summary`, `kind`, provenance, and links.
+- Keep one logical main title. The body may omit H1 or repeat the canonical title once.
+- Every page declares provenance. Cite source IDs or use `user-provided`, `agent-observed`, or `hypothesis`.
 - Use `[[stable-slug]]` for cross-references.
+
+## Writing guidance (SHOULD)
+
+- Address one primary reader question and put the current conclusion, definition, or status first.
+- Use descriptive headings and separate current knowledge from history.
 - Read an existing page before replacing it and preserve still-valid knowledge.
 - Record contradictions instead of silently choosing one source.
-- Treat source summaries as navigation, not a substitute for entity, concept, comparison, and synthesis pages.
 - Before completing ingest, update affected shared pages or record why the source needs no derived-page update.
+
+## Author freedom (MAY)
+
+- Use any section names, order, and Markdown constructs. Short pages may omit H2 headings.
+- Never add empty sections merely to satisfy a template. Existing free-form pages remain valid.
+
+## Optional questions
+
+- `entity` / `concept`: What is it, what are its boundaries, and what is true now?
+- `source`: What does it claim, how strong is the evidence, and which shared pages does it support? Treat summaries as navigation, not a substitute for shared knowledge.
+- `query`: What is the current answer, its evidence, and its unknowns?
+- `comparison` / `synthesis`: What agrees, conflicts, differs, or follows from the evidence?
 "#;
 pub const DEFAULT_PURPOSE: &str = r#"# Project Purpose
 
@@ -1216,8 +1234,23 @@ pub struct CheckpointListResponse {
     pub checkpoints: Vec<CheckpointRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum LintSeverity {
+    Error,
+    Warning,
+    Info,
+}
+
+impl LintSeverity {
+    fn is_blocking(&self) -> bool {
+        matches!(self, Self::Error)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LintIssue {
+    pub severity: LintSeverity,
     pub code: String,
     pub page: Option<String>,
     pub target: Option<String>,
@@ -1231,6 +1264,8 @@ pub struct LintResponse {
     pub issues: Vec<LintIssue>,
     pub counts: BTreeMap<String, usize>,
     pub total: usize,
+    pub blocking_total: usize,
+    pub advisory_total: usize,
     pub limit: usize,
     pub offset: usize,
     pub has_more: bool,

@@ -387,7 +387,7 @@ enum Command {
     /// Rebuild derived search or Markdown artifacts from SQLite.
     #[command(
         long_about = "Repair or compact derived artifacts without changing canonical source or page knowledge. SQLite remains authoritative.",
-        after_help = "When to use:\n  Use `materialize` when generated Markdown is missing or stale. Use `reindex` only when lint reports FTS integrity problems or after a tokenizer migration. Use `compact` during an idle maintenance window to optimize FTS and reclaim WAL space.\n\nNext action:\n  After repair, run `lint` again and verify its total is zero. After compact, inspect busy and after_bytes."
+        after_help = "When to use:\n  Use `materialize` when generated Markdown is missing or stale. Use `reindex` only when lint reports FTS integrity problems or after a tokenizer migration. Use `compact` during an idle maintenance window to optimize FTS and reclaim WAL space.\n\nNext action:\n  After repair, run `lint` again and verify blocking_total is zero. After compact, inspect busy and after_bytes."
     )]
     Maintenance {
         #[command(subcommand)]
@@ -458,7 +458,7 @@ Each selected store includes its schema, purpose, page summaries, and recent ope
     /// Report deterministic structural maintenance issues.
     #[command(
         long_about = "Read-only by default. Check the complete Wiki for missing schema, untitled sources, shallow completed ingests, uncited or orphaned pages, dangling links, and missing, orphaned, or duplicate search-index rows.\n\n\
-counts and total describe the complete Wiki; limit and offset paginate only the returned issues. Semantic contradictions and stale claims remain the Agent's responsibility. Use --record only when this validation event belongs in durable history.",
+counts and total describe all issues in the complete Wiki; blocking_total counts errors, while warning and info contribute only to advisory_total and do not block changeset commit. limit and offset paginate only the returned issues. Semantic contradictions and stale claims remain the Agent's responsibility. Use --record only when this validation event belongs in durable history.",
         after_help = "Examples:\n  lwc lint\n  lwc lint --limit 100 --offset 100\n  lwc lint --record"
     )]
     Lint {
@@ -774,6 +774,8 @@ enum AgentArg {
     #[value(alias = "copilot")]
     CopilotVscode,
     Kiro,
+    #[value(name = "opencode", alias = "open-code")]
+    OpenCode,
     Pi,
     Generic,
 }
@@ -790,6 +792,7 @@ impl From<AgentArg> for crate::agent::AgentKind {
             AgentArg::CopilotCli => Self::CopilotCli,
             AgentArg::CopilotVscode => Self::CopilotVscode,
             AgentArg::Kiro => Self::Kiro,
+            AgentArg::OpenCode => Self::OpenCode,
             AgentArg::Pi => Self::Pi,
             AgentArg::Generic => Self::Generic,
         }

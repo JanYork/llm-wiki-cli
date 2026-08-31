@@ -23,7 +23,7 @@
 
 `lwc` — это управляемый агентами интерфейс командной строки для проактивной памяти ИИ-агентов. Он позволяет агентам самостоятельно находить, поддерживать и развивать знания, которые сохраняются между сеансами и остаются привязанными к своим источникам.
 
-**Работает с Claude Code, Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes, Antigravity и pi.**
+**Работает с Claude Code, Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes, Antigravity, GitHub Copilot in VS Code, Copilot CLI, Copilot for JetBrains и pi.**
 
 LWC превращает отобранные документы в долговечную Wiki. Агент рассуждает и обобщает, а `lwc` хранит источники, страницы, цитаты, ссылки, индексы и историю. Знания накапливаются, а не собираются заново из сырых фрагментов при каждом запросе.
 
@@ -181,7 +181,8 @@ LWC обнаруживает поддерживаемые агенты и иде
 
 Единый MCP только для чтения предоставляет ограниченную память Wiki и
 необязательный контекст кода, не расширяя рабочую область. Поддерживаются Claude
-Code, Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes, Antigravity и pi.
+Code, Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes, Antigravity,
+GitHub Copilot in VS Code, Copilot CLI, Copilot for JetBrains и pi.
 
 [Интеграция AgentTarget →](https://github.com/JanYork/llm-wiki-cli/wiki/AgentTarget-Installation-and-Integration)
 

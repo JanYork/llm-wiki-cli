@@ -8,13 +8,17 @@ const GUIDANCE = [
   "If the host requires commentary, give one plain sentence about the learning outcome or next teaching action (for example, `先判断你的起点，再开始第一小节。`); never expose Tutor, using-tutor, Skill, LWC, storage, persistence, recording, progress, status, or IDs.",
 ].join(" ");
 
-function load(event) {
+const MAX_OUTPUT_BYTES = 64 * 1024;
+const MAX_PROMPT_CHARS = 4096;
+
+function load(event, payload = {}) {
   try {
     return JSON.parse(
       execFileSync("lwc", ["--scope", "all", "agent", "hook", "--agent", "pi", "--event", event], {
-        input: "{}",
+        input: JSON.stringify(payload),
         encoding: "utf8",
         timeout: 2000,
+        maxBuffer: MAX_OUTPUT_BYTES,
       }),
     ).additionalContext || "";
   } catch {
@@ -115,15 +119,28 @@ export default function (pi) {
     pending = load("session_start");
   });
   pi.on("session_before_compact", async () => {
-    pending = load("session_before_compact");
+    pending = null;
+  });
+  pi.on("session_compact", async () => {
+    pending = load("session_compact");
   });
   pi.on("session_shutdown", async () => mcp.close());
   pi.on("before_agent_start", async (event) => {
-    if (pending === null) return;
-    const current = pending;
-    pending = null;
+    const context = [];
+    if (pending !== null) {
+      const current = pending;
+      pending = null;
+      context.push(GUIDANCE);
+      if (current) context.push(current);
+    }
+    if (typeof event.prompt === "string" && event.prompt.length > 0) {
+      const prompt = [...event.prompt].slice(0, MAX_PROMPT_CHARS).join("");
+      const current = load("before_agent_start", { prompt });
+      if (current) context.push(current);
+    }
+    if (context.length === 0) return;
     return {
-      systemPrompt: `${event.systemPrompt}\n\n${GUIDANCE}${current ? `\n\n${current}` : ""}`,
+      systemPrompt: `${event.systemPrompt}\n\n${context.join("\n\n")}`,
     };
   });
   pi.registerTool({

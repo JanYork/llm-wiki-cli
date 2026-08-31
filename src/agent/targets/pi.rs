@@ -86,10 +86,11 @@ impl AgentTarget for PiTarget {
         install::unconfigure_standard(self.id(), paths, executable)
     }
 
-    fn print_config(&self, _location: AgentLocation) -> String {
+    fn print_config(&self, location: AgentLocation) -> String {
         format!(
-            "{}\nlwc --scope all agent hook --agent pi --event session_start\n# Pi uses its native extension bridge.\n",
-            install::guidance()
+            "{}\nlwc --scope all agent hook --agent pi --event session_start\n# Pi uses its native extension bridge.\nHook events: {}\n",
+            install::guidance(),
+            install::hook_events_summary(self.id(), location),
         )
     }
 

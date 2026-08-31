@@ -122,8 +122,23 @@ impl Store {
     }
 
     pub fn begin_hook_snapshot(&self) -> Result<()> {
-        self.conn.busy_timeout(std::time::Duration::from_millis(250))?;
+        self.begin_hook_snapshot_with_timeout(std::time::Duration::from_millis(250))
+    }
+
+    pub(crate) fn begin_hook_snapshot_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        self.conn.busy_timeout(timeout)?;
         self.begin_read_snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn busy_timeout_millis_for_test(&self) -> Result<i64> {
+        let timeout = self
+            .conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+        Ok(timeout)
     }
 
     pub fn tag_autoload_policies(&self) -> Result<(Vec<TagAutoloadPolicy>, bool)> {

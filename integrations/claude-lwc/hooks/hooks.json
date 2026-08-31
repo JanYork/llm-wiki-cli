@@ -18,9 +18,70 @@
         "hooks": [
           {
             "type": "command",
-            "command": "lwc agent hook --agent claude --event UserPromptSubmit",
+            "command": "lwc --scope all agent hook --agent claude --event UserPromptSubmit",
             "timeout": 2,
             "statusMessage": "Checking project structure context..."
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lwc --scope all agent hook --agent claude --event PreToolUse",
+            "timeout": 2,
+            "statusMessage": "Loading bounded LWC context..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lwc --scope all agent hook --agent claude --event PostToolUse",
+            "timeout": 2,
+            "statusMessage": "Refreshing bounded LWC context..."
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lwc --scope all agent hook --agent claude --event PostToolUseFailure",
+            "timeout": 2,
+            "statusMessage": "Refreshing bounded LWC context..."
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lwc --scope all agent hook --agent claude --event SubagentStart",
+            "timeout": 2,
+            "statusMessage": "Loading bounded LWC context..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lwc --scope all agent hook --agent claude --event Stop",
+            "timeout": 2,
+            "statusMessage": "Checking the active LWC Plan..."
           }
         ]
       }

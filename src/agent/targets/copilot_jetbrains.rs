@@ -114,7 +114,7 @@ impl AgentTarget for CopilotJetbrainsTarget {
     fn print_config(&self, location: AgentLocation) -> String {
         if location == AgentLocation::Global {
             format!(
-                "# GitHub Copilot for JetBrains: add to $XDG_CONFIG_HOME|~/.config/github-copilot/intellij/mcp.json.\n{{\"servers\":{{\"lwc\":{{\"type\":\"stdio\",\"command\":\"lwc\",\"args\":[\"serve\",\"--mcp\"]}}}}}}\n\n{}\n",
+                "# GitHub Copilot for JetBrains: add to $XDG_CONFIG_HOME|~/.config/github-copilot/intellij/mcp.json.\n{{\"servers\":{{\"lwc\":{{\"type\":\"stdio\",\"command\":\"lwc\",\"args\":[\"serve\",\"--mcp\"]}}}}}}\nHook events: none (unsupported)\n\n{}\n",
                 install::guidance()
             )
         } else {

@@ -2,7 +2,138 @@
 #[path = "sync_audit_tests.rs"]
 mod sync_audit_tests;
 
+const WORK_HOOK_MAX_ITEMS: usize = 3;
+const WORK_HOOK_MAX_SCAN_ITEMS: usize = 64;
+const WORK_HOOK_MAX_STATE_BYTES: u64 = 64 * 1024;
 const TERMINAL_SYNC_AUDIT_MAX_ITEMS: usize = 4_096;
+
+pub(crate) fn hook_summary(store: &StorePath) -> Result<WorkHookSummary> {
+    let root = work_root(&store.path)?;
+    match fs::symlink_metadata(&root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(WorkHookSummary {
+                works: Vec::new(),
+                omitted: 0,
+                has_more: false,
+            });
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(AppError::new(
+                "work_invalid",
+                "work root is not a real directory",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut entries = fs::read_dir(&root)?;
+    let mut candidates = Vec::new();
+    for _ in 0..WORK_HOOK_MAX_SCAN_ITEMS {
+        let Some(entry) = entries.next() else { break };
+        let Ok(entry) = entry else { continue };
+        let directory = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&directory) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if validate_id(&id).is_err() {
+            continue;
+        }
+        let path = directory.join("state.json");
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > WORK_HOOK_MAX_STATE_BYTES
+        {
+            continue;
+        }
+        let Ok(file) = fs::File::open(&path) else {
+            continue;
+        };
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        if file
+            .take(WORK_HOOK_MAX_STATE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            continue;
+        }
+        if bytes.len() > WORK_HOOK_MAX_STATE_BYTES as usize {
+            continue;
+        }
+        let Ok(state) = serde_json::from_slice::<WorkState>(&bytes) else {
+            continue;
+        };
+        if state.id != id
+            || !hook_code(&state.kind)
+            || !matches!(
+                state.state.as_str(),
+                "queued" | "running" | "succeeded" | "failed" | "cancelled"
+            )
+            || !hook_code(&state.phase)
+        {
+            continue;
+        }
+        let error_code = state
+            .error
+            .as_ref()
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str)
+            .filter(|code| hook_code(code))
+            .map(str::to_owned);
+        candidates.push((
+            state.updated_at_unix_ms,
+            WorkHookSummaryItem {
+                id,
+                kind: state.kind,
+                state: state.state,
+                phase: state.phase,
+                completed: state.completed,
+                total: state.total,
+                sequence: state.sequence,
+                error_code,
+            },
+        ));
+    }
+    if entries.next().is_some() {
+        return Err(AppError::new(
+            "work_hook_limit",
+            "work directory exceeds the fixed Hook scan limit",
+        ));
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    let omitted = candidates.len().saturating_sub(WORK_HOOK_MAX_ITEMS);
+    let has_more = omitted > 0;
+    let works = candidates
+        .into_iter()
+        .take(WORK_HOOK_MAX_ITEMS)
+        .map(|(_, state)| state)
+        .collect();
+    Ok(WorkHookSummary {
+        works,
+        omitted,
+        has_more,
+    })
+}
+
+fn hook_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
+        })
+}
 
 pub(crate) fn terminal_sync_audits(
     database: &Path,

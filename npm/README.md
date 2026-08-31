@@ -9,7 +9,8 @@ autonomously recall, maintain, and evolve persistent, source-grounded knowledge
 across sessions.
 
 **Works with Claude Code, Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes,
-Antigravity, and pi.**
+Antigravity, GitHub Copilot in VS Code, Copilot CLI, Copilot for JetBrains, and
+pi.**
 
 ## Install
 

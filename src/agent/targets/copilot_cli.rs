@@ -96,13 +96,15 @@ impl AgentTarget for CopilotCliTarget {
     fn print_config(&self, location: AgentLocation) -> String {
         if location == AgentLocation::Local {
             return format!(
-                "# GitHub Copilot CLI workspace MCP: <repo>/.github/mcp.json.\n{{\"mcpServers\":{{\"lwc\":{{\"type\":\"stdio\",\"command\":\"lwc\",\"args\":[\"serve\",\"--mcp\"],\"tools\":[\"*\"]}}}}}}\n\n{}\n",
+                "# GitHub Copilot CLI workspace MCP: <repo>/.github/mcp.json.\n{{\"mcpServers\":{{\"lwc\":{{\"type\":\"stdio\",\"command\":\"lwc\",\"args\":[\"serve\",\"--mcp\"],\"tools\":[\"*\"]}}}}}}\nHook events: {}\n\n{}\n",
+                install::hook_events_summary(self.id(), location),
                 install::guidance()
             );
         }
         let path = "${COPILOT_HOME:-~/.copilot}/mcp-config.json";
         format!(
-            "# GitHub Copilot CLI: add to {path}.\n{{\"mcpServers\":{{\"lwc\":{{\"type\":\"stdio\",\"command\":\"lwc\",\"args\":[\"serve\",\"--mcp\"],\"tools\":[\"*\"]}}}}}}\n\n{}\n",
+            "# GitHub Copilot CLI: add to {path}.\n{{\"mcpServers\":{{\"lwc\":{{\"type\":\"stdio\",\"command\":\"lwc\",\"args\":[\"serve\",\"--mcp\"],\"tools\":[\"*\"]}}}}}}\nHook events: {}\n\n{}\n",
+            install::hook_events_summary(self.id(), location),
             install::guidance()
         )
     }

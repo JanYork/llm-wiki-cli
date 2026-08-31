@@ -23,7 +23,7 @@
 
 `lwc` est une CLI de mémoire proactive, pilotée par les agents et conçue pour les agents d’IA. Elle leur permet de retrouver, d’entretenir et de faire évoluer de façon autonome des connaissances persistantes et traçables jusqu’à leurs sources, d’une session à l’autre.
 
-**Compatible avec Claude Code, Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes, Antigravity et pi.**
+**Compatible avec Claude Code, Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes, Antigravity, GitHub Copilot in VS Code, Copilot CLI, Copilot for JetBrains et pi.**
 
 LWC transforme des documents sélectionnés en Wiki durable. L’agent raisonne et synthétise ; `lwc` conserve les sources, pages, citations, liens, index et historiques afin que les connaissances s’accumulent au lieu d’être reconstituées à partir de fragments bruts à chaque requête.
 
@@ -183,7 +183,8 @@ et Instructions disponibles au moyen d’adaptateurs AgentTarget idempotents :
 
 Le MCP unifié et en lecture seule fournit une mémoire Wiki bornée et un contexte
 de code facultatif sans élargir l’espace de travail. Claude Code, Codex, Cursor,
-OpenCode, Gemini CLI, Kiro, Hermes, Antigravity et pi sont pris en charge.
+OpenCode, Gemini CLI, Kiro, Hermes, Antigravity, GitHub Copilot in VS Code,
+Copilot CLI, Copilot for JetBrains et pi sont pris en charge.
 
 [Intégration AgentTarget →](https://github.com/JanYork/llm-wiki-cli/wiki/AgentTarget-Installation-and-Integration)
 
