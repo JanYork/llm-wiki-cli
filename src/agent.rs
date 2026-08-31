@@ -163,7 +163,12 @@ fn compile_hook(agent: AgentKind, event: &str, scope: Scope, cwd: &Path) -> Resu
             let signal = rendered.as_ref().map(|rendered| rendered.line.as_str());
             let context = match strong_context(scope, cwd, &readiness, signal, hook_deadline) {
                 Ok(context) => context,
-                Err(error) if matches!(error.code, "store_not_found" | "agent_hook_timeout") => {
+                Err(error)
+                    if matches!(
+                        error.code,
+                        "store_not_found" | "store_hook_unavailable" | "agent_hook_timeout"
+                    ) =>
+                {
                     render_context(&readiness, signal, &[], &[], false, 0)?
                 }
                 Err(error) => return Err(error),
@@ -707,22 +712,10 @@ fn ensure_hook_deadline(deadline: Option<Instant>) -> Result<()> {
 }
 
 fn open_store_for_hook_until(scope: &str, path: &Path, deadline: Instant) -> Result<Store> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(AppError::new(
-            "agent_hook_timeout",
-            "Agent Hook exceeded its internal wall budget",
-        ));
-    }
-    let store = Store::open_for_hook_with_timeout(scope, path, remaining)?;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(AppError::new(
-            "agent_hook_timeout",
-            "Agent Hook exceeded its internal wall budget",
-        ));
-    }
-    store.begin_hook_snapshot_with_timeout(remaining)?;
+    ensure_hook_deadline(Some(deadline))?;
+    let store = Store::open_for_hook_with_timeout(scope, path, Duration::ZERO)?;
+    ensure_hook_deadline(Some(deadline))?;
+    store.begin_hook_snapshot_with_timeout(Duration::ZERO)?;
     ensure_hook_deadline(Some(deadline))?;
     Ok(store)
 }
@@ -1279,5 +1272,18 @@ mod tests {
                     .contains("Reply with 1 or 4")
             );
         }
+    }
+
+    #[test]
+    fn hook_store_queries_never_wait_on_a_busy_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("wiki.db");
+        let (store, _) = Store::initialize("project", &database).unwrap();
+        drop(store);
+
+        let hook =
+            open_store_for_hook_until("project", &database, Instant::now() + HOOK_WALL_BUDGET)
+                .unwrap();
+        assert_eq!(hook.busy_timeout_millis_for_test().unwrap(), 0);
     }
 }

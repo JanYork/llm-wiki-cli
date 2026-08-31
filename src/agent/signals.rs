@@ -1779,16 +1779,16 @@ fn typed_receipt_state(invocation: &RecognizedInvocation, receipt: &Receipt) -> 
 }
 
 fn open_store_until(scope: &str, path: &Path, deadline: Instant) -> Option<Store> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
+    if Instant::now() >= deadline {
         return None;
     }
-    let store = Store::open_for_hook_with_timeout(scope, path, remaining).ok()?;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
+    let store = Store::open_for_hook_with_timeout(scope, path, std::time::Duration::ZERO).ok()?;
+    if Instant::now() >= deadline {
         return None;
     }
-    store.begin_hook_snapshot_with_timeout(remaining).ok()?;
+    store
+        .begin_hook_snapshot_with_timeout(std::time::Duration::ZERO)
+        .ok()?;
     if Instant::now() >= deadline {
         return None;
     }

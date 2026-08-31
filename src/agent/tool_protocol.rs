@@ -1145,24 +1145,36 @@ mod tests {
         assert_eq!(argv.action, "config.set");
         assert_eq!(argv.consent, ConsentClass::Ask);
 
+        let owned_executable = if cfg!(windows) {
+            "C:/opt/lwc/bin/lwc.exe"
+        } else {
+            "/opt/lwc/bin/lwc"
+        };
+        let owned_command = format!("{owned_executable} cg status");
         let owned = recognize_invocation(
             ToolHost::Claude,
             &json!({
                 "tool_name":"Bash",
-                "tool_input":{"command":"/opt/lwc/bin/lwc cg status"}
+                "tool_input":{"command":owned_command}
             }),
-            Some("/opt/lwc/bin/lwc"),
+            Some(owned_executable),
         )
         .unwrap();
         assert_eq!(owned.action, "cg.status");
+        let unowned_executable = if cfg!(windows) {
+            "C:/tmp/unowned/lwc.exe"
+        } else {
+            "/tmp/unowned/lwc"
+        };
+        let unowned_command = format!("{unowned_executable} cg status");
         assert!(
             recognize_invocation(
                 ToolHost::Claude,
                 &json!({
                     "tool_name":"Bash",
-                    "tool_input":{"command":"/tmp/unowned/lwc cg status"}
+                    "tool_input":{"command":unowned_command}
                 }),
-                Some("/opt/lwc/bin/lwc"),
+                Some(owned_executable),
             )
             .is_none()
         );

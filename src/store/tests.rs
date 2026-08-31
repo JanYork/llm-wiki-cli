@@ -839,8 +839,12 @@ mod tests {
         create_blocked_hook_plan(&mut writer);
         assert_eq!(fs::read(&database).unwrap(), main_before);
         assert!(fs::metadata(hook_sidecar(&database, "-wal")).unwrap().len() > 32);
-        writer.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        writer
+            .conn
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+            .unwrap();
         let before = hook_tree_snapshot(temp.path());
+        writer.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
         #[cfg(windows)]
         let hook_database = {
@@ -872,8 +876,8 @@ mod tests {
             "writer-held Hook accumulated a busy wait: {:?}",
             started.elapsed()
         );
-        assert_eq!(hook_tree_snapshot(temp.path()), before);
         writer.conn.execute_batch("ROLLBACK;").unwrap();
+        assert_eq!(hook_tree_snapshot(temp.path()), before);
     }
 
     #[test]

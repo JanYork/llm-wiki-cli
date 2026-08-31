@@ -4252,7 +4252,7 @@ mod tests {
 
     #[test]
     fn windows_probe_cleanup_avoids_blocking_process_waits() {
-        let source = include_str!("install.rs");
+        let source = include_str!("install.rs").replace("\r\n", "\n");
         let probe = source
             .split_once("fn command_output_with_timeout")
             .unwrap()
