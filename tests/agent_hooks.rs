@@ -515,7 +515,9 @@ fn prompt_hook_with_env(
 
 fn prompt_hook_without_home(world: &World, prompt: &str) -> Value {
     let mut command = world.command();
-    command.env_remove("HOME");
+    for variable in ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"] {
+        command.env_remove(variable);
+    }
     let mut child = command
         .args([
             "agent",
