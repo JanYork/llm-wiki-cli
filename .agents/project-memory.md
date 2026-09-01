@@ -14,8 +14,9 @@ LWC is an Agent-first Rust CLI that compiles curated documents into a persistent
 
 ## Authoritative documentation
 
-- `README.md`: product model, architecture, capabilities, limits, and primary CLI contract.
-- `docs/agent-workflow.md`: trust boundary, ingest, changesets, retrieval, maintenance, recovery, and projection.
+- `README.md` and its locale mirrors: product positioning, visual capability overview, basic installation, SEO entry points, and links to complete documentation; detailed commands deliberately live in the public Wiki.
+- Public GitHub Wiki: complete user guides, architecture, workflows, configuration, command reference, and troubleshooting in English and Simplified Chinese.
+- `docs/agent-workflow.md`: authoritative trust boundary, ingest, changesets, retrieval, maintenance, recovery, and projection contract.
 - `SECURITY.md`: disclosure and local knowledge/sidecar security boundary.
 - `CONTRIBUTING.md`: local checks, PR expectations, and release-tag rules.
 - `benchmarks/README.md`: benchmark scope, metrics, sanitization, and fair comparison.
@@ -38,10 +39,11 @@ Translated READMEs, package summaries, integration summaries, and copied Skill t
 
 ## Current durable execution
 
-- Completed Plan `c6fd750f691a023894f10957cf29d35d` (“LWC 主动感知 Hook 全面优化”), revision 10; it has no focal step.
-- Revision 8 acceptance baseline: Clippy all-targets with warnings denied, the full Rust suite (main binary 256 passed/2 ignored plus integrations), 82 Agent CLI cases, 78 Hook cases, 7 Store Hook cases, and 5 Node integration cases passed; Step 7 owns only canonical documentation/Skill/Wiki/memory alignment and final graph, lint, and fixed-retrieval evidence.
+- No project Plan is active. Completed Plan `c6fd750f691a023894f10957cf29d35d` (“LWC 主动感知 Hook 全面优化”), revision 10, delivered the Hook work and has no focal step.
+- Revision 8 acceptance baseline: Clippy all-targets with warnings denied, the full Rust suite (main binary 256 passed/2 ignored plus integrations), 82 Agent CLI cases, 78 Hook cases, 7 Store Hook cases, and 5 Node integration cases passed; the later documentation, Skill, Wiki, memory, graph, lint, and fixed-retrieval closure is complete.
 - Post-plan host addendum (2026-08-30): `--scope all` Hook reads isolate stale project/global stores so a valid peer store still supplies context and signals without writes; Pi 0.84.2 uses the official `session_before_compact` and `session_compact` events without a synthetic `session_compact_failed`. Real Codex smoke verified Skill discovery, SessionStart Plan context, first Stop continuation, and native repeat-guard release. Real Claude smoke verified Skill discovery and SessionStart Plan context, but its model service did not return, so Stop remains unverified on that host. Global Hook-only overlays may truthfully remain `modified` against an older full-install manifest or user-owned symlink state and must not be presented as `installed`.
 - Cross-platform acceptance addendum (2026-08-31): Windows Hook reads accept canonical local verbatim-drive paths while rejecting UNC namespaces, preserve WAL/SHM bytes, and remain covered by the existing `windows-2025` runtime CI. The installer compatibility probe shares one deadline across process wait and bounded 64 KiB pipe drains; macOS/Linux runtime gates passed, while latest-source Windows GNU check/build/test-no-run linked 38 PE test executables. Windows no-run is compile/link evidence only, not a runtime PASS.
+- Release closure (2026-09-01): immutable `v0.17.8`/`v0.17.9` failed tags produced no GitHub Release. Corrective `v0.17.10` at `ea625a1` passed release acceptance and all six native targets, published 26 GitHub assets, and completed public crates.io, Homebrew Tap (`5c57167`, CI `33516548466`), and npm `@i-xor/lwc@0.17.10` distribution with independent registry readback and a fresh-prefix npm install on Pro.
 - Completed Plan `992709971591eafaf78b5a3a4a6c2281` (“弹性 Wiki 契约最小落地”) records the elastic Wiki contract delivery and acceptance evidence.
 
 ## Deliberately absent
