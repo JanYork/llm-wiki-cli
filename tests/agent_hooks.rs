@@ -306,6 +306,60 @@ fn agent_context_isolates_root_and_child_plan_todo_readiness() {
     assert!(unresolved_readiness.get("todo").is_none());
 }
 
+#[test]
+fn agent_context_stop_continues_only_its_tracked_plan() {
+    let world = World::new(true);
+    world.ok(&["config", "set", "--plan", "enabled"]);
+    let session_a = "session-stop-a";
+    let session_b = "session-stop-b";
+    let context_a = agent_context("codex", session_a, "main", "main");
+    let context_b = agent_context("codex", session_b, "main", "main");
+    let plan_a = create_active_plan(&world, "PLAN_A", "private", "verified");
+    let plan_b = create_active_plan(&world, "PLAN_B", "private", "verified");
+    let plan_a_id = plan_a["plan"]["id"].as_str().unwrap();
+    let plan_b_id = plan_b["plan"]["id"].as_str().unwrap();
+    world.ok(&["plan", "track", plan_a_id, "--context", &context_a]);
+    world.ok(&["plan", "track", plan_b_id, "--context", &context_b]);
+
+    let stopped_a = tool_hook(
+        &world,
+        "codex",
+        "Stop",
+        &serde_json::json!({"session_id":session_a,"stop_hook_active":false}),
+    );
+    let signal_a = &signal_batch(&stopped_a)["signals"][0];
+    assert_eq!(signal_a["state"]["id"], plan_a_id);
+    let rendered = serde_json::to_string(&stopped_a).unwrap();
+    assert!(!rendered.contains(plan_b_id));
+    assert!(!rendered.contains("PLAN_B"));
+
+    let unbound = tool_hook(
+        &world,
+        "codex",
+        "Stop",
+        &serde_json::json!({"session_id":"session-stop-unbound"}),
+    );
+    assert_eq!(unbound, serde_json::json!({}));
+
+    let child_id = "child-stop-b";
+    let child_context = agent_context("codex", session_a, "subagent", child_id);
+    world.ok(&["plan", "track", plan_b_id, "--context", &child_context]);
+    let child_stop = tool_hook(
+        &world,
+        "codex",
+        "SubagentStop",
+        &serde_json::json!({"session_id":session_a,"agent_id":child_id}),
+    );
+    assert_eq!(signal_batch(&child_stop)["signals"][0]["state"]["id"], plan_b_id);
+    let unresolved_child = tool_hook(
+        &world,
+        "codex",
+        "SubagentStop",
+        &serde_json::json!({"session_id":session_a,"agent_type":"worker"}),
+    );
+    assert_eq!(unresolved_child, serde_json::json!({}));
+}
+
 fn put_global_autoload_page(world: &World, slug: &str, body: &str) {
     let path = world.project.join(format!("{slug}.md"));
     fs::write(&path, body).unwrap();
