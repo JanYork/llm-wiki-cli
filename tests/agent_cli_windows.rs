@@ -106,6 +106,14 @@ fn signal_batch(context: &str) -> Value {
     serde_json::from_str(line).unwrap()
 }
 
+fn readiness(context: &str) -> Value {
+    let line = context
+        .lines()
+        .find_map(|line| line.strip_prefix("LWC_READINESS "))
+        .expect("Hook context must contain LWC_READINESS");
+    serde_json::from_str(line).unwrap()
+}
+
 #[test]
 fn npm_cmd_shim_passes_agent_install_preflight() {
     let temp = tempfile::tempdir().unwrap();
@@ -192,6 +200,32 @@ fn canonical_project_root_hooks_read_the_active_plan_without_writes() {
         ],
     );
     let plan_id = created["plan"]["id"].as_str().unwrap();
+    let session_id = "WINDOWS_VERBATIM_SESSION";
+    let discovery = project_hook(
+        &project,
+        &canonical_project,
+        &home,
+        "SessionStart",
+        &serde_json::json!({
+            "hook_event_name":"SessionStart",
+            "source":"startup",
+            "session_id":session_id,
+        }),
+    );
+    let discovery_context = discovery
+        .pointer("/hookSpecificOutput/additionalContext")
+        .and_then(Value::as_str)
+        .expect("SessionStart must expose the resolved Agent context");
+    let context_id = readiness(discovery_context)["agent_context"]["context_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    project_json(
+        &project,
+        &canonical_project,
+        &home,
+        &["plan", "track", plan_id, "--context", &context_id],
+    );
     let before = tree_snapshot(temp.path());
 
     let session = project_hook(
@@ -199,7 +233,11 @@ fn canonical_project_root_hooks_read_the_active_plan_without_writes() {
         &canonical_project,
         &home,
         "SessionStart",
-        &serde_json::json!({"hook_event_name":"SessionStart","source":"startup"}),
+        &serde_json::json!({
+            "hook_event_name":"SessionStart",
+            "source":"startup",
+            "session_id":session_id,
+        }),
     );
     let session_context = session
         .pointer("/hookSpecificOutput/additionalContext")
@@ -216,7 +254,11 @@ fn canonical_project_root_hooks_read_the_active_plan_without_writes() {
         &canonical_project,
         &home,
         "Stop",
-        &serde_json::json!({"hook_event_name":"Stop","stop_hook_active":false}),
+        &serde_json::json!({
+            "hook_event_name":"Stop",
+            "stop_hook_active":false,
+            "session_id":session_id,
+        }),
     );
     assert_eq!(stop["decision"], "block", "{stop}");
     let stop_batch = signal_batch(stop["reason"].as_str().unwrap());
