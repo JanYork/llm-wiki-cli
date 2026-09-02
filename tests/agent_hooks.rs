@@ -991,9 +991,9 @@ fn signal_prompt_maps_active_provider_states_without_mutation_or_private_fields(
     assert_eq!(plan.ok(&["plan", "show", plan_id]), before);
     create_active_plan(&plan, "second plan", "second objective", "second done");
     let signal = &signal_batch(&prompt_hook(&plan, "continue the current plan"))["signals"][0];
-    assert_eq!(signal["kind"], "plan.disambiguate");
-    assert_eq!(signal["priority"], 100);
-    assert_eq!(signal["state"], serde_json::json!({"active_count": 2}));
+    assert_eq!(signal["kind"], "plan.resume");
+    assert_eq!(signal["priority"], 80);
+    assert_eq!(signal["state"]["id"], plan_id);
 
     let blocked = World::new(true);
     blocked.ok(&["config", "set", "--plan", "enabled"]);
@@ -1966,6 +1966,7 @@ fn signal_semantic_sources_keep_real_envelopes_and_single_plan_continuity() {
                 "source": source,
                 "prompt": "PROMPT_SECRET_MUST_NOT_LEAK",
                 "transcript_path": "/private/transcript.jsonl",
+                "session_id": DEFAULT_CLAUDE_SESSION,
             })
             .to_string(),
         );
@@ -2011,6 +2012,8 @@ fn scope_all_boundary_omits_stale_global_store_without_losing_project_plan() {
         "PRIVATE_SCOPE_ISOLATION_DONE_WHEN",
     );
     let plan_id = created["plan"]["id"].as_str().unwrap();
+    let scoped_context = agent_context("codex", "thr_scope_isolation_project", "main", "main");
+    world.ok(&["plan", "track", plan_id, "--context", &scoped_context]);
     world.page("project-scope-rule", "PROJECT_SCOPE_CONTEXT");
     world.enable_tag("Rules", "project-scope-rule", "1", "1000");
     world.ok(&["--scope", "global", "init"]);
@@ -2191,7 +2194,7 @@ fn signal_plan_candidate_over_three_kib_utf8_is_dropped_deterministically() {
     let title = "🧠".repeat(600);
     let current = "🚀".repeat(600);
     let next = "📚".repeat(600);
-    world.ok(&[
+    let created = world.ok(&[
         "plan",
         "create",
         &title,
@@ -2203,6 +2206,10 @@ fn signal_plan_candidate_over_three_kib_utf8_is_dropped_deterministically() {
         &current,
         "--step",
         &next,
+    ]);
+    let context_id = agent_context("claude", DEFAULT_CLAUDE_SESSION, "main", "main");
+    world.ok(&[
+        "plan", "track", created["plan"]["id"].as_str().unwrap(), "--context", &context_id,
     ]);
 
     let first = boundary_hook(&world);
@@ -2776,10 +2783,7 @@ fn signal_stop_recovers_an_active_plan_without_a_focal_step() {
 fn signal_stop_state_machine_is_exhaustive_for_claude_and_codex() {
     let states = [
         ("zero", None),
-        (
-            "multiple",
-            Some(("plan.disambiguate", "multiple_active_plans_at_stop")),
-        ),
+        ("multiple", Some(("plan.continue", "executable_plan_at_stop"))),
         (
             "in_progress",
             Some(("plan.continue", "executable_plan_at_stop")),
