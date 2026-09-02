@@ -409,6 +409,7 @@ pub(crate) fn status(
                 "lifecycle_hook": supported && target.lifecycle_hook(location),
                 "lifecycle_hook_mode": if supported { target.lifecycle_mode(location) } else { "unsupported" },
                 "hook_capabilities": target.hook_capabilities(location),
+                "identity": target.identity_capability(),
                 "installed_hook_events": installed_manifest
                     .as_ref()
                     .map(|manifest| manifest.installed_hook_events.clone())
@@ -1180,6 +1181,7 @@ fn receipt(target: &dyn AgentTarget, location: AgentLocation, result: WriteResul
         "lifecycle_hook": matches!(lifecycle_mode, "installed" | "configured_preview"),
         "lifecycle_hook_mode": lifecycle_mode,
         "hook_capabilities": target.hook_capabilities(location),
+        "identity": target.identity_capability(),
         "installed_hook_events": result.installed_hook_events,
         "permissions": if unsupported { "unsupported" } else { target.permissions_mode(location) },
         "writes": result.files,
@@ -1200,6 +1202,7 @@ fn failed_receipt(target: &dyn AgentTarget, location: AgentLocation, error: AppE
         "lifecycle_hook": matches!(lifecycle_mode, "installed" | "configured_preview"),
         "lifecycle_hook_mode": lifecycle_mode,
         "hook_capabilities": target.hook_capabilities(location),
+        "identity": target.identity_capability(),
         "installed_hook_events": [],
         "permissions": target.permissions_mode(location),
         "writes": [],
@@ -2126,6 +2129,7 @@ pub(super) fn guidance() -> String {
 ## LWC\n\
 Use the `using-lwc` Skill when it is available for substantive project work, durable recall, code structure, document relationships, ingest, and verified memory maintenance. If it is unavailable, tell the user that full LWC capability guidance is missing, keep this marker as the safe fallback, and use `lwc agent status` plus `lwc agent refresh` to complete setup. At session start and after context compaction, inspect the lifecycle Hook's `LWC_READINESS` facts and strong-tag context.\n\
 The Agent MCP entry is `lwc` (`lwc serve --mcp`). Use its single read-only `lwc_explore` tool with the current absolute project path: memory mode is the bounded default, while code or all mode is explicit. Missing graph readiness is guidance to ask or initialize outside MCP, never permission for the tool to download or mutate state.\n\
+Only follow Plan/Todo progress bound to the current lifecycle Hook's `LWC_READINESS.agent_context`; ignore progress reminders belonging to any other Agent context.\n\
 \n\
 Treat graph applicability independently. CodeGraph authorization applies only when the current task requires code structure and the current working root contains code evidence; do not ask for a root without code evidence. The physical document graph applies only when the current task requires document relationships and the current project root contains document or Wiki evidence.\n\
 Ask only for each applicable missing capability. Show the four choices only when both capabilities apply and are missing; if only one applies or is missing, ask only for that capability. If neither applies, do not ask.\n\
@@ -2294,13 +2298,13 @@ async function readBounded(stream) {
   }
 }
 
-async function loadContext() {
+async function loadContext(sessionID) {
   let process
   let timeout
   try {
     process = Bun.spawn(
       ["lwc", "--scope", "all", "agent", "hook", "--agent", "opencode", "--event", "context"],
-      { stdin: new Blob(["{}"]), stdout: "pipe", stderr: "ignore" },
+      { stdin: new Blob([JSON.stringify({ sessionID })]), stdout: "pipe", stderr: "ignore" },
     )
     timeout = setTimeout(() => {
       try { process.kill() } catch {}
@@ -2328,7 +2332,7 @@ export default Plugin.define({
       if (initializedSessions.size > MAX_INITIALIZED_SESSIONS) {
         initializedSessions.delete(initializedSessions.values().next().value)
       }
-      const text = await loadContext()
+      const text = await loadContext(sessionID)
       if (text) event.system.push({ text })
     })
   },
@@ -2376,6 +2380,7 @@ fn install_hook(
                 "PostToolUse",
                 "PostToolUseFailure",
                 "SubagentStart",
+                "SubagentStop",
                 "Stop",
             ] {
                 set_hook(hooks, event, &command(event), "claude", |_| false)?;
@@ -2463,7 +2468,13 @@ fn install_hook(
             let command = |event: &str| {
                 format!("\"{executable}\" --scope all agent hook --agent codex --event {event}")
             };
-            for event in ["SessionStart", "PostToolUse", "SubagentStart", "Stop"] {
+            for event in [
+                "SessionStart",
+                "PostToolUse",
+                "SubagentStart",
+                "SubagentStop",
+                "Stop",
+            ] {
                 set_hook(hooks, event, &command(event), "codex", |_| false)?;
             }
             set_matched_hook(
@@ -2686,7 +2697,7 @@ fn install_hook(
             let (events, command_key, platform_key): (&[&str], _, _) = if target == "copilot-vscode"
             {
                 (
-                    &["SessionStart", "PostToolUse", "SubagentStart"],
+                    &["SessionStart", "PostToolUse", "SubagentStart", "SubagentStop"],
                     "command",
                     "windows",
                 )
@@ -2944,6 +2955,7 @@ pub(super) fn unconfigure_standard(
                         "PostToolUse",
                         "PostToolUseFailure",
                         "SubagentStart",
+                        "SubagentStop",
                         "Stop",
                     ],
                     "codex" => &[
@@ -2952,6 +2964,7 @@ pub(super) fn unconfigure_standard(
                         "PreToolUse",
                         "PostToolUse",
                         "SubagentStart",
+                        "SubagentStop",
                         "Stop",
                     ],
                     "gemini" => &["SessionStart", "BeforeAgent", "AfterTool"],
@@ -3331,7 +3344,13 @@ fn remove_copilot_hook(path: &Path, target: &str) -> Result<()> {
     let mut root: Value = serde_json::from_slice(&bytes)
         .map_err(|error| AppError::new("agent_config_invalid", error.to_string()))?;
     let events: &[&str] = if target == "copilot-vscode" {
-        &["SessionStart", "PreToolUse", "PostToolUse", "SubagentStart"]
+        &[
+            "SessionStart",
+            "PreToolUse",
+            "PostToolUse",
+            "SubagentStart",
+            "SubagentStop",
+        ]
     } else {
         &["sessionStart", "postToolUse", "subagentStart"]
     };

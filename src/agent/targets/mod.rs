@@ -80,6 +80,13 @@ pub(super) struct HookCapability {
     pub tool_consent_coverage: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(super) struct IdentityCapability {
+    pub quality: &'static str,
+    pub session_fields: &'static [&'static str],
+    pub child_fields: &'static [&'static str],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PromptForm {
     RawSubmitted,
@@ -505,6 +512,7 @@ fn configured_hook_events(
                 "PostToolUse",
                 "PostToolUseFailure",
                 "SubagentStart",
+                "SubagentStop",
                 "Stop",
             ];
             if options.prompt_hook {
@@ -518,6 +526,7 @@ fn configured_hook_events(
                 "PreToolUse",
                 "PostToolUse",
                 "SubagentStart",
+                "SubagentStop",
                 "Stop",
             ];
             if options.prompt_hook {
@@ -537,7 +546,12 @@ fn configured_hook_events(
         "gemini" => vec!["SessionStart", "BeforeAgent", "AfterTool"],
         "antigravity" => vec!["PreToolUse"],
         "kiro" => vec!["SessionStart", "UserPromptSubmit", "PostToolUse"],
-        "copilot-vscode" => vec!["SessionStart", "PostToolUse", "SubagentStart"],
+        "copilot-vscode" => vec![
+            "SessionStart",
+            "PostToolUse",
+            "SubagentStart",
+            "SubagentStop",
+        ],
         "copilot-cli" => vec!["sessionStart", "postToolUse", "subagentStart"],
         "copilot-jetbrains" => Vec::new(),
         "pi" => vec![
@@ -548,6 +562,56 @@ fn configured_hook_events(
             "session_shutdown",
         ],
         _ => Vec::new(),
+    }
+}
+
+fn identity_capability(target: &str) -> IdentityCapability {
+    match target {
+        "claude" | "codex" | "copilot-vscode" => IdentityCapability {
+            quality: "exact_child",
+            session_fields: &["session_id"],
+            child_fields: &["agent_id"],
+        },
+        "hermes" => IdentityCapability {
+            quality: "exact_child",
+            session_fields: &["session_id"],
+            child_fields: &["child_session_id", "child_subagent_id"],
+        },
+        "cursor" => IdentityCapability {
+            quality: "root_only",
+            session_fields: &["conversation_id"],
+            child_fields: &[],
+        },
+        "gemini" | "kiro" => IdentityCapability {
+            quality: "root_only",
+            session_fields: &["session_id"],
+            child_fields: &[],
+        },
+        "antigravity" => IdentityCapability {
+            quality: "root_only",
+            session_fields: &["conversationId"],
+            child_fields: &[],
+        },
+        "opencode" => IdentityCapability {
+            quality: "root_only",
+            session_fields: &["sessionID"],
+            child_fields: &[],
+        },
+        "pi" => IdentityCapability {
+            quality: "root_only",
+            session_fields: &["sessionManager.getSessionId()"],
+            child_fields: &[],
+        },
+        "copilot-cli" => IdentityCapability {
+            quality: "root_only",
+            session_fields: &["sessionId"],
+            child_fields: &[],
+        },
+        _ => IdentityCapability {
+            quality: "unavailable",
+            session_fields: &[],
+            child_fields: &[],
+        },
     }
 }
 
@@ -570,6 +634,9 @@ pub(super) trait AgentTarget: Sync {
     }
     fn hook_capabilities(&self, _location: AgentLocation) -> &'static [HookCapability] {
         hook_capabilities(self.id())
+    }
+    fn identity_capability(&self) -> IdentityCapability {
+        identity_capability(self.id())
     }
     fn configured_hook_events(
         &self,

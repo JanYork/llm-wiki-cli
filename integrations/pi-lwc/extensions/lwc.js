@@ -26,6 +26,13 @@ function load(event, payload = {}) {
   }
 }
 
+function sessionPayload(ctx, payload = {}) {
+  const sessionId = ctx?.sessionManager?.getSessionId?.();
+  return typeof sessionId === "string" && sessionId.length > 0
+    ? { ...payload, session_id: sessionId }
+    : payload;
+}
+
 class LwcMcp {
   constructor() {
     this.child = null;
@@ -115,17 +122,17 @@ class LwcMcp {
 export default function (pi) {
   const mcp = new LwcMcp();
   let pending = null;
-  pi.on("session_start", async () => {
-    pending = load("session_start");
+  pi.on("session_start", async (_event, ctx) => {
+    pending = load("session_start", sessionPayload(ctx));
   });
   pi.on("session_before_compact", async () => {
     pending = null;
   });
-  pi.on("session_compact", async () => {
-    pending = load("session_compact");
+  pi.on("session_compact", async (_event, ctx) => {
+    pending = load("session_compact", sessionPayload(ctx));
   });
   pi.on("session_shutdown", async () => mcp.close());
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     const context = [];
     if (pending !== null) {
       const current = pending;
@@ -135,7 +142,7 @@ export default function (pi) {
     }
     if (typeof event.prompt === "string" && event.prompt.length > 0) {
       const prompt = [...event.prompt].slice(0, MAX_PROMPT_CHARS).join("");
-      const current = load("before_agent_start", { prompt });
+      const current = load("before_agent_start", sessionPayload(ctx, { prompt }));
       if (current) context.push(current);
     }
     if (context.length === 0) return;
