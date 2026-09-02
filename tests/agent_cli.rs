@@ -2292,7 +2292,7 @@ assert.deepEqual(
 assert.deepEqual(argv, [
   "lwc", "--scope", "all", "agent", "hook", "--agent", "opencode", "--event", "context",
 ])
-assert.equal(await options.stdin.text(), "{}")
+assert.equal(await options.stdin.text(), JSON.stringify({ sessionID: "session-a" }))
 assert.equal(options.stdout, "pipe")
 assert.equal(options.stderr, "ignore")
 assert.equal(spawnCount, 1)
@@ -4626,6 +4626,7 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
     struct Case {
         target: &'static str,
         lifecycle_mode: &'static str,
+        identity_quality: &'static str,
         installed_events: &'static [&'static str],
         capabilities: &'static [ExpectedCapability],
     }
@@ -4638,6 +4639,7 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
         Case {
             target: "claude",
             lifecycle_mode: "installed",
+            identity_quality: "exact_child",
             installed_events: &[
                 "SessionStart",
                 "UserPromptSubmit",
@@ -4645,6 +4647,7 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
                 "PostToolUse",
                 "PostToolUseFailure",
                 "SubagentStart",
+                "SubagentStop",
                 "Stop",
             ],
             capabilities: &[
@@ -4665,7 +4668,7 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
                 ExpectedCapability {
                     event: "SubagentStop",
                     semantic_event: "subagent_stop",
-                    effects: OBSERVE,
+                    effects: CONTINUE,
                     stability: "stable",
                     loop_guard: "none",
                 },
@@ -4674,6 +4677,7 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
         Case {
             target: "cursor",
             lifecycle_mode: "installed",
+            identity_quality: "root_only",
             installed_events: &[
                 "sessionStart",
                 "preCompact",
@@ -4714,12 +4718,14 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
         Case {
             target: "codex",
             lifecycle_mode: "installed",
+            identity_quality: "exact_child",
             installed_events: &[
                 "SessionStart",
                 "UserPromptSubmit",
                 "PreToolUse",
                 "PostToolUse",
                 "SubagentStart",
+                "SubagentStop",
                 "Stop",
             ],
             capabilities: &[
@@ -4740,7 +4746,7 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
                 ExpectedCapability {
                     event: "SubagentStop",
                     semantic_event: "subagent_stop",
-                    effects: OBSERVE,
+                    effects: CONTINUE,
                     stability: "stable",
                     loop_guard: "none",
                 },
@@ -4749,6 +4755,7 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
         Case {
             target: "opencode",
             lifecycle_mode: "configured_preview",
+            identity_quality: "root_only",
             installed_events: &["context"],
             capabilities: &[ExpectedCapability {
                 event: "context",
@@ -4761,6 +4768,7 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
         Case {
             target: "hermes",
             lifecycle_mode: "installed",
+            identity_quality: "exact_child",
             installed_events: &["pre_llm_call", "pre_tool_call"],
             capabilities: &[
                 ExpectedCapability {
@@ -4789,6 +4797,7 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
         Case {
             target: "gemini",
             lifecycle_mode: "installed",
+            identity_quality: "root_only",
             installed_events: &["SessionStart", "BeforeAgent", "AfterTool"],
             capabilities: &[
                 ExpectedCapability {
@@ -4810,6 +4819,7 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
         Case {
             target: "antigravity",
             lifecycle_mode: "unsupported",
+            identity_quality: "root_only",
             installed_events: &["PreToolUse"],
             capabilities: &[
                 ExpectedCapability {
@@ -4831,6 +4841,7 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
         Case {
             target: "kiro",
             lifecycle_mode: "configured_preview",
+            identity_quality: "root_only",
             installed_events: &["SessionStart", "UserPromptSubmit", "PostToolUse"],
             capabilities: &[
                 ExpectedCapability {
@@ -4852,7 +4863,8 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
         Case {
             target: "copilot-vscode",
             lifecycle_mode: "configured_preview",
-            installed_events: &["SessionStart", "PostToolUse", "SubagentStart"],
+            identity_quality: "exact_child",
+            installed_events: &["SessionStart", "PostToolUse", "SubagentStart", "SubagentStop"],
             capabilities: &[
                 ExpectedCapability {
                     event: "SessionStart",
@@ -4880,6 +4892,7 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
         Case {
             target: "copilot-cli",
             lifecycle_mode: "installed",
+            identity_quality: "root_only",
             installed_events: &["sessionStart", "postToolUse", "subagentStart"],
             capabilities: &[
                 ExpectedCapability {
@@ -4915,12 +4928,14 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
         Case {
             target: "copilot-jetbrains",
             lifecycle_mode: "unsupported",
+            identity_quality: "unavailable",
             installed_events: &[],
             capabilities: &[],
         },
         Case {
             target: "pi",
             lifecycle_mode: "installed",
+            identity_quality: "root_only",
             installed_events: &[
                 "session_start",
                 "session_before_compact",
@@ -5047,6 +5062,11 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
         ]);
         let receipt = &installed["targets"][0];
         assert_eq!(
+            receipt["identity"]["quality"], case.identity_quality,
+            "{} identity quality",
+            case.target
+        );
+        assert_eq!(
             receipt["lifecycle_hook_mode"], case.lifecycle_mode,
             "{} lifecycle stability",
             case.target
@@ -5066,6 +5086,12 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
             "--location",
             "global",
         ]);
+        assert_eq!(
+            status["targets"][0]["identity"]["quality"],
+            case.identity_quality,
+            "{} status identity quality",
+            case.target
+        );
         assert_hook_contract(
             &status["targets"][0],
             case.target,

@@ -166,6 +166,7 @@ fi
       on: (event, handler) => handlers.set(event, handler),
       registerTool: (definition) => { tool = definition; },
     });
+    const context = { sessionManager: { getSessionId: () => "pi-session" } };
     assert.equal(handlers.has("stop"), false, "Pi must not fabricate Stop continuation");
     assert.equal(handlers.has("subagent_start"), false, "Pi has no native subagent lifecycle");
     assert.equal(handlers.has("subagent_stop"), false, "Pi has no native subagent lifecycle");
@@ -174,27 +175,27 @@ fi
       false,
       "Pi 0.84.2 has no session_compact_failed extension event",
     );
-    await handlers.get("session_start")();
-    const first = await handlers.get("before_agent_start")({ systemPrompt: "BASE" });
+    await handlers.get("session_start")({}, context);
+    const first = await handlers.get("before_agent_start")({ systemPrompt: "BASE" }, context);
     assert.match(first.systemPrompt, /^BASE\n\nUse the `using-lwc` Skill/);
     assert.match(first.systemPrompt, /current absolute project path/);
     assert.match(first.systemPrompt, /Treat graphs independently: ask for CodeGraph only for a code-structure task with code evidence/);
     assert.match(first.systemPrompt, /new stable request_id per mutation.*before display/);
     assert.match(first.systemPrompt, /one plain sentence about the learning outcome or next teaching action.*never expose Tutor, using-tutor, Skill, LWC, storage, persistence, recording, progress, status, or IDs/);
     assert.match(first.systemPrompt, /CTX$/);
-    assert.equal(await handlers.get("before_agent_start")({ systemPrompt: "BASE" }), undefined);
-    await handlers.get("session_before_compact")();
+    assert.equal(await handlers.get("before_agent_start")({ systemPrompt: "BASE" }, context), undefined);
+    await handlers.get("session_before_compact")({}, context);
     assert.equal(
-      await handlers.get("before_agent_start")({ systemPrompt: "NEXT" }),
+      await handlers.get("before_agent_start")({ systemPrompt: "NEXT" }, context),
       undefined,
       "pre-compact observation must not masquerade as post-compact context",
     );
-    await handlers.get("session_compact")();
-    const compact = await handlers.get("before_agent_start")({ systemPrompt: "NEXT" });
+    await handlers.get("session_compact")({}, context);
+    const compact = await handlers.get("before_agent_start")({ systemPrompt: "NEXT" }, context);
     assert.match(compact.systemPrompt, /^NEXT\n\nUse the `using-lwc` Skill/);
     assert.match(compact.systemPrompt, /CTX$/);
     assert.equal(
-      await handlers.get("before_agent_start")({ systemPrompt: "NEXT" }),
+      await handlers.get("before_agent_start")({ systemPrompt: "NEXT" }, context),
       undefined,
       "a compact boundary must inject exactly once",
     );
@@ -256,12 +257,13 @@ esac
       on: (event, handler) => handlers.set(event, handler),
       registerTool() {},
     });
+    const context = { sessionManager: { getSessionId: () => "pi-session" } };
 
-    await handlers.get("session_start")();
+    await handlers.get("session_start")({}, context);
     const first = await handlers.get("before_agent_start")({
       systemPrompt: "BASE",
       prompt: "first prompt",
-    });
+    }, context);
     assert.match(first.systemPrompt, /^BASE\n\nUse the `using-lwc` Skill/);
     assert.match(first.systemPrompt, /LIFECYCLE_CTX/);
     assert.match(first.systemPrompt, /PROMPT_CTX$/);
@@ -269,13 +271,13 @@ esac
     const subsequent = await handlers.get("before_agent_start")({
       systemPrompt: "NEXT",
       prompt: "subsequent prompt",
-    });
+    }, context);
     assert.equal(subsequent.systemPrompt, "NEXT\n\nPROMPT_CTX");
     assert.doesNotMatch(subsequent.systemPrompt, /using-lwc/);
 
     const huge = `😀`.repeat(5000) + "SECRET_AFTER_LIMIT";
     assert.deepEqual(
-      await handlers.get("before_agent_start")({ systemPrompt: "HUGE", prompt: huge }),
+      await handlers.get("before_agent_start")({ systemPrompt: "HUGE", prompt: huge }, context),
       { systemPrompt: "HUGE\n\nPROMPT_CTX" },
     );
     const recorded = readFileSync(calls, "utf8")
@@ -286,9 +288,13 @@ esac
         return { argv: line.slice(0, tab), payload: JSON.parse(line.slice(tab + 1)) };
       });
     const promptCalls = recorded.filter(({ argv }) => argv.includes("--event before_agent_start"));
+    const lifecycleCalls = recorded.filter(({ argv }) => argv.includes("--event session_start"));
+    assert.deepEqual(lifecycleCalls.map(({ payload }) => payload), [
+      { session_id: "pi-session" },
+    ]);
     assert.deepEqual(promptCalls.slice(0, 2).map(({ payload }) => payload), [
-      { prompt: "first prompt" },
-      { prompt: "subsequent prompt" },
+      { prompt: "first prompt", session_id: "pi-session" },
+      { prompt: "subsequent prompt", session_id: "pi-session" },
     ]);
     assert.equal(Array.from(promptCalls.at(-1).payload.prompt).length, 4096);
     assert.doesNotMatch(promptCalls.at(-1).payload.prompt, /SECRET_AFTER_LIMIT/);
@@ -300,26 +306,26 @@ esac
       get messages() { throw new Error("messages read"); },
       get conversation_history() { throw new Error("history read"); },
     };
-    assert.deepEqual(await handlers.get("before_agent_start")(privateEvent), {
+    assert.deepEqual(await handlers.get("before_agent_start")(privateEvent, context), {
       systemPrompt: "PRIVATE\n\nPROMPT_CTX",
     });
 
     assert.equal(
-      await handlers.get("before_agent_start")({ systemPrompt: "EMPTY", prompt: "UNRELATED" }),
+      await handlers.get("before_agent_start")({ systemPrompt: "EMPTY", prompt: "UNRELATED" }, context),
       undefined,
     );
     assert.equal(
-      await handlers.get("before_agent_start")({ systemPrompt: "BAD", prompt: "MALFORMED" }),
+      await handlers.get("before_agent_start")({ systemPrompt: "BAD", prompt: "MALFORMED" }, context),
       undefined,
     );
     assert.equal(
-      await handlers.get("before_agent_start")({ systemPrompt: "LARGE", prompt: "OVERSIZE" }),
+      await handlers.get("before_agent_start")({ systemPrompt: "LARGE", prompt: "OVERSIZE" }, context),
       undefined,
     );
     const beforeMissing = readFileSync(calls, "utf8");
-    assert.equal(await handlers.get("before_agent_start")({ systemPrompt: "MISSING" }), undefined);
+    assert.equal(await handlers.get("before_agent_start")({ systemPrompt: "MISSING" }, context), undefined);
     assert.equal(
-      await handlers.get("before_agent_start")({ systemPrompt: "INVALID", prompt: ["array"] }),
+      await handlers.get("before_agent_start")({ systemPrompt: "INVALID", prompt: ["array"] }, context),
       undefined,
     );
     assert.equal(
