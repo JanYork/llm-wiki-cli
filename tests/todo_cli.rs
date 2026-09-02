@@ -95,6 +95,38 @@ fn version_15_store_adds_todo_parent_and_target_columns() {
     );
 }
 
+#[test]
+fn version_17_store_migrates_agent_tracking_tables_to_v18() {
+    let w = World::new();
+    let db = w.project.join(".lwc/wiki.db");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TABLE agent_todo_tracks;
+         DROP TABLE agent_plan_tracks;
+         UPDATE meta SET value='17' WHERE key='format_version';
+         PRAGMA user_version=17;",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_eq!(w.ok(&["todo", "list"])["returned"], 0);
+    let conn = Connection::open(db).unwrap();
+    assert_eq!(
+        conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        18
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('agent_plan_tracks','agent_todo_tracks')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        2
+    );
+}
+
 impl World {
     fn new() -> Self {
         let world = Self::new_disabled();
@@ -178,6 +210,55 @@ fn todo_and_plan_capabilities_are_opt_in_and_layered() {
     assert_eq!(explicitly_inherited["plan"]["origin"], "global");
     w.ok(&["config", "unset", "--todo", "--plan"]);
     assert_eq!(w.ok(&["todo", "list"])["returned"], 1);
+}
+
+#[test]
+fn todo_tracking_is_exact_and_isolated_by_agent_context() {
+    let w = World::new();
+    let first = w.ok(&["todo", "add", "first"]);
+    let second = w.ok(&["todo", "add", "second"]);
+    let first_id = first["todo"]["id"].as_str().unwrap();
+    let second_id = second["todo"]["id"].as_str().unwrap();
+    let context_a = format!("lwcctx-v1-{}", "a".repeat(64));
+    let context_b = format!("lwcctx-v1-{}", "b".repeat(64));
+
+    assert_eq!(
+        w.ok(&["todo", "track", first_id, "--context", &context_a])["action"],
+        "tracked"
+    );
+    assert_eq!(
+        w.ok(&["todo", "track", first_id, "--context", &context_a])["action"],
+        "unchanged"
+    );
+    w.ok(&["todo", "track", second_id, "--context", &context_a]);
+    assert_eq!(
+        w.ok(&["todo", "track", second_id, "--context", &context_b])["action"],
+        "tracked"
+    );
+    let tracked = w.ok(&["todo", "list", "--context", &context_a]);
+    assert_eq!(tracked["returned"], 2);
+    assert_eq!(
+        w.ok(&["todo", "list", "--context", &context_b])["returned"],
+        1
+    );
+    assert_eq!(
+        w.error(&["todo", "untrack", first_id, "--context", &context_b])["error"]["code"],
+        "todo_tracking_not_found"
+    );
+    assert_eq!(
+        w.ok(&["todo", "untrack", first_id, "--context", &context_a])["action"],
+        "untracked"
+    );
+    assert_eq!(
+        w.error(&["todo", "list", "--context", "bad"])["error"]["code"],
+        "invalid_agent_context"
+    );
+    assert_eq!(
+        w.error(&[
+            "--scope", "all", "todo", "track", first_id, "--context", &context_a,
+        ])["error"]["code"],
+        "scope_not_supported"
+    );
 }
 
 #[test]

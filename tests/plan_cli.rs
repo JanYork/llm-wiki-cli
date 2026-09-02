@@ -145,6 +145,59 @@ fn plan_create_advance_block_brief_and_complete() {
 }
 
 #[test]
+fn plan_tracking_is_exact_and_isolated_by_agent_context() {
+    let w = World::new();
+    let first = w.ok(&[
+        "plan", "create", "first", "--objective", "o", "--done-when", "d", "--step",
+        "only",
+    ]);
+    let second = w.ok(&[
+        "plan", "create", "second", "--objective", "o", "--done-when", "d", "--step",
+        "only",
+    ]);
+    let first_id = first["plan"]["id"].as_str().unwrap();
+    let second_id = second["plan"]["id"].as_str().unwrap();
+    let context_a = format!("lwcctx-v1-{}", "a".repeat(64));
+    let context_b = format!("lwcctx-v1-{}", "b".repeat(64));
+
+    assert_eq!(
+        w.ok(&["plan", "track", first_id, "--context", &context_a])["action"],
+        "tracked"
+    );
+    assert_eq!(
+        w.ok(&["plan", "track", first_id, "--context", &context_a])["action"],
+        "unchanged"
+    );
+    assert_eq!(
+        w.ok(&["plan", "current", "--context", &context_a])["plan"]["id"],
+        first_id
+    );
+    assert!(w.ok(&["plan", "current", "--context", &context_b])["plan"].is_null());
+    assert_eq!(
+        w.error(&["plan", "track", second_id, "--context", &context_a])["error"]["code"],
+        "plan_tracking_conflict"
+    );
+    assert_eq!(
+        w.error(&["plan", "untrack", second_id, "--context", &context_a])["error"]["code"],
+        "plan_tracking_not_found"
+    );
+    assert_eq!(
+        w.ok(&["plan", "untrack", first_id, "--context", &context_a])["action"],
+        "untracked"
+    );
+    assert_eq!(
+        w.error(&["plan", "current", "--context", "bad"])["error"]["code"],
+        "invalid_agent_context"
+    );
+    assert_eq!(
+        w.error(&[
+            "--scope", "all", "plan", "track", first_id, "--context", &context_a,
+        ])["error"]["code"],
+        "scope_not_supported"
+    );
+}
+
+#[test]
 fn plan_can_finish_and_is_idempotent_by_request() {
     let w = World::new();
     let a = w.ok(&[
