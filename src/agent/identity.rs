@@ -10,7 +10,31 @@ pub(super) enum AgentExecutionContext {
 impl AgentExecutionContext {
     pub(super) fn resolve(agent: AgentKind, event: EventKind, payload: &Value) -> Self {
         let target = target_id(agent);
-        let child = matches!(event, EventKind::SubagentStart | EventKind::SubagentStop);
+        let child = match event {
+            EventKind::SubagentStart | EventKind::SubagentStop => true,
+            EventKind::Prompt | EventKind::TurnStart
+                if matches!(
+                    agent,
+                    AgentKind::Codex
+                        | AgentKind::Claude
+                        | AgentKind::Hermes
+                        | AgentKind::CopilotVscode
+                ) =>
+            {
+                let has_child_identity = match agent {
+                    AgentKind::Hermes => {
+                        native_id(payload, "child_session_id").is_some()
+                            && native_id(payload, "child_subagent_id").is_some()
+                    }
+                    _ => native_id(payload, "agent_id").is_some(),
+                };
+                if !has_child_identity {
+                    return Self::Unresolved("ambiguous_subject_identity");
+                }
+                true
+            }
+            _ => false,
+        };
         let session_field = match agent {
             AgentKind::Codex
             | AgentKind::Claude
