@@ -1985,6 +1985,53 @@ rg '^[[:space:]]*[[fenced-fake]]'
     }
 
     #[test]
+    fn sync_publish_preserves_local_agent_tracks_and_prunes_removed_targets() {
+        let temp = tempdir().unwrap();
+        let mut target = populated_sync_source();
+        let context = format!("lwcctx-v1-{}", "a".repeat(64));
+        let plan_id: String = target
+            .conn
+            .query_row("SELECT id FROM plans LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let todo_id: String = target
+            .conn
+            .query_row("SELECT id FROM todo_items LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        target.plan_track(&plan_id, &context).unwrap();
+        target.todo_track(&todo_id, &context).unwrap();
+
+        let normalized = temp.path().join("normalized.db");
+        target.export_sync_state(&normalized).unwrap();
+        Connection::open(&normalized)
+            .unwrap()
+            .execute(
+                "DELETE FROM sync_objects WHERE kind='plan' AND logical_key=?1",
+                [&plan_id],
+            )
+            .unwrap();
+        let expected = target.identity().unwrap();
+        target
+            .publish_sync_state(&normalized, &expected, "tracking-prune")
+            .unwrap();
+
+        assert_eq!(
+            target
+                .conn
+                .query_row("SELECT COUNT(*) FROM agent_plan_tracks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            target
+                .conn
+                .query_row("SELECT COUNT(*) FROM agent_todo_tracks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(target.tracked_todos(&context).unwrap()["todos"][0]["id"], todo_id);
+    }
+
+    #[test]
     fn sync_publish_reports_only_changed_page_and_source_identifiers() {
         let temp = tempdir().unwrap();
         let source = populated_sync_source();
