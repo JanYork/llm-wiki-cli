@@ -24,7 +24,7 @@ LWC is an Agent-first Rust CLI that compiles curated documents into a persistent
 - `docs/superpowers/specs/2026-08-11-using-lwc-capability-guidance-design.md`: canonical Skill routing and readiness protocol.
 - `docs/superpowers/specs/2026-08-12-lwc-agent-target-capability-matrix.md`: current AgentTarget capability authority; it supersedes the earlier strong/weak classification.
 - `docs/superpowers/specs/2026-08-30-lwc-agent-signal-hooks-design.md`: frozen semantic-event, signal catalog, host delivery, Stop continuation, consent, privacy, budget, and acceptance contract.
-- Wiki `todo-plan-harness-continuity`: acceptance-worktree contract for opt-in Todo/Plan and bounded active-Plan Hook continuity tracking.
+- Wiki `todo-plan-harness-continuity`: local opaque Agent-context Plan/Todo tracking, session/child isolation, fail-closed Hook delivery, and prompt-level cross-context rejection.
 - Wiki `lwc-sync-architecture`: non-overwriting SSH Sync semantics, normalized SQLite publication, Agent conflict resolution, Git continuity, and local derived-plane rebuild boundaries.
 
 Translated READMEs, package summaries, integration summaries, and copied Skill trees are useful delivery mirrors but should not be ingested again when the canonical document already supplies the same evidence.
@@ -39,7 +39,8 @@ Translated READMEs, package summaries, integration summaries, and copied Skill t
 
 ## Current durable execution
 
-- No project Plan is active. Completed Plan `c6fd750f691a023894f10957cf29d35d` (“LWC 主动感知 Hook 全面优化”), revision 10, delivered the Hook work and has no focal step.
+- No project Plan is active. Completed Plan `d60bf2cd634ef54db9b72cdcd70f61f9` (“Agent Plan/Todo Hook 会话隔离实现”), revision 10, delivered explicit local context tracking, schema v18, session/child-aware Hook and Stop filtering, host identity adapters, cross-context prompt rejection, Skills/docs, and Pro-only verification.
+- Completed Plan `c6fd750f691a023894f10957cf29d35d` (“LWC 主动感知 Hook 全面优化”), revision 10, delivered the preceding Hook work and has no focal step.
 - Revision 8 acceptance baseline: Clippy all-targets with warnings denied, the full Rust suite (main binary 256 passed/2 ignored plus integrations), 82 Agent CLI cases, 78 Hook cases, 7 Store Hook cases, and 5 Node integration cases passed; the later documentation, Skill, Wiki, memory, graph, lint, and fixed-retrieval closure is complete.
 - Post-plan host addendum (2026-08-30): `--scope all` Hook reads isolate stale project/global stores so a valid peer store still supplies context and signals without writes; Pi 0.84.2 uses the official `session_before_compact` and `session_compact` events without a synthetic `session_compact_failed`. Real Codex smoke verified Skill discovery, SessionStart Plan context, first Stop continuation, and native repeat-guard release. Real Claude smoke verified Skill discovery and SessionStart Plan context, but its model service did not return, so Stop remains unverified on that host. Global Hook-only overlays may truthfully remain `modified` against an older full-install manifest or user-owned symlink state and must not be presented as `installed`.
 - Cross-platform acceptance addendum (2026-08-31): Windows Hook reads accept canonical local verbatim-drive paths while rejecting UNC namespaces, preserve WAL/SHM bytes, and remain covered by the existing `windows-2025` runtime CI. The installer compatibility probe shares one deadline across process wait and bounded 64 KiB pipe drains; macOS/Linux runtime gates passed, while latest-source Windows GNU check/build/test-no-run linked 38 PE test executables. Windows no-run is compile/link evidence only, not a runtime PASS.
