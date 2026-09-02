@@ -1812,7 +1812,10 @@ pub(crate) fn stop_plan(
     let Some(store) = open_store_until("project", &path.path, deadline) else {
         return Ok(None);
     };
-    let Some(signal) = stop_signal(store.plan_tracking_for_context(context)?) else {
+    let Some(tracking) = store.plan_tracking_for_context(context)? else {
+        return Ok(None);
+    };
+    let Some(signal) = stop_signal(Some(tracking)) else {
         return Ok(None);
     };
     render(EventKind::Stop, vec![signal])
