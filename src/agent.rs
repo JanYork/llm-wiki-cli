@@ -139,7 +139,8 @@ fn compile_hook(agent: AgentKind, event: &str, scope: Scope, cwd: &Path) -> Resu
             let evidence = prompt_project_evidence(cwd);
             let intents = intent::classify(&prompt, evidence);
             if intents != intent::IntentSet::default() && Instant::now() < hook_deadline {
-                let readiness = prompt_readiness(cwd, &intents, hook_deadline, &agent_context);
+                let readiness =
+                    prompt_readiness(scope, cwd, &intents, hook_deadline, &agent_context);
                 if Instant::now() < hook_deadline
                     && let Ok(Some(rendered)) =
                         signals::prompt(kind, cwd, &readiness, &intents, hook_deadline)
@@ -160,7 +161,7 @@ fn compile_hook(agent: AgentKind, event: &str, scope: Scope, cwd: &Path) -> Resu
         | signals::EventKind::SubagentStart)
             if has_effect("context") =>
         {
-            let readiness = readiness_for_hook(cwd, hook_deadline, &agent_context)?;
+            let readiness = readiness_for_hook(scope, cwd, hook_deadline, &agent_context)?;
             let rendered = signals::lifecycle(kind, cwd, &readiness, hook_deadline)?;
             let signal = rendered.as_ref().map(|rendered| rendered.line.as_str());
             let context = match strong_context(scope, cwd, &readiness, signal, hook_deadline) {
@@ -215,7 +216,7 @@ fn compile_hook(agent: AgentKind, event: &str, scope: Scope, cwd: &Path) -> Resu
                 && has_effect("continue")
                 && capability.loop_guard == "stop_hook_active" =>
         {
-            match signals::stop_plan(cwd, hook_deadline, agent_context.id())? {
+            match signals::stop_plan(scope, cwd, hook_deadline, agent_context.id())? {
                 Some(rendered) if rendered.continues => {
                     Ok(stop_envelope(agent, &event.native, rendered.line))
                 }
@@ -271,6 +272,7 @@ fn prompt_project_evidence(cwd: &Path) -> intent::ProjectEvidence {
 }
 
 fn prompt_readiness(
+    scope: Scope,
     cwd: &Path,
     intents: &intent::IntentSet,
     deadline: Instant,
@@ -522,6 +524,7 @@ fn prompt_readiness(
     {
         value["sync"] = sync;
     }
+    let _ = apply_scoped_context_work(scope, cwd, deadline, context, &mut value);
     value
 }
 
@@ -530,11 +533,94 @@ pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
 }
 
 fn readiness_for_hook(
+    scope: Scope,
     cwd: &Path,
     deadline: Instant,
     context: &identity::AgentExecutionContext,
 ) -> Result<Value> {
-    readiness_until(cwd, Some(deadline), Some(context))
+    let mut value = readiness_until(cwd, Some(deadline), Some(context))?;
+    apply_scoped_context_work(scope, cwd, deadline, context, &mut value)?;
+    Ok(value)
+}
+
+fn apply_scoped_context_work(
+    scope: Scope,
+    cwd: &Path,
+    deadline: Instant,
+    context: &identity::AgentExecutionContext,
+    value: &mut Value,
+) -> Result<()> {
+    let Some(context_id) = context.id() else {
+        value["agent_context"] = context.readiness(None);
+        value.as_object_mut().expect("readiness object").remove("plan");
+        value.as_object_mut().expect("readiness object").remove("todo");
+        return Ok(());
+    };
+    let mut bound = false;
+    let mut plan_enabled = false;
+    let mut todo_enabled = false;
+    let mut plans = Vec::new();
+    let mut todo_open = 0_i64;
+    let mut todo_reminders = Vec::new();
+    let mut todo_omitted = 0_usize;
+    for path in resolve_read_store_paths(scope, cwd, true)? {
+        ensure_hook_deadline(Some(deadline))?;
+        let scope_name = scope_name(path.scope);
+        let store = open_store_for_hook_until(scope_name, &path.path, deadline)?;
+        bound |= store.agent_tracking_bound(context_id)?;
+        if config::resolve_plan(scope_name, &path.path)?.setting
+            == config::CapabilitySetting::Enabled
+        {
+            plan_enabled = true;
+            if let Some(plan) = store.plan_tracking_for_context(context_id)? {
+                plans.push(plan);
+            }
+        }
+        if config::resolve_todo(scope_name, &path.path)?.setting
+            == config::CapabilitySetting::Enabled
+        {
+            todo_enabled = true;
+            let (open, reminders, omitted) =
+                store.tracked_open_todo_readiness(context_id, 3)?;
+            todo_open += open;
+            todo_omitted += omitted;
+            todo_reminders.extend(reminders);
+        }
+    }
+    value["agent_context"] = context.readiness(Some(bound));
+    let object = value.as_object_mut().expect("readiness object");
+    object.remove("plan");
+    object.remove("todo");
+    if bound && plan_enabled {
+        let mut state = json!({
+            "ready": true,
+            "active": i64::from(!plans.is_empty()),
+            "tracked_active": plans.len(),
+            "current": format!("lwc --scope {} plan current --context {context_id}", scope_name(scope)),
+        });
+        if !plans.is_empty() {
+            state["tracking"] = plans.remove(0);
+        }
+        if !plans.is_empty() {
+            state["additional_trackings"] = json!(plans);
+        }
+        value["plan"] = state;
+    }
+    if bound && todo_enabled {
+        todo_omitted += todo_reminders.len().saturating_sub(3);
+        todo_reminders.truncate(3);
+        let mut state = json!({
+            "ready": true,
+            "open": todo_open,
+            "list": format!("lwc --scope {} todo list --context {context_id}", scope_name(scope)),
+        });
+        if !todo_reminders.is_empty() {
+            state["reminders"] = json!(todo_reminders);
+            state["omitted_reminders"] = json!(todo_omitted);
+        }
+        value["todo"] = state;
+    }
+    Ok(())
 }
 
 fn readiness_until(

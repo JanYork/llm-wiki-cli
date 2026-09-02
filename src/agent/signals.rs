@@ -6,7 +6,7 @@ use crate::{
     changeset,
     config::{self, CapabilitySetting},
     error::{AppError, Result},
-    scope::{Scope, StorePath, init_store_path},
+    scope::{Scope, StorePath, init_store_path, resolve_read_store_paths},
     store::Store,
     work,
 };
@@ -1796,6 +1796,7 @@ fn open_store_until(scope: &str, path: &Path, deadline: Instant) -> Option<Store
 }
 
 pub(crate) fn stop_plan(
+    scope: Scope,
     cwd: &Path,
     deadline: Instant,
     context: Option<&str>,
@@ -1803,22 +1804,28 @@ pub(crate) fn stop_plan(
     let Some(context) = context else {
         return Ok(None);
     };
-    let path = init_store_path(Scope::Project, cwd)?;
-    if config::resolve_plan("project", &path.path)?.setting != CapabilitySetting::Enabled
-        || !path.path.is_file()
-    {
-        return Ok(None);
+    let mut signals = Vec::new();
+    for path in resolve_read_store_paths(scope, cwd, true)? {
+        let scope_name = match path.scope {
+            Scope::Project => "project",
+            Scope::Global => "global",
+            Scope::All => unreachable!(),
+        };
+        if config::resolve_plan(scope_name, &path.path)?.setting != CapabilitySetting::Enabled
+            || !path.path.is_file()
+        {
+            continue;
+        }
+        let Some(store) = open_store_until(scope_name, &path.path, deadline) else {
+            continue;
+        };
+        if let Some(tracking) = store.plan_tracking_for_context(context)?
+            && let Some(signal) = stop_signal(Some(tracking))
+        {
+            signals.push(signal);
+        }
     }
-    let Some(store) = open_store_until("project", &path.path, deadline) else {
-        return Ok(None);
-    };
-    let Some(tracking) = store.plan_tracking_for_context(context)? else {
-        return Ok(None);
-    };
-    let Some(signal) = stop_signal(Some(tracking)) else {
-        return Ok(None);
-    };
-    render(EventKind::Stop, vec![signal])
+    render(EventKind::Stop, signals)
 }
 
 fn stop_signal(tracking: Option<Value>) -> Option<Signal> {
