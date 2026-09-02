@@ -12,6 +12,7 @@ use std::{
 const CODEGRAPH_VERSION: &str = "v1.5.0-lwc.1";
 const DEFAULT_CLAUDE_SESSION: &str = "default-claude-session";
 const DEFAULT_CODEX_SESSION: &str = "default-codex-session";
+const DEFAULT_CLAUDE_PROMPT_AGENT: &str = "default-claude-prompt-agent";
 
 fn codegraph_target() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -235,6 +236,15 @@ fn create_active_plan(world: &World, title: &str, objective: &str, done_when: &s
             "plan", "track", id, "--context", &context,
         ]).output();
     }
+    let prompt_context = agent_context(
+        "claude",
+        DEFAULT_CLAUDE_SESSION,
+        "subagent",
+        DEFAULT_CLAUDE_PROMPT_AGENT,
+    );
+    let _ = world.command().args([
+        "plan", "track", id, "--context", &prompt_context,
+    ]).output();
     created
 }
 
@@ -291,7 +301,7 @@ fn agent_context_isolates_root_and_child_plan_todo_readiness() {
 
     let prompt = prompt_hook_for_session(&world, "continue the current plan", session);
     let prompt_rendered = serde_json::to_string(&prompt).unwrap();
-    assert!(prompt_rendered.contains(root_plan_id));
+    assert!(!prompt_rendered.contains(root_plan_id));
     assert!(!prompt_rendered.contains(other_plan["plan"]["id"].as_str().unwrap()));
     assert!(!prompt_rendered.contains("OTHER_AGENT_PLAN"));
     let unbound_prompt = serde_json::to_string(&prompt_hook_for_session(
@@ -306,6 +316,22 @@ fn agent_context_isolates_root_and_child_plan_todo_readiness() {
     assert!(!unbound_prompt.contains("OTHER_AGENT_PLAN"));
 
     let child_id = "PRIVATE_CHILD_B";
+    let child_context = agent_context("codex", session, "subagent", child_id);
+    let other_plan_id = other_plan["plan"]["id"].as_str().unwrap();
+    world.ok(&["plan", "track", other_plan_id, "--context", &child_context]);
+    let child_prompt = tool_hook(
+        &world,
+        "codex",
+        "UserPromptSubmit",
+        &serde_json::json!({
+            "prompt":"continue the current plan",
+            "session_id":session,
+            "agent_id":child_id,
+        }),
+    );
+    let child_prompt = serde_json::to_string(&child_prompt).unwrap();
+    assert!(child_prompt.contains(other_plan_id));
+    assert!(!child_prompt.contains(root_plan_id));
     let child_value = tool_hook(
         &world,
         "codex",
@@ -313,12 +339,12 @@ fn agent_context_isolates_root_and_child_plan_todo_readiness() {
         &serde_json::json!({"session_id":session,"agent_id":child_id}),
     );
     let child_readiness = readiness(hook_context(&child_value).unwrap());
-    assert_eq!(child_readiness["agent_context"]["status"], "unbound");
+    assert_eq!(child_readiness["agent_context"]["status"], "bound");
     assert_eq!(
         child_readiness["agent_context"]["context_id"],
-        agent_context("codex", session, "subagent", child_id)
+        child_context
     );
-    assert!(child_readiness.get("plan").is_none());
+    assert_eq!(child_readiness["plan"]["tracking"]["id"], other_plan_id);
     assert!(child_readiness.get("todo").is_none());
 
     let unresolved = tool_hook(
@@ -708,6 +734,7 @@ fn prompt_hook(world: &World, prompt: &str) -> Value {
             "hook_event_name": "UserPromptSubmit",
             "prompt": prompt,
             "session_id": DEFAULT_CLAUDE_SESSION,
+            "agent_id": DEFAULT_CLAUDE_PROMPT_AGENT,
         }),
     )
 }
@@ -1035,7 +1062,12 @@ fn signal_prompt_maps_active_provider_states_without_mutation_or_private_fields(
         "--cue",
         "PRIVATE_DUE_TODO_CUE",
     ]);
-    let context_id = agent_context("claude", DEFAULT_CLAUDE_SESSION, "main", "main");
+    let context_id = agent_context(
+        "claude",
+        DEFAULT_CLAUDE_SESSION,
+        "subagent",
+        DEFAULT_CLAUDE_PROMPT_AGENT,
+    );
     todo.ok(&[
         "todo", "track", due["todo"]["id"].as_str().unwrap(), "--context", &context_id,
     ]);
