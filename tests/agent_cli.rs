@@ -1110,6 +1110,7 @@ fn refresh_upgrades_a_matching_v1_manifest_and_keeps_original_uninstall_snapshot
             "PreToolUse",
             "PostToolUse",
             "SubagentStart",
+            "SubagentStop",
             "Stop"
         ])
     );
