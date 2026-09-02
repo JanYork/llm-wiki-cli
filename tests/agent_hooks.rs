@@ -1026,7 +1026,7 @@ fn signal_prompt_maps_active_provider_states_without_mutation_or_private_fields(
     let signal = &signal_batch(&prompt_hook(&todo, "review my todo list"))["signals"][0];
     assert_eq!(signal["kind"], "todo.review");
     assert_eq!(signal["priority"], 20);
-    todo.ok(&[
+    let due = todo.ok(&[
         "todo",
         "add",
         "PRIVATE_DUE_TODO_TITLE",
@@ -1034,6 +1034,10 @@ fn signal_prompt_maps_active_provider_states_without_mutation_or_private_fields(
         "2000-01-01T00:00:00Z",
         "--cue",
         "PRIVATE_DUE_TODO_CUE",
+    ]);
+    let context_id = agent_context("claude", DEFAULT_CLAUDE_SESSION, "main", "main");
+    todo.ok(&[
+        "todo", "track", due["todo"]["id"].as_str().unwrap(), "--context", &context_id,
     ]);
     let value = prompt_hook(&todo, "review my todo list");
     let signal = &signal_batch(&value)["signals"][0];
