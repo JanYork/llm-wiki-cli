@@ -786,7 +786,7 @@ fn v16_migration_rebuilds_heading_context_and_preserves_span_locators() {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     conn.prepare("SELECT heading_terms FROM span_fts LIMIT 0")
         .unwrap();
 }

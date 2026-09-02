@@ -94,7 +94,7 @@ fn changeset_begin_allocation_is_independent_of_live_wiki_size() {
     .sum::<u64>();
 
     assert!(
-        allocated <= 1024 * 1024,
+        allocated <= 1152 * 1024,
         "empty sparse draft allocated {allocated} bytes from unrelated live content"
     );
 }

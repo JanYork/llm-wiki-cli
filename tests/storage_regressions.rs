@@ -92,7 +92,7 @@ fn new_store_has_v15_tag_schema_constraints_and_cascades() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     let indexes = {
         let mut statement = conn
             .prepare(
@@ -202,7 +202,7 @@ fn v12_store_migrates_to_v15_with_existing_pages_untagged() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!((version, format.as_str()), (17, "17"));
+    assert_eq!((version, format.as_str()), (18, "18"));
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM page_tags", [], |row| row
             .get::<_, i64>(0))
@@ -248,7 +248,7 @@ fn failed_v13_migration_leaves_v12_unchanged_and_can_retry() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
 }
 
 #[test]
@@ -318,7 +318,7 @@ fn new_store_uses_contentless_search_fts_and_keeps_identifiers_readable() {
     let version: i32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     for table in [
         "retrieval_weights",
         "retrieval_feedback",
