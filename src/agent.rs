@@ -139,7 +139,7 @@ fn compile_hook(agent: AgentKind, event: &str, scope: Scope, cwd: &Path) -> Resu
             let evidence = prompt_project_evidence(cwd);
             let intents = intent::classify(&prompt, evidence);
             if intents != intent::IntentSet::default() && Instant::now() < hook_deadline {
-                let readiness = prompt_readiness(cwd, &intents, hook_deadline);
+                let readiness = prompt_readiness(cwd, &intents, hook_deadline, &agent_context);
                 if Instant::now() < hook_deadline
                     && let Ok(Some(rendered)) =
                         signals::prompt(kind, cwd, &readiness, &intents, hook_deadline)
@@ -270,7 +270,12 @@ fn prompt_project_evidence(cwd: &Path) -> intent::ProjectEvidence {
     }
 }
 
-fn prompt_readiness(cwd: &Path, intents: &intent::IntentSet, deadline: Instant) -> Value {
+fn prompt_readiness(
+    cwd: &Path,
+    intents: &intent::IntentSet,
+    deadline: Instant,
+    context: &identity::AgentExecutionContext,
+) -> Value {
     let store = init_store_path(Scope::Project, cwd).ok();
     let wiki_initialized = store.as_ref().is_some_and(|store| store.path.is_file());
     let mut value = json!({
@@ -475,10 +480,18 @@ fn prompt_readiness(cwd: &Path, intents: &intent::IntentSet, deadline: Instant) 
     } else {
         None
     };
-    if todo_enabled {
+    let context_bound = context.id().and_then(|context_id| match &hook_store {
+        Some(Ok(store)) => store.agent_tracking_bound(context_id).ok(),
+        Some(Err(_)) | None => None,
+    });
+    value["agent_context"] = context.readiness(context_bound);
+    if todo_enabled && context_bound == Some(true) {
         value["todo"] = match &hook_store {
-            Some(Ok(store)) => match (store.open_todo_count(), store.due_todo_reminders(3)) {
-                (Ok(open), Ok((reminders, omitted))) => {
+            Some(Ok(store)) => match store.tracked_open_todo_readiness(
+                context.id().expect("bound context has an ID"),
+                3,
+            ) {
+                Ok((open, reminders, omitted)) => {
                     let mut state = json!({"ready": true, "open": open});
                     if !reminders.is_empty() {
                         state["reminders"] = json!(reminders);
@@ -486,7 +499,7 @@ fn prompt_readiness(cwd: &Path, intents: &intent::IntentSet, deadline: Instant) 
                     }
                     state
                 }
-                (Err(error), _) | (_, Err(error)) => {
+                Err(error) => {
                     json!({"ready": false, "error_code": error.code})
                 }
             },
@@ -494,9 +507,9 @@ fn prompt_readiness(cwd: &Path, intents: &intent::IntentSet, deadline: Instant) 
             None => json!({"ready": false}),
         };
     }
-    if plan_enabled {
+    if plan_enabled && context_bound == Some(true) {
         value["plan"] = match &hook_store {
-            Some(Ok(store)) => plan_hook_readiness(store, false, None)
+            Some(Ok(store)) => plan_hook_readiness(store, false, context.id())
                 .unwrap_or_else(|error| json!({"ready": false, "error_code": error.code})),
             Some(Err(error)) => json!({"ready": false, "error_code": error.code}),
             None => json!({"ready": false}),
