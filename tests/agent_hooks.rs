@@ -272,6 +272,19 @@ fn agent_context_isolates_root_and_child_plan_todo_readiness() {
     assert!(!rendered.contains("OTHER_AGENT_PLAN"));
     assert!(!rendered.contains("OTHER_AGENT_TODO"));
     assert!(!rendered.contains(session));
+    assert!(root_text.contains(
+        "Only follow Plan/Todo progress that is bound to this LWC_READINESS.agent_context"
+    ));
+
+    let prompt = prompt_hook_for_session(&world, "continue the current plan", session);
+    let prompt_rendered = serde_json::to_string(&prompt).unwrap();
+    assert!(prompt_rendered.contains(root_plan_id));
+    assert!(!prompt_rendered.contains(other_plan["plan"]["id"].as_str().unwrap()));
+    assert!(!prompt_rendered.contains("OTHER_AGENT_PLAN"));
+    assert_eq!(
+        prompt_hook_for_session(&world, "continue the current plan", "UNBOUND_SESSION"),
+        serde_json::json!({})
+    );
 
     let child_id = "PRIVATE_CHILD_B";
     let child_value = tool_hook(
@@ -618,6 +631,19 @@ fn prompt_hook(world: &World, prompt: &str) -> Value {
         &serde_json::json!({
             "hook_event_name": "UserPromptSubmit",
             "prompt": prompt,
+        }),
+    )
+}
+
+fn prompt_hook_for_session(world: &World, prompt: &str, session_id: &str) -> Value {
+    tool_hook(
+        world,
+        "claude",
+        "UserPromptSubmit",
+        &serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": prompt,
+            "session_id": session_id,
         }),
     )
 }
