@@ -227,7 +227,11 @@ fn create_active_plan(world: &World, title: &str, objective: &str, done_when: &s
 
 fn agent_context(target: &str, session: &str, subject: &str, actor: &str) -> String {
     let bytes = format!("lwc-agent-context/v1\0{target}\0{session}\0{subject}\0{actor}");
-    format!("lwcctx-v1-{:x}", Sha256::digest(bytes.as_bytes()))
+    let digest = Sha256::digest(bytes.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("lwcctx-v1-{digest}")
 }
 
 #[test]
