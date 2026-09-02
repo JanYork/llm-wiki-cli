@@ -379,6 +379,52 @@ fn agent_context_stop_continues_only_its_tracked_plan() {
     assert_eq!(unresolved_child, serde_json::json!({}));
 }
 
+#[test]
+fn scope_all_hook_merges_only_the_current_contexts_project_and_global_work() {
+    let world = World::new(true);
+    world.ok(&["config", "set", "--plan", "enabled"]);
+    world.ok(&["--scope", "global", "init"]);
+    world.ok(&["--scope", "global", "config", "set", "--plan", "enabled"]);
+    let session = "scope-all-session";
+    let context_id = agent_context("codex", session, "main", "main");
+    let project_plan = create_active_plan(&world, "PROJECT_PLAN", "p", "p");
+    let global_plan = world.ok(&[
+        "--scope", "global", "plan", "create", "GLOBAL_PLAN", "--objective", "g",
+        "--done-when", "g", "--step", "g",
+    ]);
+    let other_global = world.ok(&[
+        "--scope", "global", "plan", "create", "OTHER_GLOBAL_PLAN", "--objective", "x",
+        "--done-when", "x", "--step", "x",
+    ]);
+    let project_id = project_plan["plan"]["id"].as_str().unwrap();
+    let global_id = global_plan["plan"]["id"].as_str().unwrap();
+    world.ok(&["plan", "track", project_id, "--context", &context_id]);
+    world.ok(&[
+        "--scope", "global", "plan", "track", global_id, "--context", &context_id,
+    ]);
+
+    let start = hook_json(&world.output(
+        &["--scope", "all", "agent", "hook", "--agent", "codex", "--event", "SessionStart"],
+        &serde_json::json!({"session_id":session,"source":"startup"}).to_string(),
+    ));
+    let text = hook_context(&start).unwrap();
+    let state = readiness(text);
+    assert_eq!(state["plan"]["tracking"]["id"], project_id);
+    assert_eq!(state["plan"]["additional_trackings"][0]["id"], global_id);
+    let rendered = serde_json::to_string(&start).unwrap();
+    assert!(!rendered.contains(other_global["plan"]["id"].as_str().unwrap()));
+    assert!(!rendered.contains("OTHER_GLOBAL_PLAN"));
+
+    let stop = hook_json(&world.output(
+        &["--scope", "all", "agent", "hook", "--agent", "codex", "--event", "Stop"],
+        &serde_json::json!({"session_id":session}).to_string(),
+    ));
+    let stopped = serde_json::to_string(&stop).unwrap();
+    assert!(stopped.contains(project_id));
+    assert!(stopped.contains(global_id));
+    assert!(!stopped.contains(other_global["plan"]["id"].as_str().unwrap()));
+}
+
 fn put_global_autoload_page(world: &World, slug: &str, body: &str) {
     let path = world.project.join(format!("{slug}.md"));
     fs::write(&path, body).unwrap();
