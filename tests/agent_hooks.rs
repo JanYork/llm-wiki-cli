@@ -225,6 +225,83 @@ fn create_active_plan(world: &World, title: &str, objective: &str, done_when: &s
     ])
 }
 
+fn agent_context(target: &str, session: &str, subject: &str, actor: &str) -> String {
+    let bytes = format!("lwc-agent-context/v1\0{target}\0{session}\0{subject}\0{actor}");
+    format!("lwcctx-v1-{:x}", Sha256::digest(bytes.as_bytes()))
+}
+
+#[test]
+fn agent_context_isolates_root_and_child_plan_todo_readiness() {
+    let world = World::new(true);
+    world.ok(&["config", "set", "--todo", "enabled", "--plan", "enabled"]);
+    let session = "PRIVATE_SESSION_ROOT_A";
+    let root = agent_context("codex", session, "main", "main");
+    let root_plan = create_active_plan(&world, "ROOT_A_PLAN", "private", "verified");
+    let other_plan = create_active_plan(&world, "OTHER_AGENT_PLAN", "private", "verified");
+    let root_plan_id = root_plan["plan"]["id"].as_str().unwrap();
+    world.ok(&["plan", "track", root_plan_id, "--context", &root]);
+    let root_todo = world.ok(&[
+        "todo", "add", "ROOT_A_TODO", "--target-at", "2000-01-01T00:00:00Z",
+    ]);
+    let root_todo_id = root_todo["todo"]["id"].as_str().unwrap();
+    world.ok(&["todo", "track", root_todo_id, "--context", &root]);
+    world.ok(&[
+        "todo", "add", "OTHER_AGENT_TODO", "--target-at", "2000-01-01T00:00:00Z",
+    ]);
+
+    let root_value = tool_hook(
+        &world,
+        "codex",
+        "SessionStart",
+        &serde_json::json!({"session_id":session,"source":"startup"}),
+    );
+    let root_text = hook_context(&root_value).unwrap();
+    let root_readiness = readiness(root_text);
+    assert_eq!(root_readiness["agent_context"]["status"], "bound");
+    assert_eq!(root_readiness["agent_context"]["context_id"], root);
+    assert_eq!(root_readiness["plan"]["active"], 1);
+    assert_eq!(root_readiness["plan"]["tracking"]["id"], root_plan_id);
+    assert_eq!(root_readiness["todo"]["open"], 1);
+    assert_eq!(root_readiness["todo"]["reminders"][0]["id"], root_todo_id);
+    let rendered = serde_json::to_string(&root_value).unwrap();
+    assert!(!rendered.contains(other_plan["plan"]["id"].as_str().unwrap()));
+    assert!(!rendered.contains("OTHER_AGENT_PLAN"));
+    assert!(!rendered.contains("OTHER_AGENT_TODO"));
+    assert!(!rendered.contains(session));
+
+    let child_id = "PRIVATE_CHILD_B";
+    let child_value = tool_hook(
+        &world,
+        "codex",
+        "SubagentStart",
+        &serde_json::json!({"session_id":session,"agent_id":child_id}),
+    );
+    let child_readiness = readiness(hook_context(&child_value).unwrap());
+    assert_eq!(child_readiness["agent_context"]["status"], "unbound");
+    assert_eq!(
+        child_readiness["agent_context"]["context_id"],
+        agent_context("codex", session, "subagent", child_id)
+    );
+    assert!(child_readiness.get("plan").is_none());
+    assert!(child_readiness.get("todo").is_none());
+
+    let unresolved = tool_hook(
+        &world,
+        "codex",
+        "SubagentStart",
+        &serde_json::json!({"session_id":session,"agent_type":"worker"}),
+    );
+    let unresolved_readiness = readiness(hook_context(&unresolved).unwrap());
+    assert_eq!(unresolved_readiness["agent_context"]["status"], "unresolved");
+    assert_eq!(
+        unresolved_readiness["agent_context"]["reason"],
+        "missing_child_id"
+    );
+    assert!(unresolved_readiness["agent_context"].get("context_id").is_none());
+    assert!(unresolved_readiness.get("plan").is_none());
+    assert!(unresolved_readiness.get("todo").is_none());
+}
+
 fn put_global_autoload_page(world: &World, slug: &str, body: &str) {
     let path = world.project.join(format!("{slug}.md"));
     fs::write(&path, body).unwrap();
