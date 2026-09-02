@@ -5,13 +5,15 @@ description: Use when an Agent needs to create, resume, advance, block, revise, 
 
 # Using LWC Plan
 
-First run `lwc config show`. Continue only when `plan.setting` is `enabled`. A Skill trigger is not consent to enable Plan: when disabled, do not run Plan commands; explain that the user can opt in with `lwc config set --plan enabled`. While Plan is enabled, the lifecycle Hook includes the active count and bounded `plan.tracking` for the most recently updated active Plan: progress, current step, next step, revision, and a `plan brief` command.
+First run `lwc config show`. Continue only when `plan.setting` is `enabled`. A Skill trigger is not consent to enable Plan: when disabled, do not run Plan commands; explain that the user can opt in with `lwc config set --plan enabled`. A lifecycle Hook with a resolved `agent_context` includes only Plans explicitly tracked by that Agent context. Treat any Plan progress reminder for another context as unrelated and ignore it.
 
 Use Plan only for the current coarse execution plan. It is independent from Todo and must never be converted to or from a Todo automatically.
 
 - Create one objective, explicit done criteria, constraints, and ordered coarse steps.
+- After creating or explicitly claiming a Plan, bind it with `lwc --scope project|global plan track PLAN_ID --context CONTEXT_ID`, using only the opaque ID from the current Hook's `LWC_READINESS.agent_context`. Never infer or copy another Agent's context.
 - Resume with `lwc plan brief PLAN_ID`; it is bounded and contains no hidden reasoning.
-- Treat Hook `plan.tracking` as a continuity cue. Follow its current step and planned next step, but call its `brief` command before any mutation.
+- Treat Hook `plan.tracking` and `plan.additional_trackings` as continuity cues for this context only. Follow the current step and planned next step, but call `brief` before any mutation.
+- Use exact, idempotent `plan untrack PLAN_ID --context CONTEXT_ID` before deliberately switching a context to another Plan; a conflicting `track` never replaces the current association.
 - Before mutation, inspect the current revision and pass `--if-revision`.
 - `advance` completes the focal step with a result and explicitly selects the next pending step.
 - `block` records a concrete blocker. `revise` requires a reason and replaces only unfinished work.

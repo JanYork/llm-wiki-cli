@@ -43,9 +43,12 @@ selected scope; never infer installation from capability alone.
 For recognized LWC shell mutations, Claude Code, Cursor, global Hermes, and
 Antigravity can enforce a native ask. Codex can provide advisory additional
 context only. Every other consent/event pair is an exact no-op and must remain
-uninstalled. Active actionable Plans may use a one-shot `Stop` continuation only
-on Claude Code and Codex, whose native `stop_hook_active` guard prevents
-recursion; do not simulate this on other hosts. Install, refresh, and uninstall
+uninstalled. Active actionable Plans may use one-shot `Stop` or verified
+`SubagentStop` continuation only on Claude Code and Codex, whose native
+`stop_hook_active` guard prevents recursion; do not simulate this on other hosts.
+Status reports identity quality separately from installed events as
+`exact_child`, `root_only`, or `unavailable`; incomplete identity fails closed.
+Install, refresh, and uninstall
 operate on exact LWC-owned entries inside a hook group or named hook while
 preserving user siblings and unrelated shared-target entries.
 
@@ -640,14 +643,22 @@ immutable parent relation. Use `todo list/search --parent TODO_ID` for direct ch
 Parentage is organization only: no recursive tree expansion, state cascade, dependency,
 reparenting, or Plan-step conversion is implied.
 
-Lifecycle Hook readiness exposes only enabled capabilities. `todo` and `plan` are
-separate top-level objects. For Plan, `plan.tracking`
-selects the most recently updated active Plan and includes bounded title, progress,
-current step, next step, revision, and an exact `plan brief` command. Treat it as a
-continuity cue, then call `brief` before mutation. It omits objective, done criteria,
+Lifecycle Hook readiness exposes an opaque `agent_context`; it never stores or
+renders the host's raw session or child ID. An Agent explicitly binds work with
+`plan track` or `todo track` and removes only an exact association with the matching
+`untrack`. Plan conflicts never replace an existing association, and all track and
+untrack retries are idempotent. Project and global associations remain local to
+their Store and are not exported by Sync.
+
+`todo` and `plan` are separate top-level objects and appear only for the current
+resolved, bound context. For Plan, `plan.tracking` is the primary scoped Plan and
+`plan.additional_trackings` lists another scope tracked by the same context. Each
+includes bounded title, progress, current step, next step, revision, and an exact
+`plan brief` command. Treat these as continuity cues, ignore reminders belonging to
+another Agent context, then call `brief` before mutation. Hook output omits objective, done criteria,
 constraints, verification text, results, blockers, evidence, and Todo cue/detail text;
 the Hook never mutates task state.
-For Todo, `todo.reminders` appears only when Todo is enabled and due open items exist.
+For Todo, `todo.reminders` appears only when Todo is enabled and tracked due open items exist.
 It contains at most the three oldest-created due items and `omitted_reminders`; each
 entry is limited to ID, bounded title, direct parent ID, and normalized target time.
 

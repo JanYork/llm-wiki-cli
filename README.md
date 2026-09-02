@@ -515,9 +515,10 @@ Todo stores deferred work; Plan stores the currently executing objective,
 ordered steps, progress, and revision. They are independent, opt-in
 capabilities and never convert into each other automatically.
 
-Bounded lifecycle context lets an Agent recover the active plan and due
-reminders after session or compaction boundaries without exposing private
-details unnecessarily.
+Bounded lifecycle context isolates Plan and Todo progress by Agent session and,
+where the host exposes it, by subagent. Each Agent sees only explicitly tracked
+work for its opaque context; detailed commands and host capability limits live
+in the workflow guide.
 
 [Todo and Plan workflow →](docs/agent-workflow.md#todo-and-plan)
 

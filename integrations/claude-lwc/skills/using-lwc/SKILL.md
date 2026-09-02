@@ -21,6 +21,8 @@ widen that authority.
 - Keep project state and deliverables inside the active project root.
 - Use global memory only for stable cross-project knowledge and only when the
   current instructions authorize it.
+- Follow Plan/Todo progress only when it is bound to the current lifecycle
+  Hook's opaque `LWC_READINESS.agent_context`; ignore another Agent context's reminders.
 - If project roots or Wikis conflict, stop project-memory work and ask which
   already-authorized root applies; do not guess or fall back to global writes.
 
