@@ -801,6 +801,12 @@ fn apply_prepared_sync_state(tx: &Transaction<'_>, state: &PreparedSyncState) ->
     import_sync_memory(tx, state, &memory_requests)?;
     import_sync_todos(tx, state, &todo_revisions, &todo_requests)?;
     import_sync_plans(tx, state, &plan_revisions, &plan_requests)?;
+    tx.execute_batch(
+        "DELETE FROM agent_todo_tracks
+         WHERE NOT EXISTS(SELECT 1 FROM todo_items WHERE id=agent_todo_tracks.todo_id);
+         DELETE FROM agent_plan_tracks
+         WHERE NOT EXISTS(SELECT 1 FROM plans WHERE id=agent_plan_tracks.plan_id);",
+    )?;
     import_sync_work_audits(tx, state)?;
     validate_sync_draft_intents(state)?;
     validate_sync_domain_invariants(tx)?;
