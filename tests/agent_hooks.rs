@@ -346,7 +346,8 @@ fn agent_context_isolates_root_and_child_plan_todo_readiness() {
         child_context
     );
     assert_eq!(child_readiness["plan"]["tracking"]["id"], other_plan_id);
-    assert!(child_readiness.get("todo").is_none());
+    assert_eq!(child_readiness["todo"]["open"], 0);
+    assert!(child_readiness["todo"].get("reminders").is_none());
 
     let unresolved = tool_hook(
         &world,
