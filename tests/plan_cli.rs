@@ -178,12 +178,16 @@ fn plan_tracking_is_exact_and_isolated_by_agent_context() {
         "plan_tracking_conflict"
     );
     assert_eq!(
-        w.error(&["plan", "untrack", second_id, "--context", &context_a])["error"]["code"],
-        "plan_tracking_not_found"
+        w.ok(&["plan", "untrack", second_id, "--context", &context_a])["action"],
+        "unchanged"
     );
     assert_eq!(
         w.ok(&["plan", "untrack", first_id, "--context", &context_a])["action"],
         "untracked"
+    );
+    assert_eq!(
+        w.ok(&["plan", "untrack", first_id, "--context", &context_a])["action"],
+        "unchanged"
     );
     assert_eq!(
         w.error(&["plan", "current", "--context", "bad"])["error"]["code"],

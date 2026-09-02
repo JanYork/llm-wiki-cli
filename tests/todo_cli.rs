@@ -242,12 +242,16 @@ fn todo_tracking_is_exact_and_isolated_by_agent_context() {
         1
     );
     assert_eq!(
-        w.error(&["todo", "untrack", first_id, "--context", &context_b])["error"]["code"],
-        "todo_tracking_not_found"
+        w.ok(&["todo", "untrack", first_id, "--context", &context_b])["action"],
+        "unchanged"
     );
     assert_eq!(
         w.ok(&["todo", "untrack", first_id, "--context", &context_a])["action"],
         "untracked"
+    );
+    assert_eq!(
+        w.ok(&["todo", "untrack", first_id, "--context", &context_a])["action"],
+        "unchanged"
     );
     assert_eq!(
         w.error(&["todo", "list", "--context", "bad"])["error"]["code"],
