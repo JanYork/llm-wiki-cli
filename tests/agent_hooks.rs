@@ -332,6 +332,7 @@ fn agent_context_isolates_root_and_child_plan_todo_readiness() {
     let child_prompt = serde_json::to_string(&child_prompt).unwrap();
     assert!(child_prompt.contains(other_plan_id));
     assert!(!child_prompt.contains(root_plan_id));
+    assert!(!child_prompt.contains(child_id));
     let child_value = tool_hook(
         &world,
         "codex",
