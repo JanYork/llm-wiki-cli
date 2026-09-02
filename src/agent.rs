@@ -524,7 +524,17 @@ fn prompt_readiness(
     {
         value["sync"] = sync;
     }
-    let _ = apply_scoped_context_work(scope, cwd, deadline, context, &mut value);
+    if context.id().is_some() {
+        let _ = apply_scoped_context_work(scope, cwd, deadline, context, &mut value);
+    } else {
+        value["agent_context"] = context.readiness(None);
+    }
+    if plan_enabled && value.get("plan").is_none() {
+        value["plan"] = json!({"ready": true, "active": 0});
+    }
+    if todo_enabled && value.get("todo").is_none() {
+        value["todo"] = json!({"ready": true, "open": 0});
+    }
     value
 }
 
@@ -538,7 +548,11 @@ fn readiness_for_hook(
     deadline: Instant,
     context: &identity::AgentExecutionContext,
 ) -> Result<Value> {
-    let mut value = readiness_until(cwd, Some(deadline), Some(context))?;
+    let mut value = match readiness_until(cwd, Some(deadline), Some(context)) {
+        Ok(value) => value,
+        Err(_) if scope == Scope::All => json!({}),
+        Err(error) => return Err(error),
+    };
     apply_scoped_context_work(scope, cwd, deadline, context, &mut value)?;
     Ok(value)
 }
@@ -566,7 +580,11 @@ fn apply_scoped_context_work(
     for path in resolve_read_store_paths(scope, cwd, true)? {
         ensure_hook_deadline(Some(deadline))?;
         let scope_name = scope_name(path.scope);
-        let store = open_store_for_hook_until(scope_name, &path.path, deadline)?;
+        let store = match open_store_for_hook_until(scope_name, &path.path, deadline) {
+            Ok(store) => store,
+            Err(_) if scope == Scope::All => continue,
+            Err(error) => return Err(error),
+        };
         bound |= store.agent_tracking_bound(context_id)?;
         if config::resolve_plan(scope_name, &path.path)?.setting
             == config::CapabilitySetting::Enabled
