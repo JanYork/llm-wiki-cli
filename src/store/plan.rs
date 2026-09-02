@@ -175,6 +175,81 @@ impl Store {
         })))
     }
 
+    pub fn plan_track(&mut self, id: &str, context: &str) -> Result<Value> {
+        let id = normalize_todo_id("plan_id", id)?;
+        let context = normalize_agent_context(context)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = tx
+            .query_row("SELECT state FROM plans WHERE id=?1", [&id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .ok_or_else(|| AppError::new("plan_not_found", format!("Plan '{id}' was not found")))?;
+        if state != "active" {
+            return Err(AppError::new(
+                "invalid_plan_transition",
+                "only active Plans can be tracked",
+            ));
+        }
+        if let Some(existing) = tx
+            .query_row(
+                "SELECT plan_id FROM agent_plan_tracks WHERE context_id=?1",
+                [&context],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            if existing == id {
+                tx.commit()?;
+                return Ok(json!({"action":"unchanged","context":context,"plan_id":id}));
+            }
+            return Err(AppError::new(
+                "plan_tracking_conflict",
+                "the context already tracks another Plan",
+            )
+            .with_details(json!({"plan_id":existing})));
+        }
+        tx.execute(
+            "INSERT INTO agent_plan_tracks(context_id,plan_id) VALUES(?1,?2)",
+            params![context, id],
+        )?;
+        tx.commit()?;
+        Ok(json!({"action":"tracked","context":context,"plan_id":id}))
+    }
+    pub fn plan_untrack(&mut self, id: &str, context: &str) -> Result<Value> {
+        let id = normalize_todo_id("plan_id", id)?;
+        let context = normalize_agent_context(context)?;
+        let changed = self.conn.execute(
+            "DELETE FROM agent_plan_tracks WHERE context_id=?1 AND plan_id=?2",
+            params![context, id],
+        )?;
+        if changed == 0 {
+            return Err(AppError::new(
+                "plan_tracking_not_found",
+                "the context does not track that Plan",
+            ));
+        }
+        Ok(json!({"action":"untracked","context":context,"plan_id":id}))
+    }
+    pub fn tracked_plan(&self, context: &str) -> Result<Value> {
+        let context = normalize_agent_context(context)?;
+        let id = self
+            .conn
+            .query_row(
+                "SELECT p.id FROM agent_plan_tracks a JOIN plans p ON p.id=a.plan_id WHERE a.context_id=?1 AND p.state='active'",
+                [&context],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let plan = id
+            .as_deref()
+            .map(|id| load_plan(&self.conn, id, &self.scope))
+            .transpose()?;
+        Ok(json!({"scope":self.scope,"database":self.database,"context":context,"plan":plan}))
+    }
+
     pub fn plan_create(&mut self, mut input: PlanCreateInput) -> Result<Value> {
         input.title = normalize_todo_text("title", &input.title)?;
         input.objective = normalize_todo_text("objective", &input.objective)?;

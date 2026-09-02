@@ -37,7 +37,9 @@ fn attached_store_identity(conn: &Connection) -> Result<StoreIdentity> {
 }
 
 fn validate_changeset_table_inventory(conn: &Connection, schema: &str) -> Result<()> {
-    const TABLES: [&str; 61] = [
+    const TABLES: [&str; 63] = [
+        "agent_plan_tracks",
+        "agent_todo_tracks",
         "changesets",
         "ingest_jobs",
         "links",

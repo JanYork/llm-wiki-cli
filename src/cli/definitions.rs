@@ -665,19 +665,21 @@ enum TagCommand {
 #[derive(Subcommand)]
 enum TodoCommand {
     Add { title:Option<String>, #[arg(long="tag")] tags:Vec<String>, #[arg(long)] cue:Option<String>, #[arg(long)] detail:Option<String>, #[arg(long)] parent:Option<String>, #[arg(long)] target_at:Option<String>, #[arg(long)] request_id:Option<String>, #[arg(long,value_name="JSON|-|@PATH")] json:Option<String> },
-    List { #[arg(long,value_parser=["open","done","cancelled"])] state:Option<String>, #[arg(long)] tag:Option<String>, #[arg(long)] parent:Option<String>, #[arg(long,default_value_t=100)] limit:usize, #[arg(long,default_value_t=0)] offset:usize },
+    List { #[arg(long,value_parser=["open","done","cancelled"])] state:Option<String>, #[arg(long)] tag:Option<String>, #[arg(long)] parent:Option<String>, #[arg(long)] context:Option<String>, #[arg(long,default_value_t=100)] limit:usize, #[arg(long,default_value_t=0)] offset:usize },
     Search { query:String, #[arg(long,value_parser=["open","done","cancelled"])] state:Option<String>, #[arg(long)] tag:Option<String>, #[arg(long)] parent:Option<String>, #[arg(long,default_value_t=100)] limit:usize, #[arg(long,default_value_t=0)] offset:usize },
     Show { todo_id:String },
     Update { todo_id:String, #[arg(long)] if_revision:i64, #[arg(long)] title:Option<String>, #[arg(long,conflicts_with="clear_cue")] cue:Option<String>, #[arg(long)] clear_cue:bool, #[arg(long,conflicts_with="clear_detail")] detail:Option<String>, #[arg(long)] clear_detail:bool, #[arg(long,conflicts_with="clear_target_at")] target_at:Option<String>, #[arg(long)] clear_target_at:bool, #[arg(long="add-tag")] add_tags:Vec<String>, #[arg(long="remove-tag")] remove_tags:Vec<String> },
     Done { todo_id:String, #[arg(long)] if_revision:i64, #[arg(long)] result:String },
     Cancel { todo_id:String, #[arg(long)] if_revision:i64, #[arg(long)] reason:String },
     Reopen { todo_id:String, #[arg(long)] if_revision:i64 },
+    Track { todo_id:String, #[arg(long)] context:String },
+    Untrack { todo_id:String, #[arg(long)] context:String },
 }
 
 #[derive(Subcommand)]
 enum PlanCommand {
     Create { title:Option<String>, #[arg(long)] objective:Option<String>, #[arg(long)] done_when:Option<String>, #[arg(long="tag")] tags:Vec<String>, #[arg(long="constraint")] constraints:Vec<String>, #[arg(long="step")] steps:Vec<String>, #[arg(long)] request_id:Option<String>, #[arg(long,value_name="JSON|-|@PATH")] json:Option<String> },
-    Current { #[arg(long)] tag:Option<String>, #[arg(long,default_value_t=100)] limit:usize, #[arg(long,default_value_t=0)] offset:usize },
+    Current { #[arg(long)] context:Option<String>, #[arg(long)] tag:Option<String>, #[arg(long,default_value_t=100)] limit:usize, #[arg(long,default_value_t=0)] offset:usize },
     List { #[arg(long,value_parser=["active","completed","abandoned"])] state:Option<String>, #[arg(long)] tag:Option<String>, #[arg(long,default_value_t=100)] limit:usize, #[arg(long,default_value_t=0)] offset:usize },
     Search { query:String, #[arg(long,value_parser=["active","completed","abandoned"])] state:Option<String>, #[arg(long)] tag:Option<String>, #[arg(long,default_value_t=100)] limit:usize, #[arg(long,default_value_t=0)] offset:usize },
     Show { plan_id:String }, Brief { plan_id:String },
@@ -686,6 +688,8 @@ enum PlanCommand {
     Revise { plan_id:String, #[arg(long)] if_revision:i64, #[arg(long)] reason:String, #[arg(long,value_name="JSON|-|@PATH")] json:String },
     Complete { plan_id:String, #[arg(long)] if_revision:i64, #[arg(long)] result:String, #[arg(long)] evidence:String, #[arg(long)] done_when_checked:bool },
     Abandon { plan_id:String, #[arg(long)] if_revision:i64, #[arg(long)] reason:String },
+    Track { plan_id:String, #[arg(long)] context:String },
+    Untrack { plan_id:String, #[arg(long)] context:String },
 }
 
 #[derive(Subcommand)]

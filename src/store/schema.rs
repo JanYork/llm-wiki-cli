@@ -214,6 +214,7 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
     create_temporal_memory_schema(&tx)?;
     create_todo_schema(&tx)?;
     create_plan_schema(&tx)?;
+    create_agent_tracking_schema(&tx)?;
     create_changeset_state(&tx)?;
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('schema', ?1)",

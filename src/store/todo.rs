@@ -32,6 +32,26 @@ fn normalize_todo_id(name: &str, value: &str) -> Result<String> {
     Ok(value.to_ascii_lowercase())
 }
 
+fn normalize_agent_context(value: &str) -> Result<String> {
+    let Some(digest) = value.strip_prefix("lwcctx-v1-") else {
+        return Err(AppError::new(
+            "invalid_agent_context",
+            "context must be an lwcctx-v1 token",
+        ));
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(AppError::new(
+            "invalid_agent_context",
+            "context must be an lwcctx-v1 token",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
 fn normalize_todo_target_at(conn: &Connection, value: &str) -> Result<String> {
     let value = normalize_todo_text("target_at", value)?;
     let bytes = value.as_bytes();
@@ -193,6 +213,60 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let omitted = total.saturating_sub(reminders.len());
         Ok((reminders, omitted))
+    }
+    pub fn todo_track(&mut self, id: &str, context: &str) -> Result<Value> {
+        let id = normalize_todo_id("todo_id", id)?;
+        let context = normalize_agent_context(context)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = tx
+            .query_row("SELECT state FROM todo_items WHERE id=?1", [&id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .ok_or_else(|| AppError::new("todo_not_found", format!("Todo '{id}' was not found")))?;
+        if state != "open" {
+            return Err(AppError::new(
+                "invalid_todo_transition",
+                "only open Todos can be tracked",
+            ));
+        }
+        let changed = tx.execute(
+            "INSERT OR IGNORE INTO agent_todo_tracks(context_id,todo_id) VALUES(?1,?2)",
+            params![context, id],
+        )?;
+        tx.commit()?;
+        Ok(json!({"action":if changed == 0 {"unchanged"} else {"tracked"},"context":context,"todo_id":id}))
+    }
+    pub fn todo_untrack(&mut self, id: &str, context: &str) -> Result<Value> {
+        let id = normalize_todo_id("todo_id", id)?;
+        let context = normalize_agent_context(context)?;
+        let changed = self.conn.execute(
+            "DELETE FROM agent_todo_tracks WHERE context_id=?1 AND todo_id=?2",
+            params![context, id],
+        )?;
+        if changed == 0 {
+            return Err(AppError::new(
+                "todo_tracking_not_found",
+                "the context does not track that Todo",
+            ));
+        }
+        Ok(json!({"action":"untracked","context":context,"todo_id":id}))
+    }
+    pub fn tracked_todos(&self, context: &str) -> Result<Value> {
+        let context = normalize_agent_context(context)?;
+        let mut statement = self.conn.prepare(
+            "SELECT t.id FROM agent_todo_tracks a JOIN todo_items t ON t.id=a.todo_id WHERE a.context_id=?1 ORDER BY t.updated_at DESC,t.id",
+        )?;
+        let ids = statement
+            .query_map([&context], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let todos = ids
+            .iter()
+            .map(|id| load_todo(&self.conn, id, &self.scope))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(json!({"scope":self.scope,"database":self.database,"context":context,"returned":todos.len(),"todos":todos}))
     }
     pub fn todo_add(&mut self, mut input: TodoCreateInput) -> Result<Value> {
         input.title = normalize_todo_text("title", &input.title)?;

@@ -140,6 +140,10 @@ fn prepare_store(
         migrate_structured_span_index_v17(conn)?;
         version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     }
+    if version == STRUCTURED_SPAN_INDEX_VERSION {
+        migrate_agent_tracking_v18(conn)?;
+        version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    }
     if version != USER_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
@@ -313,6 +317,62 @@ fn create_plan_schema(tx: &Transaction<'_>) -> Result<()> {
       CREATE VIRTUAL TABLE IF NOT EXISTS plan_fts USING fts5(plan_id UNINDEXED,title_terms,tag_terms,objective_terms,constraint_terms,step_terms,content='',contentless_delete=1,contentless_unindexed=1);
     "#))?;
     Ok(())
+}
+
+fn create_agent_tracking_schema(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS agent_plan_tracks(
+          context_id TEXT PRIMARY KEY,
+          plan_id TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT ({TIMESTAMP_SQL}),
+          updated_at TEXT NOT NULL DEFAULT ({TIMESTAMP_SQL}),
+          FOREIGN KEY(plan_id) REFERENCES plans(id) DEFERRABLE INITIALLY DEFERRED
+        );
+        CREATE INDEX IF NOT EXISTS agent_plan_tracks_plan ON agent_plan_tracks(plan_id);
+        CREATE TABLE IF NOT EXISTS agent_todo_tracks(
+          context_id TEXT NOT NULL,
+          todo_id TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT ({TIMESTAMP_SQL}),
+          PRIMARY KEY(context_id,todo_id),
+          FOREIGN KEY(todo_id) REFERENCES todo_items(id) DEFERRABLE INITIALLY DEFERRED
+        );
+        CREATE INDEX IF NOT EXISTS agent_todo_tracks_todo ON agent_todo_tracks(todo_id);
+        "#
+    ))?;
+    Ok(())
+}
+
+fn migrate_agent_tracking_v18(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if current == AGENT_TRACKING_VERSION {
+        tx.commit()?;
+        return Ok(());
+    }
+    if current != STRUCTURED_SPAN_INDEX_VERSION {
+        return Err(AppError::new(
+            "unsupported_store_version",
+            format!("cannot migrate wiki database version {current} to {USER_VERSION}"),
+        ));
+    }
+    create_agent_tracking_schema(&tx).map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to prepare v{AGENT_TRACKING_VERSION} Agent tracking schema: {error}"),
+        )
+    })?;
+    tx.execute(
+        "INSERT INTO meta(key,value) VALUES ('format_version',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [AGENT_TRACKING_VERSION.to_string()],
+    )?;
+    tx.pragma_update(None, "user_version", AGENT_TRACKING_VERSION)?;
+    tx.commit().map_err(|error| {
+        AppError::new(
+            "store_migration_failed",
+            format!("failed to commit v{AGENT_TRACKING_VERSION} Agent tracking migration: {error}"),
+        )
+    })
 }
 
 fn prepare_store_read_only(conn: &Connection) -> Result<()> {
