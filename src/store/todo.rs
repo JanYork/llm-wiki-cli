@@ -246,13 +246,7 @@ impl Store {
             "DELETE FROM agent_todo_tracks WHERE context_id=?1 AND todo_id=?2",
             params![context, id],
         )?;
-        if changed == 0 {
-            return Err(AppError::new(
-                "todo_tracking_not_found",
-                "the context does not track that Todo",
-            ));
-        }
-        Ok(json!({"action":"untracked","context":context,"todo_id":id}))
+        Ok(json!({"action":if changed == 0 {"unchanged"} else {"untracked"},"context":context,"todo_id":id}))
     }
     pub fn tracked_todos(&self, context: &str) -> Result<Value> {
         let context = normalize_agent_context(context)?;

@@ -245,13 +245,7 @@ impl Store {
             "DELETE FROM agent_plan_tracks WHERE context_id=?1 AND plan_id=?2",
             params![context, id],
         )?;
-        if changed == 0 {
-            return Err(AppError::new(
-                "plan_tracking_not_found",
-                "the context does not track that Plan",
-            ));
-        }
-        Ok(json!({"action":"untracked","context":context,"plan_id":id}))
+        Ok(json!({"action":if changed == 0 {"unchanged"} else {"untracked"},"context":context,"plan_id":id}))
     }
     pub fn tracked_plan(&self, context: &str) -> Result<Value> {
         let context = normalize_agent_context(context)?;
