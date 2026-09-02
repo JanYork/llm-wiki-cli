@@ -15,8 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod install;
 mod identity;
+mod install;
 mod intent;
 mod signals;
 mod targets;
@@ -489,10 +489,9 @@ fn prompt_readiness(
     value["agent_context"] = context.readiness(context_bound);
     if todo_enabled && context_bound == Some(true) {
         value["todo"] = match &hook_store {
-            Some(Ok(store)) => match store.tracked_open_todo_readiness(
-                context.id().expect("bound context has an ID"),
-                3,
-            ) {
+            Some(Ok(store)) => match store
+                .tracked_open_todo_readiness(context.id().expect("bound context has an ID"), 3)
+            {
                 Ok((open, reminders, omitted)) => {
                     let mut state = json!({"ready": true, "open": open});
                     if !reminders.is_empty() {
@@ -566,8 +565,14 @@ fn apply_scoped_context_work(
 ) -> Result<()> {
     let Some(context_id) = context.id() else {
         value["agent_context"] = context.readiness(None);
-        value.as_object_mut().expect("readiness object").remove("plan");
-        value.as_object_mut().expect("readiness object").remove("todo");
+        value
+            .as_object_mut()
+            .expect("readiness object")
+            .remove("plan");
+        value
+            .as_object_mut()
+            .expect("readiness object")
+            .remove("todo");
         return Ok(());
     };
     let mut bound = false;
@@ -598,8 +603,7 @@ fn apply_scoped_context_work(
             == config::CapabilitySetting::Enabled
         {
             todo_enabled = true;
-            let (open, reminders, omitted) =
-                store.tracked_open_todo_readiness(context_id, 3)?;
+            let (open, reminders, omitted) = store.tracked_open_todo_readiness(context_id, 3)?;
             todo_open += open;
             todo_omitted += omitted;
             todo_reminders.extend(reminders);
@@ -817,18 +821,20 @@ fn readiness_until(
                 },
                 None => match (store.open_todo_count(), store.due_todo_reminders(3)) {
                     (Ok(open), Ok((reminders, omitted))) => {
-                    let mut state = json!({
-                        "ready": true,
-                        "open": open,
-                        "list": "lwc todo list --limit 20",
-                    });
-                    if !reminders.is_empty() {
-                        state["reminders"] = json!(reminders);
-                        state["omitted_reminders"] = json!(omitted);
+                        let mut state = json!({
+                            "ready": true,
+                            "open": open,
+                            "list": "lwc todo list --limit 20",
+                        });
+                        if !reminders.is_empty() {
+                            state["reminders"] = json!(reminders);
+                            state["omitted_reminders"] = json!(omitted);
+                        }
+                        state
                     }
-                    state
+                    (Err(error), _) | (_, Err(error)) => {
+                        json!({"ready":false,"error_code":error.code})
                     }
-                    (Err(error), _) | (_, Err(error)) => json!({"ready":false,"error_code":error.code}),
                 },
             },
             Some(Err(error)) => json!({"ready":false,"error_code":error.code}),
@@ -837,8 +843,10 @@ fn readiness_until(
     }
     if plan_enabled && context.is_none_or(|_| context_bound == Some(true)) {
         value["plan"] = match &hook_store {
-            Some(Ok(store)) => plan_hook_readiness(store, true, context.and_then(|context| context.id()))
-                .unwrap_or_else(|error| json!({"ready":false,"error_code":error.code})),
+            Some(Ok(store)) => {
+                plan_hook_readiness(store, true, context.and_then(|context| context.id()))
+                    .unwrap_or_else(|error| json!({"ready":false,"error_code":error.code}))
+            }
             Some(Err(error)) => json!({"ready":false,"error_code":error.code}),
             None => json!({"ready":false}),
         };

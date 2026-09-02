@@ -232,9 +232,10 @@ fn create_active_plan(world: &World, title: &str, objective: &str, done_when: &s
         ("codex", DEFAULT_CODEX_SESSION),
     ] {
         let context = agent_context(target, session, "main", "main");
-        let _ = world.command().args([
-            "plan", "track", id, "--context", &context,
-        ]).output();
+        let _ = world
+            .command()
+            .args(["plan", "track", id, "--context", &context])
+            .output();
     }
     let prompt_context = agent_context(
         "claude",
@@ -242,9 +243,10 @@ fn create_active_plan(world: &World, title: &str, objective: &str, done_when: &s
         "subagent",
         DEFAULT_CLAUDE_PROMPT_AGENT,
     );
-    let _ = world.command().args([
-        "plan", "track", id, "--context", &prompt_context,
-    ]).output();
+    let _ = world
+        .command()
+        .args(["plan", "track", id, "--context", &prompt_context])
+        .output();
     created
 }
 
@@ -268,12 +270,20 @@ fn agent_context_isolates_root_and_child_plan_todo_readiness() {
     let root_plan_id = root_plan["plan"]["id"].as_str().unwrap();
     world.ok(&["plan", "track", root_plan_id, "--context", &root]);
     let root_todo = world.ok(&[
-        "todo", "add", "ROOT_A_TODO", "--target-at", "2000-01-01T00:00:00Z",
+        "todo",
+        "add",
+        "ROOT_A_TODO",
+        "--target-at",
+        "2000-01-01T00:00:00Z",
     ]);
     let root_todo_id = root_todo["todo"]["id"].as_str().unwrap();
     world.ok(&["todo", "track", root_todo_id, "--context", &root]);
     world.ok(&[
-        "todo", "add", "OTHER_AGENT_TODO", "--target-at", "2000-01-01T00:00:00Z",
+        "todo",
+        "add",
+        "OTHER_AGENT_TODO",
+        "--target-at",
+        "2000-01-01T00:00:00Z",
     ]);
 
     let root_value = tool_hook(
@@ -356,12 +366,19 @@ fn agent_context_isolates_root_and_child_plan_todo_readiness() {
         &serde_json::json!({"session_id":session,"agent_type":"worker"}),
     );
     let unresolved_readiness = readiness(hook_context(&unresolved).unwrap());
-    assert_eq!(unresolved_readiness["agent_context"]["status"], "unresolved");
+    assert_eq!(
+        unresolved_readiness["agent_context"]["status"],
+        "unresolved"
+    );
     assert_eq!(
         unresolved_readiness["agent_context"]["reason"],
         "missing_child_id"
     );
-    assert!(unresolved_readiness["agent_context"].get("context_id").is_none());
+    assert!(
+        unresolved_readiness["agent_context"]
+            .get("context_id")
+            .is_none()
+    );
     assert!(unresolved_readiness.get("plan").is_none());
     assert!(unresolved_readiness.get("todo").is_none());
 }
@@ -410,7 +427,10 @@ fn agent_context_stop_continues_only_its_tracked_plan() {
         "SubagentStop",
         &serde_json::json!({"session_id":session_a,"agent_id":child_id}),
     );
-    assert_eq!(signal_batch(&child_stop)["signals"][0]["state"]["id"], plan_b_id);
+    assert_eq!(
+        signal_batch(&child_stop)["signals"][0]["state"]["id"],
+        plan_b_id
+    );
     let unresolved_child = tool_hook(
         &world,
         "codex",
@@ -430,22 +450,55 @@ fn scope_all_hook_merges_only_the_current_contexts_project_and_global_work() {
     let context_id = agent_context("codex", session, "main", "main");
     let project_plan = create_active_plan(&world, "PROJECT_PLAN", "p", "p");
     let global_plan = world.ok(&[
-        "--scope", "global", "plan", "create", "GLOBAL_PLAN", "--objective", "g",
-        "--done-when", "g", "--step", "g",
+        "--scope",
+        "global",
+        "plan",
+        "create",
+        "GLOBAL_PLAN",
+        "--objective",
+        "g",
+        "--done-when",
+        "g",
+        "--step",
+        "g",
     ]);
     let other_global = world.ok(&[
-        "--scope", "global", "plan", "create", "OTHER_GLOBAL_PLAN", "--objective", "x",
-        "--done-when", "x", "--step", "x",
+        "--scope",
+        "global",
+        "plan",
+        "create",
+        "OTHER_GLOBAL_PLAN",
+        "--objective",
+        "x",
+        "--done-when",
+        "x",
+        "--step",
+        "x",
     ]);
     let project_id = project_plan["plan"]["id"].as_str().unwrap();
     let global_id = global_plan["plan"]["id"].as_str().unwrap();
     world.ok(&["plan", "track", project_id, "--context", &context_id]);
     world.ok(&[
-        "--scope", "global", "plan", "track", global_id, "--context", &context_id,
+        "--scope",
+        "global",
+        "plan",
+        "track",
+        global_id,
+        "--context",
+        &context_id,
     ]);
 
     let start = hook_json(&world.output(
-        &["--scope", "all", "agent", "hook", "--agent", "codex", "--event", "SessionStart"],
+        &[
+            "--scope",
+            "all",
+            "agent",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "SessionStart",
+        ],
         &serde_json::json!({"session_id":session,"source":"startup"}).to_string(),
     ));
     let text = hook_context(&start).unwrap();
@@ -457,7 +510,9 @@ fn scope_all_hook_merges_only_the_current_contexts_project_and_global_work() {
     assert!(!rendered.contains("OTHER_GLOBAL_PLAN"));
 
     let stop = hook_json(&world.output(
-        &["--scope", "all", "agent", "hook", "--agent", "codex", "--event", "Stop"],
+        &[
+            "--scope", "all", "agent", "hook", "--agent", "codex", "--event", "Stop",
+        ],
         &serde_json::json!({"session_id":session}).to_string(),
     ));
     let stopped = serde_json::to_string(&stop).unwrap();
@@ -1071,7 +1126,11 @@ fn signal_prompt_maps_active_provider_states_without_mutation_or_private_fields(
         DEFAULT_CLAUDE_PROMPT_AGENT,
     );
     todo.ok(&[
-        "todo", "track", due["todo"]["id"].as_str().unwrap(), "--context", &context_id,
+        "todo",
+        "track",
+        due["todo"]["id"].as_str().unwrap(),
+        "--context",
+        &context_id,
     ]);
     let value = prompt_hook(&todo, "review my todo list");
     let signal = &signal_batch(&value)["signals"][0];
@@ -2247,7 +2306,11 @@ fn signal_plan_candidate_over_three_kib_utf8_is_dropped_deterministically() {
     ]);
     let context_id = agent_context("claude", DEFAULT_CLAUDE_SESSION, "main", "main");
     world.ok(&[
-        "plan", "track", created["plan"]["id"].as_str().unwrap(), "--context", &context_id,
+        "plan",
+        "track",
+        created["plan"]["id"].as_str().unwrap(),
+        "--context",
+        &context_id,
     ]);
 
     let first = boundary_hook(&world);
@@ -2382,10 +2445,13 @@ fn signal_multiple_active_plans_only_exposes_the_contexts_tracked_plan() {
     ];
 
     for (event, source, semantic_event) in cases {
-        let value = hook_json(&world.output(
-            &["agent", "hook", "--agent", "claude", "--event", event],
-            &serde_json::json!({"source": source, "session_id": DEFAULT_CLAUDE_SESSION}).to_string(),
-        ));
+        let value = hook_json(
+            &world.output(
+                &["agent", "hook", "--agent", "claude", "--event", event],
+                &serde_json::json!({"source": source, "session_id": DEFAULT_CLAUDE_SESSION})
+                    .to_string(),
+            ),
+        );
         let batch = signal_batch(&value);
         assert_signal_shape(&batch, semantic_event);
         let signals = batch["signals"].as_array().unwrap();
@@ -2409,10 +2475,7 @@ fn signal_multiple_active_plans_only_exposes_the_contexts_tracked_plan() {
     }
 
     let prompt = prompt_hook(&world, "continue the current plan");
-    assert_eq!(
-        signal_batch(&prompt)["signals"][0]["kind"],
-        "plan.resume"
-    );
+    assert_eq!(signal_batch(&prompt)["signals"][0]["kind"], "plan.resume");
     let prompt_rendered = serde_json::to_string(&prompt).unwrap();
     for secret in [
         second["plan"]["id"].as_str().unwrap(),
@@ -2464,10 +2527,13 @@ fn signal_stop_continues_only_the_contexts_tracked_plan_among_multiple_active() 
         "SECOND_STOP_PRIVATE_OBJECTIVE",
         "SECOND_STOP_PRIVATE_DONE_WHEN",
     );
-    let value = hook_json(&world.output(
-        &["agent", "hook", "--agent", "claude", "--event", "Stop"],
-        &serde_json::json!({"stop_hook_active": false, "session_id": DEFAULT_CLAUDE_SESSION}).to_string(),
-    ));
+    let value = hook_json(
+        &world.output(
+            &["agent", "hook", "--agent", "claude", "--event", "Stop"],
+            &serde_json::json!({"stop_hook_active": false, "session_id": DEFAULT_CLAUDE_SESSION})
+                .to_string(),
+        ),
+    );
     assert_eq!(value["decision"], "block", "{value}");
     let batch = signal_batch(&value);
     assert_signal_shape(&batch, "stop");
@@ -2597,10 +2663,13 @@ fn signal_executable_active_plan_blocks_stop_once_without_mutation() {
     let plan_id = created["plan"]["id"].as_str().unwrap();
     let before = world.ok(&["plan", "show", plan_id])["plan"].clone();
 
-    let value = hook_json(&world.output(
-        &["agent", "hook", "--agent", "claude", "--event", "Stop"],
-        &serde_json::json!({"stop_hook_active": false, "session_id": DEFAULT_CLAUDE_SESSION}).to_string(),
-    ));
+    let value = hook_json(
+        &world.output(
+            &["agent", "hook", "--agent", "claude", "--event", "Stop"],
+            &serde_json::json!({"stop_hook_active": false, "session_id": DEFAULT_CLAUDE_SESSION})
+                .to_string(),
+        ),
+    );
     assert_eq!(value["decision"], "block", "{value}");
     let batch = signal_batch(&value);
     assert_signal_shape(&batch, "stop");
@@ -2713,10 +2782,13 @@ fn signal_blocked_active_plan_does_not_force_stop() {
         "WAITING_FOR_HUMAN_SECRET",
     ]);
     let before = world.ok(&["plan", "show", plan_id])["plan"].clone();
-    let value = hook_json(&world.output(
-        &["agent", "hook", "--agent", "claude", "--event", "Stop"],
-        &serde_json::json!({"stop_hook_active": false, "session_id": DEFAULT_CLAUDE_SESSION}).to_string(),
-    ));
+    let value = hook_json(
+        &world.output(
+            &["agent", "hook", "--agent", "claude", "--event", "Stop"],
+            &serde_json::json!({"stop_hook_active": false, "session_id": DEFAULT_CLAUDE_SESSION})
+                .to_string(),
+        ),
+    );
 
     assert_eq!(value, serde_json::json!({}));
     assert_eq!(world.ok(&["plan", "show", plan_id])["plan"], before);
@@ -2755,10 +2827,13 @@ fn signal_terminal_steps_in_active_plan_continue_to_completion_check() {
             .all(|step| { matches!(step["status"].as_str(), Some("completed" | "skipped")) })
     );
 
-    let value = hook_json(&world.output(
-        &["agent", "hook", "--agent", "claude", "--event", "Stop"],
-        &serde_json::json!({"stop_hook_active": false, "session_id": DEFAULT_CLAUDE_SESSION}).to_string(),
-    ));
+    let value = hook_json(
+        &world.output(
+            &["agent", "hook", "--agent", "claude", "--event", "Stop"],
+            &serde_json::json!({"stop_hook_active": false, "session_id": DEFAULT_CLAUDE_SESSION})
+                .to_string(),
+        ),
+    );
     assert_eq!(value["decision"], "block", "{value}");
     let batch = signal_batch(&value);
     assert_signal_shape(&batch, "stop");
@@ -2797,10 +2872,13 @@ fn signal_stop_recovers_an_active_plan_without_a_focal_step() {
     drop(connection);
     let before = world.ok(&["plan", "show", plan_id])["plan"].clone();
 
-    let value = hook_json(&world.output(
-        &["agent", "hook", "--agent", "claude", "--event", "Stop"],
-        &serde_json::json!({"stop_hook_active": false, "session_id": DEFAULT_CLAUDE_SESSION}).to_string(),
-    ));
+    let value = hook_json(
+        &world.output(
+            &["agent", "hook", "--agent", "claude", "--event", "Stop"],
+            &serde_json::json!({"stop_hook_active": false, "session_id": DEFAULT_CLAUDE_SESSION})
+                .to_string(),
+        ),
+    );
     assert_eq!(value["decision"], "block", "{value}");
     let batch = signal_batch(&value);
     assert_signal_shape(&batch, "stop");
@@ -2821,7 +2899,10 @@ fn signal_stop_recovers_an_active_plan_without_a_focal_step() {
 fn signal_stop_state_machine_is_exhaustive_for_claude_and_codex() {
     let states = [
         ("zero", None),
-        ("multiple", Some(("plan.continue", "executable_plan_at_stop"))),
+        (
+            "multiple",
+            Some(("plan.continue", "executable_plan_at_stop")),
+        ),
         (
             "in_progress",
             Some(("plan.continue", "executable_plan_at_stop")),
@@ -4588,7 +4669,11 @@ fn separate_todo_and_plan_readiness_tracks_current_plan_without_sensitive_detail
     let plan_id = plan["id"].as_str().unwrap();
     let context_id = agent_context("codex", DEFAULT_CODEX_SESSION, "main", "main");
     world.ok(&[
-        "todo", "track", todo["todo"]["id"].as_str().unwrap(), "--context", &context_id,
+        "todo",
+        "track",
+        todo["todo"]["id"].as_str().unwrap(),
+        "--context",
+        &context_id,
     ]);
     world.ok(&["plan", "track", plan_id, "--context", &context_id]);
     let first = plan["steps"][0]["id"].as_str().unwrap();
@@ -4621,10 +4706,20 @@ fn separate_todo_and_plan_readiness_tracks_current_plan_without_sensitive_detail
     let value = readiness(&text);
     assert_eq!(value["todo"]["ready"], true);
     assert_eq!(value["todo"]["open"], 1);
-    assert!(value["todo"]["list"].as_str().unwrap().contains(&context_id));
+    assert!(
+        value["todo"]["list"]
+            .as_str()
+            .unwrap()
+            .contains(&context_id)
+    );
     assert_eq!(value["plan"]["ready"], true);
     assert_eq!(value["plan"]["active"], 1);
-    assert!(value["plan"]["current"].as_str().unwrap().contains(&context_id));
+    assert!(
+        value["plan"]["current"]
+            .as_str()
+            .unwrap()
+            .contains(&context_id)
+    );
     let tracking = &value["plan"]["tracking"];
     assert_eq!(tracking["id"], plan_id);
     assert_eq!(tracking["title"], "tracked release plan");
@@ -4734,7 +4829,11 @@ fn todo_hook_reminds_three_oldest_due_open_items_and_counts_omitted() {
             "2000-01-01T00:00:00Z",
         ]);
         world.ok(&[
-            "todo", "track", todo["todo"]["id"].as_str().unwrap(), "--context", &context_id,
+            "todo",
+            "track",
+            todo["todo"]["id"].as_str().unwrap(),
+            "--context",
+            &context_id,
         ]);
     }
     let future = world.ok(&[
@@ -4745,7 +4844,11 @@ fn todo_hook_reminds_three_oldest_due_open_items_and_counts_omitted() {
         "2999-01-01T00:00:00Z",
     ]);
     world.ok(&[
-        "todo", "track", future["todo"]["id"].as_str().unwrap(), "--context", &context_id,
+        "todo",
+        "track",
+        future["todo"]["id"].as_str().unwrap(),
+        "--context",
+        &context_id,
     ]);
 
     let text = context(&world.output(
@@ -4790,7 +4893,11 @@ fn plan_tracking_titles_are_bounded_at_unicode_boundaries() {
     ]);
     let context_id = agent_context("codex", DEFAULT_CODEX_SESSION, "main", "main");
     world.ok(&[
-        "plan", "track", created["plan"]["id"].as_str().unwrap(), "--context", &context_id,
+        "plan",
+        "track",
+        created["plan"]["id"].as_str().unwrap(),
+        "--context",
+        &context_id,
     ]);
     let readiness = readiness(&context(&world.output(
         &[

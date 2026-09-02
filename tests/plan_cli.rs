@@ -148,11 +148,25 @@ fn plan_create_advance_block_brief_and_complete() {
 fn plan_tracking_is_exact_and_isolated_by_agent_context() {
     let w = World::new();
     let first = w.ok(&[
-        "plan", "create", "first", "--objective", "o", "--done-when", "d", "--step",
+        "plan",
+        "create",
+        "first",
+        "--objective",
+        "o",
+        "--done-when",
+        "d",
+        "--step",
         "only",
     ]);
     let second = w.ok(&[
-        "plan", "create", "second", "--objective", "o", "--done-when", "d", "--step",
+        "plan",
+        "create",
+        "second",
+        "--objective",
+        "o",
+        "--done-when",
+        "d",
+        "--step",
         "only",
     ]);
     let first_id = first["plan"]["id"].as_str().unwrap();
@@ -195,7 +209,13 @@ fn plan_tracking_is_exact_and_isolated_by_agent_context() {
     );
     assert_eq!(
         w.error(&[
-            "--scope", "all", "plan", "track", first_id, "--context", &context_a,
+            "--scope",
+            "all",
+            "plan",
+            "track",
+            first_id,
+            "--context",
+            &context_a,
         ])["error"]["code"],
         "scope_not_supported"
     );

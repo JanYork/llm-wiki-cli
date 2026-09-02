@@ -4865,7 +4865,12 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
             target: "copilot-vscode",
             lifecycle_mode: "configured_preview",
             identity_quality: "exact_child",
-            installed_events: &["SessionStart", "PostToolUse", "SubagentStart", "SubagentStop"],
+            installed_events: &[
+                "SessionStart",
+                "PostToolUse",
+                "SubagentStart",
+                "SubagentStop",
+            ],
             capabilities: &[
                 ExpectedCapability {
                     event: "SessionStart",
@@ -5088,8 +5093,7 @@ fn hook_capabilities_and_installed_events_are_truthful_for_every_target() {
             "global",
         ]);
         assert_eq!(
-            status["targets"][0]["identity"]["quality"],
-            case.identity_quality,
+            status["targets"][0]["identity"]["quality"], case.identity_quality,
             "{} status identity quality",
             case.target
         );

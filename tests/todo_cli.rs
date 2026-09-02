@@ -259,7 +259,13 @@ fn todo_tracking_is_exact_and_isolated_by_agent_context() {
     );
     assert_eq!(
         w.error(&[
-            "--scope", "all", "todo", "track", first_id, "--context", &context_a,
+            "--scope",
+            "all",
+            "todo",
+            "track",
+            first_id,
+            "--context",
+            &context_a,
         ])["error"]["code"],
         "scope_not_supported"
     );

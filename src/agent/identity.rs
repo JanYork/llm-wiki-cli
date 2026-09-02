@@ -75,9 +75,7 @@ impl AgentExecutionContext {
         } else {
             ("main", "main")
         };
-        let canonical = format!(
-            "lwc-agent-context/v1\0{target}\0{session}\0{subject}\0{actor}"
-        );
+        let canonical = format!("lwc-agent-context/v1\0{target}\0{session}\0{subject}\0{actor}");
         let digest = Sha256::digest(canonical.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -105,10 +103,8 @@ impl AgentExecutionContext {
 
 fn native_id<'a>(payload: &'a Value, field: &str) -> Option<&'a str> {
     let value = payload.get(field)?.as_str()?;
-    (!value.is_empty()
-        && value.len() <= 512
-        && !value.chars().any(char::is_control))
-    .then_some(value)
+    (!value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control))
+        .then_some(value)
 }
 
 fn target_id(agent: AgentKind) -> &'static str {

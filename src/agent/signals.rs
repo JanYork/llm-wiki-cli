@@ -1832,22 +1832,24 @@ pub(crate) fn stop_plan(
     if continuing_plans.len() > 1 {
         return render(
             EventKind::Stop,
-            vec![Signal::new(
-                "plan.continue",
-                100,
-                "executable_plan_at_stop",
-                "Continue every active Plan tracked by this Agent context before stopping.",
-                CompletionEffect::ContinueOnce,
-            )
-            .state(json!({"plans": continuing_plans}))
-            .next_action(format!(
-                "lwc --scope {} plan current --context {context}",
-                match scope {
-                    Scope::Project => "project",
-                    Scope::Global => "global",
-                    Scope::All => "all",
-                }
-            ))],
+            vec![
+                Signal::new(
+                    "plan.continue",
+                    100,
+                    "executable_plan_at_stop",
+                    "Continue every active Plan tracked by this Agent context before stopping.",
+                    CompletionEffect::ContinueOnce,
+                )
+                .state(json!({"plans": continuing_plans}))
+                .next_action(format!(
+                    "lwc --scope {} plan current --context {context}",
+                    match scope {
+                        Scope::Project => "project",
+                        Scope::Global => "global",
+                        Scope::All => "all",
+                    }
+                )),
+            ],
         );
     }
     render(EventKind::Stop, signals)

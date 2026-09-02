@@ -2697,7 +2697,12 @@ fn install_hook(
             let (events, command_key, platform_key): (&[&str], _, _) = if target == "copilot-vscode"
             {
                 (
-                    &["SessionStart", "PostToolUse", "SubagentStart", "SubagentStop"],
+                    &[
+                        "SessionStart",
+                        "PostToolUse",
+                        "SubagentStart",
+                        "SubagentStop",
+                    ],
                     "command",
                     "windows",
                 )
