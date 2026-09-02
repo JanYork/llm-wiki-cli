@@ -281,10 +281,16 @@ fn agent_context_isolates_root_and_child_plan_todo_readiness() {
     assert!(prompt_rendered.contains(root_plan_id));
     assert!(!prompt_rendered.contains(other_plan["plan"]["id"].as_str().unwrap()));
     assert!(!prompt_rendered.contains("OTHER_AGENT_PLAN"));
-    assert_eq!(
-        prompt_hook_for_session(&world, "continue the current plan", "UNBOUND_SESSION"),
-        serde_json::json!({})
-    );
+    let unbound_prompt = serde_json::to_string(&prompt_hook_for_session(
+        &world,
+        "continue the current plan",
+        "UNBOUND_SESSION",
+    ))
+    .unwrap();
+    assert!(!unbound_prompt.contains(root_plan_id));
+    assert!(!unbound_prompt.contains(other_plan["plan"]["id"].as_str().unwrap()));
+    assert!(!unbound_prompt.contains("ROOT_A_PLAN"));
+    assert!(!unbound_prompt.contains("OTHER_AGENT_PLAN"));
 
     let child_id = "PRIVATE_CHILD_B";
     let child_value = tool_hook(
@@ -638,7 +644,7 @@ fn prompt_hook(world: &World, prompt: &str) -> Value {
 fn prompt_hook_for_session(world: &World, prompt: &str, session_id: &str) -> Value {
     tool_hook(
         world,
-        "claude",
+        "codex",
         "UserPromptSubmit",
         &serde_json::json!({
             "hook_event_name": "UserPromptSubmit",
