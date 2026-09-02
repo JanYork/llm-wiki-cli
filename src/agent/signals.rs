@@ -1805,6 +1805,7 @@ pub(crate) fn stop_plan(
         return Ok(None);
     };
     let mut signals = Vec::new();
+    let mut continuing_plans = Vec::new();
     for path in resolve_read_store_paths(scope, cwd, true)? {
         let scope_name = match path.scope {
             Scope::Project => "project",
@@ -1820,10 +1821,34 @@ pub(crate) fn stop_plan(
             continue;
         };
         if let Some(tracking) = store.plan_tracking_for_context(context)?
-            && let Some(signal) = stop_signal(Some(tracking))
+            && let Some(signal) = stop_signal(Some(tracking.clone()))
         {
+            if signal.completion_effect == CompletionEffect::ContinueOnce {
+                continuing_plans.push(tracking);
+            }
             signals.push(signal);
         }
+    }
+    if continuing_plans.len() > 1 {
+        return render(
+            EventKind::Stop,
+            vec![Signal::new(
+                "plan.continue",
+                100,
+                "executable_plan_at_stop",
+                "Continue every active Plan tracked by this Agent context before stopping.",
+                CompletionEffect::ContinueOnce,
+            )
+            .state(json!({"plans": continuing_plans}))
+            .next_action(format!(
+                "lwc --scope {} plan current --context {context}",
+                match scope {
+                    Scope::Project => "project",
+                    Scope::Global => "global",
+                    Scope::All => "all",
+                }
+            ))],
+        );
     }
     render(EventKind::Stop, signals)
 }
