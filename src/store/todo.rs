@@ -268,6 +268,47 @@ impl Store {
             .collect::<Result<Vec<_>>>()?;
         Ok(json!({"scope":self.scope,"database":self.database,"context":context,"returned":todos.len(),"todos":todos}))
     }
+    pub fn tracked_open_todo_readiness(
+        &self,
+        context: &str,
+        limit: usize,
+    ) -> Result<(i64, Vec<Value>, usize)> {
+        let context = normalize_agent_context(context)?;
+        let open = self.conn.query_row(
+            "SELECT COUNT(*) FROM agent_todo_tracks a JOIN todo_items t ON t.id=a.todo_id WHERE a.context_id=?1 AND t.state='open'",
+            [&context],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let total = self.conn.query_row(
+            "SELECT COUNT(*) FROM agent_todo_tracks a JOIN todo_items t ON t.id=a.todo_id WHERE a.context_id=?1 AND t.state='open' AND t.target_at IS NOT NULL AND t.target_at<=STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')",
+            [&context],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        let mut statement = self.conn.prepare(
+            "SELECT t.id,t.title,t.parent_id,t.target_at FROM agent_todo_tracks a JOIN todo_items t ON t.id=a.todo_id WHERE a.context_id=?1 AND t.state='open' AND t.target_at IS NOT NULL AND t.target_at<=STRFTIME('%Y-%m-%dT%H:%M:%fZ','now') ORDER BY t.created_at,t.id LIMIT ?2",
+        )?;
+        let reminders = statement
+            .query_map(params![context, limit as i64], |row| {
+                let title = row.get::<_, String>(1)?;
+                Ok(json!({
+                    "id":row.get::<_,String>(0)?,
+                    "title":bounded_todo_title(&title),
+                    "parent_id":row.get::<_,Option<String>>(2)?,
+                    "target_at":row.get::<_,String>(3)?,
+                }))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let omitted = total.saturating_sub(reminders.len());
+        Ok((open, reminders, omitted))
+    }
+    pub fn agent_tracking_bound(&self, context: &str) -> Result<bool> {
+        let context = normalize_agent_context(context)?;
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_plan_tracks WHERE context_id=?1) OR EXISTS(SELECT 1 FROM agent_todo_tracks WHERE context_id=?1)",
+            [&context],
+            |row| row.get(0),
+        ).map_err(Into::into)
+    }
     pub fn todo_add(&mut self, mut input: TodoCreateInput) -> Result<Value> {
         input.title = normalize_todo_text("title", &input.title)?;
         input.tags = normalize_labels(input.tags)?;

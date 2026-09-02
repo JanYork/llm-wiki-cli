@@ -16,6 +16,7 @@ use std::{
 };
 
 mod install;
+mod identity;
 mod intent;
 mod signals;
 mod targets;
@@ -95,6 +96,7 @@ fn compile_hook(agent: AgentKind, event: &str, scope: Scope, cwd: &Path) -> Resu
         return Ok(json!({}));
     };
     let event = signals::parse_event(capability.event, capability.semantic_event, &payload)?;
+    let agent_context = identity::AgentExecutionContext::resolve(agent, event.kind, &payload);
     if event.kind == signals::EventKind::Stop
         && payload
             .get("stop_hook_active")
@@ -158,7 +160,7 @@ fn compile_hook(agent: AgentKind, event: &str, scope: Scope, cwd: &Path) -> Resu
         | signals::EventKind::SubagentStart)
             if has_effect("context") =>
         {
-            let readiness = readiness_for_hook(cwd, hook_deadline)?;
+            let readiness = readiness_for_hook(cwd, hook_deadline, &agent_context)?;
             let rendered = signals::lifecycle(kind, cwd, &readiness, hook_deadline)?;
             let signal = rendered.as_ref().map(|rendered| rendered.line.as_str());
             let context = match strong_context(scope, cwd, &readiness, signal, hook_deadline) {
@@ -208,12 +210,12 @@ fn compile_hook(agent: AgentKind, event: &str, scope: Scope, cwd: &Path) -> Resu
             Ok(targets::tool_consent_output(agent, &event.native, advice)
                 .unwrap_or_else(|| json!({})))
         }
-        signals::EventKind::Stop
+        signals::EventKind::Stop | signals::EventKind::SubagentStop
             if has_effect("guard")
                 && has_effect("continue")
                 && capability.loop_guard == "stop_hook_active" =>
         {
-            match signals::stop_plan(cwd, hook_deadline)? {
+            match signals::stop_plan(cwd, hook_deadline, agent_context.id())? {
                 Some(rendered) if rendered.continues => {
                     Ok(stop_envelope(agent, &event.native, rendered.line))
                 }
@@ -494,7 +496,7 @@ fn prompt_readiness(cwd: &Path, intents: &intent::IntentSet, deadline: Instant) 
     }
     if plan_enabled {
         value["plan"] = match &hook_store {
-            Some(Ok(store)) => plan_hook_readiness(store, false)
+            Some(Ok(store)) => plan_hook_readiness(store, false, None)
                 .unwrap_or_else(|error| json!({"ready": false, "error_code": error.code})),
             Some(Err(error)) => json!({"ready": false, "error_code": error.code}),
             None => json!({"ready": false}),
@@ -511,14 +513,22 @@ fn prompt_readiness(cwd: &Path, intents: &intent::IntentSet, deadline: Instant) 
 }
 
 pub(crate) fn readiness(cwd: &Path) -> Result<Value> {
-    readiness_until(cwd, None)
+    readiness_until(cwd, None, None)
 }
 
-fn readiness_for_hook(cwd: &Path, deadline: Instant) -> Result<Value> {
-    readiness_until(cwd, Some(deadline))
+fn readiness_for_hook(
+    cwd: &Path,
+    deadline: Instant,
+    context: &identity::AgentExecutionContext,
+) -> Result<Value> {
+    readiness_until(cwd, Some(deadline), Some(context))
 }
 
-fn readiness_until(cwd: &Path, deadline: Option<Instant>) -> Result<Value> {
+fn readiness_until(
+    cwd: &Path,
+    deadline: Option<Instant>,
+    context: Option<&identity::AgentExecutionContext>,
+) -> Result<Value> {
     ensure_hook_deadline(deadline)?;
     let store = init_store_path(Scope::Project, cwd)?;
     let wiki_initialized = store.path.is_file();
@@ -574,7 +584,9 @@ fn readiness_until(cwd: &Path, deadline: Option<Instant>) -> Result<Value> {
         config::resolve_todo("project", &store.path)?.setting == config::CapabilitySetting::Enabled;
     let plan_enabled =
         config::resolve_plan("project", &store.path)?.setting == config::CapabilitySetting::Enabled;
-    let hook_store = if wiki_initialized && (todo_enabled || plan_enabled) {
+    let hook_store = if wiki_initialized
+        && ((todo_enabled || plan_enabled) || context.and_then(|context| context.id()).is_some())
+    {
         Some(match deadline {
             Some(deadline) => open_store_for_hook_until("project", &store.path, deadline),
             None => Store::open_for_hook("project", &store.path).and_then(|store| {
@@ -656,13 +668,38 @@ fn readiness_until(cwd: &Path, deadline: Option<Instant>) -> Result<Value> {
             "install": "lwc agent install",
         },
     });
+    let context_bound = context.and_then(|context| {
+        context.id().and_then(|context_id| match &hook_store {
+            Some(Ok(store)) => store.agent_tracking_bound(context_id).ok(),
+            Some(Err(_)) | None => None,
+        })
+    });
+    if let Some(context) = context {
+        value["agent_context"] = context.readiness(context_bound);
+    }
     if let Some(sync) = sync_readiness(&store.path, deadline) {
         value["sync"] = sync;
     }
-    if todo_enabled {
+    if todo_enabled && context.is_none_or(|_| context_bound == Some(true)) {
         value["todo"] = match &hook_store {
-            Some(Ok(store)) => match (store.open_todo_count(), store.due_todo_reminders(3)) {
-                (Ok(open), Ok((reminders, omitted))) => {
+            Some(Ok(store)) => match context.and_then(|context| context.id()) {
+                Some(context_id) => match store.tracked_open_todo_readiness(context_id, 3) {
+                    Ok((open, reminders, omitted)) => {
+                        let mut state = json!({
+                            "ready": true,
+                            "open": open,
+                            "list": format!("lwc todo list --context {context_id}"),
+                        });
+                        if !reminders.is_empty() {
+                            state["reminders"] = json!(reminders);
+                            state["omitted_reminders"] = json!(omitted);
+                        }
+                        state
+                    }
+                    Err(error) => json!({"ready":false,"error_code":error.code}),
+                },
+                None => match (store.open_todo_count(), store.due_todo_reminders(3)) {
+                    (Ok(open), Ok((reminders, omitted))) => {
                     let mut state = json!({
                         "ready": true,
                         "open": open,
@@ -673,18 +710,17 @@ fn readiness_until(cwd: &Path, deadline: Option<Instant>) -> Result<Value> {
                         state["omitted_reminders"] = json!(omitted);
                     }
                     state
-                }
-                (Err(error), _) | (_, Err(error)) => {
-                    json!({"ready":false,"error_code":error.code})
-                }
+                    }
+                    (Err(error), _) | (_, Err(error)) => json!({"ready":false,"error_code":error.code}),
+                },
             },
             Some(Err(error)) => json!({"ready":false,"error_code":error.code}),
             None => json!({"ready":false}),
         };
     }
-    if plan_enabled {
+    if plan_enabled && context.is_none_or(|_| context_bound == Some(true)) {
         value["plan"] = match &hook_store {
-            Some(Ok(store)) => plan_hook_readiness(store, true)
+            Some(Ok(store)) => plan_hook_readiness(store, true, context.and_then(|context| context.id()))
                 .unwrap_or_else(|error| json!({"ready":false,"error_code":error.code})),
             Some(Err(error)) => json!({"ready":false,"error_code":error.code}),
             None => json!({"ready":false}),
@@ -720,15 +756,28 @@ fn open_store_for_hook_until(scope: &str, path: &Path, deadline: Instant) -> Res
     Ok(store)
 }
 
-fn plan_hook_readiness(store: &Store, include_current: bool) -> Result<Value> {
-    let active = store.active_plan_count()?;
+fn plan_hook_readiness(
+    store: &Store,
+    include_current: bool,
+    context: Option<&str>,
+) -> Result<Value> {
+    let tracking = match context {
+        Some(context) => store.plan_tracking_for_context(context)?,
+        None => store.plan_tracking()?,
+    };
+    let active = if context.is_some() {
+        i64::from(tracking.is_some())
+    } else {
+        store.active_plan_count()?
+    };
     let mut state = json!({"ready": true, "active": active});
     if include_current {
-        state["current"] = json!("lwc plan current --limit 20");
+        state["current"] = match context {
+            Some(context) => json!(format!("lwc plan current --context {context}")),
+            None => json!("lwc plan current --limit 20"),
+        };
     }
-    if active == 1
-        && let Some(tracking) = store.plan_tracking()?
-    {
+    if let Some(tracking) = tracking {
         state["tracking"] = tracking;
     }
     Ok(state)

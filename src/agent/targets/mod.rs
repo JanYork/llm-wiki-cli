@@ -164,7 +164,13 @@ static CLAUDE_HOOKS: &[HookCapability] = &[
         "stable",
         "none",
     ),
-    hook("SubagentStop", "subagent_stop", OBSERVE, "stable", "none"),
+    hook(
+        "SubagentStop",
+        "subagent_stop",
+        STOP_CONTINUE,
+        "stable",
+        "stop_hook_active",
+    ),
     hook("Stop", "stop", STOP_CONTINUE, "stable", "stop_hook_active"),
     hook("SessionEnd", "session_end", OBSERVE, "stable", "none"),
 ];
@@ -183,7 +189,13 @@ static CODEX_HOOKS: &[HookCapability] = &[
     hook("SubagentStart", "subagent_start", CONTEXT, "stable", "none"),
     consent_hook("PreToolUse", "tool_before", CONTEXT, "stable", "advisory"),
     hook("PostToolUse", "tool_after", CONTEXT, "stable", "none"),
-    hook("SubagentStop", "subagent_stop", OBSERVE, "stable", "none"),
+    hook(
+        "SubagentStop",
+        "subagent_stop",
+        STOP_CONTINUE,
+        "stable",
+        "stop_hook_active",
+    ),
     hook("Stop", "stop", STOP_CONTINUE, "stable", "stop_hook_active"),
     hook("SessionEnd", "session_end", OBSERVE, "stable", "none"),
 ];

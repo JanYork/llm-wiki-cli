@@ -1795,7 +1795,14 @@ fn open_store_until(scope: &str, path: &Path, deadline: Instant) -> Option<Store
     Some(store)
 }
 
-pub(crate) fn stop_plan(cwd: &Path, deadline: Instant) -> Result<Option<RenderedSignals>> {
+pub(crate) fn stop_plan(
+    cwd: &Path,
+    deadline: Instant,
+    context: Option<&str>,
+) -> Result<Option<RenderedSignals>> {
+    let Some(context) = context else {
+        return Ok(None);
+    };
     let path = init_store_path(Scope::Project, cwd)?;
     if config::resolve_plan("project", &path.path)?.setting != CapabilitySetting::Enabled
         || !path.path.is_file()
@@ -1805,27 +1812,7 @@ pub(crate) fn stop_plan(cwd: &Path, deadline: Instant) -> Result<Option<Rendered
     let Some(store) = open_store_until("project", &path.path, deadline) else {
         return Ok(None);
     };
-    let active = store.active_plan_count()?;
-    if active > 1 {
-        return render(
-            EventKind::Stop,
-            vec![
-                Signal::new(
-                    "plan.disambiguate",
-                    100,
-                    "multiple_active_plans_at_stop",
-                    "Choose the single active Plan before allowing this run to stop.",
-                    CompletionEffect::ContinueOnce,
-                )
-                .state(json!({"active_count": active}))
-                .next_action("lwc plan current --limit 20"),
-            ],
-        );
-    }
-    if active != 1 {
-        return Ok(None);
-    }
-    let Some(signal) = stop_signal(store.plan_tracking()?) else {
+    let Some(signal) = stop_signal(store.plan_tracking_for_context(context)?) else {
         return Ok(None);
     };
     render(EventKind::Stop, vec![signal])

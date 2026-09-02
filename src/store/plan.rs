@@ -132,6 +132,26 @@ impl Store {
         let Some((id, title, revision)) = plan else {
             return Ok(None);
         };
+        self.plan_tracking_value(id, title, revision).map(Some)
+    }
+
+    pub fn plan_tracking_for_context(&self, context: &str) -> Result<Option<Value>> {
+        let context = normalize_agent_context(context)?;
+        let plan = self
+            .conn
+            .query_row(
+                "SELECT p.id,p.title,p.revision FROM agent_plan_tracks a JOIN plans p ON p.id=a.plan_id WHERE a.context_id=?1 AND p.state='active'",
+                [&context],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+            )
+            .optional()?;
+        let Some((id, title, revision)) = plan else {
+            return Ok(None);
+        };
+        self.plan_tracking_value(id, title, revision).map(Some)
+    }
+
+    fn plan_tracking_value(&self, id: String, title: String, revision: i64) -> Result<Value> {
         let (completed_steps, terminal_steps, total_steps) = self.conn.query_row(
             "SELECT
                 SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END),
@@ -153,7 +173,7 @@ impl Store {
                 })
                 .optional()?)
         };
-        Ok(Some(json!({
+        Ok(json!({
             "id": id,
             "title": bounded_hook_text(title),
             "revision": revision,
@@ -172,7 +192,7 @@ impl Store {
                  WHERE plan_id=?1 AND status='pending' ORDER BY ordinal LIMIT 1",
             )?,
             "brief": format!("lwc plan brief {id}"),
-        })))
+        }))
     }
 
     pub fn plan_track(&mut self, id: &str, context: &str) -> Result<Value> {
