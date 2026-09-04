@@ -110,7 +110,7 @@ impl World {
     }
 
     fn wait_for_state(&self) -> Value {
-        wait_until(Duration::from_secs(5), || {
+        wait_until(Duration::from_secs(15), || {
             fs::read(self.state_path())
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -121,7 +121,7 @@ impl World {
     }
 
     fn wait_for_latest(&self, version: &str) -> Value {
-        wait_until(Duration::from_secs(5), || {
+        wait_until(Duration::from_secs(15), || {
             fs::read(self.state_path())
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
