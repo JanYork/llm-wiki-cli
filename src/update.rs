@@ -89,6 +89,13 @@ pub(crate) fn mark_notified(version: &str) -> io::Result<bool> {
 }
 
 pub(crate) fn spawn_checker() -> io::Result<()> {
+    // Test-only: complete the fake transport without a second LWC process.
+    if env::var_os("LWC_TEST_UPDATE_CURL").is_some()
+        && env::var("LWC_TEST_UPDATE_WAIT_FOR_CHECKER").as_deref() == Ok("1")
+    {
+        run_checker();
+        return Ok(());
+    }
     let mut command = Command::new(env::current_exe()?);
     command
         .arg("__update-check")
@@ -100,15 +107,7 @@ pub(crate) fn spawn_checker() -> io::Result<()> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
-    let mut child = command.spawn()?;
-    // Test-only completion handshake; a real checker always remains detached.
-    if env::var_os("LWC_TEST_UPDATE_CURL").is_some()
-        && env::var("LWC_TEST_UPDATE_WAIT_FOR_CHECKER").as_deref() == Ok("1")
-    {
-        child.wait().map(|_| ())
-    } else {
-        Ok(())
-    }
+    command.spawn().map(|_| ())
 }
 
 pub(crate) fn run_checker() {
