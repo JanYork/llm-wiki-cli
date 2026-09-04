@@ -3,9 +3,7 @@ use serde_json::Value;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
-    thread,
-    time::{Duration, Instant},
+    process::{Command, Output},
 };
 
 struct World {
@@ -519,33 +517,12 @@ fn merge_rejects_a_target_write_after_staging_instead_of_overwriting_it() {
 
     let target = world.project("target", true);
     world.put_page(&target, "local", "Local", "local");
-    let child = Command::new(env!("CARGO_BIN_EXE_lwc"))
-        .current_dir(&target)
-        .env("HOME", &world.home)
-        .env("USERPROFILE", &world.home)
-        .env("LWC_PROJECT_ROOT", &target)
-        .env("LWC_TEST_ARCHIVE_BEFORE_PUBLISH_MS", "1000")
-        .args(["merge", archive.to_str().unwrap()])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    let imports = target.join(".lwc/imports");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !fs::read_dir(&imports).is_ok_and(|entries| {
-        entries
-            .filter_map(Result::ok)
-            .any(|entry| entry.path().join("state.json").is_file())
-    }) {
-        assert!(Instant::now() < deadline, "archive session was not staged");
-        thread::sleep(Duration::from_millis(20));
-    }
+    let staged = world.ok(&target, &["decompress", archive.to_str().unwrap()]);
+    assert_eq!(staged["action"], "staged");
+    let session = staged["session_id"].as_str().unwrap();
     world.put_page(&target, "concurrent", "Concurrent", "must survive");
 
-    let output = child.wait_with_output().unwrap();
-    assert!(!output.status.success());
-    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    let error = world.error(&target, &["merge", "--resume", session]);
     assert_eq!(error["error"]["code"], "archive_store_changed");
     assert!(world.has_page(&target, "concurrent"));
     assert!(!world.has_page(&target, "incoming"));

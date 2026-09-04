@@ -100,7 +100,15 @@ pub(crate) fn spawn_checker() -> io::Result<()> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
-    command.spawn().map(|_| ())
+    let mut child = command.spawn()?;
+    // Test-only completion handshake; a real checker always remains detached.
+    if env::var_os("LWC_TEST_UPDATE_CURL").is_some()
+        && env::var("LWC_TEST_UPDATE_WAIT_FOR_CHECKER").as_deref() == Ok("1")
+    {
+        child.wait().map(|_| ())
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn run_checker() {

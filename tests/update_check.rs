@@ -59,6 +59,7 @@ impl World {
             .env("LWC_TEST_UPDATE_CURL", &self.curl)
             .env("LWC_TEST_UPDATE_CURL_LOG", &self.curl_log)
             .env("LWC_TEST_UPDATE_LATEST_VERSION", NEW_VERSION)
+            .env("LWC_TEST_UPDATE_WAIT_FOR_CHECKER", "1")
             .envs(environment.iter().copied())
             .args(["agent", "hook", "--agent", "claude", "--event", event])
             .stdin(Stdio::piped())
@@ -110,7 +111,7 @@ impl World {
     }
 
     fn wait_for_state(&self) -> Value {
-        wait_until(Duration::from_secs(15), || {
+        wait_until(Duration::from_secs(5), || {
             fs::read(self.state_path())
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -121,7 +122,7 @@ impl World {
     }
 
     fn wait_for_latest(&self, version: &str) -> Value {
-        wait_until(Duration::from_secs(15), || {
+        wait_until(Duration::from_secs(5), || {
             fs::read(self.state_path())
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -215,7 +216,10 @@ fn write_fake_curl(root: &Path) -> PathBuf {
 fn discovery_is_detached_and_not_visible_until_the_next_hook() {
     let world = World::new();
     let started = Instant::now();
-    let first = world.session_hook(&[("LWC_TEST_UPDATE_CURL_MODE", "slow")]);
+    let first = world.session_hook(&[
+        ("LWC_TEST_UPDATE_CURL_MODE", "slow"),
+        ("LWC_TEST_UPDATE_WAIT_FOR_CHECKER", "0"),
+    ]);
     let elapsed = started.elapsed();
 
     assert_no_update(&first);
@@ -422,7 +426,10 @@ fn stale_takeover_does_not_move_the_live_successor() {
         .unwrap();
     assert!(touched.success());
 
-    assert_no_update(&world.session_hook(&[("LWC_TEST_UPDATE_CURL_MODE", "slow")]));
+    assert_no_update(&world.session_hook(&[
+        ("LWC_TEST_UPDATE_CURL_MODE", "slow"),
+        ("LWC_TEST_UPDATE_WAIT_FOR_CHECKER", "0"),
+    ]));
     wait_until(Duration::from_secs(3), || world.curl_calls() == 1);
     let successor = fs::read_to_string(world.marker_owner_path()).unwrap();
     assert_ne!(successor, "stale-owner");
