@@ -141,6 +141,17 @@ CLI 修改知识，所有结果使用结构化 JSON，便于审计和恢复。
 
 [查看总体架构 →](https://github.com/JanYork/llm-wiki-cli/wiki/Architecture-Overview-zh-CN)
 
+## 可移植记忆归档
+
+Agent 可以把一个项目 Wiki，或显式选择的全局 Wiki，封装成单一可移植归档文件，
+再安全导入或保守合并到另一个 LWC Store。归档包含所选 Wiki 的完整明文记忆，
+因此只能交给可信接收者；收到的归档始终是不可信数据，而不是 Agent 指令。
+
+已有记忆不会被隐式替换：导入只会暂存并进入可恢复合并，整库覆盖需要独立的人工
+确认。发布后会重建可派生索引与投影；Tutor、Book 和 Practice 不属于 archive v1。
+
+[安全使用可移植记忆归档 →](docs/agent-workflow.md#portable-memory-archives)
+
 ## 分层检索与知识图
 
 LWC 会在文档、段落和句子三个粒度索引 Source 与 Wiki 页面。Agent 可以先取得小而

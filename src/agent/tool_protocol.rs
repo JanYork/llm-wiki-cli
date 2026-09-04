@@ -119,12 +119,22 @@ pub(crate) fn recognize_invocation(
     installer_owned_lwc: Option<&str>,
 ) -> Option<RecognizedInvocation> {
     let envelope = tool_envelope(host, payload)?;
-    if envelope.name == "mcp__lwc__lwc_explore"
+    let mcp_tool = if envelope.name == "mcp__lwc__lwc_explore"
         || envelope.name == "lwc.lwc_explore"
         || (envelope.name == "lwc_explore" && envelope.server == Some("lwc"))
     {
+        Some("lwc_explore")
+    } else if envelope.name == "mcp__lwc__lwc_codegraph"
+        || envelope.name == "lwc.lwc_codegraph"
+        || (envelope.name == "lwc_codegraph" && envelope.server == Some("lwc"))
+    {
+        Some("lwc_codegraph")
+    } else {
+        None
+    };
+    if let Some(tool) = mcp_tool {
         return Some(RecognizedInvocation {
-            action: "mcp.lwc_explore".to_owned(),
+            action: format!("mcp.{tool}"),
             transport: InvocationTransport::Mcp,
             consent: ConsentClass::Noop,
             consent_advice: None,
@@ -1008,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_requires_the_exact_lwc_explore_identity() {
+    fn mcp_requires_an_exact_lwc_read_only_tool_identity() {
         let combined = recognize_invocation(
             ToolHost::Claude,
             &json!({"tool_name":"mcp__lwc__lwc_explore","tool_input":{}}),
@@ -1033,11 +1043,25 @@ mod tests {
         assert_eq!(separate.action, "mcp.lwc_explore");
         assert_eq!(separate.consent_advice, None);
 
+        let codegraph = recognize_invocation(
+            ToolHost::Claude,
+            &json!({"tool_name":"mcp__lwc__lwc_codegraph","tool_input":{}}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(codegraph.action, "mcp.lwc_codegraph");
+        assert_eq!(codegraph.transport, InvocationTransport::Mcp);
+        assert_eq!(codegraph.consent, ConsentClass::Noop);
+        assert_eq!(codegraph.consent_advice, None);
+
         for payload in [
             json!({"tool_name":"lwc_explore","tool_input":{}}),
             json!({"tool_name":"lwc_explore","mcp_server_name":"other","tool_input":{}}),
             json!({"tool_name":"mcp__other__lwc_explore","tool_input":{}}),
             json!({"tool_name":"mcp__lwc__other","tool_input":{}}),
+            json!({"tool_name":"lwc_codegraph","tool_input":{}}),
+            json!({"tool_name":"lwc_codegraph","mcp_server_name":"other","tool_input":{}}),
+            json!({"tool_name":"mcp__other__lwc_codegraph","tool_input":{}}),
         ] {
             assert!(recognize_invocation(ToolHost::Claude, &payload, None).is_none());
         }

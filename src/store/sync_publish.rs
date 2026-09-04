@@ -115,15 +115,53 @@ pub(crate) fn sync_publication_receipt(
     state_digest: &str,
 ) -> Result<Option<Value>> {
     let conn = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let detail = conn
+    let Some((operation_id, value, ending)) =
+        read_sync_publication_receipt(&conn, session_id, state_digest)?
+    else {
+        return Ok(None);
+    };
+    if operation_id != ending.operation_id || store_identity(&conn)? != ending {
+        return Err(sync_store_changed());
+    }
+    Ok(Some(value))
+}
+
+pub(crate) fn archive_publication_receipt(
+    database: &Path,
+    session_id: &str,
+    state_digest: &str,
+) -> Result<Option<Value>> {
+    let conn = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let Some((operation_id, value, ending)) =
+        read_sync_publication_receipt(&conn, session_id, state_digest)?
+    else {
+        return Ok(None);
+    };
+    let current = store_identity(&conn)?;
+    if operation_id != ending.operation_id
+        || current.store_id != ending.store_id
+        || current.operation_id < ending.operation_id
+        || (current.operation_id == ending.operation_id && current.revision != ending.revision)
+    {
+        return Err(sync_store_changed());
+    }
+    Ok(Some(value))
+}
+
+fn read_sync_publication_receipt(
+    conn: &Connection,
+    session_id: &str,
+    state_digest: &str,
+) -> Result<Option<(i64, Value, StoreIdentity)>> {
+    let receipt = conn
         .query_row(
-            "SELECT detail_json FROM operations
+            "SELECT id,detail_json FROM operations
              WHERE action='sync_merge' AND target=?1 ORDER BY id DESC LIMIT 1",
             [session_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
-    let Some(detail) = detail else {
+    let Some((operation_id, detail)) = receipt else {
         return Ok(None);
     };
     let value: Value = serde_json::from_str(&detail)
@@ -133,13 +171,19 @@ pub(crate) fn sync_publication_receipt(
     }
     let ending: StoreIdentity = serde_json::from_value(value["ending_identity"].clone())
         .map_err(|error| AppError::new("sync_receipt_invalid", error.to_string()))?;
-    if store_identity(&conn)? != ending {
-        return Err(sync_store_changed());
-    }
-    Ok(Some(value))
+    Ok(Some((operation_id, value, ending)))
 }
 
 impl Store {
+    pub(crate) fn persist_sync_derived_receipt(
+        &self,
+        session_id: &str,
+        state_digest: &str,
+        derived: &Value,
+    ) -> Result<()> {
+        persist_sync_derived_receipt(&self.conn, session_id, state_digest, derived)
+    }
+
     pub(crate) fn publish_sync_state_to_missing(
         scope: impl Into<String>,
         database: &Path,

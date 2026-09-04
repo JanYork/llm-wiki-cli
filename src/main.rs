@@ -1,4 +1,5 @@
 mod agent;
+mod archive;
 mod artifacts;
 mod changeset;
 mod cli;
@@ -24,6 +25,7 @@ mod sync_git;
 pub mod tokenize;
 mod trans;
 mod trans_adapter;
+mod update;
 mod view;
 mod work;
 

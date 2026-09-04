@@ -325,13 +325,19 @@ pub(crate) fn prompt(
     let path = init_store_path(Scope::Project, cwd).ok();
     let needs_store =
         intents.ingest || (intents.memory && intents.memory_intent == MemoryIntent::Status);
+    let context_resolved = readiness
+        .pointer("/agent_context/status")
+        .and_then(Value::as_str)
+        != Some("unresolved");
 
-    if intents.plan
+    if context_resolved
+        && intents.plan
         && let Some(signal) = plan_prompt_signal(readiness)
     {
         candidates.push(signal);
     }
-    if intents.todo
+    if context_resolved
+        && intents.todo
         && let Some(signal) = todo_prompt_signal(readiness)
     {
         candidates.push(signal);

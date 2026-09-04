@@ -4048,8 +4048,8 @@ fn sync_commit_exists(database: &Path, session_id: &str, state_digest: &str) -> 
         .is_some_and(|detail| detail["state_digest"] == state_digest))
 }
 
-fn rebuild_derived(store: &StorePath, publication: &Value) -> Value {
-    let fts = publication.get("derived").cloned().unwrap_or_else(|| {
+pub(crate) fn rebuild_derived(store: &StorePath, publication: &Value) -> Value {
+    let mut fts = publication.get("derived").cloned().unwrap_or_else(|| {
         json!({
             "status":"failed",
             "error":"sync_fts_receipt_missing",
@@ -4057,6 +4057,23 @@ fn rebuild_derived(store: &StorePath, publication: &Value) -> Value {
             "next_action":"resume_derived_rebuild",
         })
     });
+    if fts["status"] == "failed" {
+        fts = match Store::open(scope_name(store.scope), &store.path)
+            .and_then(|mut store| store.reindex())
+        {
+            Ok(response) => json!({
+                "status":"completed",
+                "indexed_pages":response.pages,
+                "indexed_sources":response.sources,
+            }),
+            Err(error) => json!({
+                "status":"failed",
+                "error":error.code,
+                "committed":true,
+                "next_action":"resume_derived_rebuild",
+            }),
+        };
+    }
     let publication = normalized_publication_receipt(publication);
     let markdown = match Store::open(scope_name(store.scope), &store.path)
         .and_then(|mut store| store.materialize_sync_selection(&publication))

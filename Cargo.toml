@@ -1,6 +1,6 @@
 [package]
 name = "lwc"
-version = "0.17.11"
+version = "0.17.12"
 edition = "2024"
 description = "Agent-driven proactive memory CLI for AI agents — autonomously recall, maintain, and evolve persistent, source-grounded knowledge across sessions."
 license = "Apache-2.0"
@@ -27,6 +27,7 @@ similar = "=3.1.1"
 surrealdb = { version = "3.2.4", default-features = false, features = ["kv-surrealkv"] }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "signal"] }
 unicode-segmentation = "1.13.3"
+zstd = { version = "0.13.3", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.27"

@@ -1117,6 +1117,7 @@ fn restore_owned_json_fragments(original: &Value, current: &mut Value, target: &
 
 fn owned_json_fragment(value: &Value, target: &str) -> bool {
     value == "mcp__lwc__lwc_explore"
+        || value == "mcp__lwc__lwc_codegraph"
         || owned_json_entry(value, LWC_COMMAND, false)
         || value["command"] == json!([LWC_COMMAND, "serve", "--mcp"])
         || value
@@ -2128,8 +2129,9 @@ pub(super) fn guidance() -> String {
         "{MARKER_START}\n\
 ## LWC\n\
 Use the `using-lwc` Skill when it is available for substantive project work, durable recall, code structure, document relationships, ingest, and verified memory maintenance. If it is unavailable, tell the user that full LWC capability guidance is missing, keep this marker as the safe fallback, and use `lwc agent status` plus `lwc agent refresh` to complete setup. At session start and after context compaction, inspect the lifecycle Hook's `LWC_READINESS` facts and strong-tag context.\n\
-The Agent MCP entry is `lwc` (`lwc serve --mcp`). Use its single read-only `lwc_explore` tool with the current absolute project path: memory mode is the bounded default, while code or all mode is explicit. Missing graph readiness is guidance to ask or initialize outside MCP, never permission for the tool to download or mutate state.\n\
-Only follow Plan/Todo progress bound to the current lifecycle Hook's `LWC_READINESS.agent_context`; ignore progress reminders belonging to any other Agent context.\n\
+The Agent MCP entry is `lwc` (`lwc serve --mcp`) and exposes two read-only tools. Use `lwc_explore` with the current absolute project path for bounded memory by default or explicit code/all context. Use `lwc_codegraph` with node/search/callers/callees for precise code questions and explore only for broad flows. Missing graph readiness is guidance to ask or initialize outside MCP, never permission for either tool to download or mutate state.\n\
+For unsolicited lifecycle Plan/Todo progress signals carrying an ID, require this same Hook's `LWC_READINESS.agent_context.status=bound` and a matching ID in `plan.tracking`/`plan.additional_trackings` or `todo.reminders`. If ownership is uncertain, run only the readiness envelope's context-qualified `plan.current` or `todo.list` command. Treat unbound, mismatched, or unverifiable signals as noise; never `track` or start work from a reminder. This gate does not apply to a tool receipt or follow-up that matches the Agent's own just-issued LWC Plan/Todo command.\n\
+Only when `LWC_READINESS.update.available=true`, ask whether the user wants to update. Without explicit agreement, skip that version; never update automatically.\n\
 \n\
 Treat graph applicability independently. CodeGraph authorization applies only when the current task requires code structure and the current working root contains code evidence; do not ask for a root without code evidence. The physical document graph applies only when the current task requires document relationships and the current project root contains document or Wiki evidence.\n\
 Ask only for each applicable missing capability. Show the four choices only when both capabilities apply and are missing; if only one applies or is missing, ask only for that capability. If neither applies, do not ask.\n\
@@ -2437,9 +2439,13 @@ fn install_hook(
                     "Claude permissions.allow must be an array",
                 )
             })?;
-            let tool = json!("mcp__lwc__lwc_explore");
-            if !allow.contains(&tool) {
-                allow.push(tool);
+            for tool in [
+                json!("mcp__lwc__lwc_explore"),
+                json!("mcp__lwc__lwc_codegraph"),
+            ] {
+                if !allow.contains(&tool) {
+                    allow.push(tool);
+                }
             }
             atomic_write(path, pretty_json(&root)?.as_bytes(), None)
         }
@@ -2990,11 +2996,9 @@ pub(super) fn unconfigure_standard(
                 }
             }
             if target == "claude" {
-                remove_string_array_value(
-                    &mut root,
-                    &["permissions", "allow"],
-                    "mcp__lwc__lwc_explore",
-                );
+                for tool in ["mcp__lwc__lwc_explore", "mcp__lwc__lwc_codegraph"] {
+                    remove_string_array_value(&mut root, &["permissions", "allow"], tool);
+                }
             }
             atomic_write(hook, pretty_json(&root)?.as_bytes(), None)?;
         } else if target == "cursor" {

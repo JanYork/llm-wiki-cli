@@ -196,6 +196,8 @@ enum Command {
         #[arg(long)]
         id: String,
     },
+    #[command(name = "__update-check", hide = true)]
+    UpdateCheck,
     /// Inspect and use the project-local CodeGraph index.
     Cg {
         #[command(subcommand)]
@@ -283,6 +285,34 @@ enum Command {
     Todo { #[command(subcommand)] command: TodoCommand },
     /// Manage an independent durable current execution plan.
     Plan { #[command(subcommand)] command: PlanCommand },
+    /// Compress one exact Wiki into a portable plaintext memory archive.
+    Compress {
+        /// Archive output path. Defaults to the selected Wiki's memory.lwc.zst.
+        output: Option<PathBuf>,
+    },
+    /// Validate and import a portable memory archive without implicit overwrite.
+    Decompress {
+        /// Archive input path. Defaults to the selected Wiki's memory.lwc.zst.
+        archive: Option<PathBuf>,
+        /// Request a separately confirmed whole-store replacement.
+        #[arg(long)]
+        overwrite: bool,
+        /// Confirmation token returned by a previous --overwrite preflight.
+        #[arg(long, requires = "overwrite")]
+        confirm_overwrite: Option<String>,
+    },
+    /// Conservatively merge a portable memory archive into one exact Wiki.
+    Merge {
+        /// Archive input path. Defaults to the selected Wiki's memory.lwc.zst.
+        #[arg(conflicts_with = "resume")]
+        archive: Option<PathBuf>,
+        /// Resume a staged or committed archive session.
+        #[arg(long)]
+        resume: Option<String>,
+        /// Apply one bounded conflict resolution packet while resuming.
+        #[arg(long, requires = "resume")]
+        resolve: Option<PathBuf>,
+    },
     /// Synchronize Git-tracked files and LWC semantic state with another machine over SSH.
     #[command(
         long_about = "Synchronize without replacing an existing Wiki database. Project files use Git; LWC semantic state is staged, merged, validated, and published separately.",

@@ -47,7 +47,17 @@ fn assert_onboarding_guidance(text: &str) {
         "lwc agent status",
         "LWC_READINESS",
         "lwc serve --mcp",
-        "single read-only `lwc_explore` tool",
+        "two read-only tools",
+        "`lwc_explore`",
+        "`lwc_codegraph`",
+        "node/search/callers/callees",
+        "explore",
+        "unsolicited lifecycle Plan/Todo progress signals",
+        "agent_context.status=bound",
+        "plan.tracking`/`plan.additional_trackings` or `todo.reminders",
+        "context-qualified `plan.current` or `todo.list` command",
+        "never `track` or start work from a reminder",
+        "tool receipt or follow-up that matches the Agent's own just-issued LWC Plan/Todo command",
         "plain-text choice",
         "Keep routine LWC bookkeeping silent",
         "meaningful multi-step operation, phase transition, or visible wait",
@@ -294,6 +304,9 @@ fn detected_yes_install_is_idempotent_and_uninstall_restores_exact_user_bytes() 
     );
     let settings: Value = serde_json::from_slice(&fs::read(&claude_settings).unwrap()).unwrap();
     let settings_text = settings.to_string();
+    let permissions = settings["permissions"]["allow"].as_array().unwrap();
+    assert!(permissions.contains(&serde_json::json!("mcp__lwc__lwc_explore")));
+    assert!(permissions.contains(&serde_json::json!("mcp__lwc__lwc_codegraph")));
     assert!(settings_text.contains("keep-hook"));
     assert!(settings_text.contains("UserPromptSubmit"));
     assert!(settings_text.contains("SessionStart"));
@@ -838,7 +851,8 @@ fn installer_fuses_official_codegraph_surfaces_into_lwc_and_uninstall_restores_t
     let claude_settings_text = fs::read_to_string(&claude_settings).unwrap();
     assert!(claude_settings_text.contains("keep-hook"));
     assert!(claude_settings_text.contains("keep-permission"));
-    assert!(!claude_settings_text.contains("codegraph"));
+    assert!(!claude_settings_text.contains("codegraph prompt-hook"));
+    assert!(!claude_settings_text.contains("mcp__codegraph__"));
     assert!(
         !fs::read_to_string(&hermes_config)
             .unwrap()
@@ -2776,6 +2790,10 @@ fn print_config_is_pure_and_pi_installs_an_mcp_tool_bridge() {
     assert!(extension.contains("[\"--scope\", \"all\", \"agent\", \"hook\", \"--agent\", \"pi\""));
     assert!(extension.contains("registerTool"));
     assert!(extension.contains("name: \"lwc_explore\""));
+    assert!(extension.contains("name: \"lwc_codegraph\""));
+    assert!(extension.contains("const CODEGRAPH_TIMEOUT_MS = 65000;"));
+    assert!(extension.contains("mcp.call(\"lwc_codegraph\", params, CODEGRAPH_TIMEOUT_MS)"));
+    assert!(extension.contains("node/search/callers/callees"));
     assert!(extension.contains("spawn(\"lwc\", [\"serve\", \"--mcp\"]"));
     for guidance in [
         "Treat graphs independently: ask for CodeGraph only for a code-structure task with code evidence, and for the document graph only for a document-relationship task with document or Wiki evidence; learning with Tutor, Book, or Practice alone does not qualify for CodeGraph, though modifying their source code can.",

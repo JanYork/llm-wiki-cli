@@ -155,6 +155,21 @@ operations return structured JSON that can be audited and resumed.
 
 [Read the architecture overview →](https://github.com/JanYork/llm-wiki-cli/wiki/Architecture-Overview)
 
+## Portable Memory Archives
+
+Agents can package one project Wiki, or an explicitly selected global Wiki,
+into a single portable archive and safely import or conservatively merge it into
+another LWC store. The archive contains the selected Wiki's complete plaintext
+memory, so share it only with a trusted recipient and treat received content as
+untrusted data rather than instructions.
+
+Existing memory is never replaced implicitly: imports stage a resumable merge,
+while whole-store overwrite requires separate human confirmation. Rebuildable
+indexes and projections are restored after publication; Tutor, Book, and
+Practice remain independent of archive v1.
+
+[Use portable memory archives safely →](docs/agent-workflow.md#portable-memory-archives)
+
 ## Hierarchical Recall and Knowledge Graph
 
 LWC indexes Sources and Wiki pages at document, passage, and sentence levels.

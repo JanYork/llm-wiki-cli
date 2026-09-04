@@ -8,6 +8,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import test from "node:test";
@@ -47,6 +48,36 @@ test("canonical LWC Skills are bundled identically for every native plugin", () 
         assert.deepEqual(readFileSync(join(copy, file)), readFileSync(join(canonical, file)), `${integration}/${skill}/${file}`);
       }
     }
+  }
+});
+
+test("canonical and mirrored guidance keeps the archive workflow Agent-safe", () => {
+  for (const directory of [
+    "skills/using-lwc",
+    "integrations/codex-lwc/skills/using-lwc",
+    "integrations/claude-lwc/skills/using-lwc",
+    "integrations/pi-lwc/skills/using-lwc",
+  ]) {
+    const guidance = [
+      readFileSync(join(root, directory, "SKILL.md"), "utf8"),
+      readFileSync(join(root, directory, "references/memory-archive.md"), "utf8"),
+    ].join("\n");
+    assert.match(guidance, /Agent-first/i, `${directory} Agent-first routing`);
+    assert.match(
+      guidance,
+      /memory.*plaintext.*trusted recipient/is,
+      `${directory} plaintext recipient warning`,
+    );
+    assert.match(
+      guidance,
+      /archive.*untrusted data.*not (?:as )?instructions/is,
+      `${directory} untrusted archive boundary`,
+    );
+    assert.match(
+      guidance,
+      /separate human confirmation.*overwrite/is,
+      `${directory} overwrite confirmation`,
+    );
   }
 });
 
@@ -113,7 +144,7 @@ test("Codex and Claude packages expose the stable LWC MCP and hook boundary", ()
   assert.equal(claude.skills, "./skills");
 });
 
-test("Pi injects boundary context and bridges lwc_explore over MCP", async () => {
+test("Pi injects boundary context and bridges both read-only LWC tools over MCP", async () => {
   if (process.platform === "win32") return;
   const directory = mkdtempSync(join(tmpdir(), "lwc-pi-integration-"));
   const executable = join(directory, "lwc");
@@ -133,7 +164,7 @@ test("Pi injects boundary context and bridges lwc_explore over MCP", async () =>
       const message = JSON.parse(line);
       if (message.id == null) continue;
       const result = message.method === "tools/call"
-        ? { content: [{ type: "text", text: "MCP_OK" }], structuredContent: { arguments: message.params.arguments } }
+        ? { content: [{ type: "text", text: "MCP_OK", annotations: { audience: ["assistant"] }, futureContentField: true }], structuredContent: { name: message.params.name, arguments: message.params.arguments } }
         : { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "fake", version: "1" } };
       console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
     }
@@ -155,16 +186,16 @@ fi
   process.env.PATH = `${directory}:${previousPath}`;
   try {
     const handlers = new Map();
-    let tool;
+    const tools = new Map();
     const source = readFileSync(join(root, "integrations/pi-lwc/extensions/lwc.js"), "utf8")
       .replace(
         'import { Type } from "typebox";',
-        'const Type = { String: () => ({}), Integer: options => ({ type: "integer", ...options }), Literal: value => ({ const: value }), Union: values => ({ anyOf: values }), Optional: value => value, Object: properties => ({ type: "object", properties }) };',
+        'const Type = { String: () => ({}), Integer: options => ({ type: "integer", ...options }), Literal: value => ({ const: value }), Union: values => ({ anyOf: values }), Optional: value => value, Object: (properties, options = {}) => ({ type: "object", properties, ...options }) };',
       );
     const extension = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
     extension.default({
       on: (event, handler) => handlers.set(event, handler),
-      registerTool: (definition) => { tool = definition; },
+      registerTool: (definition) => { tools.set(definition.name, definition); },
     });
     const context = { sessionManager: { getSessionId: () => "pi-session" } };
     assert.equal(handlers.has("stop"), false, "Pi must not fabricate Stop continuation");
@@ -179,6 +210,13 @@ fi
     const first = await handlers.get("before_agent_start")({ systemPrompt: "BASE" }, context);
     assert.match(first.systemPrompt, /^BASE\n\nUse the `using-lwc` Skill/);
     assert.match(first.systemPrompt, /current absolute project path/);
+    assert.match(first.systemPrompt, /two read-only tools.*`lwc_explore`.*`lwc_codegraph`/);
+    assert.match(first.systemPrompt, /unsolicited lifecycle Plan\/Todo progress signals/);
+    assert.match(first.systemPrompt, /agent_context\.status=bound/);
+    assert.match(first.systemPrompt, /plan\.tracking.*plan\.additional_trackings.*todo\.reminders/);
+    assert.match(first.systemPrompt, /context-qualified.*plan\.current.*todo\.list/);
+    assert.match(first.systemPrompt, /never `track` or start work from a reminder/);
+    assert.match(first.systemPrompt, /tool receipt or follow-up.*own just-issued LWC Plan\/Todo command/);
     assert.match(first.systemPrompt, /Treat graphs independently: ask for CodeGraph only for a code-structure task with code evidence/);
     assert.match(first.systemPrompt, /new stable request_id per mutation.*before display/);
     assert.match(first.systemPrompt, /one plain sentence about the learning outcome or next teaching action.*never expose Tutor, using-tutor, Skill, LWC, storage, persistence, recording, progress, status, or IDs/);
@@ -199,21 +237,169 @@ fi
       undefined,
       "a compact boundary must inject exactly once",
     );
-    assert.ok(tool.parameters.properties.maxDocuments);
-    assert.equal(tool.parameters.properties.maxDocuments.type, "integer");
-    assert.equal(tool.parameters.properties.maxDocuments.maximum, 20);
-    assert.equal(tool.parameters.properties.limit, undefined);
-    const result = await tool.execute("call-1", {
+    assert.deepEqual([...tools.keys()], ["lwc_explore", "lwc_codegraph"]);
+    const explore = tools.get("lwc_explore");
+    assert.match(explore.description, /Read/);
+    assert.ok(explore.parameters.properties.maxDocuments);
+    assert.equal(explore.parameters.properties.maxDocuments.type, "integer");
+    assert.equal(explore.parameters.properties.maxDocuments.maximum, 20);
+    assert.equal(explore.parameters.properties.limit, undefined);
+    const result = await explore.execute("call-1", {
       query: "memory",
       projectPath: directory,
       maxDocuments: 3,
     });
     assert.equal(result.content[0].text, "MCP_OK");
+    assert.equal(result.details.name, "lwc_explore");
     assert.equal(result.details.arguments.maxDocuments, 3);
+    const codegraph = tools.get("lwc_codegraph");
+    assert.match(codegraph.description, /node\/search\/callers\/callees.*precise.*explore.*broad/);
+    assert.ok(codegraph.parameters.properties.projectPath);
+    assert.ok(codegraph.parameters.properties.command);
+    assert.ok(codegraph.parameters.properties.arguments);
+    assert.equal(codegraph.parameters.properties.arguments.additionalProperties, true);
+    const codegraphResult = await codegraph.execute("call-2", {
+      projectPath: directory,
+      command: "node",
+      arguments: { symbol: "GetScanBatch", includeCode: true },
+    });
+    assert.equal(codegraphResult.content[0].text, "MCP_OK");
+    assert.deepEqual(codegraphResult.content[0].annotations, { audience: ["assistant"] });
+    assert.equal(codegraphResult.content[0].futureContentField, true);
+    assert.equal(codegraphResult.details.name, "lwc_codegraph");
+    assert.deepEqual(codegraphResult.details.arguments, {
+      projectPath: directory,
+      command: "node",
+      arguments: { symbol: "GetScanBatch", includeCode: true },
+    });
     await handlers.get("session_shutdown")();
   } finally {
     process.env.PATH = previousPath;
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Pi gives CodeGraph calls a longer timeout and replaces a timed-out MCP child", async () => {
+  const timers = new Map();
+  const scheduledDelays = [];
+  const children = [];
+  const held = new Map();
+  let nextTimer = 1;
+
+  const respond = (child, message, text = "MCP_OK") => {
+    child.stdout.emit("data", `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: message.id,
+      result: message.method === "initialize"
+        ? { protocolVersion: "2024-11-05", capabilities: {} }
+        : { content: [{ type: "text", text }] },
+    })}\n`);
+  };
+  const spawn = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stdout.setEncoding = () => {};
+    child.killed = false;
+    child.stdin = {
+      write(line) {
+        const message = JSON.parse(line);
+        if (message.id == null) return;
+        const toolArguments = message.params?.arguments;
+        const marker = toolArguments?.query ?? toolArguments?.arguments?.query;
+        if (marker === "TIMEOUT" || marker === "AFTER_TIMEOUT") {
+          held.set(marker, { child, message });
+        } else {
+          respond(child, message, `MCP_CHILD_${children.indexOf(child) + 1}`);
+        }
+      },
+    };
+    child.kill = () => {
+      child.killed = true;
+    };
+    children.push(child);
+    return child;
+  };
+  const setTimeout = (callback, delay) => {
+    const id = nextTimer++;
+    scheduledDelays.push(delay);
+    timers.set(id, callback);
+    return id;
+  };
+  const clearTimeout = (id) => timers.delete(id);
+  const fireTimer = (delay) => {
+    const entry = [...timers.entries()].find(([, callback]) => callback.delay === delay)
+      || [...timers.entries()].find(([, callback]) => callback && delay === scheduledDelays.at(-1));
+    assert.ok(entry, `missing ${delay}ms timer`);
+    timers.delete(entry[0]);
+    entry[1]();
+  };
+
+  globalThis.__piLwcBridgeHarness = {
+    execFileSync: () => "{}",
+    spawn,
+    setTimeout: (callback, delay) => {
+      callback.delay = delay;
+      return setTimeout(callback, delay);
+    },
+    clearTimeout,
+  };
+  try {
+    const source = readFileSync(join(root, "integrations/pi-lwc/extensions/lwc.js"), "utf8")
+      .replace(
+        'import { execFileSync, spawn } from "node:child_process";',
+        "const { execFileSync, spawn, setTimeout, clearTimeout } = globalThis.__piLwcBridgeHarness;",
+      )
+      .replace(
+        'import { Type } from "typebox";',
+        'const Type = { String: () => ({}), Integer: options => ({ type: "integer", ...options }), Literal: value => ({ const: value }), Union: values => ({ anyOf: values }), Optional: value => value, Object: (properties, options = {}) => ({ type: "object", properties, ...options }) };',
+      );
+    const extension = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+    const tools = new Map();
+    extension.default({
+      on() {},
+      registerTool: (definition) => tools.set(definition.name, definition),
+    });
+    const explore = tools.get("lwc_explore");
+    const codegraph = tools.get("lwc_codegraph");
+
+    await explore.execute("memory", { query: "memory", projectPath: root });
+    assert.equal(scheduledDelays.at(-1), 5_000, "memory retrieval keeps the short timeout");
+    await explore.execute("code", { query: "code", projectPath: root, mode: "code" });
+    assert.equal(scheduledDelays.at(-1), 65_000, "code exploration covers the 60s server bound");
+    await explore.execute("all", { query: "all", projectPath: root, mode: "all" });
+    assert.equal(scheduledDelays.at(-1), 65_000, "all-mode exploration covers CodeGraph");
+    await codegraph.execute("codegraph", {
+      projectPath: root,
+      command: "node",
+      arguments: { symbol: "target" },
+    });
+    assert.equal(scheduledDelays.at(-1), 65_000, "the dedicated CodeGraph tool uses 65s");
+
+    const timedOut = codegraph.execute("timeout", {
+      projectPath: root,
+      command: "search",
+      arguments: { query: "TIMEOUT" },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    fireTimer(65_000);
+    await assert.rejects(timedOut, /LWC MCP timeout/);
+    assert.equal(children[0].killed, true, "timeout closes the poisoned bridge");
+
+    const afterTimeout = explore.execute("after-timeout", {
+      query: "AFTER_TIMEOUT",
+      projectPath: root,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(children.length, 2, "the next call starts a fresh MCP child");
+    children[0].emit("exit", 1);
+    const next = held.get("AFTER_TIMEOUT");
+    respond(next.child, next.message, "NEW_CHILD_OK");
+    assert.equal((await afterTimeout).content[0].text, "NEW_CHILD_OK");
+    assert.equal(children.length, 2, "a late old-child exit must not clear the new bridge");
+  } finally {
+    delete globalThis.__piLwcBridgeHarness;
   }
 });
 
@@ -371,6 +557,12 @@ test("Pi package uses only official 0.84.2 lifecycle events and an MCP tool brid
   assert.match(extension, /systemPrompt/);
   assert.match(extension, /Use the `using-lwc` Skill/);
   assert.match(extension, /current absolute project path/);
+  assert.match(extension, /unsolicited lifecycle Plan\/Todo progress signals/);
+  assert.match(extension, /agent_context\.status=bound/);
+  assert.match(extension, /plan\.tracking.*plan\.additional_trackings.*todo\.reminders/);
+  assert.match(extension, /context-qualified.*plan\.current.*todo\.list/);
+  assert.match(extension, /never `track` or start work from a reminder/);
+  assert.match(extension, /tool receipt or follow-up.*own just-issued LWC Plan\/Todo command/);
   assert.match(extension, /"--scope", "all", "agent", "hook", "--agent", "pi"/);
   assert.match(extension, /registerTool/);
   assert.match(extension, /name: "lwc_explore"/);

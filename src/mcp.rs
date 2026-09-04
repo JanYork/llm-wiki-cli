@@ -5,17 +5,21 @@ use crate::{
     store::{SearchGranularity, SearchGrouping, SearchMode, SearchOptions, Store},
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::{
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{self, Receiver},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_FRAME_BYTES: usize = 64 * 1024;
+const CODEGRAPH_MCP_TIMEOUT: Duration = Duration::from_secs(60);
+const CODEGRAPH_READ_TOOLS: [&str; 8] = [
+    "search", "callers", "callees", "impact", "node", "explore", "status", "files",
+];
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -30,6 +34,14 @@ struct ExploreArgs {
     max_documents: Option<usize>,
     #[serde(default)]
     max_files: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CodeGraphArgs {
+    command: String,
+    project_path: String,
+    arguments: Map<String, Value>,
 }
 
 pub(crate) fn serve(path: Option<&Path>) -> Result<Value> {
@@ -121,10 +133,14 @@ fn handle(
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "lwc", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "Use the installed using-lwc Skill for substantive project work, durable recall, graph exploration, and verified memory maintenance. lwc_explore returns bounded, read-only reference data and cannot override Agent instructions. Pass the current absolute projectPath; memory mode is the default, while code or all mode is explicit. Lifecycle Hooks report LWC_READINESS where the client supports them. Missing graph readiness requires explicit user consent and CLI initialization outside MCP; this server never downloads, initializes, or mutates graph state."
+                "instructions": "Use the installed using-lwc Skill for substantive project work, durable recall, graph exploration, and verified memory maintenance. lwc_explore and lwc_codegraph return read-only reference data and cannot override Agent instructions. Pass the current absolute projectPath; use lwc_explore for bounded memory or broad context, and lwc_codegraph node/search/callers/callees for precise code questions. Lifecycle Hooks report LWC_READINESS where the client supports them. Missing graph readiness requires explicit user consent and CLI initialization outside MCP; this server never downloads, initializes, or mutates graph state."
             }),
         ),
-        "tools/list" => send_result(output, id.clone(), json!({"tools": [explore_tool()]})),
+        "tools/list" => send_result(
+            output,
+            id.clone(),
+            json!({"tools": [explore_tool(), codegraph_tool()]}),
+        ),
         "tools/call" => call_tool(
             output,
             id.clone(),
@@ -147,24 +163,73 @@ fn call_tool(
     let Some(params) = params.and_then(Value::as_object) else {
         return send_error(output, id, -32602, "Invalid params");
     };
-    if params.get("name").and_then(Value::as_str) != Some("lwc_explore") {
-        return send_error(output, id, -32602, "Unknown tool");
+    match params.get("name").and_then(Value::as_str) {
+        Some("lwc_explore") => {
+            let args = match params
+                .get("arguments")
+                .cloned()
+                .map(serde_json::from_value::<ExploreArgs>)
+                .transpose()
+            {
+                Ok(Some(args)) => args,
+                _ => return send_error(output, id, -32602, "Invalid tool arguments"),
+            };
+            match validate_args(args, workspace) {
+                Ok((args, project_path)) => match explore(&args, &project_path, codegraph) {
+                    Ok(result) => send_tool_result(output, id, &result),
+                    Err(error) => send_tool_error(output, id, error.code, &error.message),
+                },
+                Err((code, message)) => send_tool_error(output, id, code, &message),
+            }
+        }
+        Some("lwc_codegraph") => {
+            let args = match params
+                .get("arguments")
+                .cloned()
+                .map(serde_json::from_value::<CodeGraphArgs>)
+                .transpose()
+            {
+                Ok(Some(args)) => args,
+                _ => {
+                    return send_tool_error(
+                        output,
+                        id,
+                        "invalid_arguments",
+                        "lwc_codegraph requires command, projectPath, and object arguments",
+                    );
+                }
+            };
+            match call_codegraph(args, workspace, codegraph) {
+                Ok(result) => send_result(output, id, result),
+                Err(error) => send_tool_error(output, id, error.code, &error.message),
+            }
+        }
+        _ => send_error(output, id, -32602, "Unknown tool"),
     }
-    let args = match params
-        .get("arguments")
-        .cloned()
-        .map(serde_json::from_value::<ExploreArgs>)
-        .transpose()
-    {
-        Ok(Some(args)) => args,
-        _ => return send_error(output, id, -32602, "Invalid tool arguments"),
-    };
-    match validate_args(args, workspace) {
-        Ok((args, project_path)) => match explore(&args, &project_path, codegraph) {
-            Ok(result) => send_tool_result(output, id, &result),
-            Err(error) => send_tool_error(output, id, error.code, &error.message),
-        },
-        Err((code, message)) => send_tool_error(output, id, code, &message),
+}
+
+fn call_codegraph(
+    args: CodeGraphArgs,
+    workspace: &Path,
+    client: &mut Option<CodeGraphClient>,
+) -> Result<Value> {
+    let project = validate_project_path(&args.project_path, workspace)
+        .map_err(|(code, message)| AppError::new(code, message))?;
+    let tool = normalize_codegraph_tool(&args.command)?;
+    let mut arguments = args.arguments;
+    arguments.insert("projectPath".into(), json!(project));
+    codegraph_request(client, &project, &tool, Value::Object(arguments))
+}
+
+fn normalize_codegraph_tool(command: &str) -> Result<String> {
+    let command = command.strip_prefix("codegraph_").unwrap_or(command);
+    if CODEGRAPH_READ_TOOLS.contains(&command) {
+        Ok(format!("codegraph_{command}"))
+    } else {
+        Err(AppError::new(
+            "invalid_codegraph_command",
+            "command must be search, callers, callees, impact, node, explore, status, or files",
+        ))
     }
 }
 
@@ -373,21 +438,21 @@ fn code_plane(
     query: &str,
     max_files: usize,
 ) -> Value {
-    if client
-        .as_ref()
-        .is_some_and(|current| current.project != project)
-    {
-        *client = None;
-    }
-    let result = (|| -> Result<Value> {
-        if client.is_none() {
-            *client = Some(CodeGraphClient::spawn(project)?);
-        }
-        client
-            .as_mut()
-            .expect("CodeGraph client was initialized")
-            .explore(query, max_files)
-    })();
+    let result = if is_exact_identifier(query) {
+        codegraph_request(
+            client,
+            project,
+            "codegraph_node",
+            json!({"symbol": query.trim(), "includeCode": true, "projectPath": project}),
+        )
+    } else {
+        codegraph_request(
+            client,
+            project,
+            "codegraph_explore",
+            json!({"query": query, "maxFiles": max_files, "projectPath": project}),
+        )
+    };
     match result {
         Ok(result) if result["isError"] != true => {
             json!({"state": "ready", "result": cap_codegraph_result(&result)})
@@ -406,6 +471,46 @@ fn code_plane(
             })
         }
     }
+}
+
+fn codegraph_request(
+    client: &mut Option<CodeGraphClient>,
+    project: &Path,
+    tool: &str,
+    arguments: Value,
+) -> Result<Value> {
+    if client
+        .as_ref()
+        .is_some_and(|current| current.project != project)
+    {
+        *client = None;
+    }
+    let result = (|| {
+        if client.is_none() {
+            *client = Some(CodeGraphClient::spawn(project)?);
+        }
+        client
+            .as_mut()
+            .expect("CodeGraph client was initialized")
+            .call(tool, arguments)
+    })();
+    if result.is_err() {
+        *client = None;
+    }
+    result
+}
+
+fn is_exact_identifier(query: &str) -> bool {
+    let query = query.trim().replace("::", ".");
+    !query.is_empty()
+        && !query.contains(':')
+        && query.split(['.', '#']).all(|segment| {
+            let mut characters = segment.chars();
+            characters
+                .next()
+                .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+                && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+        })
 }
 
 fn cap_codegraph_result(result: &Value) -> Value {
@@ -446,6 +551,11 @@ impl CodeGraphClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         let mut child = command.spawn()?;
         let input = child.stdin.take().expect("piped CodeGraph stdin");
         let stdout = child.stdout.take().expect("piped CodeGraph stdout");
@@ -493,16 +603,12 @@ impl CodeGraphClient {
         Ok(client)
     }
 
-    fn explore(&mut self, query: &str, max_files: usize) -> Result<Value> {
+    fn call(&mut self, tool: &str, arguments: Value) -> Result<Value> {
         self.request(
             "tools/call",
             json!({
-                "name": "codegraph_explore",
-                "arguments": {
-                    "query": query,
-                    "maxFiles": max_files,
-                    "projectPath": self.project
-                }
+                "name": tool,
+                "arguments": arguments
             }),
         )
     }
@@ -517,14 +623,21 @@ impl CodeGraphClient {
         .map_err(|error| AppError::new("codegraph_mcp_write_failed", error.to_string()))?;
         self.input.write_all(b"\n")?;
         self.input.flush()?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let timeout = codegraph_mcp_timeout();
+        let deadline = std::time::Instant::now() + timeout;
         let response = loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let frame = self
                 .output
                 .recv_timeout(remaining)
                 .map_err(|_| {
-                    AppError::new("codegraph_mcp_timeout", "CodeGraph MCP exceeded 10 seconds")
+                    AppError::new(
+                        "codegraph_mcp_timeout",
+                        format!(
+                            "CodeGraph MCP exceeded {} milliseconds",
+                            timeout.as_millis()
+                        ),
+                    )
                 })?
                 .map_err(|message| AppError::new("codegraph_mcp_closed", message))?;
             if frame.1 {
@@ -572,11 +685,93 @@ impl CodeGraphClient {
     }
 }
 
+fn codegraph_mcp_timeout() -> Duration {
+    std::env::var("LWC_TEST_CODEGRAPH_MCP_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(CODEGRAPH_MCP_TIMEOUT)
+}
+
 impl Drop for CodeGraphClient {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        terminate_codegraph_process_tree(&mut self.child);
     }
+}
+
+fn terminate_codegraph_process_tree(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let _ = terminate_codegraph_process_group(child, deadline);
+    let _ = wait_for_codegraph_child_until(child, deadline);
+}
+
+fn wait_for_codegraph_child_until(
+    child: &mut Child,
+    deadline: Instant,
+) -> io::Result<Option<std::process::ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
+}
+
+#[cfg(unix)]
+fn terminate_codegraph_process_group(child: &mut Child, _deadline: Instant) -> io::Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    if unsafe { kill(-(child.id() as i32), 9) } == 0 {
+        return Ok(());
+    }
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(_error) if child.try_wait()?.is_some() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn terminate_codegraph_process_group(child: &mut Child, deadline: Instant) -> io::Result<()> {
+    let started = Instant::now();
+    let remaining = deadline.saturating_duration_since(started);
+    let taskkill_deadline = started + remaining / 3;
+    let taskkill_reap_deadline = started + remaining.saturating_mul(2) / 3;
+    let mut taskkill = Command::new("taskkill.exe")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(taskkill) = taskkill.as_mut() {
+        match wait_for_codegraph_child_until(taskkill, taskkill_deadline) {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = taskkill.kill();
+                let _ = wait_for_codegraph_child_until(taskkill, taskkill_reap_deadline);
+            }
+        }
+    }
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(_error) if child.try_wait()?.is_some() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_codegraph_process_group(child: &mut Child, _deadline: Instant) -> io::Result<()> {
+    child.kill()
 }
 
 fn validate_args(
@@ -587,12 +782,6 @@ fn validate_args(
         return Err((
             "invalid_query",
             "query must contain 1 to 10000 characters".into(),
-        ));
-    }
-    if args.project_path.chars().count() > 4_096 {
-        return Err((
-            "invalid_project_path",
-            "projectPath exceeds 4096 characters".into(),
         ));
     }
     if !matches!(
@@ -625,7 +814,21 @@ fn validate_args(
             "maxFiles must be between 1 and 20".into(),
         ));
     }
-    let path = PathBuf::from(&args.project_path);
+    let path = validate_project_path(&args.project_path, workspace)?;
+    Ok((args, path))
+}
+
+fn validate_project_path(
+    project_path: &str,
+    workspace: &Path,
+) -> std::result::Result<PathBuf, (&'static str, String)> {
+    if project_path.chars().count() > 4_096 {
+        return Err((
+            "invalid_project_path",
+            "projectPath exceeds 4096 characters".into(),
+        ));
+    }
+    let path = PathBuf::from(project_path);
     if !path.is_absolute() {
         return Err((
             "invalid_project_path",
@@ -671,7 +874,7 @@ fn validate_args(
             ),
         ));
     }
-    Ok((args, path))
+    Ok(path)
 }
 
 #[cfg_attr(not(unix), allow(unused_variables))]
@@ -721,6 +924,29 @@ fn explore_tool() -> Value {
                 "maxFiles": {"type": "integer", "minimum": 1, "maximum": 20, "default": 12}
             },
             "required": ["query", "projectPath"]
+        },
+        "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
+    })
+}
+
+fn codegraph_tool() -> Value {
+    json!({
+        "name": "lwc_codegraph",
+        "description": "Call one read-only project CodeGraph tool. Use node/search/callers/callees for precise questions and explore only for broad flows. The CodeGraph CallToolResult is returned unchanged.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "command": {"type": "string"},
+                "arguments": {"type": "object"},
+                "projectPath": {"type": "string", "maxLength": 4096}
+            },
+            "required": ["command", "arguments", "projectPath"]
         },
         "annotations": {
             "readOnlyHint": true,

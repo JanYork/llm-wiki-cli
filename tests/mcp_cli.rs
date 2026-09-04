@@ -34,6 +34,26 @@ fn run_mcp_in_with_env(
     fake_log: Option<&Path>,
     messages: &[Value],
 ) -> std::process::Output {
+    run_mcp_in_with_extra_env(
+        cwd,
+        home,
+        project_root,
+        codegraph_binary,
+        fake_log,
+        &[],
+        messages,
+    )
+}
+
+fn run_mcp_in_with_extra_env(
+    cwd: &Path,
+    home: Option<&Path>,
+    project_root: Option<&Path>,
+    codegraph_binary: Option<&Path>,
+    fake_log: Option<&Path>,
+    extra_env: &[(&str, &str)],
+    messages: &[Value],
+) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lwc"));
     command
         .args(["serve", "--mcp"])
@@ -53,6 +73,7 @@ fn run_mcp_in_with_env(
     if let Some(fake_log) = fake_log {
         command.env("FAKE_CODEGRAPH_LOG", fake_log);
     }
+    command.envs(extra_env.iter().copied());
     let mut child = command.spawn().unwrap();
     {
         let stdin = child.stdin.as_mut().unwrap();
@@ -127,7 +148,7 @@ fn file_snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, 
 }
 
 #[test]
-fn mcp_server_negotiates_and_lists_one_read_only_tool() {
+fn mcp_server_negotiates_and_lists_read_only_tools() {
     let output = run_mcp(&[
         json!({
             "jsonrpc": "2.0",
@@ -171,8 +192,11 @@ fn mcp_server_negotiates_and_lists_one_read_only_tool() {
 
     assert_eq!(responses[1]["id"], 2);
     let tools = responses[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 1);
-    let tool = &tools[0];
+    assert_eq!(tools.len(), 2);
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "lwc_explore")
+        .unwrap();
     assert_eq!(tool["name"], "lwc_explore");
     assert_eq!(tool["inputSchema"]["additionalProperties"], false);
     assert_eq!(
@@ -183,6 +207,19 @@ fn mcp_server_negotiates_and_lists_one_read_only_tool() {
     assert_eq!(tool["annotations"]["destructiveHint"], false);
     assert_eq!(tool["annotations"]["idempotentHint"], true);
     assert_eq!(tool["annotations"]["openWorldHint"], false);
+    let codegraph = tools
+        .iter()
+        .find(|tool| tool["name"] == "lwc_codegraph")
+        .unwrap();
+    assert_eq!(codegraph["inputSchema"]["additionalProperties"], false);
+    assert_eq!(
+        codegraph["inputSchema"]["required"],
+        json!(["command", "arguments", "projectPath"])
+    );
+    assert_eq!(codegraph["annotations"]["readOnlyHint"], true);
+    assert_eq!(codegraph["annotations"]["destructiveHint"], false);
+    assert_eq!(codegraph["annotations"]["idempotentHint"], true);
+    assert_eq!(codegraph["annotations"]["openWorldHint"], false);
 
     assert_eq!(
         responses[2],
@@ -1088,7 +1125,290 @@ done
 
 #[cfg(unix)]
 #[test]
-fn mcp_code_mode_times_out_and_reaps_a_hung_child() {
+fn mcp_codegraph_gateway_forwards_read_only_aliases_with_canonical_path_and_raw_result() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let home = temp.path().join("home");
+    fs::create_dir_all(project.join(".lwc/codegraph")).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(project.join(".lwc/codegraph/codegraph.db"), b"indexed").unwrap();
+    let fake = temp.path().join("codegraph");
+    let log = temp.path().join("codegraph.log");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+printf 'tools|%s\n' "$CODEGRAPH_MCP_TOOLS" >> "$FAKE_CODEGRAPH_LOG"
+next=1
+while IFS= read -r line; do
+  printf 'request|%s\n' "$line" >> "$FAKE_CODEGRAPH_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"codegraph","version":"test"}}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      next=$((next + 1))
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"raw codegraph result"}],"isError":false,"annotations":{"audience":["assistant"]},"futureField":{"preserved":true}}}\n' "$next"
+      ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake, permissions).unwrap();
+
+    let calls = [
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "lwc_codegraph", "arguments": {
+                "command": "node",
+                "projectPath": project,
+                "arguments": {
+                    "symbol": "GetScanBatch",
+                    "includeCode": true,
+                    "projectPath": "/tmp/forged-project",
+                    "futureArgument": {"preserved": true}
+                }
+            }}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "lwc_codegraph", "arguments": {
+                "command": "codegraph_callers",
+                "projectPath": project,
+                "arguments": {"symbol": "GetScanBatch"}
+            }}
+        }),
+    ];
+    let output = run_mcp_in_with_env(&project, Some(&home), None, Some(&fake), Some(&log), &calls);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = json!({
+        "content": [{"type": "text", "text": "raw codegraph result"}],
+        "isError": false,
+        "annotations": {"audience": ["assistant"]},
+        "futureField": {"preserved": true}
+    });
+    for response in responses(&output) {
+        assert_eq!(response["result"], expected);
+    }
+
+    let log = fs::read_to_string(log).unwrap();
+    let enabled = log
+        .lines()
+        .find_map(|line| line.strip_prefix("tools|"))
+        .unwrap()
+        .split(',')
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        enabled,
+        [
+            "search", "callers", "callees", "impact", "node", "explore", "status", "files"
+        ]
+        .into_iter()
+        .collect()
+    );
+    let calls = log
+        .lines()
+        .filter_map(|line| line.strip_prefix("request|"))
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|request| request["method"] == "tools/call")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["params"]["name"], "codegraph_node");
+    assert_eq!(calls[1]["params"]["name"], "codegraph_callers");
+    let canonical = project.canonicalize().unwrap();
+    for call in &calls {
+        assert_eq!(call["params"]["arguments"]["projectPath"], json!(canonical));
+    }
+    assert_eq!(
+        calls[0]["params"]["arguments"]["futureArgument"],
+        json!({"preserved": true})
+    );
+    assert!(!log.contains("/tmp/forged-project"));
+}
+
+#[test]
+fn mcp_codegraph_gateway_rejects_non_read_only_commands_and_non_object_arguments() {
+    let project = tempfile::tempdir().unwrap();
+    let calls = [
+        ("sync", json!({})),
+        ("codegraph_index", json!({})),
+        ("unknown", json!({})),
+        ("node", json!(["not", "an", "object"])),
+    ]
+    .map(|(command, arguments)| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": command,
+            "method": "tools/call",
+            "params": {"name": "lwc_codegraph", "arguments": {
+                "command": command,
+                "projectPath": project.path(),
+                "arguments": arguments
+            }}
+        })
+    });
+    let output = run_mcp_in(project.path(), None, &calls);
+    assert!(output.status.success());
+    for response in responses(&output) {
+        assert!(response.get("error").is_none(), "{response:#}");
+        assert_eq!(response["result"]["isError"], true, "{response:#}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_code_mode_routes_exact_identifiers_to_node_and_natural_language_to_explore() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let home = temp.path().join("home");
+    fs::create_dir_all(project.join(".lwc/codegraph")).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(project.join(".lwc/codegraph/codegraph.db"), b"indexed").unwrap();
+    let fake = temp.path().join("codegraph");
+    let log = temp.path().join("codegraph.log");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+next=1
+while IFS= read -r line; do
+  printf 'request|%s\n' "$line" >> "$FAKE_CODEGRAPH_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"codegraph","version":"test"}}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      next=$((next + 1))
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"routed"}]}}\n' "$next"
+      ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake, permissions).unwrap();
+
+    let calls = [
+        (1, "GetScanBatch", 12),
+        (2, "batch cancellation flow", 4),
+        (3, "取消流程", 2),
+    ]
+    .map(|(id, query, max_files)| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": "lwc_explore", "arguments": {
+                "query": query,
+                "projectPath": project,
+                "mode": "code",
+                "maxFiles": max_files
+            }}
+        })
+    });
+    let output = run_mcp_in_with_env(&project, Some(&home), None, Some(&fake), Some(&log), &calls);
+    assert!(output.status.success());
+    let log = fs::read_to_string(log).unwrap();
+    let calls = log
+        .lines()
+        .filter_map(|line| line.strip_prefix("request|"))
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|request| request["method"] == "tools/call")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0]["params"]["name"], "codegraph_node");
+    assert_eq!(calls[0]["params"]["arguments"]["symbol"], "GetScanBatch");
+    assert_eq!(calls[0]["params"]["arguments"]["includeCode"], true);
+    assert_eq!(calls[1]["params"]["name"], "codegraph_explore");
+    assert_eq!(
+        calls[1]["params"]["arguments"]["query"],
+        "batch cancellation flow"
+    );
+    assert_eq!(calls[1]["params"]["arguments"]["maxFiles"], 4);
+    assert_eq!(calls[2]["params"]["name"], "codegraph_explore");
+    assert_eq!(calls[2]["params"]["arguments"]["query"], "取消流程");
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_code_mode_waits_past_codegraph_busy_queue_deadline() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let home = temp.path().join("home");
+    fs::create_dir_all(project.join(".lwc/codegraph")).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(project.join(".lwc/codegraph/codegraph.db"), b"indexed").unwrap();
+    let fake = temp.path().join("codegraph");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"codegraph","version":"test"}}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      trap 'kill "$sleeper" 2>/dev/null; wait "$sleeper" 2>/dev/null; exit' TERM INT EXIT
+      sleep 46 & sleeper=$!
+      wait "$sleeper"
+      trap - TERM INT EXIT
+      printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"after busy deadline"}]}}\n'
+      ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake, permissions).unwrap();
+
+    let output = run_mcp_in_with_env(
+        &project,
+        Some(&home),
+        None,
+        Some(&fake),
+        None,
+        &[json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "lwc_explore", "arguments": {
+                "query": "slow broad query",
+                "projectPath": project,
+                "mode": "code"
+            }}
+        })],
+    );
+    let response = responses(&output).remove(0);
+    let result: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        result["codeGraph"]["result"]["content"][0]["text"],
+        "after busy deadline"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_code_mode_times_out_and_reaps_a_hung_process_tree() {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
@@ -1102,13 +1422,17 @@ fn mcp_code_mode_times_out_and_reaps_a_hung_child() {
     fs::write(
         &fake,
         r#"#!/bin/sh
-printf '%s' "$$" > "$FAKE_CODEGRAPH_LOG"
+printf 'parent=%s\n' "$$" > "$FAKE_CODEGRAPH_LOG"
 while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
       printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"codegraph","version":"test"}}}\n'
       ;;
-    *'"method":"tools/call"'*) read -r never ;;
+    *'"method":"tools/call"'*)
+      sleep 30 & descendant=$!
+      printf 'descendant=%s\n' "$descendant" >> "$FAKE_CODEGRAPH_LOG"
+      wait "$descendant"
+      ;;
   esac
 done
 "#,
@@ -1118,12 +1442,13 @@ done
     permissions.set_mode(0o755);
     fs::set_permissions(&fake, permissions).unwrap();
     let started = Instant::now();
-    let output = run_mcp_in_with_env(
+    let output = run_mcp_in_with_extra_env(
         &project,
         Some(&home),
         None,
         Some(&fake),
         Some(&log),
+        &[("LWC_TEST_CODEGRAPH_MCP_TIMEOUT_MS", "5000")],
         &[json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -1135,7 +1460,6 @@ done
             }}
         })],
     );
-    assert!(started.elapsed() <= Duration::from_secs(20));
     let response = responses(&output).remove(0);
     let result: Value =
         serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -1143,13 +1467,33 @@ done
         result["codeGraph"]["error"]["code"],
         "codegraph_mcp_timeout"
     );
-    let pid = fs::read_to_string(log).unwrap();
+    let pids = fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let (name, pid) = line.split_once('=').unwrap();
+            (name.to_owned(), pid.to_owned())
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     assert!(
         !Command::new("kill")
-            .args(["-0", pid.trim()])
+            .args(["-0", &pids["parent"]])
             .stderr(Stdio::null())
             .status()
             .unwrap()
             .success()
     );
+    let descendant_alive = Command::new("kill")
+        .args(["-0", &pids["descendant"]])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    if descendant_alive {
+        let _ = Command::new("kill")
+            .args(["-9", &pids["descendant"]])
+            .status();
+    }
+    assert!(!descendant_alive, "CodeGraph descendant survived timeout");
+    assert!(started.elapsed() <= Duration::from_secs(10));
 }

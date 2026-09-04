@@ -693,6 +693,10 @@ pub(crate) fn mcp_command(project: &Path) -> Result<Command> {
         .args(["serve", "--mcp"])
         .current_dir(&paths.project)
         .env("CODEGRAPH_DIR", ".lwc/codegraph")
+        .env(
+            "CODEGRAPH_MCP_TOOLS",
+            "search,callers,callees,impact,node,explore,status,files",
+        )
         .env("CODEGRAPH_TELEMETRY", "0")
         .env("DO_NOT_TRACK", "1")
         .env("NO_COLOR", "1")

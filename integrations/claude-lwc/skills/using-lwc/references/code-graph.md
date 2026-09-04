@@ -24,9 +24,24 @@ lwc --scope project cg status
 
 The pinned CodeGraph runtime is installed once globally per version/platform,
 while every project owns its separate `.lwc/codegraph` index. If
-`initialized=true`, use its read commands proactively: `query`/`node` for
-definitions, `callers`/`callees` for direction, `trace` for flow, `impact`
-before changing a shared symbol, and `files` for topology.
+`initialized=true`, use the native read-only `lwc_codegraph` tool. Its `command`
+accepts only `search`, `callers`, `callees`, `impact`, `node`, `explore`,
+`status`, and `files`, either as short names or with the `codegraph_` prefix.
+Pass `arguments` as an object. LWC validates the project root and always
+overwrites any nested `projectPath` with that canonical path.
+
+Choose `node` for one known symbol, `search` for candidates,
+`callers`/`callees` for direction, `impact` before changing shared code, and
+`files` for topology. Reserve `explore` for broad flows. A successful call
+returns CodeGraph's complete `CallToolResult` unchanged; LWC transport,
+protocol, and timeout failures remain structured LWC errors. The outer 60-second
+deadline covers CodeGraph's 45-second busy queue while still bounding a hung
+child.
+
+Keep `lwc_explore` for bounded Wiki memory and compatible mixed exploration. In
+code mode, one exact identifier or qualified identifier routes to `node` with
+code included; natural-language and multi-token queries continue to use
+`explore`.
 
 If `initialized=false`, explain tree-sitter-derived structure, project-local
 indexing, telemetry disabled, and single-file document-granular commits. Always

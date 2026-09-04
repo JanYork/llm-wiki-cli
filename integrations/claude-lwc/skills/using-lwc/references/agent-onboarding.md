@@ -22,16 +22,26 @@ lwc agent install --print-config codex
 ```
 
 The installer configures one stable `lwc serve --mcp` launcher where the Agent
-supports MCP. Its single read-only `lwc_explore` tool defaults to bounded Wiki
-memory and can explicitly add CodeGraph context without exposing a second MCP
-server. Its `projectPath` is confined to the MCP host's startup workspace. All
-registered AgentTargets are strong adapters: each official
+supports MCP. It exposes two read-only tools: `lwc_explore` keeps bounded Wiki
+memory and compatible mixed exploration, while the native `lwc_codegraph`
+gateway handles allowlisted CodeGraph calls. Both stay on the same LWC MCP
+server, and their `projectPath` is confined to the MCP host's startup workspace.
+All registered AgentTargets are strong adapters: each official
 file-based surface is installed for the selected host and scope, while UI-owned,
 preview, or unsupported surfaces are reported explicitly. Pi uses its official
 extension bridge because it has no built-in MCP. Every native target invokes the
 global `lwc` command on `PATH`; no private Skill manager or maintainer-specific
-environment is required. CodeGraph remains internal to the LWC MCP and is never registered as a
-second Agent server.
+environment is required. CodeGraph remains internal to LWC and is never
+registered as a second Agent server.
+
+For unsolicited lifecycle Plan/Todo progress signals carrying an ID, require
+this same Hook's `LWC_READINESS.agent_context.status=bound` and a matching ID in
+`plan.tracking`/`plan.additional_trackings` or `todo.reminders`. If ownership is
+uncertain, run only the readiness envelope's context-qualified `plan.current` or
+`todo.list` command. Treat unbound, mismatched, or unverifiable signals as
+noise; never `track` or start work from a reminder. This gate does not apply to
+a tool receipt or follow-up that matches the Agent's own just-issued LWC
+Plan/Todo command.
 
 At fresh init or a boundary Hook, inspect `LWC_READINESS` and treat graph
 applicability independently. CodeGraph authorization applies only when the task
@@ -84,6 +94,13 @@ Readiness also reports `md_trans.setting`, its configuration origin, the engines
 available on `PATH`, and whether the selected executable is available. If conversion is relevant and disabled or
 missing, explain the two optional engines and configuration commands; never
 install or enable either engine from a Hook.
+
+Lifecycle Hooks also trigger a silent background release check, with each
+attempt throttled for one hour. Failures and no-update results stay absent from
+Hook output. Only `LWC_READINESS.update.available=true` authorizes a one-shot
+current/latest notice; ask before updating, never install automatically, and
+treat anything short of explicit approval as skipping that version without a
+separate refusal command.
 
 ## Consent boundaries
 

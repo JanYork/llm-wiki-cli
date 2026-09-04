@@ -7,6 +7,7 @@ fn run(cli: Cli) -> Result<Value> {
             | Command::Init { .. }
             | Command::Work { .. }
             | Command::WorkRun { .. }
+            | Command::UpdateCheck
             | Command::Cg { .. }
             | Command::Office { .. }
             | Command::Tutor { .. }
@@ -17,6 +18,9 @@ fn run(cli: Cli) -> Result<Value> {
             | Command::Agent { .. }
             | Command::Todo { .. }
             | Command::Plan { .. }
+            | Command::Compress { .. }
+            | Command::Decompress { .. }
+            | Command::Merge { .. }
             | Command::Sync { .. }
             | Command::SyncPeer
     ) {
@@ -99,6 +103,10 @@ fn run(cli: Cli) -> Result<Value> {
         Command::WorkRun { root, id } => {
             changeset::reject_selector(selected_changeset.as_deref(), "work runner")?;
             work::run(&root, &id)
+        }
+        Command::UpdateCheck => {
+            crate::update::run_checker();
+            Ok(Value::Null)
         }
         Command::Cg { command } => {
             changeset::reject_selector(selected_changeset.as_deref(), "cg")?;
@@ -688,6 +696,38 @@ fn run(cli: Cli) -> Result<Value> {
                 PlanCommand::Track { plan_id,context } => {ensure_scope_supported(cli.scope,false,"plan track")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.plan_track(&plan_id,&context)}
                 PlanCommand::Untrack { plan_id,context } => {ensure_scope_supported(cli.scope,false,"plan untrack")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.plan_untrack(&plan_id,&context)}
             }
+        }
+        Command::Compress { output } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "compress")?;
+            crate::archive::compress(&cwd, cli.scope, output.as_deref())
+        }
+        Command::Decompress {
+            archive,
+            overwrite,
+            confirm_overwrite,
+        } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "decompress")?;
+            crate::archive::decompress(
+                &cwd,
+                cli.scope,
+                archive.as_deref(),
+                overwrite,
+                confirm_overwrite.as_deref(),
+            )
+        }
+        Command::Merge {
+            archive,
+            resume,
+            resolve,
+        } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "merge")?;
+            crate::archive::merge(
+                &cwd,
+                cli.scope,
+                archive.as_deref(),
+                resume.as_deref(),
+                resolve.as_deref(),
+            )
         }
         Command::Sync { host, directory, mode, resume, resolve, abort } => {
             changeset::reject_selector(selected_changeset.as_deref(), "sync")?;
