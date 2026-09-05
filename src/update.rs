@@ -136,10 +136,7 @@ fn fetch_latest_version() -> io::Result<String> {
         let log = env::var_os("LWC_TEST_UPDATE_CURL_LOG")
             .ok_or_else(|| io::Error::other("test update curl log is unavailable"))?;
         writeln!(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log)?,
+            OpenOptions::new().create(true).append(true).open(log)?,
             "-fsSLI --connect-timeout 2 --max-time 5 --output NUL --write-out %{{url_effective}} {LATEST_URL}"
         )?;
         let effective = match env::var("LWC_TEST_UPDATE_CURL_MODE").as_deref() {
