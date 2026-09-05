@@ -90,9 +90,7 @@ pub(crate) fn mark_notified(version: &str) -> io::Result<bool> {
 
 pub(crate) fn spawn_checker() -> io::Result<()> {
     // Test-only: complete the fake transport without a second LWC process.
-    if env::var_os("LWC_TEST_UPDATE_CURL").is_some()
-        && env::var("LWC_TEST_UPDATE_WAIT_FOR_CHECKER").as_deref() == Ok("1")
-    {
+    if synchronous_test_checker() {
         run_checker();
         return Ok(());
     }
@@ -133,6 +131,31 @@ fn pending_notice(state: &UpdateState) -> Option<(String, String)> {
 }
 
 fn fetch_latest_version() -> io::Result<String> {
+    #[cfg(windows)]
+    if synchronous_test_checker() {
+        let log = env::var_os("LWC_TEST_UPDATE_CURL_LOG")
+            .ok_or_else(|| io::Error::other("test update curl log is unavailable"))?;
+        writeln!(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)?,
+            "-fsSLI --connect-timeout 2 --max-time 5 --output NUL --write-out %{{url_effective}} {LATEST_URL}"
+        )?;
+        let effective = match env::var("LWC_TEST_UPDATE_CURL_MODE").as_deref() {
+            Ok("fail") => return Err(io::Error::other("release check failed")),
+            Ok("malformed") => {
+                "https://github.com/JanYork/llm-wiki-cli/releases/tag/v1.2.3-beta".to_owned()
+            }
+            _ => format!(
+                "https://github.com/JanYork/llm-wiki-cli/releases/tag/v{}",
+                env::var("LWC_TEST_UPDATE_LATEST_VERSION")
+                    .map_err(|_| io::Error::other("test update version is unavailable"))?
+            ),
+        };
+        return parse_latest_version_url(&effective);
+    }
+
     let curl = env::var_os("LWC_TEST_UPDATE_CURL").unwrap_or_else(|| "curl".into());
     let null_output = if cfg!(windows) { "NUL" } else { "/dev/null" };
     let output = Command::new(curl)
@@ -158,6 +181,10 @@ fn fetch_latest_version() -> io::Result<String> {
     let effective = std::str::from_utf8(&output.stdout)
         .map_err(|_| io::Error::other("release URL is not UTF-8"))?
         .trim();
+    parse_latest_version_url(effective)
+}
+
+fn parse_latest_version_url(effective: &str) -> io::Result<String> {
     let tag = effective
         .strip_prefix("https://github.com/JanYork/llm-wiki-cli/releases/tag/v")
         .ok_or_else(|| io::Error::other("unexpected release URL"))?;
@@ -167,6 +194,11 @@ fn fetch_latest_version() -> io::Result<String> {
     parse_version(tag)
         .map(|version| version.to_string())
         .ok_or_else(|| io::Error::other("invalid release version"))
+}
+
+fn synchronous_test_checker() -> bool {
+    env::var_os("LWC_TEST_UPDATE_CURL").is_some()
+        && env::var("LWC_TEST_UPDATE_WAIT_FOR_CHECKER").as_deref() == Ok("1")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
