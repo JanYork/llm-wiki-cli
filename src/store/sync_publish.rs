@@ -999,15 +999,22 @@ fn validate_sync_domain_invariants(tx: &Transaction<'_>) -> Result<()> {
         }
     }
 
+    // Abandon preserves the last step states; advance can finish every step
+    // before complete closes the plan. Neither is a missing-focal corruption.
     let invalid_plan: Option<String> = tx
         .query_row(
             "SELECT p.id FROM plans p
-             WHERE (p.state='active' AND
-                    (SELECT COUNT(*) FROM plan_steps s
-                     WHERE s.plan_id=p.id AND s.status IN ('in_progress','blocked')) <> 1)
-                OR (p.state<>'active' AND
+             WHERE NOT EXISTS(SELECT 1 FROM plan_steps s WHERE s.plan_id=p.id)
+                OR (SELECT COUNT(*) FROM plan_steps s
+                    WHERE s.plan_id=p.id AND s.status IN ('in_progress','blocked')) > 1
+                OR (p.state='active' AND
                     EXISTS(SELECT 1 FROM plan_steps s
-                           WHERE s.plan_id=p.id AND s.status IN ('in_progress','blocked')))
+                           WHERE s.plan_id=p.id AND s.status='pending') AND
+                    NOT EXISTS(SELECT 1 FROM plan_steps s
+                               WHERE s.plan_id=p.id AND s.status IN ('in_progress','blocked')))
+                OR (p.state='completed' AND
+                    EXISTS(SELECT 1 FROM plan_steps s
+                           WHERE s.plan_id=p.id AND s.status NOT IN ('completed','skipped')))
              ORDER BY p.id LIMIT 1",
             [],
             |row| row.get(0),

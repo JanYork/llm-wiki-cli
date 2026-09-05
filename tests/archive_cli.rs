@@ -115,6 +115,209 @@ fn resolution_packet(conflicts: &[Value]) -> Value {
     })
 }
 
+fn archive_plan(world: &World, source: &Path) -> Value {
+    world.ok(source, &["config", "set", "--plan", "enabled"]);
+    world.ok(
+        source,
+        &[
+            "plan",
+            "create",
+            "Release history",
+            "--objective",
+            "Preserve history",
+            "--done-when",
+            "Verified",
+            "--step",
+            "Publish",
+            "--step",
+            "Verify",
+        ],
+    )["plan"]
+        .clone()
+}
+
+#[test]
+fn archive_round_trip_and_merge_preserve_abandoned_plan_history() {
+    for blocked in [false, true] {
+        let world = World::new();
+        let source = world.project("source", true);
+        let plan = archive_plan(&world, &source);
+        let id = plan["id"].as_str().unwrap();
+        if blocked {
+            world.ok(
+                &source,
+                &[
+                    "plan",
+                    "block",
+                    id,
+                    "--if-revision",
+                    "1",
+                    "--step",
+                    plan["steps"][0]["id"].as_str().unwrap(),
+                    "--reason",
+                    "Failed tag",
+                ],
+            );
+        }
+        world.ok(
+            &source,
+            &[
+                "plan",
+                "abandon",
+                id,
+                "--if-revision",
+                if blocked { "2" } else { "1" },
+                "--reason",
+                "Keep immutable failed release history",
+            ],
+        );
+        let archive = world.root.join("history.lwc.zst");
+        let original = world.compress(&source, &archive);
+        let target = world.project("imported", false);
+        assert_eq!(
+            world.ok(&target, &["decompress", archive.to_str().unwrap()])["committed"],
+            true
+        );
+        let exported = world.compress(&target, &world.root.join("roundtrip.lwc.zst"));
+        assert_eq!(original["state_digest"], exported["state_digest"]);
+
+        let merged = world.project("merged", true);
+        world.put_page(&merged, "local-note", "Local", "Retain local memory");
+        assert_eq!(
+            world.ok(&merged, &["merge", archive.to_str().unwrap()])["committed"],
+            true
+        );
+        assert!(world.has_page(&merged, "local-note"));
+        for project in [&source, &target, &merged] {
+            let db = Connection::open(project.join(".lwc/wiki.db")).unwrap();
+            let preserved: (String, String, String) = db.query_row(
+                "SELECT p.state,p.abandoned_reason,s.status FROM plans p JOIN plan_steps s ON s.plan_id=p.id WHERE p.id=?1 AND s.ordinal=0",
+                [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).unwrap();
+            assert_eq!(
+                preserved,
+                (
+                    "abandoned".into(),
+                    "Keep immutable failed release history".into(),
+                    if blocked { "blocked" } else { "in_progress" }.into(),
+                )
+            );
+        }
+    }
+}
+
+#[test]
+fn archive_round_trip_accepts_active_plan_awaiting_completion() {
+    let world = World::new();
+    let source = world.project("source", true);
+    let plan = archive_plan(&world, &source);
+    let id = plan["id"].as_str().unwrap();
+    world.ok(
+        &source,
+        &[
+            "plan",
+            "advance",
+            id,
+            "--if-revision",
+            "1",
+            "--done",
+            plan["steps"][0]["id"].as_str().unwrap(),
+            "--next",
+            plan["steps"][1]["id"].as_str().unwrap(),
+            "--result",
+            "Published",
+        ],
+    );
+    world.ok(
+        &source,
+        &[
+            "plan",
+            "advance",
+            id,
+            "--if-revision",
+            "2",
+            "--done",
+            plan["steps"][1]["id"].as_str().unwrap(),
+            "--result",
+            "Verified",
+        ],
+    );
+    let archive = world.root.join("awaiting-completion.lwc.zst");
+    let original = world.compress(&source, &archive);
+    let target = world.project("target", false);
+    world.ok(&target, &["decompress", archive.to_str().unwrap()]);
+    assert_eq!(
+        original["state_digest"],
+        world.compress(&target, &world.root.join("again.lwc.zst"))["state_digest"]
+    );
+
+    world.ok(
+        &source,
+        &[
+            "plan",
+            "complete",
+            id,
+            "--if-revision",
+            "3",
+            "--result",
+            "Verified",
+            "--evidence",
+            "Both steps finished",
+            "--done-when-checked",
+        ],
+    );
+    let completed_archive = world.root.join("completed.lwc.zst");
+    let completed = world.compress(&source, &completed_archive);
+    let completed_target = world.project("completed-target", false);
+    world.ok(
+        &completed_target,
+        &["decompress", completed_archive.to_str().unwrap()],
+    );
+    assert_eq!(
+        completed["state_digest"],
+        world.compress(
+            &completed_target,
+            &world.root.join("completed-again.lwc.zst")
+        )["state_digest"]
+    );
+}
+
+#[test]
+fn archive_rejects_invalid_plan_steps_without_publishing() {
+    for (state, first, second) in [
+        ("active", "pending", "pending"),
+        ("active", "in_progress", "blocked"),
+        ("abandoned", "in_progress", "blocked"),
+        ("completed", "in_progress", "completed"),
+        ("completed", "completed", "pending"),
+        ("active", "", ""),
+        ("abandoned", "", ""),
+        ("completed", "", ""),
+    ] {
+        let world = World::new();
+        let source = world.project("source", true);
+        archive_plan(&world, &source);
+        let db = Connection::open(source.join(".lwc/wiki.db")).unwrap();
+        db.execute("UPDATE plans SET state=?1", [state]).unwrap();
+        if first.is_empty() {
+            db.execute("DELETE FROM plan_steps", []).unwrap();
+        } else {
+            db.execute(
+                "UPDATE plan_steps SET status=CASE ordinal WHEN 0 THEN ?1 ELSE ?2 END",
+                [first, second],
+            )
+            .unwrap();
+        }
+        drop(db);
+        let archive = world.root.join("invalid.lwc.zst");
+        world.compress(&source, &archive);
+        let target = world.project("target", false);
+        let error = world.error(&target, &["decompress", archive.to_str().unwrap()]);
+        assert_eq!(error["error"]["code"], "sync_state_invalid");
+        assert!(!target.join(".lwc/wiki.db").exists());
+    }
+}
+
 #[test]
 fn compress_help_default_and_custom_round_trip_preserve_memory_without_source_paths() {
     let world = World::new();

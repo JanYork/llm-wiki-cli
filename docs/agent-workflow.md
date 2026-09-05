@@ -686,6 +686,11 @@ exact `merge --resume SESSION_ID`; it does not overwrite canonical memory.
 `merge` conservatively combines unique objects and returns bounded conflict
 batches that the Agent resolves and resumes until publication completes.
 
+Plan history survives import and merge unchanged: abandoned plans retain their
+last step states, and active plans whose steps are all terminal may still await
+`plan complete`. Validation rejects empty plans, multiple focal steps, pending active work
+without a focal step, and completed plans containing unfinished steps.
+
 Whole-store replacement is a separate exception. The first `decompress
 --overwrite` call performs preflight and returns a token bound to the archive,
 scope, and current target identity. Use `--confirm-overwrite TOKEN` only after a
