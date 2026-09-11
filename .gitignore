@@ -6,3 +6,7 @@
 web/node_modules/
 .local-benchmarks/
 /docs/superpowers/
+
+# Local Agent working records; retain the shared project map.
+/.agents/*
+!/.agents/project-memory.md

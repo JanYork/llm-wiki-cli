@@ -148,7 +148,8 @@ impl Store {
         self.export_sync_relations(output, &source_hashes)?;
         self.export_sync_memory(output)?;
         self.export_sync_todos(output)?;
-        self.export_sync_plans(output)
+        self.export_sync_plans(output)?;
+        self.export_sync_discussions(output)
     }
 
     fn export_sync_meta(&self, output: &Connection) -> Result<()> {
@@ -2620,6 +2621,10 @@ fn sync_conflict_variant_for_key(
         .as_object_mut()
         .ok_or_else(|| AppError::new("sync_state_invalid", "conflict candidate is not an object"))?
         .insert(id_field.to_owned(), Value::String(variant_key.to_owned()));
+    if kind=="discussion" {
+        variant["body"]["id"]=json!(variant_key);
+        if let Some(events)=variant["history"].as_array_mut() {for event in events {event["input"]["id"]=json!(variant_key);}}
+    }
     if matches!(kind, "todo" | "plan") {
         let tags = variant
             .get_mut("tags")
@@ -2694,7 +2699,7 @@ fn sync_conflict_variant_key_at(
                 format!("{base}-{}", attempt + 1)
             })
         }
-        "todo" | "plan" | "memory" => {
+        "todo" | "plan" | "memory" | "discussion" => {
             let identity = if attempt == 0 {
                 format!("sync-conflict\0{kind}\0{logical_key}\0{losing_hash}")
             } else {

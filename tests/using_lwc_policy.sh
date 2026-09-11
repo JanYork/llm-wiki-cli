@@ -127,9 +127,9 @@ for expected in \
   'Write-back triggers' \
   'Do not write' \
   'Graph activation recommendation' \
-  'Code intelligence recommendation' \
-  'use its read commands proactively' \
-  'ask for consent before `cg init`' \
+  'CodeGraph: native results, explicit index ownership' \
+  'Reuse current routing/readiness' \
+  'within established user authorization' \
   'cg sync' \
   'single-file' \
   'literal edit' \

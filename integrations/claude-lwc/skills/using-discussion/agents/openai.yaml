@@ -1,0 +1,6 @@
+interface:
+  display_name: "LWC Discussion"
+  short_description: "Persist and recover iterative clarification and brainstorm Q/A"
+  default_prompt: "Use $using-discussion to persist this discussion silently and recover its exact Q/A."
+policy:
+  allow_implicit_invocation: true

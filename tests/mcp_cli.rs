@@ -192,7 +192,7 @@ fn mcp_server_negotiates_and_lists_read_only_tools() {
 
     assert_eq!(responses[1]["id"], 2);
     let tools = responses[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 2);
+    assert_eq!(tools.len(), 4);
     let tool = tools
         .iter()
         .find(|tool| tool["name"] == "lwc_explore")
@@ -214,7 +214,7 @@ fn mcp_server_negotiates_and_lists_read_only_tools() {
     assert_eq!(codegraph["inputSchema"]["additionalProperties"], false);
     assert_eq!(
         codegraph["inputSchema"]["required"],
-        json!(["command", "arguments", "projectPath"])
+        json!(["command", "projectPath"])
     );
     assert_eq!(codegraph["annotations"]["readOnlyHint"], true);
     assert_eq!(codegraph["annotations"]["destructiveHint"], false);
@@ -624,11 +624,8 @@ fn mcp_code_mode_reports_missing_index_without_initializing_or_downloading() {
     let response = responses(&output).remove(0);
     let result: Value =
         serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(result["codeGraph"]["state"], "unavailable");
-    assert_eq!(
-        result["codeGraph"]["error"]["code"],
-        "codegraph_index_missing"
-    );
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(result["error"]["code"], "codegraph_index_missing");
     assert!(!project.path().join(".lwc").exists());
 }
 
@@ -661,10 +658,7 @@ fn mcp_code_mode_rejects_a_symlinked_index() {
     let response = responses(&output).remove(0);
     let result: Value =
         serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(
-        result["codeGraph"]["error"]["code"],
-        "codegraph_index_invalid"
-    );
+    assert_eq!(result["error"]["code"], "codegraph_index_invalid");
     assert_eq!(fs::read(outside.join("codegraph.db")).unwrap(), b"outside");
 }
 
@@ -964,13 +958,8 @@ done
     let responses = responses(&output);
     assert_eq!(responses.len(), 2);
     for response in responses {
-        let result: Value =
-            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
-                .unwrap();
-        assert_eq!(result["memory"]["state"], "not_requested");
-        assert_eq!(result["codeGraph"]["state"], "ready");
         assert_eq!(
-            result["codeGraph"]["result"]["content"][0]["text"],
+            response["result"]["content"][0]["text"],
             "fake code context"
         );
     }
@@ -1044,11 +1033,8 @@ done
         })],
     );
     let response = responses(&output).remove(0);
-    let result: Value =
-        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(result["codeGraph"]["state"], "ready");
     assert_eq!(
-        result["codeGraph"]["result"]["content"][0]["text"],
+        response["result"]["content"][0]["text"],
         "after notification"
     );
 }
@@ -1108,18 +1094,9 @@ done
             .unwrap(),
     )
     .unwrap();
-    let second: Value = serde_json::from_str(
-        responses[1]["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(first["codeGraph"]["state"], "error");
-    assert_eq!(
-        first["codeGraph"]["error"]["code"],
-        "codegraph_mcp_wrong_id"
-    );
-    assert_eq!(second["codeGraph"]["state"], "ready");
+    assert_eq!(responses[0]["result"]["isError"], true);
+    assert_eq!(first["error"]["code"], "codegraph_mcp_wrong_id");
+    assert_eq!(responses[1]["result"]["content"][0]["text"], "recovered");
     assert_eq!(fs::read_to_string(log).unwrap().lines().count(), 2);
 }
 
@@ -1398,10 +1375,8 @@ done
         })],
     );
     let response = responses(&output).remove(0);
-    let result: Value =
-        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(
-        result["codeGraph"]["result"]["content"][0]["text"],
+        response["result"]["content"][0]["text"],
         "after busy deadline"
     );
 }
@@ -1463,10 +1438,7 @@ done
     let response = responses(&output).remove(0);
     let result: Value =
         serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(
-        result["codeGraph"]["error"]["code"],
-        "codegraph_mcp_timeout"
-    );
+    assert_eq!(result["error"]["code"], "codegraph_mcp_timeout");
     let pids = fs::read_to_string(log)
         .unwrap()
         .lines()
@@ -1496,4 +1468,145 @@ done
     }
     assert!(!descendant_alive, "CodeGraph descendant survived timeout");
     assert!(started.elapsed() <= Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
+fn native_schema_discovery_filters_writes_and_reuses_the_selected_client() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    fs::create_dir_all(project.join(".lwc/codegraph")).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(project.join(".lwc/codegraph/codegraph.db"), b"index").unwrap();
+    let fake = root.path().join("cg");
+    fs::write(&fake,r#"#!/bin/sh
+while IFS= read -r line; do
+case "$line" in
+*'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}}}}\n';;
+*'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"codegraph_node","description":"native node schema","inputSchema":{"type":"object","properties":{"symbol":{"type":"string"},"projectPath":{"type":"string"}},"required":["symbol","projectPath"]}},{"name":"codegraph_delete","inputSchema":{"type":"object"}}]}}\n';;
+*'"method":"tools/call"'*) printf '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"native"}],"structuredContent":null,"isError":true,"custom":"preserved"}}\n';;
+esac
+done
+"#).unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = run_mcp_in_with_env(
+        &project,
+        Some(&home),
+        None,
+        Some(&fake),
+        None,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"lwc_codegraph","arguments":{"command":"node","projectPath":project,"arguments":{"symbol":"Widget"}}}}),
+        ],
+    );
+    let replies = responses(&output);
+    let tool = replies[0]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "lwc_codegraph")
+        .unwrap();
+    let branches = tool["inputSchema"]["oneOf"].as_array().unwrap();
+    assert_eq!(branches.len(), 2);
+    assert_eq!(
+        branches[0]["properties"]["arguments"]["required"],
+        json!(["symbol"])
+    );
+    assert!(!tool.to_string().contains("codegraph_delete"));
+    assert_eq!(
+        replies[1]["result"],
+        json!({"content":[{"type":"text","text":"native"}],"structuredContent":null,"isError":true,"custom":"preserved"})
+    );
+}
+
+#[test]
+fn inspect_reuses_cli_contract_and_rejects_an_outside_project() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    let outside = root.path().join("outside");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let replies = responses(&run_mcp_in(
+        &project,
+        None,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lwc_inspect","arguments":{"kind":"contract","name":"remember","projectPath":project}}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"lwc_inspect","arguments":{"kind":"doctor","projectPath":outside}}}),
+        ],
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_lwc"))
+        .current_dir(&project)
+        .args(["contract", "remember"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        replies[0]["result"]["structuredContent"],
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    );
+    assert_eq!(replies[1]["result"]["isError"], true);
+    assert!(!project.join(".lwc").exists());
+    assert!(!outside.join(".lwc").exists());
+}
+
+#[test]
+fn doctor_uses_the_validated_checkout_despite_an_ambient_root() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    let outside = root.path().join("outside");
+    let home = root.path().join("home");
+    for path in [&project, &outside, &home] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let replies = responses(&run_mcp_in_with_root(
+        &project,
+        Some(&home),
+        Some(&outside),
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lwc_inspect","arguments":{"kind":"doctor","projectPath":project}}}),
+        ],
+    ));
+    assert_eq!(
+        replies[0]["result"]["structuredContent"]["project"]["checkout"],
+        project.canonicalize().unwrap().to_string_lossy().as_ref()
+    );
+    assert!(!outside.join(".lwc").exists());
+    assert!(!project.join(".lwc").exists());
+}
+
+#[test]
+fn mcp_discussion_shares_contract_and_enforces_workspace_and_context() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_lwc"))
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env_remove("LWC_PROJECT_ROOT")
+            .arg("init")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let context = format!("lwcctx-v1-{}", "7".repeat(64));
+    let input = json!({"id":"mcp-discussion","context":context,"request_id":"1","if_revision":0,"operations":[{"op":"start","text":"MCP discussion"},{"op":"question","id":"q","text":"Ready?"}]});
+    let out = run_mcp_in(
+        &project,
+        Some(&home),
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lwc_discussion","arguments":{"projectPath":project,"action":"apply","input":input}}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"lwc_discussion","arguments":{"projectPath":project,"action":"current","context":context}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lwc_discussion","arguments":{"projectPath":root.path(),"action":"apply","input":input}}}),
+        ],
+    );
+    let r = responses(&out);
+    assert_eq!(r[0]["result"]["structuredContent"]["revision"], 1);
+    assert_eq!(r[1]["result"]["structuredContent"]["pending"], json!(["q"]));
+    assert_eq!(r[2]["result"]["isError"], true);
 }

@@ -127,7 +127,9 @@ test("Codex and Claude packages expose the stable LWC MCP and hook boundary", ()
   assert.equal(codex.name, "codex-lwc");
   assert.equal(codex.mcpServers, "./.mcp.json");
   assert.equal(codex.skills, "./skills");
-  assert.equal(codex.hooks, "./hooks/hooks.json");
+  assert.equal(codex.hooks, undefined);
+  assert.equal(codex.interface.displayName, "LWC");
+  assert.ok(files(join(root,"integrations/codex-lwc")).includes("hooks/hooks.json"));
   const codexMarketplace = JSON.parse(
     readFileSync(
       join(root, "integrations/codex-lwc/.agents/plugins/marketplace.json"),
@@ -144,7 +146,7 @@ test("Codex and Claude packages expose the stable LWC MCP and hook boundary", ()
   assert.equal(claude.skills, "./skills");
 });
 
-test("Pi injects boundary context and bridges both read-only LWC tools over MCP", async () => {
+test("Pi injects boundary context and bridges read-only LWC tools over MCP", async () => {
   if (process.platform === "win32") return;
   const directory = mkdtempSync(join(tmpdir(), "lwc-pi-integration-"));
   const executable = join(directory, "lwc");
@@ -190,7 +192,7 @@ fi
     const source = readFileSync(join(root, "integrations/pi-lwc/extensions/lwc.js"), "utf8")
       .replace(
         'import { Type } from "typebox";',
-        'const Type = { String: () => ({}), Integer: options => ({ type: "integer", ...options }), Literal: value => ({ const: value }), Union: values => ({ anyOf: values }), Optional: value => value, Object: (properties, options = {}) => ({ type: "object", properties, ...options }) };',
+        'const Type = { String: () => ({}), Boolean: () => ({ type: "boolean" }), Array: (items, options = {}) => ({ type: "array", items, ...options }), Integer: options => ({ type: "integer", ...options }), Literal: value => ({ const: value }), Union: values => ({ anyOf: values }), Optional: value => value, Object: (properties, options = {}) => ({ type: "object", properties, ...options }) };',
       );
     const extension = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
     extension.default({
@@ -210,7 +212,7 @@ fi
     const first = await handlers.get("before_agent_start")({ systemPrompt: "BASE" }, context);
     assert.match(first.systemPrompt, /^BASE\n\nUse the `using-lwc` Skill/);
     assert.match(first.systemPrompt, /current absolute project path/);
-    assert.match(first.systemPrompt, /two read-only tools.*`lwc_explore`.*`lwc_codegraph`/);
+    assert.match(first.systemPrompt, /read-only.*`lwc_explore`.*`lwc_codegraph`/);
     assert.match(first.systemPrompt, /unsolicited lifecycle Plan\/Todo progress signals/);
     assert.match(first.systemPrompt, /agent_context\.status=bound/);
     assert.match(first.systemPrompt, /plan\.tracking.*plan\.additional_trackings.*todo\.reminders/);
@@ -237,7 +239,7 @@ fi
       undefined,
       "a compact boundary must inject exactly once",
     );
-    assert.deepEqual([...tools.keys()], ["lwc_explore", "lwc_codegraph"]);
+    assert.deepEqual([...tools.keys()], ["lwc_explore", "lwc_codegraph", "lwc_inspect", "lwc_discussion"]);
     const explore = tools.get("lwc_explore");
     assert.match(explore.description, /Read/);
     assert.ok(explore.parameters.properties.maxDocuments);
@@ -252,6 +254,10 @@ fi
     assert.equal(result.content[0].text, "MCP_OK");
     assert.equal(result.details.name, "lwc_explore");
     assert.equal(result.details.arguments.maxDocuments, 3);
+    const discussion = tools.get("lwc_discussion");
+    const recorded = await discussion.execute("discussion-call", {projectPath: directory, action: "current", context: "test-context"});
+    assert.equal(recorded.details.name, "lwc_discussion");
+    assert.equal(recorded.details.arguments.action, "current");
     const codegraph = tools.get("lwc_codegraph");
     assert.match(codegraph.description, /node\/search\/callers\/callees.*precise.*explore.*broad/);
     assert.ok(codegraph.parameters.properties.projectPath);
@@ -351,7 +357,7 @@ test("Pi gives CodeGraph calls a longer timeout and replaces a timed-out MCP chi
       )
       .replace(
         'import { Type } from "typebox";',
-        'const Type = { String: () => ({}), Integer: options => ({ type: "integer", ...options }), Literal: value => ({ const: value }), Union: values => ({ anyOf: values }), Optional: value => value, Object: (properties, options = {}) => ({ type: "object", properties, ...options }) };',
+        'const Type = { String: () => ({}), Boolean: () => ({ type: "boolean" }), Array: (items, options = {}) => ({ type: "array", items, ...options }), Integer: options => ({ type: "integer", ...options }), Literal: value => ({ const: value }), Union: values => ({ anyOf: values }), Optional: value => value, Object: (properties, options = {}) => ({ type: "object", properties, ...options }) };',
       );
     const extension = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
     const tools = new Map();
@@ -431,7 +437,7 @@ esac
     const source = readFileSync(join(root, "integrations/pi-lwc/extensions/lwc.js"), "utf8")
       .replace(
         'import { Type } from "typebox";',
-        'const Type = { String: () => ({}), Integer: options => ({ type: "integer", ...options }), Literal: value => ({ const: value }), Union: values => ({ anyOf: values }), Optional: value => value, Object: properties => ({ type: "object", properties }) };',
+        'const Type = { String: () => ({}), Boolean: () => ({ type: "boolean" }), Array: (items, options = {}) => ({ type: "array", items, ...options }), Integer: options => ({ type: "integer", ...options }), Literal: value => ({ const: value }), Union: values => ({ anyOf: values }), Optional: value => value, Object: properties => ({ type: "object", properties }) };',
       );
     assert.doesNotMatch(source, /transcript|conversation_history|event\.messages/);
     assert.doesNotMatch(source, /node:fs|readFile|writeFile/);

@@ -120,7 +120,7 @@ struct FileFingerprint {
     long_about = "Build and maintain a persistent, source-grounded wiki for the current project or the user.\n\n\
 SQLite stores immutable sources, Agent-written pages, citations, links, ingest state, search indexes, and the operation log. \
 Markdown under .lwc/ is a human-readable projection for Obsidian and can be rebuilt from SQLite.\n\n\
-Every successful command prints JSON to stdout. Failures print a structured JSON error to stderr and exit non-zero.",
+LWC commands print JSON; forwarded CG commands preserve native stdout, stderr and exit status. Failures print a structured JSON error to stderr and exit non-zero.",
     after_help = "Agent operating contract:\n  \
 - Read stdout as JSON; on failure read stderr.error.code and stderr.error.message.\n  \
 - Do not edit .lwc/wiki.db or generated Markdown directly; mutate knowledge through lwc commands.\n  \
@@ -162,12 +162,22 @@ struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     changeset: Option<String>,
 
+    /// Return complete LWC records instead of compact mutation receipts.
+    #[arg(long, global=true)]
+    full: bool,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Persist opt-in discussion Q/A in SQLite.
+    Discussion { #[command(subcommand)] command: DiscussionCommand },
+    /// Inspect the resolved project, checkout, capability and index state without writes.
+    Doctor { #[arg(long)] context: Option<String>, #[arg(long)] verbose: bool },
+    /// Read machine-readable input contracts and examples without initializing a Wiki.
+    Contract { #[arg(value_parser=["remember", "plan-create", "plan-revise", "discussion"])] name: String },
     /// Serve LWC to Agent hosts over a foreground protocol transport.
     Serve {
         /// Use the standard MCP JSON-RPC protocol over stdin/stdout.
@@ -200,6 +210,10 @@ enum Command {
     UpdateCheck,
     /// Inspect and use the project-local CodeGraph index.
     Cg {
+        /// Fail closed unless every named file matches its indexed content hash.
+        #[arg(long)] require_fresh: bool,
+        /// Files whose indexed content must match before a query (repeatable).
+        #[arg(long="file", requires="require_fresh")] files: Vec<PathBuf>,
         #[command(subcommand)]
         command: CgCommand,
     },
@@ -512,8 +526,16 @@ counts and total describe all issues in the complete Wiki; blocking_total counts
 }
 
 #[derive(Subcommand)]
-#[command(disable_help_subcommand = true)]
+#[command(disable_help_subcommand = true, after_help = "Native commands (output is not wrapped): query, node, callers, callees, impact, affected, explore, files, sync, index, help. Use lwc cg help COMMAND for the selected runtime contract. Use lwc cg tools for native MCP schemas. Status is LWC routing metadata; lwc cg inspect returns native statistics.")]
 enum CgCommand {
+    /// Select one runtime/index owner for this checkout; never installs or reindexes.
+    Configure { #[arg(long, conflicts_with="bundled", required_unless_present="bundled")] executable: Option<PathBuf>, #[arg(long)] bundled: bool },
+    /// Return native read-only MCP tool schemas from the selected runtime.
+    Tools,
+    /// Native CodeGraph statistics, unchanged.
+    Inspect,
+    /// Check content hashes for explicit files; unknown or missing evidence fails closed.
+    Check { #[arg(required=true)] files: Vec<PathBuf>, #[arg(long)] require_fresh: bool },
     /// Download the pinned LWC CodeGraph runtime and build the project index.
     Init {
         /// Show detailed CodeGraph indexing progress.
@@ -708,6 +730,10 @@ enum TodoCommand {
 
 #[derive(Subcommand)]
 enum PlanCommand {
+    /// Inspect immutable revision history, including scope changes and dispositions.
+    History { plan_id: String },
+    /// Read-only comparison with relevant events and an optional Markdown plan; never advances state.
+    Reconcile { plan_id: String, #[arg(long)] from: Option<PathBuf>, #[arg(long, default_value_t=5)] limit: usize },
     Create { title:Option<String>, #[arg(long)] objective:Option<String>, #[arg(long)] done_when:Option<String>, #[arg(long="tag")] tags:Vec<String>, #[arg(long="constraint")] constraints:Vec<String>, #[arg(long="step")] steps:Vec<String>, #[arg(long)] request_id:Option<String>, #[arg(long,value_name="JSON|-|@PATH")] json:Option<String> },
     Current { #[arg(long)] context:Option<String>, #[arg(long)] tag:Option<String>, #[arg(long,default_value_t=100)] limit:usize, #[arg(long,default_value_t=0)] offset:usize },
     List { #[arg(long,value_parser=["active","completed","abandoned"])] state:Option<String>, #[arg(long)] tag:Option<String>, #[arg(long,default_value_t=100)] limit:usize, #[arg(long,default_value_t=0)] offset:usize },
@@ -1514,4 +1540,16 @@ Read pages, limit, offset, and has_more from the JSON response. When has_more=tr
         /// Existing Wiki page slug.
         slug: String,
     },
+}
+
+#[derive(Subcommand)]
+enum DiscussionCommand {
+    List { #[arg(long)] context: String, #[arg(long,default_value_t=0)] offset: usize, #[arg(long,default_value_t=50)] limit: usize },
+    Item { id: String, item: String, #[arg(long)] context: String },
+    /// Atomically append or revise a batch of visible Q/A; normal receipts are compact.
+    Apply { #[arg(long)] json: String },
+    Show { id: String, #[arg(long)] context: String, #[arg(long, default_value_t=0)] offset: usize, #[arg(long, default_value_t=50)] limit: usize },
+    Current { id: Option<String>, #[arg(long)] context: String },
+    History { id: String, #[arg(long)] context: String, #[arg(long, default_value_t=0)] offset: usize, #[arg(long, default_value_t=50)] limit: usize },
+    Export { id: String, #[arg(long)] context: String },
 }

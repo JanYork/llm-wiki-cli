@@ -1666,8 +1666,24 @@ fn signal_prompt_memory_learning_book_and_conversion_catalog_obeys_precedence() 
     assert_eq!(signal["priority"], 20);
     assert_eq!(signal["requires_consent"], false);
     conversion.ok(&["config", "set", "--trans", "markitdown"]);
-    let signal =
-        &signal_batch(&prompt_hook(&conversion, "convert report.pdf to markdown"))["signals"][0];
+    let mut child = conversion
+        .command()
+        .env("PATH", conversion.project.join("empty-path"))
+        .args([
+            "agent",
+            "hook",
+            "--agent",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(serde_json::to_string(&serde_json::json!({"hook_event_name":"UserPromptSubmit","prompt":"convert report.pdf to markdown","session_id":DEFAULT_CLAUDE_SESSION,"agent_id":DEFAULT_CLAUDE_PROMPT_AGENT})).unwrap().as_bytes()).unwrap();
+    let output = hook_json(&child.wait_with_output().unwrap());
+    let signal = &signal_batch(&output)["signals"][0];
     assert_eq!(signal["kind"], "trans.runtime");
     assert_eq!(signal["priority"], 60);
     assert_eq!(signal["requires_consent"], false);
@@ -5518,24 +5534,15 @@ fn boundary_hook_can_report_a_missing_wiki_without_creating_it() {
     assert_eq!(readiness["md_trans"]["enabled"], false);
     assert_eq!(readiness["md_trans"]["setting"], "disabled");
     assert!(readiness["md_trans"]["available_engines"].is_array());
-    assert_eq!(
-        readiness["md_trans"]["configure"]["anydoc"],
-        "lwc --scope project config set --trans anydoc"
-    );
-    assert_eq!(
-        readiness["md_trans"]["configure"]["markitdown"],
-        "lwc --scope project config set --trans markitdown"
-    );
+    assert!(readiness["md_trans"].get("configure").is_none());
+    assert_eq!(readiness["inspect"], "lwc doctor --verbose");
     assert_eq!(readiness["office"]["setting"], "disabled");
     assert_eq!(readiness["office"]["enabled"], false);
     assert_eq!(readiness["office"]["runtime_installed"], false);
     assert_eq!(readiness["office"]["ready"], false);
     assert_eq!(readiness["office"]["requires_consent"], true);
-    assert_eq!(
-        readiness["office"]["configure"],
-        "lwc --scope global config set --office officecli"
-    );
-    assert_eq!(readiness["office"]["command"], "lwc office COMMAND ...");
+    assert!(readiness["office"].get("configure").is_none());
+    assert!(readiness["office"].get("command").is_none());
     assert_eq!(readiness["authorization"]["recommended_choice"], "1");
     assert!(!world.project.join(".lwc").exists());
 }
@@ -5650,14 +5657,8 @@ fn boundary_hook_reports_learning_readiness_without_installing_or_reading_plugin
         assert_eq!(readiness[plugin]["enabled"], enabled, "{plugin}");
         assert_eq!(readiness[plugin]["runtime_installed"], false, "{plugin}");
         assert_eq!(readiness[plugin]["ready"], false, "{plugin}");
-        assert_eq!(
-            readiness[plugin]["configure"],
-            format!("lwc --scope global config set --{plugin} enabled")
-        );
-        assert_eq!(
-            readiness[plugin]["command"],
-            format!("lwc {plugin} COMMAND ...")
-        );
+        assert!(readiness[plugin].get("configure").is_none());
+        assert!(readiness[plugin].get("command").is_none());
     }
     let rendered = serde_json::to_string(&readiness).unwrap();
     assert!(!rendered.contains("sensitive learner profile"));
@@ -5745,12 +5746,7 @@ fn temporal_memory_readiness_is_bounded_and_hook_is_read_only() {
             "origin": "project",
             "enabled": true,
             "ready": true,
-            "max_age_days": 30,
-            "max_bytes": 4096,
-            "record": "lwc remember --json '{...}'",
-            "recall": "lwc memory recall QUERY --limit 5",
             "status": "lwc memory status",
-            "maintain": "lwc memory maintain"
         })
     );
     let rendered = serde_json::to_string(&readiness["memory"]).unwrap();
@@ -6418,8 +6414,8 @@ fn claude_prompt_hook_uses_codegraph_without_opening_or_creating_a_wiki() {
     )
     .unwrap();
     let graph_survives = prompt_hook_output(&world, &fake, &plan_input);
-    assert!(context(&graph_survives).contains("survives signal failure"));
-    assert!(!context(&graph_survives).contains("LWC_SIGNAL "));
+    // With explicit index ownership, unreadable routing config must never silently choose a runtime.
+    assert_eq!(hook_json(&graph_survives), serde_json::json!({}));
     fs::remove_file(world.project.join(".lwc/config.json")).unwrap();
 
     fs::write(&fake, "#!/bin/sh\nsleep 3\nprintf late\n").unwrap();

@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const CONFIG_VERSION: u32 = 7;
+pub const CONFIG_VERSION: u32 = 8;
 pub const DEFAULT_TRANS_TIMEOUT_SECONDS: u16 = 120;
 pub const MIN_TRANS_TIMEOUT_SECONDS: u16 = 1;
 pub const MAX_TRANS_TIMEOUT_SECONDS: u16 = 900;
@@ -91,6 +91,9 @@ pub struct MemorySettings {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
+    /// Project-local selection; None uses the bundled runtime and .lwc/codegraph.
+    #[serde(default)]
+    pub codegraph_executable: Option<PathBuf>,
     pub version: u32,
     #[serde(default = "default_graph")]
     pub graph: GraphSettings,
@@ -149,6 +152,7 @@ pub struct EffectiveCapabilityConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct ConfigPatch {
+    pub codegraph_executable: Option<Option<PathBuf>>,
     pub graph: Option<GraphSetting>,
     pub trans: Option<TransSettings>,
     pub office: Option<OfficeSetting>,
@@ -285,6 +289,7 @@ impl Default for ConfigFile {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
+            codegraph_executable: None,
             graph: default_graph(),
             trans: default_trans(),
             office: default_office(),
@@ -447,6 +452,7 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                 })?;
                 return validate_config_file(ConfigFile {
                     version: CONFIG_VERSION,
+                    codegraph_executable: None,
                     graph: legacy.graph,
                     trans: default_trans(),
                     office: default_office(),
@@ -464,6 +470,7 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                 })?;
                 return validate_config_file(ConfigFile {
                     version: CONFIG_VERSION,
+                    codegraph_executable: None,
                     graph: legacy.graph,
                     trans: legacy.trans,
                     office: default_office(),
@@ -481,6 +488,7 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                 })?;
                 return validate_config_file(ConfigFile {
                     version: CONFIG_VERSION,
+                    codegraph_executable: None,
                     graph: legacy.graph,
                     trans: legacy.trans,
                     office: legacy.office,
@@ -498,6 +506,7 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                 })?;
                 return validate_config_file(ConfigFile {
                     version: CONFIG_VERSION,
+                    codegraph_executable: None,
                     graph: legacy.graph,
                     trans: legacy.trans,
                     office: legacy.office,
@@ -515,6 +524,7 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                 })?;
                 return validate_config_file(ConfigFile {
                     version: CONFIG_VERSION,
+                    codegraph_executable: None,
                     graph: legacy.graph,
                     trans: legacy.trans,
                     office: legacy.office,
@@ -526,7 +536,7 @@ pub fn load_file(path: &Path) -> Result<ConfigFile> {
                     practice: disabled_capability(),
                 });
             }
-            if version != u64::from(CONFIG_VERSION) {
+            if version != 7 && version != u64::from(CONFIG_VERSION) {
                 return Err(AppError::new(
                     "unsupported_config_version",
                     format!("unsupported config version {version}"),
@@ -804,6 +814,9 @@ pub fn update(database: &Path, patch: ConfigPatch) -> Result<(PathBuf, ConfigFil
     fs::create_dir_all(parent)?;
     let mut config = load_file(&path)?;
     config.version = CONFIG_VERSION;
+    if let Some(executable) = patch.codegraph_executable {
+        config.codegraph_executable = executable;
+    }
     if let Some(setting) = patch.graph {
         config.graph.setting = setting;
     }
@@ -941,6 +954,7 @@ pub fn response(scope: &str, database: &Path) -> Result<Value> {
     Ok(json!({
         "scope": scope,
         "path": config_path_for_database(database)?,
+        "codegraph_executable": load_file(&config_path_for_database(database)?)?.codegraph_executable,
         "graph": graph,
         "trans": trans,
         "office": office,

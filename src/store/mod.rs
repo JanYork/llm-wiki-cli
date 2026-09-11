@@ -19,3 +19,5 @@ include!("plan.rs");
 include!("sync.rs");
 include!("sync_publish.rs");
 include!("tests.rs");
+
+include!("discussion.rs");

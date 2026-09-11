@@ -1,5 +1,5 @@
 use rusqlite::Connection;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -798,4 +798,69 @@ fn committed_merge_resumes_rebuild_without_republishing() {
         )
         .unwrap();
     assert_eq!(publications, 1);
+}
+
+#[test]
+fn archive_discussion_preserves_originals_and_history_without_binding() {
+    let world = World::new();
+    let source = world.root.join("discussion-source");
+    let target = world.root.join("discussion-target");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    world.ok(&source, &["init"]);
+    let c = format!("lwcctx-v1-{}", "8".repeat(64));
+    let input = json!({"id":"portable-discussion","context":c,"request_id":"1","if_revision":0,"operations":[{"op":"start","text":"Portable"},{"op":"question","id":"q","text":"Storage?"},{"op":"answer","id":"a","parent":"q","text":"SQLite"}]});
+    world.ok(
+        &source,
+        &["discussion", "apply", "--json", &input.to_string()],
+    );
+    let archive = world.root.join("discussion.lwc.zst");
+    let original = world.compress(&source, &archive);
+    world.ok(&target, &["decompress", archive.to_str().unwrap()]);
+    let exported = world.compress(&target, &world.root.join("discussion-roundtrip.lwc.zst"));
+    assert_eq!(original["state_digest"], exported["state_digest"]);
+    let merged = world.project("discussion-merged", true);
+    world.put_page(
+        &merged,
+        "unrelated",
+        "Unrelated",
+        "Preserve local knowledge",
+    );
+    assert_eq!(
+        world.ok(&merged, &["merge", archive.to_str().unwrap()])["committed"],
+        true
+    );
+    assert!(world.has_page(&merged, "unrelated"));
+    assert_eq!(
+        world.ok(&merged, &["discussion", "list", "--context", &c])["total"],
+        1
+    );
+
+    assert!(world.ok(&target, &["discussion", "current", "--context", &c])["discussion"].is_null());
+    let listing = world.ok(&target, &["discussion", "list", "--context", &c]);
+    assert_eq!(listing["discussions"][0]["unbound"], true);
+    let revision = listing["discussions"][0]["revision"].as_i64().unwrap();
+    let resume = json!({"id":"portable-discussion","context":c,"from_context":"","request_id":"resume","if_revision":revision,"operations":[{"op":"resume","reason":"User explicitly resumes imported discussion"}]});
+    world.ok(
+        &target,
+        &["discussion", "apply", "--json", &resume.to_string()],
+    );
+    let state = world.ok(
+        &target,
+        &["discussion", "show", "portable-discussion", "--context", &c],
+    );
+    assert_eq!(state["items"]["a"]["original"], "SQLite");
+    assert_eq!(
+        world.ok(
+            &target,
+            &[
+                "discussion",
+                "history",
+                "portable-discussion",
+                "--context",
+                &c
+            ]
+        )["total"],
+        2
+    );
 }

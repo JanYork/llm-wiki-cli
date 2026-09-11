@@ -20,8 +20,24 @@ pub struct PlanCreateInput {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanReviseInput {
-    pub steps: Vec<PlanStepInput>,
+    #[serde(default)] pub steps: Vec<PlanStepInput>,
     pub focal: Option<usize>,
+    pub title: Option<String>,
+    pub objective: Option<String>,
+    pub done_when: Option<String>,
+    pub constraints: Option<Vec<String>>,
+    pub current_step: Option<String>,
+    #[serde(default)] pub updates: Vec<PlanStepUpdate>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanStepUpdate {
+    pub id: String,
+    pub title: Option<String>,
+    pub verify: Option<String>,
+    pub disposition: Option<String>,
+    pub basis: Option<String>,
 }
 
 fn plan_fingerprint(input: &PlanCreateInput) -> Result<String> {
@@ -58,6 +74,18 @@ fn load_plan(conn: &Connection, id: &str, scope: &str) -> Result<Value> {
     );
     let mut st=conn.prepare("SELECT step_id,ordinal,title,status,verify,result,blocker,created_revision,updated_revision,created_at,updated_at FROM plan_steps WHERE plan_id=?1 ORDER BY ordinal")?;
     p["steps"]=json!(st.query_map([id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"ordinal":r.get::<_,i64>(1)?,"title":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?,"verify":r.get::<_,Option<String>>(4)?,"result":r.get::<_,Option<String>>(5)?,"blocker":r.get::<_,Option<String>>(6)?,"created_revision":r.get::<_,i64>(7)?,"updated_revision":r.get::<_,i64>(8)?,"created_at":r.get::<_,String>(9)?,"updated_at":r.get::<_,String>(10)?})))?.collect::<std::result::Result<Vec<_>,_>>()?);
+    let mut history = conn.prepare("SELECT result FROM plan_history WHERE plan_id=?1 AND action='revised' AND result IS NOT NULL ORDER BY revision")?;
+    let records = history.query_map([id], |r| r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+    for raw in records {
+        if let Ok(record) = serde_json::from_str::<Value>(&raw) {
+            for resolution in record["resolutions"].as_array().into_iter().flatten() {
+                if let Some(step) = p["steps"].as_array_mut().unwrap().iter_mut().find(|s| s["id"] == resolution["id"]) {
+                    step["disposition"] = resolution["disposition"].clone();
+                    step["basis"] = resolution["basis"].clone();
+                }
+            }
+        }
+    }
     Ok(p)
 }
 fn index_plan(tx: &Transaction<'_>, id: &str, p: &Value) -> Result<()> {
@@ -484,7 +512,7 @@ impl Store {
         let rev = current + 1;
         tx.execute(&format!("UPDATE plan_steps SET status='completed',result=?3,blocker=NULL,updated_revision=?4,updated_at={TIMESTAMP_SQL} WHERE plan_id=?1 AND step_id=?2"),params![id,done,result,rev])?;
         if let Some(n) = next {
-            tx.execute(&format!("UPDATE plan_steps SET status='in_progress',updated_revision=?3,updated_at={TIMESTAMP_SQL} WHERE plan_id=?1 AND step_id=?2"),params![id,n,rev])?;
+            tx.execute(&format!("UPDATE plan_steps SET status='in_progress',blocker=NULL,updated_revision=?3,updated_at={TIMESTAMP_SQL} WHERE plan_id=?1 AND step_id=?2"),params![id,n,rev])?;
         }
         tx.execute(
             &format!("UPDATE plans SET revision=?2,updated_at={TIMESTAMP_SQL} WHERE id=?1"),
@@ -552,24 +580,26 @@ impl Store {
         mut input: PlanReviseInput,
     ) -> Result<Value> {
         let reason = normalize_todo_text("reason", reason)?;
-        if input.steps.is_empty() || input.steps.len() > 100 {
-            return Err(AppError::new(
-                "invalid_input",
-                "revision steps must contain 1 to 100 items",
-            ));
+        if input.steps.len() > 100 || input.updates.len() > 100 {
+            return Err(AppError::new("invalid_input", "revision accepts at most 100 steps or updates"));
+        }
+        if !input.steps.is_empty() && (!input.updates.is_empty() || input.current_step.is_some()) {
+            return Err(AppError::new("invalid_input", "replace steps or update by ID, not both"));
         }
         let focal = input.focal.unwrap_or(0);
-        if focal >= input.steps.len() {
-            return Err(AppError::new(
-                "invalid_input",
-                "focal index is out of range",
-            ));
+        if input.focal.is_some() && focal >= input.steps.len() {
+            return Err(AppError::new("invalid_input", "focal requires replacement steps and must be in range"));
+        }
+        for (field, value) in [("title", &mut input.title), ("objective", &mut input.objective), ("done_when", &mut input.done_when)] {
+            if let Some(value) = value { *value = normalize_todo_text(field, value)?; }
+        }
+        if let Some(constraints) = &mut input.constraints {
+            if constraints.len() > 100 { return Err(AppError::new("invalid_input", "revision accepts at most 100 constraints")); }
+            for constraint in constraints { *constraint = normalize_todo_text("constraint", constraint)?; }
         }
         for step in &mut input.steps {
             step.title = normalize_todo_text("step title", &step.title)?;
-            if let Some(verify) = step.verify.as_mut() {
-                *verify = normalize_todo_text("verify", verify)?;
-            }
+            if let Some(verify) = step.verify.as_mut() { *verify = normalize_todo_text("verify", verify)?; }
         }
         let scope = self.scope.clone();
         let tx = self
@@ -582,25 +612,66 @@ impl Store {
             return Err(plan_revision_error(expected, current));
         }
         let rev = current + 1;
-        tx.execute(&format!("UPDATE plan_steps SET status='skipped',blocker=NULL,updated_revision=?2,updated_at={TIMESTAMP_SQL} WHERE plan_id=?1 AND status IN ('pending','in_progress','blocked')"),params![id,rev])?;
-        let max: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(ordinal),-1) FROM plan_steps WHERE plan_id=?1",
-            [id],
-            |r| r.get(0),
-        )?;
-        for (i, s) in input.steps.iter().enumerate() {
-            let sid: String =
-                tx.query_row("SELECT LOWER(HEX(RANDOMBLOB(16)))", [], |r| r.get(0))?;
-            tx.execute(&format!("INSERT INTO plan_steps(plan_id,step_id,ordinal,title,status,verify,created_revision,updated_revision,created_at,updated_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?7,{TIMESTAMP_SQL},{TIMESTAMP_SQL})"),params![id,sid,max+1+i as i64,s.title,if i==focal{"in_progress"}else{"pending"},s.verify,rev])?;
+        let before = p.clone();
+        if let Some(title) = &input.title { tx.execute("UPDATE plans SET title=?2 WHERE id=?1", params![id,title])?; }
+        if let Some(objective) = &input.objective { tx.execute("UPDATE plans SET objective=?2 WHERE id=?1", params![id,objective])?; }
+        if let Some(done_when) = &input.done_when { tx.execute("UPDATE plans SET done_when=?2 WHERE id=?1", params![id,done_when])?; }
+        if let Some(constraints) = &input.constraints {
+            tx.execute("DELETE FROM plan_constraints WHERE plan_id=?1", [id])?;
+            for (i, value) in constraints.iter().enumerate() { tx.execute("INSERT INTO plan_constraints VALUES(?1,?2,?3)", params![id,i as i64,value])?; }
         }
-        tx.execute(
-            &format!("UPDATE plans SET revision=?2,updated_at={TIMESTAMP_SQL} WHERE id=?1"),
-            params![id, rev],
-        )?;
-        tx.execute(
-            "INSERT INTO plan_history(plan_id,revision,action,reason)VALUES(?1,?2,'revised',?3)",
-            params![id, rev, reason],
-        )?;
+        let mut resolutions = Vec::new();
+        if !input.steps.is_empty() {
+            for step in p["steps"].as_array().unwrap().iter().filter(|s| matches!(s["status"].as_str(), Some("pending" | "in_progress" | "blocked"))) {
+                resolutions.push(json!({"id":step["id"],"disposition":"superseded","basis":reason}));
+            }
+            tx.execute(&format!("UPDATE plan_steps SET status='skipped',blocker=NULL,updated_revision=?2,updated_at={TIMESTAMP_SQL} WHERE plan_id=?1 AND status IN ('pending','in_progress','blocked')"),params![id,rev])?;
+            let max: i64 = tx.query_row("SELECT COALESCE(MAX(ordinal),-1) FROM plan_steps WHERE plan_id=?1", [id], |r| r.get(0))?;
+            for (i, step) in input.steps.iter().enumerate() {
+                let sid: String = tx.query_row("SELECT LOWER(HEX(RANDOMBLOB(16)))", [], |r| r.get(0))?;
+                tx.execute(&format!("INSERT INTO plan_steps(plan_id,step_id,ordinal,title,status,verify,created_revision,updated_revision,created_at,updated_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?7,{TIMESTAMP_SQL},{TIMESTAMP_SQL})"), params![id,sid,max+1+i as i64,step.title,if i==focal{"in_progress"}else{"pending"},step.verify,rev])?;
+            }
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for update in &input.updates {
+            if update.title.is_none() && update.verify.is_none() && update.disposition.is_none() { return Err(AppError::new("invalid_input", "step update requires title, verify, or disposition")); }
+            if update.basis.is_some() && update.disposition.is_none() { return Err(AppError::new("invalid_input", "basis requires a disposition")); }
+            if !ids.insert(&update.id) { return Err(AppError::new("invalid_input", "duplicate step update")); }
+            let old = p["steps"].as_array().unwrap().iter().find(|s| s["id"] == update.id)
+                .ok_or_else(|| AppError::new("plan_step_not_found", "update names an unknown step"))?;
+            if matches!(old["status"].as_str(), Some("completed" | "skipped")) {
+                return Err(AppError::new("invalid_input", "terminal step history cannot be rewritten"));
+            }
+            if let Some(title) = &update.title {
+                let title = normalize_todo_text("step title", title)?;
+                tx.execute("UPDATE plan_steps SET title=?3 WHERE plan_id=?1 AND step_id=?2", params![id,update.id,title])?;
+            }
+            if let Some(verify) = &update.verify {
+                let verify = normalize_todo_text("verify", verify)?;
+                tx.execute("UPDATE plan_steps SET verify=?3 WHERE plan_id=?1 AND step_id=?2", params![id,update.id,verify])?;
+            }
+            if let Some(disposition) = &update.disposition {
+                if !matches!(disposition.as_str(), "waived" | "superseded") { return Err(AppError::new("invalid_input", "disposition must be waived or superseded")); }
+                let basis = normalize_todo_text("basis", update.basis.as_deref().unwrap_or(""))?;
+                tx.execute("UPDATE plan_steps SET status='skipped',blocker=NULL,result=?3 WHERE plan_id=?1 AND step_id=?2", params![id,update.id,format!("{disposition}: {basis}")])?;
+                resolutions.push(json!({"id":update.id,"disposition":disposition,"basis":basis}));
+            }
+            tx.execute(&format!("UPDATE plan_steps SET updated_revision=?3,updated_at={TIMESTAMP_SQL} WHERE plan_id=?1 AND step_id=?2"),params![id,update.id,rev])?;
+        }
+        if let Some(step) = &input.current_step {
+            let state: Option<String> = tx.query_row("SELECT status FROM plan_steps WHERE plan_id=?1 AND step_id=?2", params![id,step], |r| r.get(0)).optional()?;
+            if !matches!(state.as_deref(), Some("pending" | "in_progress" | "blocked")) { return Err(AppError::new("invalid_input", "current_step must name an unfinished step")); }
+            tx.execute(&format!("UPDATE plan_steps SET status='pending',updated_revision=?2,updated_at={TIMESTAMP_SQL} WHERE plan_id=?1 AND status='in_progress'"),params![id,rev])?;
+            tx.execute(&format!("UPDATE plan_steps SET status='in_progress',blocker=NULL,updated_revision=?3,updated_at={TIMESTAMP_SQL} WHERE plan_id=?1 AND step_id=?2"),params![id,step,rev])?;
+        }
+        let focal_count: i64 = tx.query_row("SELECT COUNT(*) FROM plan_steps WHERE plan_id=?1 AND status IN ('in_progress','blocked')",[id],|r|r.get(0))?;
+        let pending: i64 = tx.query_row("SELECT COUNT(*) FROM plan_steps WHERE plan_id=?1 AND status='pending'",[id],|r|r.get(0))?;
+        if focal_count > 1 || (pending > 0 && focal_count == 0) { return Err(AppError::new("invalid_input", "revision must leave exactly one current step while pending work remains; specify current_step")); }
+        let after = load_plan(&tx,id,&scope)?;
+        if before == after { return Err(AppError::new("invalid_input", "revision has no changes")); }
+        tx.execute(&format!("UPDATE plans SET revision=?2,updated_at={TIMESTAMP_SQL} WHERE id=?1"),params![id,rev])?;
+        let after = load_plan(&tx,id,&scope)?;
+        tx.execute("INSERT INTO plan_history(plan_id,revision,action,reason,result)VALUES(?1,?2,'revised',?3,?4)", params![id,rev,reason,serde_json::to_string(&json!({"before":before,"after":after,"resolutions":resolutions})).unwrap()])?;
         record_operation(&tx, "plan_revise", id, &json!({"reason":reason}))?;
         let p = load_plan(&tx, id, &scope)?;
         index_plan(&tx, id, &p)?;
@@ -661,5 +732,27 @@ impl Store {
         let p = load_plan(&tx, id, &scope)?;
         tx.commit()?;
         Ok(json!({"action":"updated","plan":p}))
+    }
+}
+
+impl Store {
+    pub fn plan_history(&self, id: &str) -> Result<Value> {
+        load_plan(&self.conn, id, &self.scope)?;
+        let mut statement = self.conn.prepare("SELECT revision,action,reason,step_id,result,created_at FROM plan_history WHERE plan_id=?1 ORDER BY revision,id")?;
+        let entries = statement.query_map([id], |row| {
+            let result: Option<String> = row.get(4)?;
+            Ok(json!({"revision":row.get::<_,i64>(0)?,"action":row.get::<_,String>(1)?,"reason":row.get::<_,Option<String>>(2)?,"step_id":row.get::<_,Option<String>>(3)?,"result":result.map(|v|serde_json::from_str::<Value>(&v).unwrap_or(Value::String(v))),"created_at":row.get::<_,String>(5)?}))
+        })?.collect::<std::result::Result<Vec<_>,_>>()?;
+        Ok(json!({"plan_id":id,"history":entries}))
+    }
+
+    pub fn plan_reconcile(&self, id: &str, document: Option<&str>, limit: usize) -> Result<Value> {
+        let plan = load_plan(&self.conn,id,&self.scope)?;
+        let title = plan["title"].as_str().unwrap();
+        let candidates = self.memory_recall(title,None,None,false,limit)?;
+        let mut markdown = format!("# {title}\n\n{}\n\nAcceptance: {}\n",plan["objective"].as_str().unwrap(),plan["done_when"].as_str().unwrap());
+        for step in plan["steps"].as_array().unwrap() { markdown.push_str(&format!("\n- [{}] {} ({})",step["status"].as_str().unwrap(),step["title"].as_str().unwrap(),step["id"].as_str().unwrap())); }
+        let diff = document.map(|text| similar::TextDiff::from_lines(&markdown,text).unified_diff().header("LWC plan", "reference document").to_string());
+        Ok(json!({"plan":plan,"events":candidates,"document_diff":diff,"read_only":true,"matching":"title-based candidates; relevance and completion require review","current_state_verified":false,"next_action":format!("Use lwc plan revise {id} --if-revision {} --reason ... --json ... for supported, reviewed changes",plan["revision"])}))
     }
 }

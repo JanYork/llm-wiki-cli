@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -38,11 +38,16 @@ pub fn status(store: &StorePath) -> Result<Value> {
     let runtime = runtime_state(&paths);
     Ok(json!({
         "scope": "project",
-        "version": VERSION,
+        "version": if paths.external.is_some() { Value::Null } else { json!(VERSION) },
+        "owner": if paths.external.is_some() { "independent" } else { "lwc" },
+        "checkout": paths.project,
+        "executable": runtime.binary,
+        "freshness": "unknown",
+        "coverage": "unknown",
         "installed": runtime.binary.is_some(),
         "runtime_health": runtime.health,
-        "initialized": paths.index.join("codegraph.db").is_file(),
-        "runtime": paths.runtime,
+        "initialized": validate_index(&paths).is_ok(),
+        "runtime": paths.external.as_ref().and_then(|path| path.parent()).unwrap_or(&paths.runtime),
         "legacy_project_runtime": paths.legacy_runtime.exists(),
         "legacy_runtime": paths.legacy_runtime,
         "index": paths.index,
@@ -52,7 +57,9 @@ pub fn status(store: &StorePath) -> Result<Value> {
 
 pub fn init(store: &StorePath, verbose: bool) -> Result<Value> {
     let paths = Paths::new(store)?;
-    install(&paths)?;
+    if paths.external.is_none() {
+        install(&paths)?;
+    }
     let mut args = vec![
         OsString::from("init"),
         OsString::from("."),
@@ -61,7 +68,7 @@ pub fn init(store: &StorePath, verbose: bool) -> Result<Value> {
     if verbose {
         args.push(OsString::from("--verbose"));
     }
-    execute(&paths, &args, true)
+    execute(&paths, &args)
 }
 
 pub fn run(store: &StorePath, args: &[OsString]) -> Result<Value> {
@@ -98,9 +105,28 @@ pub fn run(store: &StorePath, args: &[OsString]) -> Result<Value> {
             "run `lwc cg init` to install the pinned global CodeGraph runtime",
         ));
     }
-    validate_project_arguments(&paths, args)?;
-
     let mut forwarded = args.to_vec();
+    if name == "affected" && forwarded.iter().any(|arg| arg == "--stdin") {
+        let mut input = String::new();
+        io::stdin()
+            .take(1024 * 1024 + 1)
+            .read_to_string(&mut input)?;
+        if input.len() > 1024 * 1024 {
+            return Err(AppError::new(
+                "invalid_input",
+                "affected file list exceeds 1 MiB",
+            ));
+        }
+        forwarded.retain(|arg| arg != "--stdin");
+        for line in input.lines().filter(|line| !line.is_empty()) {
+            if line.starts_with('-') {
+                return Err(external_path_error());
+            }
+            ensure_project_path(&paths, OsStr::new(line))?;
+            forwarded.push(OsString::from(line));
+        }
+    }
+    validate_project_arguments(&paths, &forwarded)?;
     if matches!(name, "index" | "sync" | "uninit" | "unlock") {
         if forwarded
             .iter()
@@ -119,22 +145,11 @@ pub fn run(store: &StorePath, args: &[OsString]) -> Result<Value> {
             forwarded.push(OsString::from("--force"));
         }
     }
-    execute(
-        &paths,
-        &forwarded,
-        matches!(name, "index" | "sync" | "uninit" | "unlock"),
-    )
+    execute(&paths, &forwarded)
 }
 
 fn serve_mcp(paths: &Paths, args: &[OsString]) -> Result<Value> {
-    let status = configured_command(paths, args)?.status()?;
-    if !status.success() {
-        return Err(AppError::new(
-            "codegraph_command_failed",
-            format!("CodeGraph MCP server exited with {status}"),
-        ));
-    }
-    Ok(Value::Null)
+    execute(paths, args)
 }
 
 fn validate_project_arguments(paths: &Paths, args: &[OsString]) -> Result<()> {
@@ -190,13 +205,45 @@ fn validate_affected_paths(paths: &Paths, args: &[OsString]) -> Result<()> {
     Ok(())
 }
 
-fn ensure_project_path(paths: &Paths, value: &OsStr) -> Result<()> {
-    let path = Path::new(value);
+fn project_relative_path(paths: &Paths, path: &Path) -> Result<PathBuf> {
+    let root = fs::canonicalize(&paths.project)?;
+    #[cfg(windows)]
+    if let Some(Component::Prefix(prefix)) = path.components().next()
+        && !matches!(
+            prefix.kind(),
+            std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+        )
+    {
+        return Err(external_path_error());
+    }
     let relative = if path.is_absolute() {
-        path.strip_prefix(&paths.project)
+        // Resolve through the filesystem so Windows casing and local verbatim paths agree.
+        // Missing files retain their suffix beneath the nearest existing ancestor.
+        let mut existing = path;
+        while !existing.try_exists()? {
+            existing = existing.parent().ok_or_else(external_path_error)?;
+        }
+        let mut resolved = fs::canonicalize(existing)?;
+        for component in path
+            .strip_prefix(existing)
             .map_err(|_| external_path_error())?
+            .components()
+        {
+            resolved.push(component.as_os_str());
+        }
+        #[cfg(windows)]
+        let boundary = resolved
+            .ancestors()
+            .find(|ancestor| same_file::is_same_file(ancestor, &root).unwrap_or(false))
+            .ok_or_else(external_path_error)?;
+        #[cfg(not(windows))]
+        let boundary = root.as_path();
+        resolved
+            .strip_prefix(boundary)
+            .map_err(|_| external_path_error())?
+            .to_path_buf()
     } else {
-        path
+        path.to_path_buf()
     };
     let mut depth = 0_usize;
     for component in relative.components() {
@@ -207,11 +254,13 @@ fn ensure_project_path(paths: &Paths, value: &OsStr) -> Result<()> {
             _ => return Err(external_path_error()),
         }
     }
-    let candidate = paths.project.join(relative);
-    if candidate.exists() && !fs::canonicalize(candidate)?.starts_with(&paths.project) {
-        return Err(external_path_error());
-    }
-    Ok(())
+    crate::scope::ensure_project_path(&root.join(&relative), &root)
+        .map_err(|_| external_path_error())?;
+    Ok(relative)
+}
+
+fn ensure_project_path(paths: &Paths, value: &OsStr) -> Result<()> {
+    project_relative_path(paths, Path::new(value)).map(|_| ())
 }
 
 fn external_path_error() -> AppError {
@@ -300,6 +349,7 @@ fn read_graph(database: &Path) -> Result<Value> {
 }
 
 struct Paths {
+    external: Option<PathBuf>,
     project: PathBuf,
     runtime: PathBuf,
     legacy_runtime: PathBuf,
@@ -325,9 +375,30 @@ impl Paths {
         let target = target_name()?;
         let extension = if cfg!(windows) { "zip" } else { "tar.gz" };
         let project_lwc = project.join(".lwc");
+        if fs::symlink_metadata(&project_lwc).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(AppError::new(
+                "codegraph_index_invalid",
+                "project .lwc must not be a symlink",
+            ));
+        }
+        let external = crate::config::load_file(&crate::config::config_path_for_database(
+            &project_lwc.join("wiki.db"),
+        )?)?
+        .codegraph_executable;
+        if external.as_ref().is_some_and(|p| !p.is_absolute()) {
+            return Err(AppError::new(
+                "invalid_codegraph_runtime",
+                "configured executable must be an absolute path",
+            ));
+        }
         Ok(Self {
             legacy_runtime: project_lwc.join("runtime").join("codegraph"),
-            index: project_lwc.join("codegraph"),
+            index: if external.is_some() {
+                project.join(".codegraph")
+            } else {
+                project_lwc.join("codegraph")
+            },
+            external,
             project,
             runtime: global_lwc_root()?
                 .join("runtime")
@@ -558,54 +629,42 @@ fn terminate_prompt_hook_process_group(child: &mut Child, _deadline: Instant) ->
     }
 }
 
-fn execute(paths: &Paths, args: &[OsString], stream: bool) -> Result<Value> {
-    let mut command = configured_command(paths, args)?;
-    let (status, stdout, stderr) = if stream {
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = command.spawn()?;
-        let stdout = stream_lines(child.stdout.take().expect("piped stdout"));
-        let stderr = stream_lines(child.stderr.take().expect("piped stderr"));
-        let status = child.wait()?;
-        (
-            status,
-            stdout.join().unwrap_or_default(),
-            stderr.join().unwrap_or_default(),
-        )
-    } else {
-        let output = command.output()?;
-        (
-            output.status,
-            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        )
-    };
+fn execute(paths: &Paths, args: &[OsString]) -> Result<Value> {
+    let status = configured_command(paths, args)?.status()?;
     if !status.success() {
-        return Err(AppError::new(
-            "codegraph_command_failed",
-            format!("CodeGraph exited with {status}"),
-        )
-        .with_details(json!({"stdout": stdout, "stderr": stderr})));
+        return Err(AppError::new("codegraph_exit", "upstream process exited")
+            .with_details(json!({"exit_code": status.code().unwrap_or(1)})));
     }
-    Ok(json!({
-        "scope": "project",
-        "command": args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
-        "stdout": stdout,
-        "stderr": stderr,
-        "telemetry": false,
-    }))
+    Ok(Value::Null)
 }
 
 fn configured_command(paths: &Paths, args: &[OsString]) -> Result<Command> {
     let executable = binary(paths)
         .ok_or_else(|| AppError::new("codegraph_runtime_missing", "run `lwc cg init` first"))?;
-    let home = paths.runtime.join("home");
+    let home = if paths.external.is_some() {
+        crate::scope::global_lwc_root()?
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    } else {
+        paths.runtime.join("home")
+    };
     fs::create_dir_all(&home)?;
     Ok(build_configured_command(paths, args, &executable, &home))
 }
 
 fn configured_prompt_hook_command(paths: &Paths, args: &[OsString]) -> Result<Command> {
-    require_prompt_hook_directory(&paths.runtime)?;
-    let home = paths.runtime.join("home");
+    if paths.external.is_none() {
+        require_prompt_hook_directory(&paths.runtime)?;
+    }
+    let home = if paths.external.is_some() {
+        crate::scope::global_lwc_root()?
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    } else {
+        paths.runtime.join("home")
+    };
     require_prompt_hook_directory(&home)?;
     let executable = binary(paths).ok_or_else(prompt_hook_unavailable)?;
     Ok(build_configured_command(paths, args, &executable, &home))
@@ -635,7 +694,14 @@ fn build_configured_command(
     command
         .args(args)
         .current_dir(&paths.project)
-        .env("CODEGRAPH_DIR", ".lwc/codegraph")
+        .env(
+            "CODEGRAPH_DIR",
+            if paths.external.is_some() {
+                ".codegraph"
+            } else {
+                ".lwc/codegraph"
+            },
+        )
         .env("CODEGRAPH_TELEMETRY", "0")
         .env("DO_NOT_TRACK", "1")
         .env("NO_COLOR", "1")
@@ -646,53 +712,33 @@ fn build_configured_command(
 
 pub(crate) fn mcp_command(project: &Path) -> Result<Command> {
     let paths = Paths::from_project(fs::canonicalize(project)?)?;
-    for directory in [paths.project.join(".lwc"), paths.index.clone()] {
-        match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => {
-                return Err(AppError::new(
-                    "codegraph_index_invalid",
-                    "CodeGraph index directories must be real project-local directories",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(AppError::new(
-                    "codegraph_index_missing",
-                    "run `lwc cg init` to build the project code index",
-                ));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let database = paths.index.join("codegraph.db");
-    match fs::symlink_metadata(&database) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
-        Ok(_) => {
-            return Err(AppError::new(
-                "codegraph_index_invalid",
-                "CodeGraph database must be a regular project-local file",
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(AppError::new(
-                "codegraph_index_missing",
-                "run `lwc cg init` to build the project code index",
-            ));
-        }
-        Err(error) => return Err(error.into()),
-    }
+    validate_index(&paths)?;
     let executable = binary(&paths).ok_or_else(|| {
         AppError::new(
             "codegraph_runtime_missing",
             "run `lwc cg init` to install the pinned CodeGraph runtime",
         )
     })?;
-    let home = paths.runtime.join("home");
+    let home = if paths.external.is_some() {
+        crate::scope::global_lwc_root()?
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    } else {
+        paths.runtime.join("home")
+    };
     let mut command = Command::new(executable);
     command
         .args(["serve", "--mcp"])
         .current_dir(&paths.project)
-        .env("CODEGRAPH_DIR", ".lwc/codegraph")
+        .env(
+            "CODEGRAPH_DIR",
+            if paths.external.is_some() {
+                ".codegraph"
+            } else {
+                ".lwc/codegraph"
+            },
+        )
         .env(
             "CODEGRAPH_MCP_TOOLS",
             "search,callers,callees,impact,node,explore,status,files",
@@ -703,23 +749,6 @@ pub(crate) fn mcp_command(project: &Path) -> Result<Command> {
         .env("HOME", &home)
         .env("USERPROFILE", &home);
     Ok(command)
-}
-
-fn stream_lines(pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut captured = String::new();
-        for line in BufReader::new(pipe)
-            .lines()
-            .map_while(std::result::Result::ok)
-        {
-            eprintln!("{line}");
-            if !captured.is_empty() {
-                captured.push('\n');
-            }
-            captured.push_str(&line);
-        }
-        captured
-    })
 }
 
 fn install(paths: &Paths) -> Result<()> {
@@ -960,6 +989,16 @@ struct RuntimeState {
 }
 
 fn runtime_state(paths: &Paths) -> RuntimeState {
+    if let Some(executable) = &paths.external {
+        return RuntimeState {
+            health: if executable.is_file() {
+                "ready"
+            } else {
+                "missing"
+            },
+            binary: executable.is_file().then(|| executable.clone()),
+        };
+    }
     let Ok(runtime_metadata) = fs::symlink_metadata(&paths.runtime) else {
         return RuntimeState {
             health: "missing",
@@ -1074,6 +1113,184 @@ fn target_name() -> Result<&'static str> {
     }
 }
 
+pub fn configure(store: &StorePath, executable: Option<&Path>) -> Result<Value> {
+    let executable = executable
+        .map(|path| {
+            if !path.is_absolute() || !path.is_file() {
+                return Err(AppError::new(
+                    "invalid_codegraph_runtime",
+                    "--executable must name an existing absolute executable path",
+                ));
+            }
+            Ok(fs::canonicalize(path)?)
+        })
+        .transpose()?;
+    crate::config::update(
+        &store.path,
+        crate::config::ConfigPatch {
+            codegraph_executable: Some(executable),
+            ..Default::default()
+        },
+    )?;
+    status(store)
+}
+
+/// This is evidence for named files, not a completeness claim about call edges.
+pub fn check_files(store: &StorePath, files: &[PathBuf], require_fresh: bool) -> Result<Value> {
+    let paths = Paths::new(store)?;
+    let project = fs::canonicalize(&paths.project)?;
+    let database = paths.index.join("codegraph.db");
+    if files.len() > 1000 {
+        return Err(AppError::new(
+            "invalid_input",
+            "at most 1000 files can be checked per request",
+        ));
+    }
+    let conn = validate_index(&paths).and_then(|_| {
+        Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(Into::into)
+    });
+    let index_state = match &conn {
+        Err(error) if error.code == "codegraph_index_missing" => "index_missing",
+        Err(_) => "index_unreadable",
+        Ok(conn) => match conn.prepare("SELECT path,content_hash FROM files LIMIT 0") {
+            Ok(_) => "ready",
+            Err(error)
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
+                ) =>
+            {
+                "index_unreadable"
+            }
+            Err(_) => "unsupported_index",
+        },
+    };
+    let mut checks = Vec::new();
+    for file in files {
+        let file = project_relative_path(&paths, file)?;
+        let mut relative = PathBuf::new();
+        for component in file.components() {
+            match component {
+                Component::Normal(name) => relative.push(name),
+                Component::ParentDir => {
+                    relative.pop();
+                }
+                Component::CurDir => {}
+                _ => return Err(external_path_error()),
+            }
+        }
+        let name = relative.to_string_lossy().replace('\\', "/");
+        let indexed = if index_state == "ready" {
+            use rusqlite::OptionalExtension;
+            conn.as_ref()
+                .unwrap()
+                .query_row(
+                    "SELECT content_hash FROM files WHERE path=?1",
+                    [&name],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+        } else {
+            Ok(None)
+        };
+        let current = content_hash(&project.join(&relative));
+        let state = match (&indexed, &current) {
+            _ if index_state != "ready" => index_state,
+            (Err(_), _) => "index_unreadable",
+            (Ok(None), _) => "not_indexed",
+            (_, Err(error)) if error.kind() == io::ErrorKind::NotFound => "missing_file",
+            (_, Err(_)) => "file_unreadable",
+            (Ok(Some(indexed)), Ok(current)) if indexed == current => "fresh",
+            _ => "stale",
+        };
+        checks.push(json!({"file":name,"state":state,"indexed_hash":indexed.ok().flatten(),"current_hash":current.ok()}));
+    }
+    let fresh = !checks.is_empty() && checks.iter().all(|check| check["state"] == "fresh");
+    let result = json!({"checkout": project, "index": paths.index, "files": checks, "fresh": fresh,
+        "coverage": "explicit_files_only", "relationship_completeness": "unknown", "indexed_commit":null, "hash_algorithm":"sha256",
+        "checked_at": chrono::Utc::now().to_rfc3339()});
+    if require_fresh && !fresh {
+        return Err(AppError::new(
+            "codegraph_freshness_unproven",
+            "at least one requested file is stale, missing, or not proven indexed",
+        )
+        .with_details(result));
+    }
+    Ok(result)
+}
+
+fn validate_index(paths: &Paths) -> Result<()> {
+    for directory in [
+        paths.index.parent().unwrap().to_path_buf(),
+        paths.index.clone(),
+    ] {
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(AppError::new(
+                    "codegraph_index_invalid",
+                    "CodeGraph index directories must be real project-local directories",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AppError::new(
+                    "codegraph_index_missing",
+                    "run `lwc cg init` to build the project code index",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let database = paths.index.join("codegraph.db");
+    match fs::symlink_metadata(&database) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(AppError::new(
+                "codegraph_index_invalid",
+                "CodeGraph database must be a regular project-local file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AppError::new(
+                "codegraph_index_missing",
+                "run `lwc cg init` to build the project code index",
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn content_hash(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+pub(crate) fn query_identity(project: &Path) -> Result<(PathBuf, PathBuf)> {
+    let paths = Paths::from_project(fs::canonicalize(project)?)?;
+    validate_index(&paths)?;
+    let executable = binary(&paths).ok_or_else(|| {
+        AppError::new(
+            "codegraph_runtime_missing",
+            "the selected CodeGraph runtime is unavailable",
+        )
+    })?;
+    Ok((executable, paths.index))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,6 +1319,7 @@ mod tests {
         )
         .unwrap();
         Paths {
+            external: None,
             legacy_runtime: project.join(".lwc/runtime/codegraph"),
             index: project.join(".lwc/codegraph"),
             project,

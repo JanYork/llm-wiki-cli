@@ -455,6 +455,14 @@ fn scope_not_supported(command: &str) -> AppError {
     )
 }
 
+/// Resolve exactly the caller-validated checkout, without ambient root or ancestor discovery.
+pub(crate) fn explicit_project_store(project: &Path) -> Result<StorePath> {
+    let project = fs::canonicalize(project)?;
+    let database = project_store_path(&project);
+    inspect_store_path(&database, Some(&project))?;
+    Ok(StorePath::new(Scope::Project, database))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

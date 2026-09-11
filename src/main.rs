@@ -5,6 +5,7 @@ mod changeset;
 mod cli;
 mod codegraph;
 mod config;
+mod contracts;
 mod error;
 mod external_graph;
 pub mod graph;

@@ -2,7 +2,7 @@ use crate::{
     codegraph,
     config::{self, GraphSetting, MemorySetting, OfficeSetting, TransSetting},
     error::{AppError, Result},
-    scope::{Scope, init_store_path, resolve_read_store_paths},
+    scope::{Scope, StorePath, init_store_path, resolve_read_store_paths},
     store::{PageRecord, Store, TagAutoloadPolicy, TagPageIdentity},
 };
 use serde::Serialize;
@@ -119,12 +119,43 @@ fn compile_hook(agent: AgentKind, event: &str, scope: Scope, cwd: &Path) -> Resu
             let Some(prompt) = prompt else {
                 return Ok(json!({}));
             };
+            let mut discussion_notice = None;
+            if let (Some(context), Some(message_id), Some(exact)) = (
+                agent_context.id(),
+                payload.get("message_id").and_then(Value::as_str),
+                targets::exact_current_prompt(agent, &event.native, &payload),
+            ) && exact.form == targets::PromptForm::RawSubmitted
+                && !message_id.is_empty()
+                && message_id.len() <= 256
+                && let Ok(paths) = resolve_read_store_paths(Scope::Project, cwd, true)
+            {
+                for path in paths {
+                    if let Ok(store) =
+                        open_store_for_hook_until("project", &path.path, hook_deadline)
+                        && store
+                            .discussion_read("", context, "current", 0, 20)
+                            .ok()
+                            .is_some_and(|v| v["id"].is_string())
+                    {
+                        drop(store);
+                        let outcome =
+                            Store::open_for_discussion_capture(&path.path).and_then(|mut store| {
+                                store.capture_discussion_reply(context, message_id, exact.text)
+                            });
+                        discussion_notice=Some(match outcome {
+                                        Ok(_)=>"LWC_DISCUSSION: host reply persisted unassigned; recover current discussion and associate it before the next question.".to_string(),
+                                        Err(error)=>format!("LWC_DISCUSSION_CAPTURE_FAILED: {}; use using-discussion failure recovery; do not claim complete capture.",error.code),
+                                    });
+                    }
+                }
+            }
             let prompt = prompt.chars().take(4_096).collect::<String>();
             if prompt.is_empty() {
                 return Ok(json!({}));
             }
 
             let mut contexts = Vec::new();
+            contexts.extend(discussion_notice);
             if matches!(agent, AgentKind::Claude) && kind == signals::EventKind::Prompt {
                 let budget = hook_deadline
                     .saturating_duration_since(Instant::now())
@@ -253,8 +284,8 @@ fn compile_hook(agent: AgentKind, event: &str, scope: Scope, cwd: &Path) -> Resu
 
 fn inject_update(context: &mut String, readiness: &mut Value, notice: Value) {
     readiness["update"] = notice;
-    let serialized =
-        serde_json::to_string(readiness).expect("JSON Value serialization cannot fail");
+    let serialized = serde_json::to_string(&compact_readiness(readiness))
+        .expect("JSON Value serialization cannot fail");
     let start = context
         .find("LWC_READINESS ")
         .expect("rendered lifecycle context has readiness");
@@ -366,6 +397,7 @@ fn prompt_readiness(
                 json!({
                     "runtime_installed": runtime_installed,
                     "runtime_health": status["runtime_health"],
+                    "owner": status["owner"], "checkout": status["checkout"], "index": status["index"], "freshness": status["freshness"], "coverage": status["coverage"],
                     "initialized": initialized,
                     "ready": runtime_installed && initialized,
                     "requires_consent": !initialized,
@@ -618,6 +650,11 @@ fn apply_scoped_context_work(
             Err(error) => return Err(error),
         };
         bound |= store.agent_tracking_bound(context_id)?;
+        if let Ok(current) = store.discussion_read("", context_id, "current", 0, 20)
+            && current["id"].is_string()
+        {
+            value["discussion"] = json!({"scope":scope_name,"current":current,"resume":format!("lwc --scope {scope_name} discussion current --context {context_id}")});
+        }
         if config::resolve_plan(scope_name, &path.path)?.setting
             == config::CapabilitySetting::Enabled
         {
@@ -679,6 +716,14 @@ fn readiness_until(
 ) -> Result<Value> {
     ensure_hook_deadline(deadline)?;
     let store = init_store_path(Scope::Project, cwd)?;
+    readiness_for_store(deadline, context, &store)
+}
+
+fn readiness_for_store(
+    deadline: Option<Instant>,
+    context: Option<&identity::AgentExecutionContext>,
+    store: &StorePath,
+) -> Result<Value> {
     let wiki_initialized = store.path.is_file();
     let graph = config::resolve_graph("project", &store.path)?;
     ensure_hook_deadline(deadline)?;
@@ -695,7 +740,7 @@ fn readiness_until(
         .unwrap_or_else(|error| json!({"status": "error", "error_code": error.code}))
     };
     let document_graph_ready = document_graph_projection["status"] == "ready";
-    let code_graph = codegraph::status(&store)?;
+    let code_graph = codegraph::status(store)?;
     ensure_hook_deadline(deadline)?;
     let code_graph_runtime_installed = code_graph["installed"].as_bool().unwrap_or(false);
     let code_graph_initialized = code_graph["initialized"].as_bool().unwrap_or(false);
@@ -765,6 +810,7 @@ fn readiness_until(
         "code_graph": {
             "runtime_installed": code_graph_runtime_installed,
             "runtime_health": code_graph["runtime_health"],
+            "owner": code_graph["owner"], "checkout": code_graph["checkout"], "index": code_graph["index"], "freshness": code_graph["freshness"], "coverage": code_graph["coverage"],
             "initialized": code_graph_initialized,
             "ready": code_graph_ready,
             "requires_consent": code_graph_needs_consent,
@@ -1393,7 +1439,8 @@ fn render_context(
         context.push_str("For unsolicited lifecycle Plan/Todo progress signals carrying an ID, require this same Hook's `LWC_READINESS.agent_context.status=bound` and a matching ID in `plan.tracking`/`plan.additional_trackings` or `todo.reminders`. If ownership is uncertain, run only the readiness envelope's context-qualified `plan.current` or `todo.list` command. Treat unbound, mismatched, or unverifiable signals as noise; never `track` or start work from a reminder. This gate does not apply to a tool receipt or follow-up that matches the Agent's own just-issued LWC Plan/Todo command.\n");
     }
     context.push_str("LWC_READINESS ");
-    context.push_str(&serde_json::to_string(readiness).map_err(hook_json_error)?);
+    context
+        .push_str(&serde_json::to_string(&compact_readiness(readiness)).map_err(hook_json_error)?);
     context.push('\n');
     if let Some(signal) = signal {
         context.push_str(signal);
@@ -1434,6 +1481,103 @@ fn scope_name(scope: Scope) -> &'static str {
 
 fn scope_priority(scope: &str) -> u8 {
     if scope == "project" { 0 } else { 1 }
+}
+
+pub(crate) fn doctor(cwd: &Path, context: Option<&str>, verbose: bool) -> Result<Value> {
+    let store = init_store_path(Scope::Project, cwd)?;
+    doctor_for_store(cwd, context, verbose, &store)
+}
+
+pub(crate) fn doctor_explicit(project: &Path, context: Option<&str>) -> Result<Value> {
+    let store = crate::scope::explicit_project_store(project)?;
+    doctor_for_store(project, context, true, &store)
+}
+
+fn doctor_for_store(
+    cwd: &Path,
+    context: Option<&str>,
+    verbose: bool,
+    store: &StorePath,
+) -> Result<Value> {
+    let mut value = readiness_for_store(None, None, store)?;
+    let checkout = store.path.parent().unwrap().parent().unwrap();
+    let git = |args: &[&str]| -> Option<String> {
+        let output = std::process::Command::new("git")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .arg("-C")
+            .arg(checkout)
+            .args(args)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    value["project"] = json!({
+        "shell_root": cwd, "checkout": checkout, "wiki_database": store.path,
+        "git_common_dir": git(&["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+        "head": git(&["rev-parse", "HEAD"]),
+        "working_tree": git(&["status", "--porcelain=v1", "--untracked-files=normal"]),
+        "authorization": "current_workspace_only"
+    });
+    value["code_graph"] = codegraph::status(store)?;
+    value["agent_context"] = json!({"status":"unbound"});
+    if let Some(context) = context {
+        if store.path.is_file() {
+            value["plan"] = Store::open_for_read("project", &store.path)?.tracked_plan(context)?;
+        }
+        value["agent_context"] = json!({"status":"explicit_context", "context_id":context});
+    }
+    Ok(if verbose {
+        value
+    } else {
+        compact_readiness(&value)
+    })
+}
+
+/// Keep recovery ownership and actionable state, omit repetitive setup recipes.
+fn compact_readiness(readiness: &Value) -> Value {
+    let mut value = readiness.clone();
+    if let Some(object) = value.as_object_mut() {
+        for (name, capability) in object.iter_mut() {
+            if matches!(
+                name.as_str(),
+                "agent_context" | "plan" | "todo" | "sync" | "archive" | "update" | "project"
+            ) {
+                continue;
+            }
+            if let Some(fields) = capability.as_object_mut() {
+                fields.retain(|key, _| {
+                    !matches!(
+                        key.as_str(),
+                        "initialize"
+                            | "enable"
+                            | "disable"
+                            | "configure"
+                            | "command"
+                            | "convert"
+                            | "maintain"
+                            | "recall"
+                            | "record"
+                            | "verify"
+                            | "check"
+                            | "max_age_days"
+                            | "max_bytes"
+                            | "runtime"
+                            | "legacy_runtime"
+                            | "legacy_project_runtime"
+                    )
+                });
+            }
+        }
+        object.insert("inspect".into(), json!("lwc doctor --verbose"));
+    }
+    value
 }
 
 #[cfg(test)]

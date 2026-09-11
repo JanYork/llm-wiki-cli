@@ -296,12 +296,12 @@ impl Store {
         Ok((open, reminders, omitted))
     }
     pub fn agent_tracking_bound(&self, context: &str) -> Result<bool> {
-        let context = normalize_agent_context(context)?;
-        self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agent_plan_tracks WHERE context_id=?1) OR EXISTS(SELECT 1 FROM agent_todo_tracks WHERE context_id=?1)",
-            [&context],
-            |row| row.get(0),
-        ).map_err(Into::into)
+        let context=normalize_agent_context(context)?;
+        let existing:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM agent_plan_tracks WHERE context_id=?1) OR EXISTS(SELECT 1 FROM agent_todo_tracks WHERE context_id=?1)",[&context],|r|r.get(0))?;
+        if existing {return Ok(true);}
+        let supported:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='discussion_bindings')",[],|r|r.get(0))?;
+        if !supported {return Ok(false);}
+        self.conn.query_row("SELECT EXISTS(SELECT 1 FROM discussion_bindings WHERE context=?1)",[&context],|r|r.get(0)).map_err(Into::into)
     }
     pub fn todo_add(&mut self, mut input: TodoCreateInput) -> Result<Value> {
         input.title = normalize_todo_text("title", &input.title)?;

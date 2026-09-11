@@ -30,6 +30,7 @@ impl World {
         Command::new(env!("CARGO_BIN_EXE_lwc"))
             .current_dir(&self.project)
             .env("HOME", &self.home)
+            .arg("--full")
             .args(args)
             .output()
             .unwrap()

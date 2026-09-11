@@ -1,7 +1,7 @@
 {
   "name": "codex-lwc",
-  "version": "0.1.0",
-  "description": "Durable LWC Wiki context and project-scoped CodeGraph for Codex.",
+  "version": "0.18.0",
+  "description": "LWC Wiki, CodeGraph and durable Discussion for Codex.",
   "author": {
     "name": "JanYork",
     "url": "https://github.com/JanYork"
@@ -9,18 +9,31 @@
   "homepage": "https://github.com/JanYork/llm-wiki-cli",
   "repository": "https://github.com/JanYork/llm-wiki-cli",
   "license": "Apache-2.0",
-  "keywords": ["memory", "wiki", "codegraph", "codex"],
+  "keywords": [
+    "memory",
+    "wiki",
+    "codegraph",
+    "codex"
+  ],
   "interface": {
-    "displayName": "LWC for Codex",
-    "shortDescription": "Durable Wiki memory and project code structure",
-    "longDescription": "Loads bounded LWC readiness at session boundaries and exposes one read-only LWC MCP for Wiki and project code context.",
+    "displayName": "LWC",
+    "shortDescription": "Persistent discussions, memory and native code navigation",
+    "longDescription": "Native Codex plugin with lifecycle hooks, LWC Skills, read-only context tools and the dedicated SQLite Discussion tool.",
     "developerName": "JanYork",
     "category": "Developer Tools",
-    "capabilities": ["Interactive", "Read"],
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
     "websiteURL": "https://github.com/JanYork/llm-wiki-cli",
-    "defaultPrompt": ["Recall relevant LWC context, then inspect this project structurally"]
+    "defaultPrompt": [
+      "Recall relevant LWC context, then inspect this project structurally"
+    ],
+    "composerIcon": "./assets/logo.png",
+    "logo": "./assets/logo.png",
+    "logoDark": "./assets/logo.png"
   },
   "mcpServers": "./.mcp.json",
-  "skills": "./skills",
-  "hooks": "./hooks/hooks.json"
+  "skills": "./skills"
 }

@@ -1,0 +1,43 @@
+{
+  "candidate_sha256": "30174fa22219263fa5b693467afba36d4c59c81a06f6c73318967a2ac30ce89e",
+  "baseline": "lwc 0.17.18",
+  "independent_codegraph": "1.6.0",
+  "measurement": "small real-source fixture; observational samples, not a performance guarantee",
+  "bundled_cli": {
+    "baseline": {
+      "samples": 5,
+      "p50_ms": 129.47,
+      "p95_ms": 163.21,
+      "output_bytes": 935,
+      "calls_per_query": 1
+    },
+    "candidate": {
+      "samples": 5,
+      "p50_ms": 85.97,
+      "p95_ms": 4896.07,
+      "output_bytes": 703,
+      "calls_per_query": 1
+    }
+  },
+  "hook": {
+    "baseline": {
+      "output_bytes": 4550
+    },
+    "candidate": {
+      "output_bytes": 3549
+    }
+  },
+  "mcp_first_query_ms": 231.72,
+  "mcp_warm": {
+    "samples": 20,
+    "p50_ms": 0.45,
+    "p95_ms": 1.07
+  },
+  "checks": {
+    "native_cli_byte_equality": true,
+    "worktree_index_isolation": true,
+    "shared_logical_repository": true,
+    "fresh_dirty_untracked": true,
+    "repeat_query_equality": true
+  }
+}

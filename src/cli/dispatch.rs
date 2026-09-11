@@ -9,6 +9,8 @@ fn run(cli: Cli) -> Result<Value> {
             | Command::WorkRun { .. }
             | Command::UpdateCheck
             | Command::Cg { .. }
+            | Command::Doctor { .. }
+            | Command::Contract { .. }
             | Command::Office { .. }
             | Command::Tutor { .. }
             | Command::Book { .. }
@@ -18,6 +20,7 @@ fn run(cli: Cli) -> Result<Value> {
             | Command::Agent { .. }
             | Command::Todo { .. }
             | Command::Plan { .. }
+            | Command::Discussion { .. }
             | Command::Compress { .. }
             | Command::Decompress { .. }
             | Command::Merge { .. }
@@ -36,6 +39,31 @@ fn run(cli: Cli) -> Result<Value> {
         }
     }
     match cli.command {
+        Command::Discussion { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "discussion")?;
+            ensure_scope_supported(cli.scope, false, "discussion")?;
+            let p=resolve_live_store_path(cli.scope,&cwd)?;
+            match command {
+                DiscussionCommand::Apply { json } => {
+                    let raw=read_memory_json(&p,&cwd,&json)?;
+                    let input=crate::contracts::parse::<store::DiscussionInput>("discussion", &raw)?;
+                    Store::open(scope_name(p.scope),&p.path)?.discussion_apply(input)
+                }
+                DiscussionCommand::List {context,offset,limit} => Store::open_for_read(scope_name(p.scope),&p.path)?.discussion_list(&context,offset,limit),
+                DiscussionCommand::Item {id,item,context} => Store::open_for_read(scope_name(p.scope),&p.path)?.discussion_item(&id,&context,&item),
+                DiscussionCommand::Show {id,context,offset,limit} => Store::open_for_read(scope_name(p.scope),&p.path)?.discussion_read(&id,&context,"show",offset,limit),
+                DiscussionCommand::Export {id,context} => Store::open_for_read(scope_name(p.scope),&p.path)?.discussion_read(&id,&context,"export",0,100),
+                DiscussionCommand::Current {id,context} => Store::open_for_read(scope_name(p.scope),&p.path)?.discussion_read(id.as_deref().unwrap_or(""),&context,"current",0,20),
+                DiscussionCommand::History {id,context,offset,limit} => Store::open_for_read(scope_name(p.scope),&p.path)?.discussion_read(&id,&context,"history",offset,limit),
+            }
+        }
+
+        Command::Doctor { context, verbose } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "doctor")?;
+            ensure_scope_supported(cli.scope, false, "doctor")?;
+            crate::agent::doctor(&cwd, context.as_deref(), verbose)
+        }
+        Command::Contract { name } => crate::contracts::describe(&name),
         Command::Serve { mcp, path } => {
             changeset::reject_selector(selected_changeset.as_deref(), "serve")?;
             if !mcp {
@@ -108,11 +136,19 @@ fn run(cli: Cli) -> Result<Value> {
             crate::update::run_checker();
             Ok(Value::Null)
         }
-        Command::Cg { command } => {
+        Command::Cg { command, require_fresh, files } => {
             changeset::reject_selector(selected_changeset.as_deref(), "cg")?;
             ensure_scope_supported(cli.scope, false, "cg")?;
-            let store_path = resolve_live_store_path(cli.scope, &cwd)?;
+            let store_path = init_store_path(cli.scope, &cwd)?;
+            if require_fresh {
+                if files.is_empty() { return Err(AppError::new("invalid_input", "--require-fresh requires at least one --file; repository-wide completeness cannot be inferred")); }
+                codegraph::check_files(&store_path,&files,true)?;
+            }
             match command {
+                CgCommand::Configure { executable, bundled: _ } => codegraph::configure(&store_path, executable.as_deref()),
+                CgCommand::Tools => crate::mcp::codegraph_tools(store_path.path.parent().unwrap().parent().unwrap()),
+                CgCommand::Inspect => codegraph::run(&store_path, &[OsString::from("status")]),
+                CgCommand::Check { files, require_fresh } => codegraph::check_files(&store_path, &files, require_fresh),
                 CgCommand::Init { verbose } => codegraph::init(&store_path, verbose),
                 CgCommand::Status => codegraph::status(&store_path),
                 CgCommand::Run(args) => codegraph::run(&store_path, &args),
@@ -682,7 +718,9 @@ fn run(cli: Cli) -> Result<Value> {
                 require_capability("plan", &path)?;
             }
             match command {
-                PlanCommand::Create { title,objective,done_when,tags,constraints,steps,request_id,json } => {ensure_scope_supported(cli.scope,false,"plan create")?;let p=resolve_live_store_path(cli.scope,&cwd)?;let input=if let Some(raw)=json{let raw=read_memory_json(&p,&cwd,&raw)?;serde_json::from_str::<store::PlanCreateInput>(&raw).map_err(|e|AppError::new("invalid_input",format!("invalid Plan JSON: {e}")))?}else{store::PlanCreateInput{title:title.ok_or_else(||AppError::new("invalid_input","title is required"))?,objective:objective.ok_or_else(||AppError::new("invalid_input","--objective is required"))?,done_when:done_when.ok_or_else(||AppError::new("invalid_input","--done-when is required"))?,tags,constraints,steps:steps.into_iter().map(|title|store::PlanStepInput{title,verify:None}).collect(),request_id}};Store::open(scope_name(p.scope),&p.path)?.plan_create(input)}
+                PlanCommand::History { plan_id } => { ensure_scope_supported(cli.scope,false,"plan history")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open_for_read(scope_name(p.scope),&p.path)?.plan_history(&plan_id) }
+                PlanCommand::Reconcile { plan_id, from, limit } => { ensure_scope_supported(cli.scope,false,"plan reconcile")?;validate_limit(limit)?;let p=resolve_live_store_path(cli.scope,&cwd)?;let file = from.map(|path| read_memory_json(&p,&cwd,&format!("@{}",path.display()))).transpose()?;Store::open_for_read(scope_name(p.scope),&p.path)?.plan_reconcile(&plan_id,file.as_deref(),limit) }
+                PlanCommand::Create { title,objective,done_when,tags,constraints,steps,request_id,json } => {ensure_scope_supported(cli.scope,false,"plan create")?;let p=resolve_live_store_path(cli.scope,&cwd)?;let input=if let Some(raw)=json{let raw=read_memory_json(&p,&cwd,&raw)?;crate::contracts::parse::<store::PlanCreateInput>("plan-create", &raw)?}else{store::PlanCreateInput{title:title.ok_or_else(||AppError::new("invalid_input","title is required"))?,objective:objective.ok_or_else(||AppError::new("invalid_input","--objective is required"))?,done_when:done_when.ok_or_else(||AppError::new("invalid_input","--done-when is required"))?,tags,constraints,steps:steps.into_iter().map(|title|store::PlanStepInput{title,verify:None}).collect(),request_id}};Store::open(scope_name(p.scope),&p.path)?.plan_create(input)}
                 PlanCommand::Current { context,tag,limit,offset } => if let Some(context)=context { ensure_scope_supported(cli.scope,false,"plan current --context")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open_for_read(scope_name(p.scope),&p.path)?.tracked_plan(&context) } else { plan_list_response(cli.scope,&cwd,None,Some("active"),tag.as_deref(),limit,offset) },
                 PlanCommand::List { state,tag,limit,offset } => plan_list_response(cli.scope,&cwd,None,state.as_deref(),tag.as_deref(),limit,offset),
                 PlanCommand::Search { query,state,tag,limit,offset } => {require_text("query",&query)?;plan_list_response(cli.scope,&cwd,Some(&query),state.as_deref(),tag.as_deref(),limit,offset)},
@@ -690,7 +728,7 @@ fn run(cli: Cli) -> Result<Value> {
                 PlanCommand::Brief { plan_id } => {ensure_scope_supported(cli.scope,false,"plan brief")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open_for_read(scope_name(p.scope),&p.path)?.plan_brief(&plan_id)}
                 PlanCommand::Advance { plan_id,if_revision,done,result,next } => {ensure_scope_supported(cli.scope,false,"plan advance")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.plan_advance(&plan_id,if_revision,&done,&result,next.as_deref())}
                 PlanCommand::Block { plan_id,if_revision,step,reason } => {ensure_scope_supported(cli.scope,false,"plan block")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.plan_block(&plan_id,if_revision,&step,&reason)}
-                PlanCommand::Revise { plan_id,if_revision,reason,json } => {ensure_scope_supported(cli.scope,false,"plan revise")?;let p=resolve_live_store_path(cli.scope,&cwd)?;let raw=read_memory_json(&p,&cwd,&json)?;let input=serde_json::from_str::<store::PlanReviseInput>(&raw).map_err(|e|AppError::new("invalid_input",format!("invalid Plan revision JSON: {e}")))?;Store::open(scope_name(p.scope),&p.path)?.plan_revise(&plan_id,if_revision,&reason,input)}
+                PlanCommand::Revise { plan_id,if_revision,reason,json } => {ensure_scope_supported(cli.scope,false,"plan revise")?;let p=resolve_live_store_path(cli.scope,&cwd)?;let raw=read_memory_json(&p,&cwd,&json)?;let input=crate::contracts::parse::<store::PlanReviseInput>("plan-revise", &raw)?;Store::open(scope_name(p.scope),&p.path)?.plan_revise(&plan_id,if_revision,&reason,input)}
                 PlanCommand::Complete { plan_id,if_revision,result,evidence,done_when_checked } => {ensure_scope_supported(cli.scope,false,"plan complete")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.plan_finish(&plan_id,if_revision,true,Some(&result),Some(&evidence),done_when_checked,None)}
                 PlanCommand::Abandon { plan_id,if_revision,reason } => {ensure_scope_supported(cli.scope,false,"plan abandon")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.plan_finish(&plan_id,if_revision,false,None,None,false,Some(&reason))}
                 PlanCommand::Track { plan_id,context } => {ensure_scope_supported(cli.scope,false,"plan track")?;let p=resolve_live_store_path(cli.scope,&cwd)?;Store::open(scope_name(p.scope),&p.path)?.plan_track(&plan_id,&context)}
@@ -1132,6 +1170,7 @@ fn run(cli: Cli) -> Result<Value> {
                     config::update(
                         &store_path.path,
                         config::ConfigPatch {
+                            codegraph_executable: None,
                             graph: graph_setting,
                             trans: trans_setting,
                             office: office_setting,
@@ -1177,6 +1216,7 @@ fn run(cli: Cli) -> Result<Value> {
                     config::update(
                         &store_path.path,
                         config::ConfigPatch {
+                            codegraph_executable: None,
                             graph: graph.then_some(config::GraphSetting::Inherit),
                             trans: trans.then_some(config::inherit_trans_settings()),
                             office: None,

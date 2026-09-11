@@ -492,3 +492,7 @@ CLI 和迁移修复，不要手工修改。
 ## 许可证
 
 本项目使用 [Apache License 2.0](LICENSE)。
+
+## 0.18.0 新增
+
+Discussion 将可见澄清问答持久保存到 SQLite，支持最小粒度修订及带证据总结。CodeGraph 支持原生结果透传，Agent 契约发现与恢复输出得到改进。Codex 额外支持原生插件，其他宿主安装方式保持不变。参见 [Discussion](docs/discussion.md) 和 [Codex 插件](integrations/codex-lwc/README.md)。

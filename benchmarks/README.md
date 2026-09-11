@@ -103,3 +103,22 @@ material you are not allowed to snapshot into a temporary wiki.
   selecting the best result.
 - Do not accept a latency or storage win that reduces Recall@5/10 or MRR.
 - Keep private corpora and reviewed ground-truth files outside Git.
+
+## Agent UX and native CodeGraph acceptance
+
+`agent_ux.py` compares an installed baseline with a candidate in disposable HOME,
+Git checkout and worktree fixtures made from this repository's Rust sources. It
+uses already installed bundled and independent CodeGraph runtimes; it never
+installs runtimes or changes the source project's indexes.
+
+```bash
+python3 benchmarks/agent_ux.py --candidate /absolute/path/to/candidate-lwc \
+  --baseline /absolute/path/to/installed-lwc \
+  --codegraph /absolute/path/to/codegraph --output /tmp/agent-ux.json
+```
+
+The report records binary hash, native output equality, worktree isolation,
+named-file freshness, output bytes, calls, five cold CLI samples and twenty warm
+MCP samples. These are small observational samples, not throughput or whole-repo
+coverage guarantees. Byte counts are not tokenizer measurements. See
+[2026-09-11 evidence](results/2026-09-11-agent-ux.json).

@@ -34,27 +34,19 @@ widen that authority.
 
 ## Start once per working root
 
-1. From the current project directory, run `scripts/bootstrap.sh` from this
-   Skill directory. Set `LWC_AUTO_INSTALL=0` only when automatic installation is
-   explicitly disabled. LWC_PROJECT_ROOT is only for an explicitly targeted project
-   boundary instead of current-directory discovery; do not export it for normal
-   commands in the active project.
-2. Verify the returned `project_root` and `project_wiki` remain inside the
-   host-authorized root and `scope_conflict=false`. Require `command -v lwc` to
-   succeed after bootstrap. Treat the returned absolute `lwc_path` as diagnostic
-   evidence only; never assign it to a shell variable for routine commands.
-3. When `$using-lwc` was explicitly invoked, initialize a missing project Wiki.
-   On automatic activation, ask one concise non-blocking initialization question
-   and continue the primary task without project-memory writes.
-4. Recall bounded context once:
+LWC_PROJECT_ROOT is only for an explicitly targeted project boundary, not normal
+current-directory discovery. Reuse current Hook readiness and known bindings. Search the authorized project for
+relevant task terms with a small result limit; open only relevant pages and verify
+mutable claims against current sources. Widen recall only after a relevant miss.
+Do not repeat status, bootstrap or broad context reads without a scope change,
+stale evidence or a state error.
 
-   ```bash
-   lwc --scope all context --limit 25
-   lwc --scope all search "task terms" --limit 20
-   ```
-
-Do not repeat bootstrap or broad recall in the same working root. Rerun it after
-an authorized project change.
+Missing optional memory or CG does not block the primary task. Consult onboarding
+when setup is requested or required for the requested capability.
+`scripts/bootstrap.sh` is an optional diagnostic, not a session prerequisite.
+Installation, initialization and updates require established authorization; invoking
+this Skill alone does not authorize provisioning. Use the project's chosen durable
+owner; other files or Wiki pages should reference it rather than mirror progress.
 
 ## Update notice
 
@@ -135,3 +127,11 @@ when evolving memory architecture or resolving a compounding-knowledge policy.
 
 The repository benchmark is for developing or auditing LWC itself, not routine
 memory use. When needed, follow `benchmarks/README.md` with sanitized inputs.
+
+## Iterative clarification
+
+When entering multi-turn clarification or brainstorming through any Skill or user
+prompt, use `using-discussion` to persist exact visible questions and answers
+silently in its dedicated SQLite records. This opt-in discussion protocol is an
+exception to excluding ordinary transcript logs; it never permits hidden reasoning
+or secrets, and does not turn every chat into a recorded discussion.

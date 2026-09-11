@@ -32,6 +32,7 @@ impl TestWorld {
         Command::new(env!("CARGO_BIN_EXE_lwc"))
             .current_dir(&self.project)
             .env("HOME", &self.home)
+            .arg("--full")
             .args(args)
             .output()
             .unwrap()
@@ -68,6 +69,7 @@ impl TestWorld {
         let mut child = Command::new(env!("CARGO_BIN_EXE_lwc"))
             .current_dir(&self.project)
             .env("HOME", &self.home)
+            .arg("--full")
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -239,7 +241,7 @@ fn memory_config_is_layered_validated_and_unsettable() {
 
     world.ok(&["config", "set", "--memory", "enabled"]);
     let stored: Value = serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
-    assert_eq!(stored["version"], 7);
+    assert_eq!(stored["version"], 8);
     assert_eq!(stored["memory"]["setting"], "enabled");
 }
 
@@ -854,7 +856,7 @@ fn superseding_event_completes_the_old_pattern_without_merging_other_entities() 
         current["results"][0]["event"]["id"],
         replacement["event"]["id"]
     );
-    assert_eq!(current["results"][0]["state"], "current");
+    assert_eq!(current["results"][0]["state"], "latest_known");
     assert_eq!(
         current["results"][0]["explanation"]["matched_via"],
         "superseded_event"
@@ -875,7 +877,7 @@ fn superseding_event_completes_the_old_pattern_without_merging_other_entities() 
         result["event"]["id"] == old["event"]["id"] && result["state"] == "superseded"
     }));
     assert!(history.iter().any(|result| {
-        result["event"]["id"] == replacement["event"]["id"] && result["state"] == "current"
+        result["event"]["id"] == replacement["event"]["id"] && result["state"] == "latest_known"
     }));
     let old_position = history
         .iter()

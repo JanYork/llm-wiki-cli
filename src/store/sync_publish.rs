@@ -76,6 +76,7 @@ fn bounded_sync_selection(
         "memory",
         "todo",
         "plan",
+        "discussion",
         "work_audit",
         "draft_intent",
     ] {
@@ -750,6 +751,7 @@ fn prepare_sync_state(path: &Path) -> Result<PreparedSyncState> {
         "memory",
         "todo",
         "plan",
+        "discussion",
         "work_audit",
         "draft_intent",
     ];
@@ -845,6 +847,7 @@ fn apply_prepared_sync_state(tx: &Transaction<'_>, state: &PreparedSyncState) ->
     import_sync_memory(tx, state, &memory_requests)?;
     import_sync_todos(tx, state, &todo_revisions, &todo_requests)?;
     import_sync_plans(tx, state, &plan_revisions, &plan_requests)?;
+    import_sync_discussions(tx,state)?;
     tx.execute_batch(
         "DELETE FROM agent_todo_tracks
          WHERE NOT EXISTS(SELECT 1 FROM todo_items WHERE id=agent_todo_tracks.todo_id);

@@ -571,3 +571,7 @@ Report security issues according to [SECURITY.md](SECURITY.md).
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
+
+## New in 0.18.0
+
+Durable Discussion records preserve visible clarification Q/A in SQLite with granular corrections and evidence-linked summaries. CodeGraph supports native result passthrough, and Agent contracts and recovery output are easier to discover. Codex additionally supports a native plugin package; other host installation routes remain unchanged. See [Discussion](docs/discussion.md) and [Codex plugin](integrations/codex-lwc/README.md).

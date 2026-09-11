@@ -16,7 +16,7 @@ Also skip guesses, repeated wording, and a result that will not matter after the
 
 ## Minimum workflow
 
-Record one small normalized capsule in one command:
+Use `lwc contract remember` (or `lwc_inspect` with `kind: contract`, `name: remember`) when the input shape is unfamiliar. Schema validation reports all field-path errors together with a working example. Record one small normalized capsule in one command:
 
 ```bash
 lwc remember --json '{...}'
@@ -58,3 +58,12 @@ conclusion; otherwise resolve, pin, or ignore it without rewriting history.
   or authoritative sources.
 - Usefulness feedback is explicit; retrieval alone never counts as success.
 - Any Wiki synthesis is separately validated under the normal Wiki workflow.
+
+## Receipts and historical state
+
+Default write receipts keep the event identity, retention/hints and a read command.
+Use `lwc memory show EVENT_ID` or `--full` for the complete event. Recall labels an
+unsuperseded event `latest_known`, not live-verified. Supersedes relations remain
+explicit evidence links; no timestamp alone automatically supersedes another task.
+An unresolved contradiction needs investigation, not automatic merging. Verify
+current-state claims against current code or another authoritative live source.

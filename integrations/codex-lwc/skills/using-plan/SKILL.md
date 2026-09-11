@@ -5,7 +5,7 @@ description: Use when an Agent needs to create, resume, advance, block, revise, 
 
 # Using LWC Plan
 
-First run `lwc config show`. Continue only when `plan.setting` is `enabled`. A Skill trigger is not consent to enable Plan: when disabled, do not run Plan commands; explain that the user can opt in with `lwc config set --plan enabled`. A lifecycle Hook with a resolved `agent_context` includes only Plans explicitly tracked by that Agent context. Treat any Plan progress reminder for another context as unrelated and ignore it.
+Reuse current readiness/config facts; run `lwc config show` only when the setting is unknown or stale. Continue only when `plan.setting` is `enabled`. A Skill trigger is not consent to enable Plan: when disabled, do not run Plan commands; explain that the user can opt in with `lwc config set --plan enabled`. A lifecycle Hook with a resolved `agent_context` includes only Plans explicitly tracked by that Agent context. Treat any Plan progress reminder for another context as unrelated and ignore it.
 
 Use Plan only for the current coarse execution plan. It is independent from Todo and must never be converted to or from a Todo automatically.
 
@@ -16,7 +16,12 @@ Use Plan only for the current coarse execution plan. It is independent from Todo
 - Use exact, idempotent `plan untrack PLAN_ID --context CONTEXT_ID` before deliberately switching a context to another Plan; a conflicting `track` never replaces the current association.
 - Before mutation, inspect the current revision and pass `--if-revision`.
 - `advance` completes the focal step with a result and explicitly selects the next pending step.
-- `block` records a concrete blocker. `revise` requires a reason and replaces only unfinished work.
+- `block` records a concrete blocker. `revise` requires a reason and CAS revision. Inspect `lwc contract plan-revise` for its full schema and example.
+- Prefer a targeted revision of `objective`, `done_when`, `constraints`, or `updates` by stable step ID. Use `current_step` when changing focus. The replacement `steps` form supersedes unfinished work and cannot be mixed with ID updates.
+- Use `disposition: waived` with an explicit user-instruction `basis` for waived work; use `superseded` for replaced work. Neither means verification passed. Terminal steps cannot be rewritten.
+- Mutation receipts show changed steps; `lwc plan show PLAN_ID` and `--full` expose full records. `lwc plan history PLAN_ID` returns revision evidence.
+- `lwc plan reconcile PLAN_ID --from plan.md` is read-only: it returns title-matched event candidates and a textual document comparison. It does not infer semantic agreement or advance the plan. Review evidence before a CAS mutation.
+- Keep execution state in this Plan. File maps should point to it, not mirror its progress. Use Wiki for stable knowledge and Memory for historical evidence.
 - Complete only after all steps are terminal, evidence is supplied, and done criteria were checked.
 - Use project/global for exact reads and writes. Use `--scope all` only for current/list/search.
 - On a revision or request conflict, reload and reconcile; never overwrite blindly.

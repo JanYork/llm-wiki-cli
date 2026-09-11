@@ -821,3 +821,66 @@ under the same conditions.
 - A private manifest removes only stale files previously written by `lwc`;
   user-created files and `raw/assets` are preserved.
 - Raw source contents are projected without newline normalization.
+
+## Native CG and low-friction state contracts
+
+CodeGraph query output is native: forwarded CLI commands retain stdout, stderr
+and exit status; MCP retains complete CallToolResult fields, including errors,
+null values and non-text content. `lwc_explore` code mode also returns native
+results; mixed `all` retains its memory/code envelope without clipping the native
+code result. Resource limits produce explicit errors, not partial successful data.
+
+`lwc cg status` is routing metadata; `lwc cg inspect` is upstream status.
+`lwc cg help COMMAND` and `lwc cg tools` expose the selected runtime's commands and
+read-only schemas. `lwc cg configure --executable /absolute/path/to/codegraph`
+selects an existing independent runtime and the checkout's `.codegraph` index;
+`--bundled` selects the pinned runtime and `.lwc/codegraph`. This configuration
+never installs or merges indexes, and a missing selected owner never falls back.
+Runtime selection is checkout-local, including during an existing MCP session.
+
+`lwc doctor [--context CONTEXT_ID] [--verbose]` reports the resolved checkout,
+Git common directory, HEAD, capability state and index owner. The common Git
+directory identifies related worktrees but does not authorize cross-workspace
+access or share their indexes. MCP `lwc_inspect` (`kind: doctor`) uses the validated
+project path, ignores conflicting ambient project-root selection and reports the
+host workspace. An absent binding is explicit; diagnosis never claims a Plan.
+
+`lwc cg check FILE... --require-fresh` compares the named files' SHA-256 hashes with
+indexed hashes. `lwc cg --require-fresh --file FILE node SYMBOL` gates a query on
+that same named-file evidence; MCP uses `requireFresh` and `files`. A check reports
+its scope and observation time, and distinguishes stale, unindexed, missing,
+unreadable and unsupported evidence. It does not prove all query dependencies,
+all repository files, dynamic call edges, or changes after the check. Indexed
+commit remains null when the index supplies no such evidence. Upstream `affected`
+results identify candidate tests, not executed tests or a sufficient minimal suite.
+
+`lwc contract remember|plan-create|plan-revise` provides input schemas and examples.
+MCP `lwc_inspect` (`kind: contract`, `name: ...`) returns the same contract. Shared
+prevalidation collects field-path/type/enum errors before writes; storage retains
+semantic, revision, ownership and transaction checks. Input may use inline JSON,
+`--json -` for stdin, or a file inside the authorized scope.
+
+Plan revisions accept changes to title, objective, done_when, constraints and
+individual step IDs. `current_step` selects unfinished focus; replacement `steps`
+supersedes unfinished steps and cannot be mixed with individual updates. A step
+update may specify `disposition: waived|superseded` with a nonempty `basis`.
+Waiver requires an actual user instruction; neither disposition means a check
+passed. Terminal steps are immutable. `plan history` preserves before/after scope
+and disposition evidence under the same CAS revision transaction.
+
+`plan reconcile PLAN_ID [--from plan.md]` returns title-matched historical event
+candidates and a textual comparison with a generated Plan outline. It is a review
+surface, not semantic synchronization: it never applies events or advances steps.
+A Plan owns execution state; file discovery maps point to it. Wiki owns curated
+stable knowledge; Memory owns historical evidence. If a project chooses Markdown
+as its execution owner, reference it instead of manually mirroring progress.
+
+Default mutation receipts omit unchanged step histories and full event bodies;
+`--full`, `plan show`, `plan history` and `memory show` expose full records.
+Unbound Plan lists are summaries, not a guessed current task. Hook summaries retain
+binding IDs, recovery commands, state and errors while removing repeated capability
+setup recipes; `lwc doctor --verbose` provides details on demand. Prompt signals
+remain intent-scoped. Latest unsuperseded memory is `latest_known`, with
+`live_verified: false` and an explicit unresolved-conflict indicator; it is not a
+claim about current code. Superseding relations require evidence and are not
+inferred merely from timestamps.

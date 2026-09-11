@@ -198,8 +198,8 @@ pub struct MemoryRelationInput {
 }
 
 pub fn parse_memory_capsule(raw: &str) -> Result<MemoryEventInput> {
-    let mut input: MemoryEventInput = serde_json::from_str(raw)
-        .map_err(|error| AppError::new("invalid_memory_capsule", error.to_string()))?;
+    let mut input: MemoryEventInput = crate::contracts::parse("remember", raw)
+        .map_err(|error| AppError::new("invalid_memory_capsule", error.message).with_details(error.details.unwrap_or(Value::Null)))?;
     input.normalize()?;
     Ok(input)
 }
@@ -765,6 +765,8 @@ const MEMORY_EVENT_PROTECTED_SQL: &str = "
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryRecallResult {
+    pub live_verified: bool,
+    pub unresolved_conflict: bool,
     pub scope: String,
     pub event: Value,
     pub state: String,
@@ -892,11 +894,15 @@ impl Store {
             let adjustment = candidate.lexical_rank.abs().max(1e-6)
                 * 0.05
                 * feedback.clamp(-3, 3) as f64;
+            let unresolved_conflict: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_relations conflict WHERE conflict.relation_type='contradicts' AND (conflict.event_id=?1 OR conflict.target_event_id=?1) AND NOT EXISTS(SELECT 1 FROM memory_relations resolution WHERE resolution.relation_type='resolves' AND resolution.target_event_id=conflict.event_id))", [&event_id], |row|row.get(0))?;
             results.push(MemoryRecallResult {
+                live_verified: false,
+                unresolved_conflict,
                 scope: self.scope.clone(),
                 event: load_memory_event(&self.conn, &event_id)?,
                 state: if current_id == event_id {
-                    "current".to_owned()
+                    "latest_known".to_owned()
                 } else {
                     "superseded".to_owned()
                 },

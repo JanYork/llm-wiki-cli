@@ -144,6 +144,14 @@ fn prepare_store(
         migrate_agent_tracking_v18(conn)?;
         version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     }
+    if version == AGENT_TRACKING_VERSION {
+        let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        create_discussion_schema(&tx)?;
+        tx.execute("UPDATE meta SET value=?1 WHERE key='format_version'",[DISCUSSION_VERSION.to_string()])?;
+        tx.pragma_update(None,"user_version",DISCUSSION_VERSION)?;
+        tx.commit()?;
+        version=DISCUSSION_VERSION;
+    }
     if version != USER_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",
