@@ -34,6 +34,9 @@ jobs:
           node-version: "24"
           package-manager-cache: false
 
+      - name: Codex plugin Skill ownership
+        run: python3 tests/codex_plugin_install.py
+
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
 

@@ -36,6 +36,9 @@ jobs:
           key: release-quality
           cache-targets: false
 
+      - name: Codex plugin Skill ownership
+        run: python3 tests/codex_plugin_install.py
+
       - name: Viewer
         working-directory: web
         run: |
