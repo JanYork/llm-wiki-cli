@@ -6,6 +6,9 @@ on:
     tags:
       - "v*"
 
+env:
+  RUST_TEST_THREADS: "2"
+
 permissions:
   contents: read
 

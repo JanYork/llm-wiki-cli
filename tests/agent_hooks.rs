@@ -3038,6 +3038,16 @@ fn signal_subagent_stop_never_blocks_an_active_parent_plan() {
 
 #[test]
 fn signal_stop_loop_guard_short_circuits_locked_or_corrupt_wiki() {
+    // Measure process startup separately: Wine and slow runners can exceed 100 ms
+    // before the hook executes. Keep the guard's budget independent of that cost.
+    let empty = World::new(false);
+    let started = Instant::now();
+    let output = empty.output(
+        &["agent", "hook", "--agent", "claude", "--event", "Stop"],
+        &serde_json::json!({"stop_hook_active": true}).to_string(),
+    );
+    let process_budget = started.elapsed() * 2 + Duration::from_millis(100);
+    assert_eq!(hook_json(&output), serde_json::json!({}));
     let locked = World::new(true);
     locked.ok(&["config", "set", "--plan", "enabled"]);
     create_active_plan(&locked, "locked stop", "finish", "verified");
@@ -3052,7 +3062,7 @@ fn signal_stop_loop_guard_short_circuits_locked_or_corrupt_wiki() {
         &["agent", "hook", "--agent", "claude", "--event", "Stop"],
         &serde_json::json!({"stop_hook_active": true}).to_string(),
     );
-    assert!(started.elapsed() < Duration::from_millis(100));
+    assert!(started.elapsed() < process_budget);
     assert_eq!(hook_json(&output), serde_json::json!({}));
     assert_eq!(snapshot_tree(&locked.project), locked_before);
     connection.execute_batch("ROLLBACK").unwrap();
@@ -3069,7 +3079,7 @@ fn signal_stop_loop_guard_short_circuits_locked_or_corrupt_wiki() {
         &["agent", "hook", "--agent", "codex", "--event", "Stop"],
         &serde_json::json!({"stop_hook_active": true}).to_string(),
     );
-    assert!(started.elapsed() < Duration::from_millis(100));
+    assert!(started.elapsed() < process_budget);
     assert_eq!(hook_json(&output), serde_json::json!({}));
     assert_eq!(snapshot_tree(&corrupt.project), corrupt_before);
 }

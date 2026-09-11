@@ -1282,7 +1282,16 @@ fn graph_work_cancel_then_resume_reaches_a_verified_terminal_state() {
         );
     }
 
-    let configured = world.ok(&world.project, &["config", "set", "--graph", "grafeo"]);
+    // Hold this worker until cancellation arrives; process startup must not race projection.
+    let output = Command::new(env!("CARGO_BIN_EXE_lwc"))
+        .current_dir(&world.project)
+        .env("HOME", &world.home)
+        .env("LWC_TEST_GRAPH_WAIT_FOR_CANCEL", "1")
+        .args(["config", "set", "--graph", "grafeo"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let configured: Value = serde_json::from_slice(&output.stdout).unwrap();
     let work_id = configured["work"]["id"].as_str().unwrap();
     let cancellation = world.ok(&world.project, &["work", "cancel", work_id]);
     assert!(cancellation["work"]["cancel_requested"].as_bool().unwrap());

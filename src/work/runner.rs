@@ -3,6 +3,16 @@ fn run_graph_projection(
     root: &Path,
     progress: &mut dyn FnMut(usize, usize, &str) -> Result<()>,
 ) -> Result<Value> {
+    if env::var_os("LWC_TEST_GRAPH_WAIT_FOR_CANCEL").is_some() {
+        let cancel = root.join(&request.id).join("cancel");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !cancel.exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err(AppError::new("graph_test_timeout", "cancel barrier timed out"));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
     let mut completed = 0;
     let mut result = json!({"status": "ready", "documents": 0});
     loop {
@@ -112,6 +122,21 @@ pub fn run(root: &Path, id: &str) -> Result<Value> {
         ));
     }
     let mut initial: WorkState = read_json(&directory.join("state.json"))?;
+    if directory.join("cancel").exists() {
+        initial.cancel_requested = true;
+        initial.error = Some(json!({
+            "code": "work_cancelled",
+            "message": format!("{} cancelled", request.kind),
+        }));
+        initial.update(
+            "cancelled",
+            "cancelled",
+            format!("{} cancelled", request.kind),
+        );
+        write_json(&directory.join("state.json"), &initial)?;
+        release_active(root, id)?;
+        return Ok(json!({"work": initial}));
+    }
     initial.pid = Some(std::process::id());
     initial.started_at_unix_ms = Some(now_ms());
     initial.update("running", "starting", format!("{} started", request.kind));
