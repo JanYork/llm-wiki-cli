@@ -1,6 +1,6 @@
 {
   "name": "codex-lwc",
-  "version": "0.18.0",
+  "version": "0.18.1",
   "description": "LWC Wiki, CodeGraph and durable Discussion for Codex.",
   "author": {
     "name": "JanYork",

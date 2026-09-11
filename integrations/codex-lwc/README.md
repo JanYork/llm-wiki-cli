@@ -13,8 +13,7 @@ Ensure a compatible `lwc` binary is available on PATH before using the plugin.
 To select this native installation route from this repository:
 
 ```bash
-codex plugin marketplace add /absolute/path/to/integrations/codex-lwc
-codex plugin add codex-lwc@lwc-local
+python3 /absolute/path/to/integrations/codex-lwc/scripts/install.py
 codex plugin list --marketplace lwc-local --json
 ```
 
@@ -39,3 +38,7 @@ No Claude/Pi migration is performed by this route.
 
 Source: [official hooks discovery](https://learn.chatgpt.com/docs/hooks) and
 [plugin packaging](https://developers.openai.com/plugins/build/plugins).
+
+## Codex Skill ownership
+
+The installer archives matching global `$CODEX_HOME/skills` entries (default `~/.codex/skills`) outside Skill discovery, under `$CODEX_HOME/backups`. Only Skill names bundled by this plugin are moved; unrelated Skills remain. Symlinks themselves are moved without touching their targets. This handles regular directories and any local Skill manager equally, with no dependency on a particular manager. Repeated installation does not duplicate backups. Other Agents and their Skill locations remain unchanged. Start a new Codex task to refresh discovery.
