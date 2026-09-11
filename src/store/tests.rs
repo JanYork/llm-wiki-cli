@@ -2501,6 +2501,7 @@ rg '^[[:space:]]*[[fenced-fake]]'
         assert_eq!(selection.counts["work_audit"], 0);
         assert_eq!(selection.counts["draft_intent"], 0);
         assert_eq!(selection.affected, Some(json!({
+            "discussion": [],
             "draft_intent": [],
             "ingest": [],
             "memory": [],
