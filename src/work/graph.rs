@@ -78,7 +78,9 @@ fn lock_graph_pending(root: &Path) -> Result<GraphPendingLock> {
         match options.open(&path) {
             Ok(_) => return Ok(GraphPendingLock(path)),
             Err(error)
-                if error.kind() == io::ErrorKind::AlreadyExists
+                if (error.kind() == io::ErrorKind::AlreadyExists
+                    // Windows may retain a delete-pending handle briefly after unlock.
+                    || (cfg!(windows) && error.kind() == io::ErrorKind::PermissionDenied))
                     && attempt < STATE_REPLACE_RETRIES =>
             {
                 thread::sleep(STATE_REPLACE_RETRY_DELAY);

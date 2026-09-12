@@ -224,6 +224,22 @@ mod tests {
         assert_eq!(attempts, 3);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn graph_queue_lock_retries_a_delete_pending_handle() {
+        let temp = tempdir().unwrap();
+        let lock = lock_graph_pending(temp.path()).unwrap();
+        let handle = fs::File::open(temp.path().join(GRAPH_PENDING_LOCK)).unwrap();
+        drop(lock);
+        thread::scope(|scope| {
+            let pending = scope.spawn(|| lock_graph_pending(temp.path()));
+            thread::sleep(Duration::from_millis(30));
+            drop(handle);
+            drop(pending.join().unwrap().unwrap());
+        });
+        assert!(!temp.path().join(GRAPH_PENDING_LOCK).exists());
+    }
+
     #[test]
     fn removing_an_already_released_active_file_is_idempotent() {
         let temp = tempdir().unwrap();
