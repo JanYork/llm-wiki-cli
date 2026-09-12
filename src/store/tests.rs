@@ -1021,6 +1021,19 @@ mod tests {
     }
 
     #[test]
+    fn late_migrations_accept_a_completed_upgrade_and_reject_future_schemas() {
+        let mut store = test_store();
+        for migrate in [migrate_structured_span_index_v17, migrate_agent_tracking_v18] {
+            migrate(&mut store.conn).unwrap();
+            let version: i32 = store.conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+            assert_eq!(version, USER_VERSION);
+            store.conn.pragma_update(None, "user_version", USER_VERSION + 1).unwrap();
+            assert_eq!(migrate(&mut store.conn).unwrap_err().code, "unsupported_store_version");
+            store.conn.pragma_update(None, "user_version", USER_VERSION).unwrap();
+        }
+    }
+
+    #[test]
     fn stale_ingest_migration_step_accepts_a_newer_intermediate_version() {
         let mut store = test_store();
         store

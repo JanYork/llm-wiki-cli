@@ -229,7 +229,7 @@ fn migrate_todo_features_v16(conn: &mut Connection) -> Result<()> {
 fn migrate_structured_span_index_v17(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current == STRUCTURED_SPAN_INDEX_VERSION {
+    if (STRUCTURED_SPAN_INDEX_VERSION..=USER_VERSION).contains(&current) {
         tx.commit()?;
         return Ok(());
     }
@@ -354,7 +354,7 @@ fn create_agent_tracking_schema(tx: &Transaction<'_>) -> Result<()> {
 fn migrate_agent_tracking_v18(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current == AGENT_TRACKING_VERSION {
+    if (AGENT_TRACKING_VERSION..=USER_VERSION).contains(&current) {
         tx.commit()?;
         return Ok(());
     }
