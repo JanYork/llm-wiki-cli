@@ -14,7 +14,10 @@
     "mrr": 0.883668,
     "latency_ms": {
       "p50": 507.697,
-      "p95": 731.766
+      "p95": 731.766,
+      "mean": 509.883,
+      "p90": 663.061,
+      "p99": 888.555
     }
   },
   "workers": 4,
@@ -51,5 +54,6 @@
     }
   },
   "report_sha256": "3e523bdca9348374d1dc3cbcfea221c42555b591b2a03a3ac007823740596ae0",
-  "limitations": "Local session-source retrieval, no answer generation or official submission. Historical host/concurrency not established; latency is not a controlled speedup comparison."
+  "limitations": "Local session-source retrieval, no answer generation or official submission. Historical host/concurrency not established; latency is not a controlled speedup comparison.",
+  "metric_definition": "Recall@K is any relevant session hit rate; latency aggregates the 470 non-abstention questions. Percentile index: ceil((n-1)*p/100), zero-based."
 }

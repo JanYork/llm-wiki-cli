@@ -313,12 +313,22 @@ de várias execuções.
 Duas execuções locais em 13 de setembro de 2026: 500/500 questões, 470 avaliadas para recuperação, conjunto fixado e 4 trabalhadores simultâneos em um Mac Apple M5 Pro. A segunda reutilizou as fontes; as 500 listas ordenadas foram idênticas.
 
 | Métrica | Primeira | Segunda |
-|---|---:|---:|
-| Recall@5 (any relevant session) | 95.11% | 95.11% |
-| Recall@10 (any relevant session) | 97.66% | 97.66% |
+| --- | ---: | ---: |
+| Questões processadas | 500 / 500 | 500 / 500 |
+| Questões avaliadas | 470 | 470 |
+| Questões de abstenção excluídas | 30 | 30 |
+| Recall@1 | 83.83% (394/470) | 83.83% (394/470) |
+| Recall@3 | 91.49% (430/470) | 91.49% (430/470) |
+| Recall@5 | 95.11% (447/470) | 95.11% (447/470) |
+| Recall@10 | 97.66% (459/470) | 97.66% (459/470) |
+| Recall@30 | 99.15% (466/470) | 99.15% (466/470) |
+| Recall@50 | 99.15% (466/470) | 99.15% (466/470) |
 | MRR | 0.883668 | 0.883668 |
-| P50 | 508 ms | 665 ms |
-| P95 | 732 ms | 990 ms |
+| Latência média | 509.883 ms | 679.759 ms |
+| P50 | 507.697 ms | 665.454 ms |
+| P90 | 663.061 ms | 931.238 ms |
+| P95 | 731.766 ms | 990.375 ms |
+| P99 | 888.555 ms | 1094.886 ms |
 
 Estes resultados não incluem ajuste proativo. O adaptador apenas recupera fontes de sessões, sem curadoria pelo modelo, feedback de relevância ou atualização de pesos. No uso real, o modelo pode analisar evidências e ajustar explicitamente pesos de documentos ou feedback por consulta para melhorar a recuperação. Isso não ocorre automaticamente a cada busca; os ganhos dependem da qualidade do feedback e não foram medidos aqui. Avalie ajustes com questões reservadas, sem realimentar o teste com suas respostas. São resultados locais de recuperação, não pontuações oficiais nem acurácia de respostas. As latências representam quatro trabalhadores simultâneos, não uma comparação controlada de velocidade entre versões.
 

@@ -9,12 +9,48 @@
     "mrr": 0.883668,
     "latency_ms": {
       "p50": 665.454,
-      "p95": 990.375
+      "p95": 990.375,
+      "mean": 679.759,
+      "p90": 931.238,
+      "p99": 1094.886
     }
   },
   "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
   "workers": 4,
   "reused_state": true,
   "feedback_applied": false,
-  "identical_ranked_results": 500
+  "identical_ranked_results": 500,
+  "recall_any": {
+    "1": {
+      "hits": 394,
+      "scored": 470,
+      "rate": 0.838298
+    },
+    "3": {
+      "hits": 430,
+      "scored": 470,
+      "rate": 0.914894
+    },
+    "5": {
+      "hits": 447,
+      "scored": 470,
+      "rate": 0.951064
+    },
+    "10": {
+      "hits": 459,
+      "scored": 470,
+      "rate": 0.976596
+    },
+    "30": {
+      "hits": 466,
+      "scored": 470,
+      "rate": 0.991489
+    },
+    "50": {
+      "hits": 466,
+      "scored": 470,
+      "rate": 0.991489
+    }
+  },
+  "metric_definition": "Recall@K is any relevant session hit rate; latency aggregates the 470 non-abstention questions. Percentile index: ceil((n-1)*p/100), zero-based."
 }

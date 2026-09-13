@@ -322,12 +322,22 @@ conditions, puis compare les médianes de plusieurs exécutions.
 Deux exécutions locales le 13 septembre 2026 : 500/500 questions, dont 470 évaluées pour la recherche, jeu de données figé et 4 travailleurs concurrents sur Mac Apple M5 Pro. La seconde réutilise les sources ; les 500 classements sont identiques.
 
 | Mesure | Première | Seconde |
-|---|---:|---:|
-| Recall@5 (any relevant session) | 95.11% | 95.11% |
-| Recall@10 (any relevant session) | 97.66% | 97.66% |
+| --- | ---: | ---: |
+| Questions traitées | 500 / 500 | 500 / 500 |
+| Questions évaluées | 470 | 470 |
+| Questions d’abstention exclues | 30 | 30 |
+| Recall@1 | 83.83% (394/470) | 83.83% (394/470) |
+| Recall@3 | 91.49% (430/470) | 91.49% (430/470) |
+| Recall@5 | 95.11% (447/470) | 95.11% (447/470) |
+| Recall@10 | 97.66% (459/470) | 97.66% (459/470) |
+| Recall@30 | 99.15% (466/470) | 99.15% (466/470) |
+| Recall@50 | 99.15% (466/470) | 99.15% (466/470) |
 | MRR | 0.883668 | 0.883668 |
-| P50 | 508 ms | 665 ms |
-| P95 | 732 ms | 990 ms |
+| Latence moyenne | 509.883 ms | 679.759 ms |
+| P50 | 507.697 ms | 665.454 ms |
+| P90 | 663.061 ms | 931.238 ms |
+| P95 | 731.766 ms | 990.375 ms |
+| P99 | 888.555 ms | 1094.886 ms |
 
 Ces résultats excluent tout ajustement proactif. L’adaptateur recherche uniquement les sources des sessions, sans synthèse par le modèle, retour de pertinence ni modification des poids. En usage réel, le modèle peut examiner les preuves et ajuster explicitement les poids ou les retours propres à une requête pour améliorer la recherche. Ce n’est pas automatique à chaque recherche ; le gain dépend de la qualité des retours et n’a pas été mesuré ici. Évaluer les ajustements sur des questions réservées, sans réinjecter les réponses du test. Il s’agit de recherche locale, pas d’un classement officiel ni de l’exactitude des réponses. Les latences décrivent quatre travailleurs concurrents, pas une comparaison contrôlée de vitesse entre versions.
 
