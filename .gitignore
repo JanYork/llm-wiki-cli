@@ -10,3 +10,8 @@ web/node_modules/
 # Local Agent working records; retain the shared project map.
 /.agents/*
 !/.agents/project-memory.md
+
+# Local scratch data and Python bytecode.
+/.tmp/
+__pycache__/
+*.py[cod]
