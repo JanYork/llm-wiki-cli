@@ -313,6 +313,23 @@ y compara medianas de varias ejecuciones.
 
 [Metodología →](../../benchmarks/README.md)
 
+### Resultados LongMemEval-S (v0.18.5)
+
+Dos ejecuciones locales del 13 de septiembre de 2026: 500/500 preguntas, 470 puntuadas para recuperación, conjunto de datos fijado y 4 trabajadores concurrentes en un Mac Apple M5 Pro. La segunda reutilizó las fuentes; las 500 listas ordenadas fueron idénticas.
+
+| Métrica | Primera | Segunda |
+|---|---:|---:|
+| Recall@5 (any relevant session) | 95.11% | 95.11% |
+| Recall@10 (any relevant session) | 97.66% | 97.66% |
+| MRR | 0.883668 | 0.883668 |
+| P50 | 508 ms | 665 ms |
+| P95 | 732 ms | 990 ms |
+
+Estos resultados no incluyen ajuste proactivo. El adaptador solo recupera fuentes de sesiones; no incluye curación por el modelo, comentarios de relevancia ni cambios de peso. Durante el uso, el modelo puede evaluar evidencia y ajustar explícitamente pesos o comentarios por consulta para mejorar la recuperación. No ocurre automáticamente en cada búsqueda; depende de la calidad del feedback y aquí no se midió su beneficio. Evaluar los ajustes con preguntas reservadas, sin reutilizar las respuestas de prueba. Son resultados locales de recuperación, no una clasificación oficial ni exactitud de respuestas. Las latencias reflejan carga de cuatro trabajadores, no una comparación controlada de velocidad entre versiones.
+
+[Datos: 1](../../benchmarks/results/2026-09-13-longmemeval-s-0185.json) · [Datos: 2](../../benchmarks/results/2026-09-13-longmemeval-s-0185-second.json) · [LongMemEval-S](../../benchmarks/agent_memory/README.md#longmemeval-s)
+
+
 ## Límites y objetivos excluidos
 
 Restricciones actuales:

@@ -1,0 +1,20 @@
+{
+  "lwc_version": "lwc 0.18.5",
+  "complete": true,
+  "instances_processed": 500,
+  "instances_retrieval_scored": 470,
+  "metrics": {
+    "recall_at_5": 0.951064,
+    "recall_at_10": 0.976596,
+    "mrr": 0.883668,
+    "latency_ms": {
+      "p50": 665.454,
+      "p95": 990.375
+    }
+  },
+  "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+  "workers": 4,
+  "reused_state": true,
+  "feedback_applied": false,
+  "identical_ranked_results": 500
+}

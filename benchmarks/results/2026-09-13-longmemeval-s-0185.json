@@ -1,0 +1,55 @@
+{
+  "benchmark": "LongMemEval-S",
+  "mode": "session-source-retrieval",
+  "complete": true,
+  "instances_processed": 500,
+  "instances_retrieval_scored": 470,
+  "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+  "upstream_revision": "9e0b455f4ef0e2ab8f2e582289761153549043fc",
+  "lwc_version": "lwc 0.18.5",
+  "lwc_commit": "45d275d3af8e68d8eef2186e1d5474345a01125b",
+  "metrics": {
+    "recall_at_5": 0.951064,
+    "recall_at_10": 0.976596,
+    "mrr": 0.883668,
+    "latency_ms": {
+      "p50": 507.697,
+      "p95": 731.766
+    }
+  },
+  "workers": 4,
+  "recall_any": {
+    "1": {
+      "hits": 394,
+      "scored": 470,
+      "rate": 0.838298
+    },
+    "3": {
+      "hits": 430,
+      "scored": 470,
+      "rate": 0.914894
+    },
+    "5": {
+      "hits": 447,
+      "scored": 470,
+      "rate": 0.951064
+    },
+    "10": {
+      "hits": 459,
+      "scored": 470,
+      "rate": 0.976596
+    },
+    "30": {
+      "hits": 466,
+      "scored": 470,
+      "rate": 0.991489
+    },
+    "50": {
+      "hits": 466,
+      "scored": 470,
+      "rate": 0.991489
+    }
+  },
+  "report_sha256": "3e523bdca9348374d1dc3cbcfea221c42555b591b2a03a3ac007823740596ae0",
+  "limitations": "Local session-source retrieval, no answer generation or official submission. Historical host/concurrency not established; latency is not a controlled speedup comparison."
+}

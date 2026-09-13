@@ -524,6 +524,37 @@ corpus, query set, and run conditions, then compare repeated-run medians.
 
 [Benchmark methodology →](benchmarks/README.md)
 
+
+### LongMemEval-S retrieval results (v0.18.5)
+
+On September 13, 2026, two complete local runs processed **500/500 questions**,
+with **470 retrieval-scored questions**, using the pinned LongMemEval-S dataset
+and four concurrent workers on an Apple M5 Pro Mac. The second run reused the
+first run's stored sources; all 500 ranked result lists were identical.
+
+| Metric | First run | Second run |
+| --- | ---: | ---: |
+| Recall@5 (any relevant session) | 95.11% | 95.11% |
+| Recall@10 (any relevant session) | 97.66% | 97.66% |
+| MRR | 0.883668 | 0.883668 |
+| Retrieval latency P50 | 508 ms | 665 ms |
+| Retrieval latency P95 | 732 ms | 990 ms |
+
+**These results exclude proactive tuning.** The adapter retrieves raw session
+sources without model-led knowledge curation, relevance feedback, or weight
+updates. In actual Agent workflows, a model can proactively assess evidence,
+curate knowledge, and explicitly adjust document weights or query-specific
+feedback to improve subsequent retrieval. This is an evidence-driven Agent
+workflow, not automatic weight changes on every search; gains depend on feedback
+quality and were not measured here. Evaluate tuning on held-out questions rather
+than feeding test answers back into the same evaluation.
+
+These are local retrieval results, not official leaderboard scores or answer
+accuracy. Latencies describe four-worker load, not a controlled version-speedup
+comparison. [First-run data](benchmarks/results/2026-09-13-longmemeval-s-0185.json)
+· [Second-run data](benchmarks/results/2026-09-13-longmemeval-s-0185-second.json)
+· [Reproduction and scoring](benchmarks/agent_memory/README.md#longmemeval-s).
+
 ## Durable Todo and current Plan
 
 Todo stores deferred work; Plan stores the currently executing objective,
