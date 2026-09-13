@@ -527,6 +527,8 @@ corpus, query set, and run conditions, then compare repeated-run medians.
 
 ### LongMemEval-S retrieval results (v0.18.5)
 
+**This is an untuned retrieval baseline, not a ceiling on LWC’s effectiveness over continued use.** In real workflows, the model can proactively assess evidence and react to user corrections or relevance feedback, continually updating document weights and query feedback. With reliable feedback and sustained tuning, retrieval is expected to improve beyond this static baseline; that additional gain was not quantified here. Reactive adjustment means feedback-triggered Agent updates, not automatic background learning on every query.
+
 On September 13, 2026, two complete local runs processed **500/500 questions**,
 with **470 retrieval-scored questions**, using the pinned LongMemEval-S dataset
 and four concurrent workers on an Apple M5 Pro Mac. The second run reused the

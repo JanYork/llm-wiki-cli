@@ -315,6 +315,8 @@ y compara medianas de varias ejecuciones.
 
 ### Resultados LongMemEval-S (v0.18.5)
 
+**Esta es una referencia sin ajuste, no el límite del rendimiento de LWC durante el uso continuado.** El modelo puede evaluar pruebas de forma proactiva y responder a correcciones del usuario o comentarios de relevancia, actualizando pesos y feedback por consulta. Con feedback fiable y ajustes sostenidos, cabe esperar mejores resultados que esta referencia estática; esa mejora adicional no se ha cuantificado. El ajuste reactivo lo ejecuta el Agent en respuesta al feedback, no un aprendizaje automático con cada búsqueda.
+
 Dos ejecuciones locales del 13 de septiembre de 2026: 500/500 preguntas, 470 puntuadas para recuperación, conjunto de datos fijado y 4 trabajadores concurrentes en un Mac Apple M5 Pro. La segunda reutilizó las fuentes; las 500 listas ordenadas fueron idénticas.
 
 | Métrica | Primera | Segunda |
