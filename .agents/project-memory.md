@@ -26,6 +26,7 @@ LWC is an Agent-first Rust CLI that compiles curated documents into a persistent
 - `docs/superpowers/specs/2026-08-30-lwc-agent-signal-hooks-design.md`: frozen semantic-event, signal catalog, host delivery, Stop continuation, consent, privacy, budget, and acceptance contract.
 - Wiki `todo-plan-harness-continuity`: local opaque Agent-context Plan/Todo tracking, session/child isolation, fail-closed Hook delivery, and prompt-level cross-context rejection.
 - Wiki `lwc-sync-architecture`: non-overwriting SSH Sync and exact-scope portable memory archives, normalized SQLite publication, Agent conflict resolution, receipt recovery, and local derived-plane rebuild boundaries.
+- Wiki `lwc-ecosystem-directory-outreach`: audited public-directory requests, duplicate prevention, target-policy constraints, and open LWC inclusion work.
 
 Translated READMEs, package summaries, integration summaries, and copied Skill trees are useful delivery mirrors but should not be ingested again when the canonical document already supplies the same evidence.
 
