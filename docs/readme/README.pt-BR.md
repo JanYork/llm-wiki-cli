@@ -308,6 +308,8 @@ de várias execuções.
 
 ### Resultados LongMemEval-S (v0.18.5)
 
+**Esta é uma referência sem ajuste, não um limite de eficácia.** No uso contínuo, o modelo pode ajustar pesos proativamente e reagir a correções e feedback de relevância. Com feedback confiável e ajustes contínuos, espera-se melhor recuperação que esta referência; esse ganho ainda não foi medido. São atualizações explícitas pelo Agent, não aprendizado automático a cada busca.
+
 Duas execuções locais em 13 de setembro de 2026: 500/500 questões, 470 avaliadas para recuperação, conjunto fixado e 4 trabalhadores simultâneos em um Mac Apple M5 Pro. A segunda reutilizou as fontes; as 500 listas ordenadas foram idênticas.
 
 | Métrica | Primeira | Segunda |

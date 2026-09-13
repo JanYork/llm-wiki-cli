@@ -317,6 +317,8 @@ conditions, puis compare les médianes de plusieurs exécutions.
 
 ### Résultats LongMemEval-S (v0.18.5)
 
+**Ces résultats sont une référence sans ajustement, pas un plafond.** En usage continu, le modèle peut ajuster les poids de manière proactive et réagir aux corrections et retours de pertinence. Des retours fiables et une optimisation suivie devraient améliorer la recherche au-delà de cette référence ; ce gain reste non mesuré. Il s’agit de mises à jour explicites par l’Agent, pas d’un apprentissage automatique à chaque recherche.
+
 Deux exécutions locales le 13 septembre 2026 : 500/500 questions, dont 470 évaluées pour la recherche, jeu de données figé et 4 travailleurs concurrents sur Mac Apple M5 Pro. La seconde réutilise les sources ; les 500 classements sont identiques.
 
 | Mesure | Première | Seconde |
