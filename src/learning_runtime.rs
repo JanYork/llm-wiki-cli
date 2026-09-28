@@ -362,16 +362,22 @@ fn validate_archive_listing(archive: &Path, root: &str, binary: &str) -> Result<
             "runtime archive listing is not UTF-8",
         )
     })?;
+    validate_archive_entries(listing, root, binary)
+}
+
+fn validate_archive_entries(listing: &str, root: &str, binary: &str) -> Result<()> {
     let expected_root = format!("{root}/");
     let expected_binary = format!("{root}/{binary}");
     let entries = listing.lines().collect::<Vec<_>>();
-    if entries.len() != 2
-        || !entries.contains(&expected_root.as_str())
-        || !entries.contains(&expected_binary.as_str())
+    // ZIP archives may omit the explicit parent directory entry.
+    if entries != [expected_binary.as_str()]
+        && (entries.len() != 2
+            || !entries.contains(&expected_root.as_str())
+            || !entries.contains(&expected_binary.as_str()))
     {
         return Err(AppError::new(
             "learning_archive_invalid",
-            "runtime archive must contain exactly its fixed root and binary",
+            "runtime archive must contain only its fixed binary and optional root directory",
         ));
     }
     Ok(())
@@ -585,6 +591,37 @@ mod tests {
     use super::*;
 
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn archive_entries_allow_optional_root_but_reject_unexpected_paths() {
+        for listing in [
+            "runtime/lwc-practice.exe\n",
+            "runtime/lwc-practice.exe\r\n",
+            "runtime/\nruntime/lwc-practice.exe\n",
+            "runtime/lwc-practice.exe\nruntime/\n",
+        ] {
+            validate_archive_entries(listing, "runtime", "lwc-practice.exe").unwrap();
+        }
+        for listing in [
+            "",
+            "runtime/\n",
+            "other/lwc-practice.exe\n",
+            "runtime/../lwc-practice.exe\n",
+            "/runtime/lwc-practice.exe\n",
+            "runtime/lwc-practice.exe\nextra\n",
+            "runtime/\nruntime/lwc-practice.exe\nextra\n",
+            "runtime/lwc-practice.exe\nruntime/lwc-practice.exe\n",
+            "runtime/\nruntime/\nruntime/lwc-practice.exe\n",
+        ] {
+            assert_eq!(
+                validate_archive_entries(listing, "runtime", "lwc-practice.exe")
+                    .unwrap_err()
+                    .code,
+                "learning_archive_invalid",
+                "{listing:?}"
+            );
+        }
+    }
 
     #[test]
     fn checksum_manifest_requires_one_strict_exact_entry() {
