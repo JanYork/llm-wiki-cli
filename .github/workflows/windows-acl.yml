@@ -1,0 +1,35 @@
+name: Windows private directory regression
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acl:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify private directory permissions
+        shell: pwsh
+        run: |
+          $source = Get-Content src/team/mod.rs -Raw
+          $script = [regex]::Match($source, 'let script = "([^"\r\n]+)";').Groups[1].Value
+          if (!$script) { throw 'Private directory script not found' }
+          $env:LWC_PRIVATE_DIRECTORY = Join-Path $env:RUNNER_TEMP 'lwc-private-acl-regression'
+          New-Item -ItemType Directory -Path $env:LWC_PRIVATE_DIRECTORY -Force | Out-Null
+          & powershell.exe -NoProfile -NonInteractive -Command $script
+          if ($LASTEXITCODE -ne 0) { throw 'Private directory script failed' }
+          $acl = Get-Acl -LiteralPath $env:LWC_PRIVATE_DIRECTORY
+          $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+          if (!$acl.AreAccessRulesProtected -or $rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid -or $rules[0].AccessControlType -ne 'Allow') { throw 'Directory is not user-only' }
+          Set-Content (Join-Path $env:LWC_PRIVATE_DIRECTORY 'probe.txt') 'fixture'
+          & powershell.exe -NoProfile -NonInteractive -Command $script
+          if ($LASTEXITCODE -ne 0) { throw 'Repeated private directory call failed' }
