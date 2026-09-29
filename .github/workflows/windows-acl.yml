@@ -22,7 +22,7 @@ jobs:
           $source = Get-Content src/team/mod.rs -Raw
           $script = [regex]::Match($source, 'let script = "([^"\r\n]+)";').Groups[1].Value
           if (!$script) { throw 'Private directory script not found' }
-          $env:LWC_PRIVATE_DIRECTORY = Join-Path $env:RUNNER_TEMP 'lwc-private-acl-regression'
+          $env:LWC_PRIVATE_DIRECTORY = Join-Path $env:RUNNER_TEMP 'lwc-private [acl] regression'
           New-Item -ItemType Directory -Path $env:LWC_PRIVATE_DIRECTORY -Force | Out-Null
           # Match Rust's direct child process, without pwsh's native-command environment cleanup.
           $start = [System.Diagnostics.ProcessStartInfo]::new('powershell.exe')
@@ -30,6 +30,7 @@ jobs:
           $start.RedirectStandardOutput = $true
           $start.RedirectStandardError = $true
           $start.Arguments = '-NoProfile -NonInteractive -Command "' + $script + '"'
+          if ($source.Contains('.env_remove("PSModulePath")')) { [void]$start.Environment.Remove('PSModulePath') }
           $process = [System.Diagnostics.Process]::Start($start)
           $stderr = $process.StandardError.ReadToEnd()
           $stdout = $process.StandardOutput.ReadToEnd()

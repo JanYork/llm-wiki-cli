@@ -52,6 +52,8 @@ pub(crate) fn private_directory(path: &std::path::Path) -> crate::error::Result<
         let script = "$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); $acl.AddAccessRule($rule); Set-Acl -LiteralPath $env:LWC_PRIVATE_DIRECTORY -AclObject $acl";
         let result = Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            // A PS7 parent otherwise makes Windows PowerShell load incompatible modules.
+            .env_remove("PSModulePath")
             .env("LWC_PRIVATE_DIRECTORY", path)
             .output()?;
         if !result.status.success() {
