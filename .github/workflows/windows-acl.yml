@@ -82,6 +82,6 @@ jobs:
         with:
           key: windows-codegraph
       - name: Team identity, policy and HTTP roundtrip
-        run: cargo test --locked --bin lwc team::
+        run: cargo test --locked --bin lwc "team::"
       - name: Team CLI sync and recovery
         run: cargo test --locked --test team_cli
