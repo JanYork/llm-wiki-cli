@@ -205,7 +205,7 @@ test("both pages contain the exact normative README Agent prompt", () => {
 test("both locales expose continuity and Learning Suite capabilities", () => {
   for (const [locale, names] of [
     ["en", ["Temporal memory", "Durable Todo", "Current Plan", "Tutor", "Book", "Practice"]],
-    ["zh", ["时序记忆", "持久 Todo", "当前 Plan", "Tutor 教学", "Book 整书阅读", "Practice 练习"]],
+    ["zh", ["时序记忆", "持久待办", "执行计划", "循序学习", "整书阅读", "持续练习"]],
   ]) {
     const html = page(locale);
     for (const name of names) assert.ok(html.includes(`<h3>${name}</h3>`), `${locale}: ${name} is missing`);
@@ -239,8 +239,8 @@ test("public docs and Pages share the bounded graph and learning-turn contract",
     "Before a meaningful batch, phase change, or visible wait, the Agent gives one outcome-level sentence.",
   ]) assert.ok(page("en").includes(statement), `site/index.html: missing ${statement}`);
   for (const statement of [
-    "无代码学习绝不提示启用 CodeGraph。",
-    "已绑定的 Tutor 回合保持静默，只在 commit 成功后展示回复。",
+    "无代码学习绝不提示启用代码图谱。",
+    "已绑定的教学回合保持静默，只在提交成功后展示回复。",
     "只在有意义的批次、阶段变化或明显等待前，用一句面向结果的话说明。",
   ]) assert.ok(page("zh").includes(statement), `site/zh-CN/index.html: missing ${statement}`);
 });
@@ -302,9 +302,9 @@ test("native behavior is bounded to copy and explicit locale persistence", () =>
 
 test("the visual system includes accessibility and reduced-motion safeguards", () => {
   const css = read(files.css);
-  assert.match(css, /^\/\* Hallmark · pre-emit critique:[^\n]+\n \* macrostructure: Split Studio/);
+  assert.match(css, /--blue:\s*#005cff/);
   assert.match(css, /:root\s*{/);
-  assert.match(css, /oklch\(/);
+  assert.match(css, /--canvas:\s*#f5f7fb/);
   assert.match(css, /overflow-x:\s*clip/);
   assert.match(css, /:focus-visible/);
   assert.match(css, /prefers-reduced-motion:\s*reduce/);

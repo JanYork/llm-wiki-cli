@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="LWC 为 AI Agent 提供可跨会话、跨项目与跨工具持续使用的、来源可追溯的持久记忆。">
-  <meta name="theme-color" content="#EAF0FF">
+  <meta name="theme-color" content="#f5f7fb">
   <title>LWC — AI Agent 的主动记忆系统</title>
   <link rel="canonical" href="https://janyork.github.io/llm-wiki-cli/zh-CN/">
   <link rel="alternate" hreflang="en" href="https://janyork.github.io/llm-wiki-cli/">
@@ -49,212 +49,20 @@
   }
   </script>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;700&amp;family=Commit+Mono:wght@400;600&amp;family=Literata:opsz,wght@7..72,300;7..72,700&amp;display=swap">
   <link rel="stylesheet" href="../assets/site.css">
   <script src="../assets/site.js" defer></script>
 </head>
 <body>
-  <a class="skip-link" href="#main">跳到正文</a>
-
-  <header class="site-header">
-    <nav class="nav shell" aria-label="主导航">
-      <a class="wordmark" href="./" aria-label="LWC 中文首页">LWC <small>记忆图册</small></a>
-      <div class="nav-links">
-        <a class="nav-link" href="#how-it-works">工作方式</a>
-        <a class="nav-link" href="#capabilities">核心能力</a>
-        <a class="nav-link" href="https://github.com/JanYork/llm-wiki-cli/wiki">Wiki</a>
-        <a class="nav-link" href="https://github.com/JanYork/llm-wiki-cli">GitHub</a>
-      </div>
-      <div class="nav-actions">
-        <a class="language-link" data-locale="en" href="../" lang="en">English</a>
-        <a class="button button--small" href="#install">让 Agent 安装</a>
-      </div>
-      <details class="mobile-nav">
-        <summary>菜单</summary>
-        <ul>
-          <li><a href="#how-it-works">工作方式</a></li>
-          <li><a href="#capabilities">核心能力</a></li>
-          <li><a href="#install">让 Agent 安装</a></li>
-          <li><a href="https://github.com/JanYork/llm-wiki-cli/wiki">Wiki</a></li>
-          <li><a href="https://github.com/JanYork/llm-wiki-cli">GitHub</a></li>
-          <li><a data-locale="en" href="../" lang="en">English</a></li>
-        </ul>
-      </details>
-    </nav>
-  </header>
-
-  <main id="main">
-    <header class="hero shell" id="hero">
-      <div class="hero__copy">
-        <p class="eyebrow">AI Agent 的主动记忆</p>
-        <h1>让记忆跨越每一次会话。</h1>
-        <p class="hero__lede">LWC 为 AI Agent 提供一套持久、来源可追溯的 Wiki，让它们在编码、研究、运维和知识工作中主动回忆、维护并持续改进记忆。</p>
-        <div class="hero__actions">
-          <a class="button" href="#install">让 Agent 安装 <span aria-hidden="true">→</span></a>
-          <a class="button button--secondary" href="https://github.com/JanYork/llm-wiki-cli/wiki">浏览 Wiki</a>
-        </div>
-      </div>
-
-      <div class="relay" aria-hidden="true">
-        <svg viewBox="0 0 520 530" role="img">
-          <path class="relay__orbit" d="M66 115C170 20 381 31 459 152C536 271 457 452 294 485C137 517 24 416 34 276C39 207 45 147 66 115Z" />
-          <path class="relay__line" d="M112 259C160 259 171 259 212 259" />
-          <path class="relay__line relay__line--2" d="M308 259C354 259 369 259 409 259" />
-          <rect class="relay__node" x="44" y="211" width="128" height="96" rx="18" />
-          <rect class="relay__node relay__node--wiki" x="202" y="193" width="116" height="132" rx="20" />
-          <rect class="relay__node" x="390" y="211" width="90" height="96" rx="18" />
-          <circle class="relay__dot" cx="91" cy="211" r="7" />
-          <circle class="relay__dot" cx="436" cy="307" r="7" />
-          <rect class="relay__tag" x="91" y="96" width="86" height="34" rx="17" />
-          <rect class="relay__tag" x="222" y="73" width="92" height="34" rx="17" />
-          <rect class="relay__tag" x="342" y="112" width="112" height="34" rx="17" />
-          <rect class="relay__tag" x="89" y="393" width="114" height="34" rx="17" />
-          <text class="relay__micro" x="134" y="117">标签</text>
-          <text class="relay__micro" x="268" y="94">文档图</text>
-          <text class="relay__micro" x="398" y="133">词图</text>
-          <text class="relay__micro" x="146" y="414">代码图</text>
-          <text class="relay__label" x="108" y="254">来源</text>
-          <text class="relay__label" x="108" y="273">证据</text>
-          <text class="relay__label relay__label--inverse" x="260" y="252">维护中的</text>
-          <text class="relay__label relay__label--inverse" x="260" y="272">WIKI</text>
-          <text class="relay__label" x="435" y="254">下一次</text>
-          <text class="relay__label" x="435" y="273">会话</text>
-        </svg>
-      </div>
-    </header>
-
-    <section class="trust shell" id="trust">
-      <h2>源于设计的可信</h2>
-      <ul class="trust__list">
-        <li><strong>由 Agent 操作</strong><span>为 Agent 直接使用而设计。</span></li>
-        <li><strong>以来源为依据</strong><span>记忆保留证据与来源证明。</span></li>
-        <li><strong>作用域明确</strong><span>全局记忆与项目记忆彼此分离。</span></li>
-        <li><strong>可审计</strong><span>结构化输出让工作过程可检查。</span></li>
-      </ul>
-    </section>
-
-    <section class="section" id="how-it-works">
-      <div class="shell">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">工作方式</p>
-            <h2>从可靠证据到有效回忆。</h2>
-          </div>
-          <p>LWC 把记忆变成一项持续维护的项目资产：以来源为依据，整理成 Wiki，并只在当前任务需要时载入。</p>
-        </div>
-        <ol class="steps">
-          <li class="step">
-            <span class="step__number">01 / 加入证据</span>
-            <h3>收录真正重要的内容。</h3>
-            <p>记录页面、导入来源或转换文档，同时保留知识从何而来的证明。</p>
-          </li>
-          <li class="step">
-            <span class="step__number">02 / 维护 Wiki</span>
-            <h3>让记忆保持连贯。</h3>
-            <p>通过可审计的 CLI 工作流检索、校验、打标签、修订并连接知识。</p>
-          </li>
-          <li class="step">
-            <span class="step__number">03 / 带着上下文回忆</span>
-            <h3>从理解现状开始。</h3>
-            <p>Agent 在最有用的时刻载入有限记忆、强标签内容和图关系上下文。</p>
-          </li>
-        </ol>
-      </div>
-    </section>
-
-    <section class="section capabilities" id="capabilities">
-      <div class="shell">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">能力分层</p>
-            <h2>不只是一个笔记文件夹。</h2>
-          </div>
-          <p>图能力提示必须同时有相关任务和匹配的项目证据。无代码学习绝不提示启用 CodeGraph。只在有意义的批次、阶段变化或明显等待前，用一句面向结果的话说明。</p>
-        </div>
-        <div class="capability-layout">
-          <article class="capability-primary">
-            <span class="capability-primary__label">核心层</span>
-            <h3>持久 Wiki 记忆</h3>
-            <p>来源支撑的页面、检索、上下文载入、标签、Changeset、Checkpoint 与结构化 JSON 契约共同构成持久基础。</p>
-          </article>
-          <ul class="capability-list">
-            <li class="capability-item"><span class="capability-item__label">持久问答与头脑风暴</span><h3>Discussion</h3><p>保存成组问答与原文，按项修订、恢复讨论并生成有证据的总结。 <a href="https://github.com/JanYork/llm-wiki-cli/wiki/Discussion-zh-CN">使用指南</a></p></li>
-            <li class="capability-item"><span class="capability-item__label">原生集成</span><h3>Codex 原生插件</h3><p>以插件提供 Hooks、Skills、MCP 与 Logo，可恢复迁移重复 Skills；其他 Agent 不变。 <a href="https://github.com/JanYork/llm-wiki-cli/wiki/Codex-Native-Plugin-zh-CN">使用指南</a></p></li>
-            <li class="capability-item">
-              <span class="capability-item__label">历史层</span>
-              <h3>时序记忆</h3>
-              <p>稀疏记录决策、变化、结果与未决事项；有界保留让普通历史持续有用，又不会无限膨胀。</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">待办层</span>
-              <h3>持久 Todo</h3>
-              <p>按需启用，以标题和标签索引独立的未来工作，并支持可选线索、到期提醒、直接子项与 revision 安全更新。</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">执行层</span>
-              <h3>当前 Plan</h3>
-              <p>按项修订目标与步骤，保留稳定身份、历史和证据；用户免除或方案替代与验证完成明确区分。</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">学习套件</span>
-              <h3>Tutor 教学</h3>
-              <p>以可恢复的老师主导模式学习，持久保存目标、动态计划、学习证据与隔离的教学记忆。已绑定的 Tutor 回合保持静默，只在 commit 成功后展示回复。</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">学习套件</span>
-              <h3>Book 整书阅读</h3>
-              <p>导入并索引支持的书籍，按可验证的原文顺序阅读，同时保留正文、覆盖率、总结与引用。</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">学习套件</span>
-              <h3>Practice 练习</h3>
-              <p>持久管理带来源的题库、题集、不可变试卷、答题、评分历史、闪卡与计划复习。</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">关系层</span>
-              <h3>文档知识图</h3>
-              <p>项目页面、来源、链接、来源证明与语义关系构成一个可验证的物理图。</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">发现层</span>
-              <h3>词图网</h3>
-              <p>词项在有限范围内揭示文档之间的高信号联系，无需一次载入全部高密度词汇。</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">可选代码层</span>
-              <h3>代码图网</h3>
-              <p>原生透传符号与影响查询，明确索引所有者和指定范围的新鲜度；就绪不代表关系完整。</p>
-            </li>
-          </ul>
-        </div>
-      </div>
-    </section>
-
-    <section class="section" id="team-memory">
-      <div class="shell"><p class="eyebrow">自建团队版</p><h2>团队共享，本地仍在。</h2>
-      <p>核心记忆保留在本地数据库和知识文件中，由 LWC 自动同步已授权空间。外部智能体通过命令行与工具接口合并冲突，程序不内嵌模型。</p>
-      <p>用自动生成的密钥登录，选择空间、邀请成员并授予权限。阅读和分享知识，控制每项操作，并通过审计记录恢复修改；只读智能体无需创建本地副本。</p>
-      <p><a href="https://github.com/JanYork/llm-wiki-cli/wiki/Team-Memory-zh-CN">查看部署、权限与恢复指南 →</a></p></div>
-    </section>
-
-    <section class="section" id="install">
-      <div class="shell install-layout">
-        <div class="install-copy">
-          <p class="eyebrow">Agent 安装</p>
-          <h2>直接让你的 Agent 完成配置。</h2>
-          <p>复制完整提示词。它会要求 Agent 使用 LWC 官方安装器、保留现有配置、验证每一项集成能力，并在启用项目记忆或图能力之前先征得同意。</p>
-          <p><a href="https://github.com/JanYork/llm-wiki-cli/wiki/Whats-New-zh-CN">v0.19.0：本地优先团队记忆与升级说明</a></p>
-          <p class="target-examples"><strong>AgentTarget 示例</strong>Claude Code、Codex、Cursor、OpenCode、Gemini CLI、Kiro、Hermes、Antigravity 与 Pi。这里仅列举示例，并非完整清单。</p>
-          <a class="manual-link" href="https://github.com/JanYork/llm-wiki-cli#installation">更希望手动安装？查看官方安装方式 →</a>
-        </div>
-        <div class="prompt-panel">
-          <div class="prompt-panel__bar">
-            <span>完整配置提示词</span>
-            <button class="copy-button" type="button" data-copy-target="agent-setup-prompt" data-copy-status="copy-status" data-copy-label="复制提示词" data-copy-success="已复制" data-copy-failure="请手动选择并复制提示词。">复制提示词</button>
-          </div>
-          <pre class="prompt" id="agent-setup-prompt"><code data-agent-prompt>Configure LWC completely for this user. Perform and verify the work; do not
+<a class="skip-link" href="#main">跳到正文</a>
+<header class="site-header"><nav class="shell nav" aria-label="主导航"><a class="brand-link" href="./"><span class="wordmark" aria-label="LWC"><span>L</span>WC</span><span class="brand-caption">让记忆延续</span></a><div class="nav-links"><a href="#capabilities">产品能力</a><a href="#team-memory">团队协作</a><a href="https://github.com/JanYork/llm-wiki-cli/wiki">使用文档</a><a href="https://github.com/JanYork/llm-wiki-cli">代码仓库</a></div><div class="nav-actions"><a class="language-link" data-locale="en" href="../" lang="en">English</a><a class="button button--small" href="#install">开始使用</a></div><details class="mobile-nav"><summary>菜单</summary><div><a href="#capabilities">产品能力</a><a href="#team-memory">团队协作</a><a href="https://github.com/JanYork/llm-wiki-cli/wiki">使用文档</a><a href="https://github.com/JanYork/llm-wiki-cli">代码仓库</a></div></details></nav></header>
+<main id="main">
+<section class="hero shell" id="hero"><div class="hero-copy"><a class="release-badge" href="https://github.com/JanYork/llm-wiki-cli/wiki/Whats-New-zh-CN"><span class="status-dot"></span>v0.19.0 · 团队记忆，现已加入<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a><h1>每次开始，<br><span>都不必从零。</span></h1><p class="hero-description">让智能体记住项目知识、决策与计划。个人本地使用，团队按权限共享，让重要信息随工作一起延续。</p><div class="hero-actions"><a class="button " href="#install">让智能体开始使用<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a><a class="button button--secondary" href="https://github.com/JanYork/llm-wiki-cli/wiki/Team-Memory-zh-CN">了解团队版<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a></div><p class="hero-note">开源可自建 · 本地持有记忆 · 不内嵌模型</p></div>
+<figure class="product-preview"><div class="preview-top"><span class="preview-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 4h14v17l-7-4-7 4V4Z"/></svg>知识工作区</span><span class="preview-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg>本地与团队</span></div><div class="preview-layout"><div class="preview-sidebar"><p>记忆空间</p><div class="preview-space active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 4h14v17l-7-4-7 4V4Z"/></svg><span>产品知识</span></div><div class="preview-space "><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 4h14v17l-7-4-7 4V4Z"/></svg><span>工程实践</span></div><div class="preview-space "><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 4h14v17l-7-4-7 4V4Z"/></svg><span>项目计划</span></div><p class="preview-section-label">知识页面</p><div class="preview-page active"><span class="page-dot"></span>团队使用指南</div><div class="preview-page "><span class="page-dot"></span>协作约定</div><div class="preview-page "><span class="page-dot"></span>决策与背景</div><div class="preview-sidebar-footer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg>知识保留在本地</div></div><div class="preview-document"><div class="document-meta">产品知识 / 使用指南</div><h2>团队使用指南</h2><div class="document-tags"><span>知识页</span><span>团队协作</span></div><h3>从第一次协作开始</h3><p>将团队需要的上下文整理在一起，留给下一位伙伴和下一次任务。</p><ul><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg><span>知识与来源一起查找</span></li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg><span>仅与获授权的成员共享</span></li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg><span>让智能体接着完成工作</span></li></ul><div class="document-callout"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 4h14v17l-7-4-7 4V4Z"/></svg><div><strong>让积累跟上工作的进度</strong><p>保留来源与修改记录，每一步都有依据。</p></div></div></div></div><figcaption>产品界面示意 · 内容仅作展示</figcaption></figure></section>
+<section class="trust shell" id="trust"><h2 class="sr-only">围绕你的记忆而设计</h2><ul><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg><div><strong>本地优先</strong><span>本地始终保留你的记忆。</span></div></li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg><div><strong>智能体自主</strong><span>开放工具，自由选择智能体。</span></div></li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg><div><strong>按权限共享</strong><span>每个空间，明确授权。</span></div></li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg><div><strong>开源可自建</strong><span>部署在你自己的环境。</span></div></li></ul></section>
+<section class="section shell" id="how-it-works"><div class="section-heading"><p class="eyebrow">简单的工作方式</p><h2>从有用的信息，<br>到持续积累的知识。</h2><p>智能体负责工作，LWC 保存工作的延续。</p></div><ol class="steps"><li><span class="step-number">01</span><h3>留下重要的知识</h3><p>把工作中的来源、决策和有用信息整理成可持续使用的记忆。</p></li><li><span class="step-number">02</span><h3>让知识有条理</h3><p>将知识、证据与计划连接起来，需要时快速找到。</p></li><li><span class="step-number">03</span><h3>带着上下文继续</h3><p>下次任务开始时，智能体可以直接接上已有积累。</p></li></ol></section>
+<section class="section section-tinted" id="capabilities"><div class="shell"><div class="section-heading"><p class="eyebrow">为持续工作而准备</p><h2>记住的，不止是一条笔记。</h2><p>让知识、未完成的工作与学习积累相互连接。</p></div><a class="feature-lead" href="https://github.com/JanYork/llm-wiki-cli/wiki"><div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 4h14v17l-7-4-7 4V4Z"/></svg></div><div><h3>可以持续维护的知识空间</h3><p>可搜索的知识页、关联的来源与完整修改记录。人可以轻松阅读，智能体也可以直接使用。</p></div><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a><div class="feature-grid"><article class="feature-card"><span class="feature-index">01</span><h3>时序记忆</h3><p>保留决策、变化与结果，理解事情的来龙去脉。</p></article><article class="feature-card"><span class="feature-index">02</span><h3>持久待办</h3><p>跨越会话保存未完成事项，重要的事不会遗漏。</p></article><article class="feature-card"><span class="feature-index">03</span><h3>执行计划</h3><p>明确执行步骤，保留进度、变化和完成依据。</p></article><article class="feature-card"><span class="feature-index">04</span><h3>循序学习</h3><p>保留学习目标与进度，从上次停下的地方继续。</p></article><article class="feature-card"><span class="feature-index">05</span><h3>整书阅读</h3><p>按原文顺序阅读，保留可追溯的笔记与引用。</p></article><article class="feature-card"><span class="feature-index">06</span><h3>持续练习</h3><p>积累练习、反馈和复习记录，让学习持续发生。</p></article></div><div class="capability-footer"><span>需要更深入地梳理知识？</span><a href="https://github.com/JanYork/llm-wiki-cli/wiki/Architecture-Overview-zh-CN">了解来源、关系与代码图谱<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a></div></div></section>
+<section class="section shell team-layout" id="team-memory"><div class="section-heading"><p class="eyebrow">也为你的团队而准备</p><h2>共享知识，<br>也守住边界。</h2><p>以本地记忆为基础，增加团队空间与明确的权限。把服务部署在适合团队的环境中。</p><a class="button " href="https://github.com/JanYork/llm-wiki-cli/wiki/Team-Memory-zh-CN">查看团队版指南<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a></div><div class="team-features"><article><span class="team-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg></span><div><h3>从登录到协作，顺畅衔接</h3><p>使用自动生成的个人密钥登录，选择空间，开通成员时一并设置初始权限。</p></div></article><article><span class="team-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg></span><div><h3>程序同步，智能体合并</h3><p>授权修改由程序自动同步。遇到语义冲突，保留完整证据并通知外部智能体合并。</p></div></article><article><span class="team-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg></span><div><h3>重要修改，可以追溯恢复</h3><p>明确的访问策略、可审计的记忆恢复，以及保留当前权限的备份恢复机制。</p></div></article><a class="inline-link" href="https://github.com/JanYork/llm-wiki-cli/blob/main/deploy/team/README.md">自建部署说明<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a></div></section>
+<section class="section section-tinted" id="install"><div class="shell install-layout"><div class="section-heading"><p class="eyebrow">开始使用</p><h2>把安装交给<br>你的智能体。</h2><p>复制安装说明，发给你正在使用的智能体。由它完成安装、配置与核验。</p><a class="inline-link" href="https://github.com/JanYork/llm-wiki-cli#installation">希望自己安装？查看安装文档<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a></div><div class="setup-card"><div class="setup-card-header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 4h14v17l-7-4-7 4V4Z"/></svg><strong>完整安装说明</strong><span>一键复制</span></div><ol class="setup-steps"><li>复制下方完整说明。</li><li>发送给你常用的智能体。</li><li>由它配置并验证安装结果。</li></ol><button class="button copy-button" type="button" data-copy-target="agent-setup-prompt" data-copy-status="copy-status" data-copy-label="复制安装说明" data-copy-success="已复制" data-copy-failure="请展开说明，选中并手动复制。">复制安装说明</button><p id="copy-status" class="copy-status" role="status" aria-live="polite"></p><details class="setup-details"><summary>查看完整说明</summary><pre id="agent-setup-prompt"><code data-agent-prompt>Configure LWC completely for this user. Perform and verify the work; do not
 merely describe commands for me to run.
 
 Source of truth:
@@ -281,30 +89,7 @@ Requirements:
    inventing paths or keys.
 
 Finish with the LWC version, detected and configured Targets, status results,
-files changed, unsupported surfaces, and any restart or trust action remaining.</code></pre>
-          <p class="copy-status" id="copy-status" role="status" aria-live="polite"></p>
-        </div>
-      </div>
-    </section>
-
-    <section class="resources shell" id="resources">
-      <h2>项目资源</h2>
-      <ul class="resource-index">
-        <li><a href="https://github.com/JanYork/llm-wiki-cli/wiki"><strong>Wiki</strong><span>完整文档</span></a></li>
-        <li><a href="https://github.com/JanYork/llm-wiki-cli/releases"><strong>版本发布</strong><span>下载</span></a></li>
-        <li><a href="https://github.com/JanYork/llm-wiki-cli"><strong>GitHub</strong><span>源代码</span></a></li>
-        <li><a href="https://github.com/JanYork/llm-wiki-cli/issues"><strong>问题反馈</strong><span>报告与跟踪</span></a></li>
-        <li><a href="https://github.com/JanYork/llm-wiki-cli/security/policy"><strong>安全</strong><span>安全报告</span></a></li>
-        <li><a href="https://github.com/JanYork/llm-wiki-cli/blob/main/LICENSE"><strong>许可证</strong><span>Apache-2.0</span></a></li>
-      </ul>
-    </section>
-  </main>
-
-  <footer class="site-footer">
-    <div class="shell">
-      <p>LWC 采用 Apache License 2.0 开源。</p>
-      <p>英文是项目规范正文。<a data-locale="en" href="../" lang="en">Read in English</a></p>
-    </div>
-  </footer>
-</body>
-</html>
+files changed, unsupported surfaces, and any restart or trust action remaining.</code></pre></details></div></div></section>
+<section class="section shell resources" id="resources"><div class="section-heading"><p class="eyebrow">继续了解</p><h2>需要的资料，就在这里。</h2></div><div class="resource-grid"><a href="https://github.com/JanYork/llm-wiki-cli/wiki"><strong>使用文档</strong><span>指南与完整参考</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a><a href="https://github.com/JanYork/llm-wiki-cli/releases"><strong>版本下载</strong><span>版本说明与安装包</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a><a href="https://github.com/JanYork/llm-wiki-cli"><strong>源代码</strong><span>了解实现与参与贡献</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a><a href="https://github.com/JanYork/llm-wiki-cli/issues"><strong>问题反馈</strong><span>反馈问题与建议</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a></div><details class="behavior-contract"><summary>智能体行为与边界</summary><p>无代码学习绝不提示启用代码图谱。已绑定的教学回合保持静默，只在提交成功后展示回复。只在有意义的批次、阶段变化或明显等待前，用一句面向结果的话说明。</p></details></section>
+</main><footer class="site-footer"><div class="shell footer-content"><a class="brand-link" href="#hero"><span class="wordmark" aria-label="LWC"><span>L</span>WC</span></a><p>采用 Apache-2.0 许可证开源。</p><div><a href="https://github.com/JanYork/llm-wiki-cli/security/policy">安全</a><a href="https://github.com/JanYork/llm-wiki-cli/blob/main/LICENSE">许可证</a><a data-locale="en" href="../" lang="en">English</a></div></div></footer>
+</body></html>

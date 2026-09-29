@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="LWC gives AI Agents durable, source-grounded memory across sessions, projects, and tools.">
-  <meta name="theme-color" content="#EAF0FF">
+  <meta name="theme-color" content="#f5f7fb">
   <title>LWC — Proactive Memory for AI Agents</title>
   <link rel="canonical" href="https://janyork.github.io/llm-wiki-cli/">
   <link rel="alternate" hreflang="en" href="https://janyork.github.io/llm-wiki-cli/">
@@ -49,212 +49,20 @@
   }
   </script>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;700&amp;family=Commit+Mono:wght@400;600&amp;family=Literata:opsz,wght@7..72,300;7..72,700&amp;display=swap">
   <link rel="stylesheet" href="assets/site.css">
   <script src="assets/site.js" defer></script>
 </head>
 <body>
-  <a class="skip-link" href="#main">Skip to content</a>
-
-  <header class="site-header">
-    <nav class="nav shell" aria-label="Primary navigation">
-      <a class="wordmark" href="./" aria-label="LWC home">LWC <small>Memory Atlas</small></a>
-      <div class="nav-links">
-        <a class="nav-link" href="#how-it-works">How it works</a>
-        <a class="nav-link" href="#capabilities">Capabilities</a>
-        <a class="nav-link" href="https://github.com/JanYork/llm-wiki-cli/wiki">Wiki</a>
-        <a class="nav-link" href="https://github.com/JanYork/llm-wiki-cli">GitHub</a>
-      </div>
-      <div class="nav-actions">
-        <a class="language-link" data-locale="zh-CN" href="zh-CN/" lang="zh-CN">中文</a>
-        <a class="button button--small" href="#install">Install with your Agent</a>
-      </div>
-      <details class="mobile-nav">
-        <summary>Menu</summary>
-        <ul>
-          <li><a href="#how-it-works">How it works</a></li>
-          <li><a href="#capabilities">Capabilities</a></li>
-          <li><a href="#install">Install with your Agent</a></li>
-          <li><a href="https://github.com/JanYork/llm-wiki-cli/wiki">Wiki</a></li>
-          <li><a href="https://github.com/JanYork/llm-wiki-cli">GitHub</a></li>
-          <li><a data-locale="zh-CN" href="zh-CN/" lang="zh-CN">中文</a></li>
-        </ul>
-      </details>
-    </nav>
-  </header>
-
-  <main id="main">
-    <header class="hero shell" id="hero">
-      <div class="hero__copy">
-        <p class="eyebrow">Proactive memory for AI Agents</p>
-        <h1>Memory that survives the session.</h1>
-        <p class="hero__lede">LWC gives AI Agents a durable, source-grounded Wiki they can recall, maintain, and improve across coding, research, operations, and knowledge work.</p>
-        <div class="hero__actions">
-          <a class="button" href="#install">Install with your Agent <span aria-hidden="true">→</span></a>
-          <a class="button button--secondary" href="https://github.com/JanYork/llm-wiki-cli/wiki">Explore the Wiki</a>
-        </div>
-      </div>
-
-      <div class="relay" aria-hidden="true">
-        <svg viewBox="0 0 520 530" role="img">
-          <path class="relay__orbit" d="M66 115C170 20 381 31 459 152C536 271 457 452 294 485C137 517 24 416 34 276C39 207 45 147 66 115Z" />
-          <path class="relay__line" d="M112 259C160 259 171 259 212 259" />
-          <path class="relay__line relay__line--2" d="M308 259C354 259 369 259 409 259" />
-          <rect class="relay__node" x="44" y="211" width="128" height="96" rx="18" />
-          <rect class="relay__node relay__node--wiki" x="202" y="193" width="116" height="132" rx="20" />
-          <rect class="relay__node" x="390" y="211" width="90" height="96" rx="18" />
-          <circle class="relay__dot" cx="91" cy="211" r="7" />
-          <circle class="relay__dot" cx="436" cy="307" r="7" />
-          <rect class="relay__tag" x="91" y="96" width="86" height="34" rx="17" />
-          <rect class="relay__tag" x="222" y="73" width="92" height="34" rx="17" />
-          <rect class="relay__tag" x="342" y="112" width="112" height="34" rx="17" />
-          <rect class="relay__tag" x="89" y="393" width="114" height="34" rx="17" />
-          <text class="relay__micro" x="134" y="117">TAG</text>
-          <text class="relay__micro" x="268" y="94">DOC GRAPH</text>
-          <text class="relay__micro" x="398" y="133">WORD GRAPH</text>
-          <text class="relay__micro" x="146" y="414">CODEGRAPH</text>
-          <text class="relay__label" x="108" y="254">SOURCE</text>
-          <text class="relay__label" x="108" y="273">EVIDENCE</text>
-          <text class="relay__label relay__label--inverse" x="260" y="252">MAINTAINED</text>
-          <text class="relay__label relay__label--inverse" x="260" y="272">WIKI</text>
-          <text class="relay__label" x="435" y="254">NEXT</text>
-          <text class="relay__label" x="435" y="273">SESSION</text>
-        </svg>
-      </div>
-    </header>
-
-    <section class="trust shell" id="trust">
-      <h2>Trust by design</h2>
-      <ul class="trust__list">
-        <li><strong>Agent-operated</strong><span>Designed for Agents to use directly.</span></li>
-        <li><strong>Source-grounded</strong><span>Memory keeps evidence and provenance.</span></li>
-        <li><strong>Explicitly scoped</strong><span>Global and project memory stay distinct.</span></li>
-        <li><strong>Auditable</strong><span>Structured output makes work inspectable.</span></li>
-      </ul>
-    </section>
-
-    <section class="section" id="how-it-works">
-      <div class="shell">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">How it works</p>
-            <h2>From evidence to useful recall.</h2>
-          </div>
-          <p>LWC makes memory a maintained project asset: grounded in sources, shaped into a Wiki, and loaded only when the current task needs it.</p>
-        </div>
-        <ol class="steps">
-          <li class="step">
-            <span class="step__number">01 / Add evidence</span>
-            <h3>Bring in what matters.</h3>
-            <p>Record pages, ingest sources, or convert documents while preserving where knowledge came from.</p>
-          </li>
-          <li class="step">
-            <span class="step__number">02 / Maintain the Wiki</span>
-            <h3>Keep memory coherent.</h3>
-            <p>Search, lint, tag, revise, and connect knowledge through audited CLI workflows.</p>
-          </li>
-          <li class="step">
-            <span class="step__number">03 / Recall with context</span>
-            <h3>Start informed.</h3>
-            <p>Agents load bounded memory, strong tags, and graph context at the moment they become useful.</p>
-          </li>
-        </ol>
-      </div>
-    </section>
-
-    <section class="section capabilities" id="capabilities">
-      <div class="shell">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">Capability layers</p>
-            <h2>More than a folder of notes.</h2>
-          </div>
-          <p>Graph prompts require both a relevant task and matching project evidence. No-code learning never prompts for CodeGraph. Before a meaningful batch, phase change, or visible wait, the Agent gives one outcome-level sentence.</p>
-        </div>
-        <div class="capability-layout">
-          <article class="capability-primary">
-            <span class="capability-primary__label">Core layer</span>
-            <h3>Persistent Wiki memory</h3>
-            <p>Source-backed pages, retrieval, context loading, tags, changesets, checkpoints, and structured JSON contracts form the durable foundation.</p>
-          </article>
-          <ul class="capability-list">
-            <li class="capability-item"><span class="capability-item__label">Persistent clarification</span><h3>Discussion</h3><p>Preserve grouped Q/A and originals, revise individual items, recover discussions and summarize with evidence. <a href="https://github.com/JanYork/llm-wiki-cli/wiki/Discussion">Guide</a></p></li>
-            <li class="capability-item"><span class="capability-item__label">Native integration</span><h3>Codex native plugin</h3><p>Plugin-owned Hooks, Skills, MCP and logos, with recoverable duplicate Skill migration. Other Agents stay unchanged. <a href="https://github.com/JanYork/llm-wiki-cli/wiki/Codex-Native-Plugin">Guide</a></p></li>
-            <li class="capability-item">
-              <span class="capability-item__label">History layer</span>
-              <h3>Temporal memory</h3>
-              <p>Record sparse decisions, changes, outcomes, and unresolved work. Bounded retention keeps ordinary history useful without growing forever.</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">Deferred work</span>
-              <h3>Durable Todo</h3>
-              <p>Opt in to keep independent future work indexed by title and tags, with optional cues, due reminders, direct children, and revision-safe updates.</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">Active work</span>
-              <h3>Current Plan</h3>
-              <p>Revise objectives and individual steps with stable IDs, history and evidence. Keep waived or replaced work distinct from completed verification.</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">Learning suite</span>
-              <h3>Tutor</h3>
-              <p>Run resumable, teacher-led learning with durable goals, adaptive plans, learner evidence, and isolated teaching memory. Bound Tutor turns stay silent and display only after commit.</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">Learning suite</span>
-              <h3>Book</h3>
-              <p>Import, index, and read supported books in verified source order while preserving exact text, coverage, summaries, and citations.</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">Learning suite</span>
-              <h3>Practice</h3>
-              <p>Keep source-linked banks, question sets, immutable papers, attempts, grading history, flashcards, and scheduled review.</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">Relationship layer</span>
-              <h3>Document knowledge graph</h3>
-              <p>Project pages, sources, links, provenance, and semantic relations become a verifiable physical graph.</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">Discovery layer</span>
-              <h3>Word graph</h3>
-              <p>Terms reveal bounded, high-signal connections across documents without loading the entire vocabulary at once.</p>
-            </li>
-            <li class="capability-item">
-              <span class="capability-item__label">Optional code layer</span>
-              <h3>CodeGraph</h3>
-              <p>Query symbols and impact with native results, explicit index ownership and scoped freshness checks. Readiness does not imply complete coverage.</p>
-            </li>
-          </ul>
-        </div>
-      </div>
-    </section>
-
-    <section class="section" id="team-memory">
-      <div class="shell"><p class="eyebrow">Self-hosted teams</p><h2>Shared memory. Local ownership.</h2>
-      <p>Keep core memory in local SQLite and Wiki files. LWC automatically synchronizes authorized spaces; external Agents merge conflicts through CLI and MCP without an embedded model.</p>
-      <p>Sign in with a generated key, choose a space, invite members and grant access. Read and share knowledge, apply fine-grained permissions, and recover changes with an audit trail. Cloud-only readers do not need a local replica.</p>
-      <p><a href="https://github.com/JanYork/llm-wiki-cli/wiki/Team-Memory">Deployment, permissions and recovery →</a></p></div>
-    </section>
-
-    <section class="section" id="install">
-      <div class="shell install-layout">
-        <div class="install-copy">
-          <p class="eyebrow">Agent installation</p>
-          <h2>Ask your Agent to set it up.</h2>
-          <p>Copy the complete prompt. It tells your Agent to use LWC's official installer, preserve existing configuration, verify every integration surface, and ask before enabling project memory or graphs.</p>
-          <p><a href="https://github.com/JanYork/llm-wiki-cli/wiki/Whats-New">v0.19.0: local-first team memory and upgrade guidance</a></p>
-          <p class="target-examples"><strong>AgentTarget examples</strong>Claude Code, Codex, Cursor, OpenCode, Gemini CLI, Kiro, Hermes, Antigravity, and Pi. Examples are not exhaustive.</p>
-          <a class="manual-link" href="https://github.com/JanYork/llm-wiki-cli#installation">Prefer manual installation? Read the official options →</a>
-        </div>
-        <div class="prompt-panel">
-          <div class="prompt-panel__bar">
-            <span>Complete setup prompt</span>
-            <button class="copy-button" type="button" data-copy-target="agent-setup-prompt" data-copy-status="copy-status" data-copy-label="Copy prompt" data-copy-success="Copied" data-copy-failure="Select and copy the prompt manually.">Copy prompt</button>
-          </div>
-          <pre class="prompt" id="agent-setup-prompt"><code data-agent-prompt>Configure LWC completely for this user. Perform and verify the work; do not
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header"><nav class="shell nav" aria-label="Main navigation"><a class="brand-link" href="./"><span class="wordmark" aria-label="LWC"><span>L</span>WC</span><span class="brand-caption">Memory, continued.</span></a><div class="nav-links"><a href="#capabilities">Capabilities</a><a href="#team-memory">For teams</a><a href="https://github.com/JanYork/llm-wiki-cli/wiki">Documentation</a><a href="https://github.com/JanYork/llm-wiki-cli">Source code</a></div><div class="nav-actions"><a class="language-link" data-locale="zh-CN" href="zh-CN/" lang="zh-CN">中文</a><a class="button button--small" href="#install">Get started</a></div><details class="mobile-nav"><summary>Menu</summary><div><a href="#capabilities">Capabilities</a><a href="#team-memory">For teams</a><a href="https://github.com/JanYork/llm-wiki-cli/wiki">Documentation</a><a href="https://github.com/JanYork/llm-wiki-cli">Source code</a></div></details></nav></header>
+<main id="main">
+<section class="hero shell" id="hero"><div class="hero-copy"><a class="release-badge" href="https://github.com/JanYork/llm-wiki-cli/wiki/Whats-New"><span class="status-dot"></span>v0.19.0 · Meet team memory<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a><h1>Your next session.<br><span>Already in context.</span></h1><p class="hero-description">Give your Agent a lasting home for knowledge, decisions and plans. Keep it local, or share it with your team. Pick up where the work left off.</p><div class="hero-actions"><a class="button " href="#install">Start with your Agent<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a><a class="button button--secondary" href="https://github.com/JanYork/llm-wiki-cli/wiki/Team-Memory">Explore team memory<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a></div><p class="hero-note">Open source. Local ownership. No embedded model.</p></div>
+<figure class="product-preview"><div class="preview-top"><span class="preview-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 4h14v17l-7-4-7 4V4Z"/></svg>Knowledge workspace</span><span class="preview-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg>Local + shared</span></div><div class="preview-layout"><div class="preview-sidebar"><p>MY SPACES</p><div class="preview-space active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 4h14v17l-7-4-7 4V4Z"/></svg><span>Product knowledge</span></div><div class="preview-space "><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 4h14v17l-7-4-7 4V4Z"/></svg><span>Engineering notes</span></div><div class="preview-space "><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 4h14v17l-7-4-7 4V4Z"/></svg><span>Project plans</span></div><p class="preview-section-label">PAGES</p><div class="preview-page active"><span class="page-dot"></span>Team guide</div><div class="preview-page "><span class="page-dot"></span>Working together</div><div class="preview-page "><span class="page-dot"></span>Decisions and context</div><div class="preview-sidebar-footer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg>Knowledge stays local</div></div><div class="preview-document"><div class="document-meta">Product knowledge / Guide</div><h2>Team guide</h2><div class="document-tags"><span>Knowledge</span><span>Collaboration</span></div><h3>A shared place to begin</h3><p>Keep the context your team needs, ready for the next person and the next task.</p><ul><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg><span>Find knowledge with its sources</span></li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg><span>Share only with the right people</span></li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg><span>Continue work with your Agent</span></li></ul><div class="document-callout"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 4h14v17l-7-4-7 4V4Z"/></svg><div><strong>Context travels with the work</strong><p>Sources and change history remain traceable.</p></div></div></div></div><figcaption>Interface illustration · example content</figcaption></figure></section>
+<section class="trust shell" id="trust"><h2 class="sr-only">Built around your memory</h2><ul><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg><div><strong>Local first</strong><span>Your memory stays with you.</span></div></li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg><div><strong>Agent operated</strong><span>Open tools. Your choice of Agent.</span></div></li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg><div><strong>Shared by permission</strong><span>Decide who can access each space.</span></div></li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg><div><strong>Open source</strong><span>Run it on your own infrastructure.</span></div></li></ul></section>
+<section class="section shell" id="how-it-works"><div class="section-heading"><p class="eyebrow">A simple rhythm</p><h2>From useful information<br>to lasting knowledge.</h2><p>Your Agent does the work. LWC keeps the continuity.</p></div><ol class="steps"><li><span class="step-number">01</span><h3>Keep what matters</h3><p>Capture sources, decisions and useful context as you work.</p></li><li><span class="step-number">02</span><h3>Make knowledge usable</h3><p>Connect pages, evidence and plans in a searchable knowledge space.</p></li><li><span class="step-number">03</span><h3>Continue with context</h3><p>Your Agent can pick up the next task with the knowledge already in place.</p></li></ol></section>
+<section class="section section-tinted" id="capabilities"><div class="shell"><div class="section-heading"><p class="eyebrow">One place for continuity</p><h2>More than remembering a note.</h2><p>Keep knowledge, unfinished work and learning connected.</p></div><a class="feature-lead" href="https://github.com/JanYork/llm-wiki-cli/wiki"><div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 4h14v17l-7-4-7 4V4Z"/></svg></div><div><h3>A knowledge space you can build on</h3><p>Searchable pages, linked sources and a record of what changed. Ready for people to read and Agents to use.</p></div><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a><div class="feature-grid"><article class="feature-card"><span class="feature-index">01</span><h3>Temporal memory</h3><p>Keep decisions, changes and outcomes in context.</p></article><article class="feature-card"><span class="feature-index">02</span><h3>Durable Todo</h3><p>Keep unfinished work visible across sessions.</p></article><article class="feature-card"><span class="feature-index">03</span><h3>Current Plan</h3><p>Follow clear steps and retain progress and evidence.</p></article><article class="feature-card"><span class="feature-index">04</span><h3>Tutor</h3><p>Continue a learning path from where you left off.</p></article><article class="feature-card"><span class="feature-index">05</span><h3>Book</h3><p>Read in source order, with traceable notes and citations.</p></article><article class="feature-card"><span class="feature-index">06</span><h3>Practice</h3><p>Build on exercises, feedback and scheduled review.</p></article></div><div class="capability-footer"><span>Need more structure?</span><a href="https://github.com/JanYork/llm-wiki-cli/wiki/Architecture-Overview">Explore sources, relations and code graphs<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a></div></div></section>
+<section class="section shell team-layout" id="team-memory"><div class="section-heading"><p class="eyebrow">Built for your team</p><h2>Share knowledge.<br>Keep control.</h2><p>The same local-first foundation, with shared spaces and clear permissions. Host it where your team needs it.</p><a class="button " href="https://github.com/JanYork/llm-wiki-cli/wiki/Team-Memory">Read the team guide<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a></div><div class="team-features"><article><span class="team-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg></span><div><h3>A straightforward way in</h3><p>Generated personal keys, space selection, and member setup with initial access.</p></div></article><article><span class="team-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg></span><div><h3>Sync that follows the work</h3><p>LWC moves authorized changes automatically. Your external Agent resolves semantic conflicts with the evidence preserved.</p></div></article><article><span class="team-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m6 12 4 4 8-8"/></svg></span><div><h3>Recover with confidence</h3><p>Explicit access policies, auditable recovery and backups that preserve current permissions.</p></div></article><a class="inline-link" href="https://github.com/JanYork/llm-wiki-cli/blob/main/deploy/team/README.md">Self-host deployment guide<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a></div></section>
+<section class="section section-tinted" id="install"><div class="shell install-layout"><div class="section-heading"><p class="eyebrow">Get started</p><h2>Let your Agent<br>take it from here.</h2><p>Copy the setup instructions and send them to your Agent. It can install, configure and verify LWC for your environment.</p><a class="inline-link" href="https://github.com/JanYork/llm-wiki-cli#installation">Prefer to install manually?<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a></div><div class="setup-card"><div class="setup-card-header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 4h14v17l-7-4-7 4V4Z"/></svg><strong>Ready-to-use setup instructions</strong><span>One copy</span></div><ol class="setup-steps"><li>Copy the instructions below.</li><li>Send them to your preferred Agent.</li><li>Let it configure and verify the installation.</li></ol><button class="button copy-button" type="button" data-copy-target="agent-setup-prompt" data-copy-status="copy-status" data-copy-label="Copy setup instructions" data-copy-success="Copied" data-copy-failure="Select and copy the instructions manually.">Copy setup instructions</button><p id="copy-status" class="copy-status" role="status" aria-live="polite"></p><details class="setup-details"><summary>Read the full instructions</summary><pre id="agent-setup-prompt"><code data-agent-prompt>Configure LWC completely for this user. Perform and verify the work; do not
 merely describe commands for me to run.
 
 Source of truth:
@@ -281,30 +89,7 @@ Requirements:
    inventing paths or keys.
 
 Finish with the LWC version, detected and configured Targets, status results,
-files changed, unsupported surfaces, and any restart or trust action remaining.</code></pre>
-          <p class="copy-status" id="copy-status" role="status" aria-live="polite"></p>
-        </div>
-      </div>
-    </section>
-
-    <section class="resources shell" id="resources">
-      <h2>Project resources</h2>
-      <ul class="resource-index">
-        <li><a href="https://github.com/JanYork/llm-wiki-cli/wiki"><strong>Wiki</strong><span>Documentation</span></a></li>
-        <li><a href="https://github.com/JanYork/llm-wiki-cli/releases"><strong>Releases</strong><span>Downloads</span></a></li>
-        <li><a href="https://github.com/JanYork/llm-wiki-cli"><strong>GitHub</strong><span>Source code</span></a></li>
-        <li><a href="https://github.com/JanYork/llm-wiki-cli/issues"><strong>Issues</strong><span>Report and track</span></a></li>
-        <li><a href="https://github.com/JanYork/llm-wiki-cli/security/policy"><strong>Security</strong><span>Report safely</span></a></li>
-        <li><a href="https://github.com/JanYork/llm-wiki-cli/blob/main/LICENSE"><strong>License</strong><span>Apache-2.0</span></a></li>
-      </ul>
-    </section>
-  </main>
-
-  <footer class="site-footer">
-    <div class="shell">
-      <p>LWC is open source under the Apache License 2.0.</p>
-      <p>English is the normative project copy. <a data-locale="zh-CN" href="zh-CN/" lang="zh-CN">阅读中文版</a></p>
-    </div>
-  </footer>
-</body>
-</html>
+files changed, unsupported surfaces, and any restart or trust action remaining.</code></pre></details></div></div></section>
+<section class="section shell resources" id="resources"><div class="section-heading"><p class="eyebrow">Keep exploring</p><h2>Everything you need, within reach.</h2></div><div class="resource-grid"><a href="https://github.com/JanYork/llm-wiki-cli/wiki"><strong>Documentation</strong><span>Guides and reference</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a><a href="https://github.com/JanYork/llm-wiki-cli/releases"><strong>Downloads</strong><span>Release notes and packages</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a><a href="https://github.com/JanYork/llm-wiki-cli"><strong>Source code</strong><span>Explore and contribute</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a><a href="https://github.com/JanYork/llm-wiki-cli/issues"><strong>Feedback</strong><span>Report issues and ideas</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a></div><details class="behavior-contract"><summary>Agent behavior and boundaries</summary><p>No-code learning never prompts for CodeGraph. Bound Tutor turns stay silent and display only after commit. Before a meaningful batch, phase change, or visible wait, the Agent gives one outcome-level sentence.</p></details></section>
+</main><footer class="site-footer"><div class="shell footer-content"><a class="brand-link" href="#hero"><span class="wordmark" aria-label="LWC"><span>L</span>WC</span></a><p>Open source under Apache-2.0.</p><div><a href="https://github.com/JanYork/llm-wiki-cli/security/policy">Security</a><a href="https://github.com/JanYork/llm-wiki-cli/blob/main/LICENSE">License</a><a data-locale="zh-CN" href="zh-CN/" lang="zh-CN">中文</a></div></div></footer>
+</body></html>
