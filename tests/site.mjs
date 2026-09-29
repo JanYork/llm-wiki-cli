@@ -83,8 +83,8 @@ test("locale pages share structure and independently canonical metadata", () => 
   const en = page("en");
   const zh = page("zh");
   const expected = {
-    ids: ["hero", "trust", "how-it-works", "capabilities", "install", "resources"],
-    levels: [1, 2, 2, 2, 2, 2],
+    ids: ["hero", "trust", "how-it-works", "capabilities", "team-memory", "install", "resources"],
+    levels: [1, 2, 2, 2, 2, 2, 2],
   };
 
   assert.deepEqual(sectionContract(en), expected);
