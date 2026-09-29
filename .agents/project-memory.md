@@ -72,3 +72,5 @@ Translated READMEs, package summaries, integration summaries, and copied Skill t
 There are no project-brain todos, activity logs, or operations journals yet. Create one only when current evidence demonstrates a continuity need, and update this discovery map at the same time.
 
 - Team implementation entry points: `src/team/` (instance admission, identities, signed policies, API), `src/replica/` (client credentials, project binding, worker and merge lifecycle), `admin/` (React console reusing `web/src/tokens.css`), and `deploy/team/` (self-host configuration). `docs/team-cloud/protocol.md` records current commands and remaining delivery boundaries.
+
+- Project Wiki `lwc-team-cloud` owns the verified team-memory architecture, core-sync scope, identity/recovery boundaries, public bilingual guide links and acceptance entry point. Public user guides are `Team-Memory` and `Team-Memory-zh-CN` in the GitHub Wiki.

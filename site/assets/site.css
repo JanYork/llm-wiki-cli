@@ -1017,3 +1017,6 @@ h3 {
     stroke-dashoffset: 0;
   }
 }
+
+/* Keep team guidance readable at wide desktop sizes. */
+#team-memory p { max-width: 72ch; }
