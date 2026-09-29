@@ -171,7 +171,7 @@ pub(super) fn read_record(path: &Path) -> Result<SpaceRecord> {
     Ok(record)
 }
 pub(super) fn records() -> Result<Vec<(PathBuf, SpaceRecord)>> {
-    let accounts = crate::scope::global_lwc_root()?.join("team/accounts");
+    let accounts = super::team_root()?.join("accounts");
     let mut output = vec![];
     if !accounts.exists() {
         return Ok(output);
@@ -482,7 +482,7 @@ pub(crate) fn join_space(
 }
 
 fn bindings_file() -> Result<PathBuf> {
-    let root = crate::scope::global_lwc_root()?.join("team/bindings");
+    let root = super::team_root()?.join("bindings");
     Ok(match selected_principal()?.and_then(|p| p.agent_id) {
         Some(agent) => root.join(agent).join("projects.json"),
         None => root.join("projects.json"),

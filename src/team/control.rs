@@ -77,6 +77,7 @@ pub(crate) fn initialize(directory: &Path, admin_email: &str, name: &str) -> Res
     let email = normalize_email(admin_email)?;
     let name = label(name)?;
     super::private_directory(directory)?;
+    let directory = &std::fs::canonicalize(directory)?;
     let mut conn = Connection::open(directory.join("control.db"))?;
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch(

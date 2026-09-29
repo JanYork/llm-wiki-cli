@@ -53,13 +53,21 @@ fn origin(input: &str) -> Result<String> {
     Ok(url.origin().ascii_serialization())
 }
 
+fn team_root() -> Result<PathBuf> {
+    let root = crate::scope::global_lwc_root()?;
+    // Canonical Windows paths retain the extended-length prefix for SQLite.
+    // Resolve only the existing home, without creating local memory for cloud reads.
+    #[cfg(windows)]
+    let root = fs::canonicalize(root.parent().unwrap())?.join(root.file_name().unwrap());
+    Ok(root.join("team"))
+}
+
 fn account_file(server: &str) -> Result<PathBuf> {
     let key: String = Sha256::digest(server.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    Ok(crate::scope::global_lwc_root()?
-        .join("team")
+    Ok(team_root()?
         .join("accounts")
         .join(key)
         .join("credentials.json"))

@@ -161,6 +161,7 @@ pub(crate) fn run(path: &Path) -> Result<Value> {
         *assets = path.parent().unwrap_or(Path::new(".")).join(&*assets);
     }
     super::private_directory(&config.data)?;
+    config.data = std::fs::canonicalize(&config.data)?;
     let _lifecycle_lock = super::backup::offline_lock(&config.data)?;
     control::open(&config.data)?;
     super::access::initialize(&config.data)?;
