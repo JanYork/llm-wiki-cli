@@ -1,6 +1,6 @@
 # 团队用户体验验收（2026-09-29）
 
-状态：候选实现仍在验收，未发布 0.19.0。用户于本轮明确暂免邮件验证码、飞书及 GitHub 实际登录验收；豁免不等于验证通过。其余列明缺口继续补齐并验收。
+状态：当前候选为 0.19.2，正式发布检查进行中；0.19.0 和 0.19.1 均未完成发布。用户于本轮明确暂免邮件验证码、飞书及 GitHub 实际登录验收；豁免不等于验证通过。其余列明缺口继续补齐并验收。
 
 ## 环境与证据边界
 
@@ -112,3 +112,14 @@ Pro 全核心合成 fixture 经普通个人密钥登录和真实 HTTP/CLI 传输
 最终 macOS arm64 安装包解压后，在隔离目录完成初始化、配置和图谱状态读取；Linux arm64 安装包解压后在 Linux 容器执行版本回读。管理端静态包、npm 安装器包与可导入 Docker 镜像同时打包，附 SHA-256 清单。npm 安装器自身 10 项回归通过，但安装器仍依赖相应版本的公开 GitHub 平台资产。
 
 候选制品保存在忽略目录 `.tmp/team-design/artifacts/`，源码状态和文件摘要单独记录。GitHub 正式版本、六平台完整发布、npm/crates.io/Homebrew 渠道发布不能由这些双平台候选验收代替；本轮没有发布正式标签。2026-09-29 再次调用 npm whoami 仍返回 E401。邮件验证码、飞书/GitHub 实际登录按用户要求暂免。
+
+
+## 正式发行中的 Windows 权限回归（2026-09-29）
+
+v0.19.1 的发行前检查、Linux 两种架构与 macOS ARM64 原生检查通过；Windows x64/ARM64 各有7项测试在共用 private_directory 入口失败。失败不是权限检查过严，而是从 PowerShell 7 经 Rust 子进程启动 Windows PowerShell 时，继承的 PSModulePath 导致系统 Microsoft.PowerShell.Security 模块无法加载。
+
+通过独立的 Windows 子进程权限检查确认：直接由 pwsh 调用会自动清理环境，不能代表 Rust 路径；按 Rust 的直接子进程环境复现后，两个 Windows 架构均失败（任务36553611262）。修复在 powershell.exe 子进程上移除 PSModulePath，保留原有当前用户独占的保护 DACL；两个架构定向检查均通过（任务36553895451），包含字面量含空格/方括号路径、单一当前用户授权、禁止继承、写入以及重复设置。
+
+微软协议说明：https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_psmodulepath?view=powershell-7.6 。完整原生 Rust 回归仍由 v0.19.2 正式发行门禁验证，定向脚本成功不冒充该门禁成功。
+
+官网已采用静态双语后台视觉风格，桌面与390像素布局、语言切换、复制完整安装说明通过；C为品牌蓝色、菜单无边框图标、Favicon复用仓库正式透明品牌图片。线上已回读，Favicon与品牌源图片字节一致。14项页面检查通过；邮件、飞书、GitHub真实登录继续按用户要求暂免。
