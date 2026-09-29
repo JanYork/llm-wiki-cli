@@ -7,6 +7,8 @@ pub(crate) mod lease;
 mod policy;
 mod query;
 mod server;
+#[cfg(windows)]
+mod windows_permissions;
 pub(crate) use identity::{DeviceProfile, IdentityRegistration};
 pub(crate) use query::CloudQuery;
 
@@ -40,28 +42,19 @@ pub(crate) fn private_directory(path: &std::path::Path) -> crate::error::Result<
     }
     #[cfg(windows)]
     {
-        use std::{os::windows::fs::MetadataExt, process::Command};
+        use std::os::windows::fs::MetadataExt;
         if metadata.file_attributes() & 0x400 != 0 {
             return Err(AppError::new(
                 "unsafe_private_directory",
                 "private data directory cannot be a reparse point",
             ));
         }
-        // Apply an explicit user-only DACL before creating credentials or sessions.
-        // A static script and an environment argument avoid shell interpolation.
-        let script = "$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); $acl.AddAccessRule($rule); Set-Acl -LiteralPath $env:LWC_PRIVATE_DIRECTORY -AclObject $acl";
-        let result = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            // A PS7 parent otherwise makes Windows PowerShell load incompatible modules.
-            .env_remove("PSModulePath")
-            .env("LWC_PRIVATE_DIRECTORY", path)
-            .output()?;
-        if !result.status.success() {
-            return Err(AppError::new(
+        windows_permissions::restrict(path).map_err(|_| {
+            AppError::new(
                 "private_directory_acl_failed",
                 "could not restrict the data directory to the current user",
-            ));
-        }
+            )
+        })?;
         let _ = existed;
     }
     Ok(())

@@ -16,31 +16,51 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - name: Verify private directory permissions
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify native private directory permissions and latency
         shell: pwsh
         run: |
-          $source = Get-Content src/team/mod.rs -Raw
-          $script = [regex]::Match($source, 'let script = "([^"\r\n]+)";').Groups[1].Value
-          if (!$script) { throw 'Private directory script not found' }
-          $env:LWC_PRIVATE_DIRECTORY = Join-Path $env:RUNNER_TEMP 'lwc-private [acl] regression'
-          New-Item -ItemType Directory -Path $env:LWC_PRIVATE_DIRECTORY -Force | Out-Null
-          # Match Rust's direct child process, without pwsh's native-command environment cleanup.
-          $start = [System.Diagnostics.ProcessStartInfo]::new('powershell.exe')
-          $start.UseShellExecute = $false
-          $start.RedirectStandardOutput = $true
-          $start.RedirectStandardError = $true
-          $start.Arguments = '-NoProfile -NonInteractive -Command "' + $script + '"'
-          if ($source.Contains('.env_remove("PSModulePath")')) { [void]$start.Environment.Remove('PSModulePath') }
-          $process = [System.Diagnostics.Process]::Start($start)
-          $stderr = $process.StandardError.ReadToEnd()
-          $stdout = $process.StandardOutput.ReadToEnd()
-          $process.WaitForExit()
-          Write-Output $stdout
-          if ($process.ExitCode -ne 0) { throw $stderr }
-          $acl = Get-Acl -LiteralPath $env:LWC_PRIVATE_DIRECTORY
-          $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-          $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
-          if (!$acl.AreAccessRulesProtected -or $rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid -or $rules[0].AccessControlType -ne 'Allow') { throw 'Directory is not user-only' }
-          Set-Content -LiteralPath (Join-Path $env:LWC_PRIVATE_DIRECTORY 'probe.txt') -Value 'fixture'
-          & powershell.exe -NoProfile -NonInteractive -Command $script
-          if ($LASTEXITCODE -ne 0) { throw 'Repeated private directory call failed' }
+          $fixture = Join-Path $env:RUNNER_TEMP 'acl-check'
+          New-Item -ItemType Directory -Path "$fixture/src" -Force | Out-Null
+          Copy-Item src/team/windows_permissions.rs "$fixture/src/windows_permissions.rs"
+          $dependency = (Get-Content Cargo.toml | Where-Object { $_ -match '^windows-sys = ' })
+          @"
+          [package]
+          name = "acl-check"
+          version = "0.0.0"
+          edition = "2024"
+          [dependencies]
+          $dependency
+          "@ | Set-Content "$fixture/Cargo.toml"
+          @'
+          mod windows_permissions;
+          fn main() {
+              let path = std::path::PathBuf::from(std::env::args_os().nth(1).unwrap());
+              let start = std::time::Instant::now();
+              for _ in 0..100 { windows_permissions::restrict(&path).unwrap(); }
+              println!("100 ACL applications: {:?}", start.elapsed());
+              assert!(start.elapsed() < std::time::Duration::from_secs(5));
+              assert!(windows_permissions::restrict(&path.join("missing")).is_err());
+              assert!(windows_permissions::restrict(std::path::Path::new("invalid\0path")).is_err());
+              std::fs::write(path.join("probe.txt"), "fixture").unwrap();
+          }
+          '@ | Set-Content "$fixture/src/main.rs"
+          $path = Join-Path $env:RUNNER_TEMP 'lwc-private [acl] regression'
+          New-Item -ItemType Directory -Path $path -Force | Out-Null
+          cargo build --manifest-path "$fixture/Cargo.toml" --release
+          if ($LASTEXITCODE -ne 0) { throw 'Native ACL fixture build failed' }
+          for ($attempt = 0; $attempt -lt 2; $attempt++) {
+            # Prove a later external broad grant is removed too, not cached away.
+            if ($attempt -eq 1) {
+              $acl = Get-Acl -LiteralPath $path
+              $rule = [System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'), 'Read', 'Allow')
+              $acl.AddAccessRule($rule)
+              Set-Acl -LiteralPath $path -AclObject $acl
+            }
+            & "$fixture/target/release/acl-check.exe" $path
+            if ($LASTEXITCODE -ne 0) { throw 'Native ACL regression failed' }
+            $acl = Get-Acl -LiteralPath $path
+            $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+            if (!$acl.AreAccessRulesProtected -or $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid -or $rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid -or $rules[0].AccessControlType -ne 'Allow' -or $rules[0].FileSystemRights -ne 'FullControl' -or $rules[0].InheritanceFlags -ne 'ContainerInherit, ObjectInherit') { throw 'Directory is not user-only with child inheritance' }
+          }
