@@ -70,7 +70,7 @@ fn spawn(root: &Path, id: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn disable_standard_handle_inheritance() -> Result<()> {
+pub(crate) fn disable_standard_handle_inheritance() -> Result<()> {
     use std::ffi::c_void;
 
     const STD_INPUT_HANDLE: u32 = -10_i32 as u32;
@@ -95,7 +95,7 @@ fn disable_standard_handle_inheritance() -> Result<()> {
             return Err(AppError::new(
                 "work_spawn_failed",
                 format!(
-                    "failed to detach Work standard handles: {}",
+                    "failed to detach background process standard handles: {}",
                     io::Error::last_os_error()
                 ),
             ));

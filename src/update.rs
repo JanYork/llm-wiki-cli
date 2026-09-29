@@ -94,6 +94,8 @@ pub(crate) fn spawn_checker() -> io::Result<()> {
         run_checker();
         return Ok(());
     }
+    #[cfg(windows)]
+    crate::work::disable_standard_handle_inheritance().map_err(io::Error::other)?;
     let mut command = Command::new(env::current_exe()?);
     command
         .arg("__update-check")

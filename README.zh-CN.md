@@ -39,7 +39,7 @@ LWC 把经过筛选的文档转化为可长期维护的 Wiki。Agent 负责理�
   <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-overview-zh.png" alt="LWC 产品概览" width="820">
 </p>
 
-## 自建团队记忆 — v0.19.2
+## 自建团队记忆 — v0.19.3
 
 团队空间将核心记忆保留在本地 SQLite 与 Wiki，再由 LWC 自动双向同步。
 外部智能体通过命令行或工具接口处理冲突，程序不内嵌模型。团队界面支持中英文，
@@ -50,7 +50,7 @@ LWC 把经过筛选的文档转化为可长期维护的 Wiki。Agent 负责理�
 和[访问及恢复设计](docs/team-cloud/access-policy-recovery.md)。邮箱验证码、飞书和
 代码托管账号登录所需配置由部署者提供。
 
-使用自动生成的个人密钥登录并选择有权访问的空间；开通成员时可同时授予初始空间权限。知识页支持受权限保护的分享链接和正文知识跳转。[团队版指南](https://github.com/JanYork/llm-wiki-cli/wiki/Team-Memory-zh-CN) · [版本说明](docs/releases/v0.19.2.md)。
+使用自动生成的个人密钥登录并选择有权访问的空间；开通成员时可同时授予初始空间权限。知识页支持受权限保护的分享链接和正文知识跳转。[团队版指南](https://github.com/JanYork/llm-wiki-cli/wiki/Team-Memory-zh-CN) · [版本说明](docs/releases/v0.19.3.md)。
 
 ## LWC 是 Agent 记忆，不是 RAG
 

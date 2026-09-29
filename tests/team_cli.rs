@@ -274,7 +274,7 @@ fn team_server_bootstrap_and_http_boundaries() {
             let joined_agent=delegated_run(&["space","join",space_id,"--server",&origin,"--manual"]);
             assert!(joined_agent.status.success(),"{}",String::from_utf8_lossy(&joined_agent.stderr));
             let read_only:Value=serde_json::from_slice(&joined_agent.stdout).unwrap();assert_eq!(read_only["role"],"viewer");
-            assert!(read_only["database"].as_str().unwrap().contains("/agents/"));
+            assert!(std::path::Path::new(read_only["database"].as_str().unwrap()).components().any(|part|part.as_os_str()=="agents"));
             let same_home=Command::new(env!("CARGO_BIN_EXE_lwc")).current_dir(temp.path()).env("HOME",&home).env("USERPROFILE",&home).env_remove("LWC_PROJECT_ROOT").env("LWC_TEAM_CREDENTIALS_FILE",&delegated_file).args(["space","join",space_id,"--server",&origin,"--manual"]).output().unwrap();
             assert!(same_home.status.success(),"{}",String::from_utf8_lossy(&same_home.stderr));
             let isolated:Value=serde_json::from_slice(&same_home.stdout).unwrap();

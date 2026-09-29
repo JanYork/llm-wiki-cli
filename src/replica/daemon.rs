@@ -45,6 +45,8 @@ pub(crate) fn start_worker(space: &str) -> Result<()> {
         Err(error) if error.code == "worker_running" => return Ok(()),
         Err(error) => return Err(error),
     }
+    #[cfg(windows)]
+    crate::work::disable_standard_handle_inheritance()?;
     let mut command = Command::new(std::env::current_exe()?);
     command
         .args(["space", "watch", &reference(&directory, &record)])
