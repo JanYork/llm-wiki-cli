@@ -22,3 +22,6 @@ __pycache__/
 /deploy/team/.env
 /deploy/team/data/
 /deploy/team/backups/
+
+# Generated release archives and staging directories.
+/dist/
