@@ -41,6 +41,6 @@ jobs:
           $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
           $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
           if (!$acl.AreAccessRulesProtected -or $rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid -or $rules[0].AccessControlType -ne 'Allow') { throw 'Directory is not user-only' }
-          Set-Content (Join-Path $env:LWC_PRIVATE_DIRECTORY 'probe.txt') 'fixture'
+          Set-Content -LiteralPath (Join-Path $env:LWC_PRIVATE_DIRECTORY 'probe.txt') -Value 'fixture'
           & powershell.exe -NoProfile -NonInteractive -Command $script
           if ($LASTEXITCODE -ne 0) { throw 'Repeated private directory call failed' }
