@@ -24,8 +24,18 @@ jobs:
           if (!$script) { throw 'Private directory script not found' }
           $env:LWC_PRIVATE_DIRECTORY = Join-Path $env:RUNNER_TEMP 'lwc-private-acl-regression'
           New-Item -ItemType Directory -Path $env:LWC_PRIVATE_DIRECTORY -Force | Out-Null
-          & powershell.exe -NoProfile -NonInteractive -Command $script
-          if ($LASTEXITCODE -ne 0) { throw 'Private directory script failed' }
+          # Match Rust's direct child process, without pwsh's native-command environment cleanup.
+          $start = [System.Diagnostics.ProcessStartInfo]::new('powershell.exe')
+          $start.UseShellExecute = $false
+          $start.RedirectStandardOutput = $true
+          $start.RedirectStandardError = $true
+          $start.Arguments = '-NoProfile -NonInteractive -Command "' + $script + '"'
+          $process = [System.Diagnostics.Process]::Start($start)
+          $stderr = $process.StandardError.ReadToEnd()
+          $stdout = $process.StandardOutput.ReadToEnd()
+          $process.WaitForExit()
+          Write-Output $stdout
+          if ($process.ExitCode -ne 0) { throw $stderr }
           $acl = Get-Acl -LiteralPath $env:LWC_PRIVATE_DIRECTORY
           $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
           $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
