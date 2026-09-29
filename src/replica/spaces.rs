@@ -389,7 +389,7 @@ pub(super) fn save_baseline(
     for (source, name) in [(local, "local.db"), (remote, "remote.db")] {
         let path = root.join(name);
         fs::copy(source, &path)?;
-        fs::File::open(path)?.sync_all()?;
+        fs::OpenOptions::new().write(true).open(path)?.sync_all()?;
     }
     #[cfg(unix)]
     fs::File::open(&root)?.sync_all()?;

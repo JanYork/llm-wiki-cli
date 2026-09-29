@@ -306,7 +306,10 @@ async fn tick(
             ));
             if !saved.exists() {
                 fs::copy(&active, &saved)?;
-                fs::File::open(&saved)?.sync_all()?;
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&saved)?
+                    .sync_all()?;
             }
             fs::remove_file(active)?;
         }
@@ -424,7 +427,10 @@ async fn tick(
             save_pending(&root, &pending)?;
         } else if pending.digest == pending.remote_head["digest"].as_str().unwrap_or("") {
             fs::copy(file(&root, &pending.merged), root.join("accepted.db"))?;
-            fs::File::open(root.join("accepted.db"))?.sync_all()?;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(root.join("accepted.db"))?
+                .sync_all()?;
             pending.accepted = Some(pending.remote_head.clone());
             save_pending(&root, &pending)?;
         } else {
@@ -552,7 +558,10 @@ async fn tick(
             }
             // Preserve the exact remote-accepted snapshot independently of later local rebases.
             fs::copy(file(&root, &pending.merged), root.join("accepted.db"))?;
-            fs::File::open(root.join("accepted.db"))?.sync_all()?;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(root.join("accepted.db"))?
+                .sync_all()?;
             let receipt=request_json(client.post(format!("{endpoint}/push")).bearer_auth(&credentials.access_token).json(&json!({"protocol":"lwc-team-sync/1","share_schema":1,"server_epoch":pending.remote_head["server_epoch"],"expected_head":pending.remote_head["head"],"replica_id":record.replica_id,"batch_id":pending.batch,"artifact_id":artifact,"payload_digest":pending.digest}))).await;
             let receipt = match receipt {
                 Ok(receipt) => receipt,
@@ -820,7 +829,10 @@ pub(crate) fn resolve_space_json(
     } else {
         sync_state_digest(&target)?
     };
-    fs::File::open(&target)?.sync_all()?;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&target)?
+        .sync_all()?;
     save_credentials(
         &root.join(format!("{merged}.resolution.json")),
         &json!({"session":session,"previous_digest":digest,"resolution":resolution}),

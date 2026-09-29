@@ -64,3 +64,24 @@ jobs:
             $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
             if (!$acl.AreAccessRulesProtected -or $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid -or $rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid -or $rules[0].AccessControlType -ne 'Allow' -or $rules[0].FileSystemRights -ne 'FullControl' -or $rules[0].InheritanceFlags -ne 'ContainerInherit, ObjectInherit') { throw 'Directory is not user-only with child inheritance' }
           }
+
+  team:
+    name: Team HTTP and CLI (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      RUST_TEST_THREADS: "2"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-codegraph
+      - name: Team identity, policy and HTTP roundtrip
+        run: cargo test --locked --bin lwc team::
+      - name: Team CLI sync and recovery
+        run: cargo test --locked --test team_cli

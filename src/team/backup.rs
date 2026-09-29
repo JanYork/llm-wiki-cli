@@ -38,7 +38,7 @@ fn copy_tree(source: &Path, target: &Path) -> Result<()> {
             copy_tree(&entry.path(), &path)?;
         } else if kind.is_file() {
             fs::copy(entry.path(), &path)?;
-            fs::File::open(&path)?.sync_all()?;
+            fs::OpenOptions::new().write(true).open(&path)?.sync_all()?;
         } else {
             return Err(AppError::new(
                 "unsafe_backup",
@@ -168,7 +168,10 @@ pub(crate) fn snapshot(source: &Path, output: &Path, authority: Option<&Path>) -
     }
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
     fs::write(target.join("backup.complete"), b"lwc-team-backup/1\n")?;
-    fs::File::open(target.join("backup.complete"))?.sync_all()?;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(target.join("backup.complete"))?
+        .sync_all()?;
     Ok(
         json!({"data":target,"restored":restore,"backed_up":!restore,"spaces":spaces.len(),"source_preserved":true}),
     )

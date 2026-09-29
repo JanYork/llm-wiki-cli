@@ -120,7 +120,7 @@ pub(super) async fn space_operation<T: Send + 'static>(
             let artifact = control::token()?;
             let path = directory.join("snapshots").join(&artifact);
             let exported = store.export_sync_state(&path)?;
-            fs::File::open(&path)?.sync_all()?;
+            fs::OpenOptions::new().write(true).open(&path)?.sync_all()?;
             #[cfg(unix)]
             fs::File::open(directory.join("snapshots"))?.sync_all()?;
             store.initialize_team_artifact(&artifact, &exported.state_digest)?;
@@ -509,7 +509,7 @@ async fn push(
         if !normalized.exists() {
             quota(directory,fs::metadata(&baseline)?.len().saturating_add(transfer.size),limit)?;
             crate::store::apply_sync_transfer_artifact(Some(&baseline),&directory.join("uploads").join(&input.artifact_id),&transfer,&normalized)?;
-            fs::File::open(&normalized)?.sync_all()?;
+            fs::OpenOptions::new().write(true).open(&normalized)?.sync_all()?;
             #[cfg(unix)] fs::File::open(directory.join("snapshots"))?.sync_all()?;
         } else if crate::store::sync_state_digest(&normalized)?!=input.payload_digest {return Err(AppError::new("sync_checksum_mismatch","previous reconstruction digest differs"));}
         store.reject_revoked_images(&normalized)?;
@@ -716,7 +716,10 @@ mod tests {
             let server=tokio::spawn(async move{axum::serve(listener,routes().with_state(state)).await.unwrap();});
             let root=format!("{origin}/api/spaces/{space}");
             let registration=json!({"device":"A","device_id":"1".repeat(64)});
-            let registered:Value=client.post(format!("{root}/replicas")).bearer_auth(&secret).json(&registration).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+            let response=client.post(format!("{root}/replicas")).bearer_auth(&secret).json(&registration).send().await.unwrap();
+            let status=response.status(); let body=response.text().await.unwrap();
+            assert!(status.is_success(), "registration returned {status}: {body}");
+            let registered:Value=serde_json::from_str(&body).unwrap();
             let repeated:Value=client.post(format!("{root}/replicas")).bearer_auth(&secret).json(&registration).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
             assert_eq!(registered["replica_id"],repeated["replica_id"]);
             let reservation=json!({"replica_id":registered["replica_id"],"request_id":"2".repeat(64),"transfer":transfer});

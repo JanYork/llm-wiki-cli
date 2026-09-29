@@ -235,7 +235,7 @@ pub(super) async fn execute(
                 preview.digest=resolve_sync_conflicts(&path,&batch,&resolution)?;
                 preview.conflicts.drain(..batch.len());
                 if preview.conflicts.is_empty(){preview.digest=cleanup_sync_conflict_candidates(&path)?;authorize(tx,actor,&target,&artifact(directory,&preview.head)?,&path)?;}
-                fs::File::open(path)?.sync_all()?;
+                fs::OpenOptions::new().write(true).open(path)?.sync_all()?;
                 preview.candidate=candidate;save(&root,&preview)?;Ok(response(&preview))
             }
             RecoveryQuery::Apply{preview_id,digest,request_id}=>{
@@ -253,7 +253,7 @@ pub(super) async fn execute(
                 let bad=store.team_commit_at(preview.revert_head)?;
                 let rejected=rejected_images(&artifact(directory,&bad["parent"])?,&artifact(directory,&json!({"artifact_id":bad["artifact_id"],"digest":bad["accepted_digest"]}))?,&candidate)?;
                 hub::quota(directory,fs::metadata(&candidate)?.len(),capacity)?;
-                let artifact_id=control::token()?;let published=directory.join("snapshots").join(&artifact_id);fs::copy(&candidate,&published)?;fs::File::open(&published)?.sync_all()?;
+                let artifact_id=control::token()?;let published=directory.join("snapshots").join(&artifact_id);fs::copy(&candidate,&published)?;fs::OpenOptions::new().write(true).open(&published)?.sync_all()?;
                 #[cfg(unix)] fs::File::open(directory.join("snapshots"))?.sync_all()?;
                 let commit=TeamCommit{epoch:head["server_epoch"].as_str().unwrap().into(),expected_head:head["head"].as_u64().unwrap(),actor:actor.into(),principal:json!(super::delegation::current(tx)?),recovery:Some(json!({"revert_head":preview.revert_head,"preview_id":preview.id,"rejected_images":rejected})),replica_id:preview_id.clone(),batch_id:request_id.clone(),artifact_id,payload_digest:digest};
                 store.publish_team_state(&published,&store.identity()?,&commit)?;
