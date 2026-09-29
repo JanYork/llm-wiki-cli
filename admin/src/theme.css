@@ -1,0 +1,27 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import '../../web/src/tokens.css';
+@theme inline {
+  --color-background: var(--color-canvas);
+  --color-foreground: var(--color-body-strong);
+  --color-card: var(--color-surface-card);
+  --color-card-foreground: var(--color-body-strong);
+  --color-popover: var(--color-surface-card);
+  --color-popover-foreground: var(--color-body-strong);
+  --color-primary: #005cff;
+  --color-primary-foreground: #fff;
+  --color-secondary: var(--color-surface-soft);
+  --color-secondary-foreground: var(--color-body-strong);
+  --color-muted: #f1f3f8;
+  --color-muted-foreground: #737d89;
+  --color-accent: #edf3ff;
+  --color-accent-foreground: #0046c3;
+  --color-destructive: #b42318;
+  --color-border: var(--color-hairline);
+  --color-input: var(--color-hairline);
+  --color-ring: var(--color-focus);
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+}

@@ -1,0 +1,22 @@
+{
+  // Run `lwc server init --data ./data --admin-email you@example.com` first.
+  // Relative data paths resolve against this configuration file.
+  "data": "./data",
+  // Build with `npm --prefix admin ci && npm --prefix admin run build`.
+  "admin_assets": "../../admin/dist",
+  "listen": "127.0.0.1:8787",
+  "public_url": "https://memory.example.com",
+
+  // Providers stay hidden when null. Enable only after setting their environment
+  // variables; literal secrets do not belong in this file or the management API.
+  "smtp": null,
+  // "smtp": {
+  //   "host": "smtp.example.com", "port": 587,
+  //   "from": "LWC <noreply@example.com>", "username": "noreply@example.com",
+  //   "password_env": "LWC_SMTP_PASSWORD"
+  // },
+  "github": null,
+  // "github": { "client_id": "YOUR_CLIENT_ID", "client_secret_env": "LWC_GITHUB_SECRET" },
+  "feishu": null
+  // "feishu": { "client_id": "YOUR_APP_ID", "client_secret_env": "LWC_FEISHU_SECRET" }
+}

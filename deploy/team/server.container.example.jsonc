@@ -1,0 +1,9 @@
+{
+  "data": "/data",
+  "admin_assets": "/opt/lwc/admin",
+  "listen": "0.0.0.0:8787",
+  "public_url": "https://memory.example.com",
+  "smtp": null,
+  "github": null,
+  "feishu": null
+}

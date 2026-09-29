@@ -2518,6 +2518,7 @@ rg '^[[:space:]]*[[fenced-fake]]'
             "draft_intent": [],
             "ingest": [],
             "memory": [],
+            "memory_audit": [],
             "meta": [],
             "page": [],
             "plan": [],
@@ -2525,6 +2526,7 @@ rg '^[[:space:]]*[[fenced-fake]]'
             "retrieval_weight": [],
             "semantic_relation": [],
             "source": [],
+            "source_revision": [],
             "tag": [],
             "todo": [],
             "work_audit": []
@@ -3169,16 +3171,23 @@ rg '^[[:space:]]*[[fenced-fake]]'
             "todo",
             "plan",
             "memory",
+            "discussion",
         ] {
-            let base = SyncObjectRow {
-                payload: json!({"value": "base", "updated_at": "2026-01-01T00:00:00Z"}),
+            let row = |value: &str, updated: &str| {
+                let mut payload = json!({"value":value,"updated_at":updated});
+                if kind == "memory" {
+                    // Temporal merges now recompute derived fields from the complete event.
+                    payload.as_object_mut().unwrap().extend(json!({
+                        "type":"observation","context":"test","occurred_at":"2026-01-01T00:00:00Z",
+                        "pinned":false,"observed":[],"decision":[],"constraints":[],"learned":[],
+                        "unresolved":[],"outcome":[],"changes":[],"evidence":[],"relations":[]
+                    }).as_object().unwrap().clone());
+                }
+                SyncObjectRow { payload }
             };
-            let local = SyncObjectRow {
-                payload: json!({"value": "local", "updated_at": "2026-01-02T00:00:00Z"}),
-            };
-            let remote = SyncObjectRow {
-                payload: json!({"value": "remote", "updated_at": "2026-01-03T00:00:00Z"}),
-            };
+            let base = row("base", "2026-01-01T00:00:00Z");
+            let local = row("local", "2026-01-02T00:00:00Z");
+            let remote = row("remote", "2026-01-03T00:00:00Z");
             let mut conflicts = Vec::new();
             merge_sync_object_directional(
                 kind,
@@ -3193,7 +3202,7 @@ rg '^[[:space:]]*[[fenced-fake]]'
             .unwrap();
             assert_eq!(
                 !conflicts.is_empty(),
-                matches!(kind, "page" | "todo" | "plan" | "memory"),
+                matches!(kind, "page" | "todo" | "plan" | "memory" | "discussion"),
                 "unexpected resolver coverage for {kind}"
             );
         }
@@ -4784,4 +4793,176 @@ rg '^[[:space:]]*[[fenced-fake]]'
         assert_eq!(error.code, "sync_state_invalid");
         assert!(error.message.contains("schema"));
     }
+    #[test]
+    fn replica_core_history_roundtrip_is_complete_and_does_not_echo() {
+        let temp = tempdir().unwrap();
+        let mut source = populated_sync_source();
+        let mut tables=source.conn.prepare("SELECT name FROM pragma_table_list WHERE schema='main' AND type='table' AND name NOT LIKE 'sqlite_%'").unwrap();
+        for table in tables.query_map([],|r|r.get::<_,String>(0)).unwrap() {
+            let table=table.unwrap();
+            let disposition=match table.as_str() {
+                "sources"|"pages"|"page_sources"|"page_provenance"|"tags"|"page_tags"|
+                "semantic_relations"|"ingest_jobs"|"retrieval_weights"|"retrieval_feedback"|
+                "memory_events"|"memory_fragments"|"memory_changes"|"memory_evidence"|
+                "memory_relations"|"memory_feedback"|"todo_items"|"todo_tags"|
+                "plans"|"plan_tags"|"plan_constraints"|"plan_steps"|"plan_history"|
+                "discussions"|"discussion_revisions"|"replica_history"=>"replicated",
+                "source_path_revisions"|"operations"|"meta"=>"portable semantic projection",
+                "links"|"search_spans"|"memory_state"=>"derived from replicated content",
+                "agent_plan_tracks"|"agent_todo_tracks"|"discussion_bindings"|"memory_hint_state"|"changesets"=>"local execution authority",
+                _=>panic!("unclassified core table {table}: define its replication contract"),
+            };
+            assert!(!disposition.is_empty());
+        }
+        drop(tables);
+        source.conn.execute_batch("INSERT INTO source_path_revisions(tracked_path,revision,source_id,observed_at) SELECT '/private/local/guide.md',1,id,'2026-09-28T00:00:00.000Z' FROM sources LIMIT 1;
+            INSERT INTO memory_feedback(event_id,signal,reason) SELECT id,'useful','keep this evidence' FROM memory_events LIMIT 1;
+            INSERT INTO memory_changes(event_id,ordinal,subject,before_value,after_value) SELECT id,0,'sync','manual','automatic' FROM memory_events LIMIT 1;
+            INSERT INTO memory_evidence(event_id,ordinal,reference,excerpt) SELECT id,0,'wiki:sync-guide','source-backed' FROM memory_events LIMIT 1;
+            INSERT INTO memory_relations(event_id,ordinal,relation_type,target_event_id,basis) SELECT id,0,'related',id,'same observation' FROM memory_events LIMIT 1;
+            INSERT INTO retrieval_feedback(query_fingerprint,target_type,target_identifier,provenance,signal,reason) VALUES(printf('%064d',1),'page','sync-guide','agent-observed',1,'useful citation');").unwrap();
+        source.discussion_apply(serde_json::from_value(json!({
+            "id":"replica-discussion", "context":format!("lwcctx-v1-{}","1".repeat(64)),
+            "request_id":"start", "if_revision":0,
+            "operations":[{"op":"start","text":"Replica design"},
+              {"op":"question","id":"q1","text":"Which store?"},
+              {"op":"answer","id":"a1","parent":"q1","text":"Local SQLite"}]
+        })).unwrap()).unwrap();
+        let first=temp.path().join("a.db");
+        source.export_sync_state(&first).unwrap();
+        let before=load_sync_objects(&first).unwrap();
+        for kind in ["page","source","tag","ingest","retrieval_weight","retrieval_feedback","semantic_relation",
+                     "memory","todo","plan","discussion","source_revision","memory_audit"] {
+            assert!(before.keys().any(|(k,_)|k==kind),"missing core kind {kind}");
+        }
+        assert!(!std::fs::read(&first).unwrap().windows(b"/private/local/guide.md".len()).any(|w|w==b"/private/local/guide.md"));
+        let mut target=test_store();
+        target.publish_sync_state(&first,&target.identity().unwrap(),"replica-roundtrip").unwrap();
+        let second=temp.path().join("b.db");
+        target.export_sync_state(&second).unwrap();
+        let after=load_sync_objects(&second).unwrap();
+        assert_eq!(before,after,"re-export must not invent histories or lose semantic fields");
+        assert_eq!(target.conn.query_row("SELECT COUNT(*) FROM discussion_bindings",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(target.conn.query_row("SELECT COUNT(*) FROM source_path_revisions",[],|r|r.get::<_,i64>(0)).unwrap(),0,"remote provenance must not create a local path subscription");
+        source.publish_sync_state(&second,&source.identity().unwrap(),"return-to-a").unwrap();
+        let third=temp.path().join("a-return.db");
+        source.export_sync_state(&third).unwrap();
+        assert_eq!(after,load_sync_objects(&third).unwrap(),"returning history must deduplicate");
+        // The fixture contains synthetic data only and can be reused by the HTTP/CLI acceptance journey.
+        println!("CORE_FIXTURE_PROJECT={}", std::path::Path::new(source.conn.path().unwrap()).parent().unwrap().parent().unwrap().display());
+    }
+
+    #[test]
+    fn replica_viewer_rejects_writes_without_partial_changes() {
+        let mut store = test_store();
+        store.bind_team_space(&"a".repeat(64), &"b".repeat(64)).unwrap();
+        store.set_replica_role("viewer").unwrap();
+        let before = store.identity().unwrap();
+        let error = store.page_put(PagePutInput {
+            slug:"denied".into(), title:"Denied".into(), kind:None, summary:None,
+            body:"Do not persist".into(), source_ids:vec![], provenance:vec!["agent-observed".into()],
+        }).unwrap_err();
+        assert_eq!(error.code,"space_read_only");
+        let input = serde_json::from_value(json!({
+            "id":"denied", "context":format!("lwcctx-v1-{}","1".repeat(64)),
+            "request_id":"denied-start", "if_revision":0,
+            "operations":[{"op":"start","text":"Do not persist"}]
+        })).unwrap();
+        assert_eq!(store.discussion_apply(input).unwrap_err().code,"space_read_only");
+        assert_eq!(store.identity().unwrap(),before);
+        for table in ["pages","discussions","discussion_revisions"] {
+            assert_eq!(store.conn.query_row(&format!("SELECT COUNT(*) FROM {table}"),[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        }
+        validate_changeset_table_inventory(&store.conn,"main").unwrap();
+    }
+
+    #[test]
+    fn replica_retention_never_evicts_offline_memory() {
+        let mut store=populated_sync_source();
+        store.conn.execute("INSERT INTO meta VALUES('replica_space','space-test')",[]).unwrap();
+        store.conn.execute("UPDATE memory_events SET pinned=0,occurred_at='2000-01-01T00:00:00.000Z'",[]).unwrap();
+        let tx=store.conn.transaction().unwrap();
+        enforce_memory_retention(&tx,1,1024,None,true).unwrap();
+        assert_eq!(tx.query_row("SELECT COUNT(*) FROM memory_events",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(enforce_memory_retention(&tx,1,1,None,true).unwrap_err().code,"memory_capacity_exceeded");
+        assert_eq!(tx.query_row("SELECT COUNT(*) FROM memory_events",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[test]
+    fn replica_v2_merge_accepts_new_body_and_rejects_stale_or_missing_evidence() {
+        let temp=tempdir().unwrap();
+        let mut source=test_store();
+        source.page_put(PagePutInput {slug:"guide".into(),title:"Guide".into(),kind:None,summary:None,
+            body:"Base".into(),source_ids:vec![],provenance:vec!["agent-observed".into()]}).unwrap();
+        let base=temp.path().join("base.db"); source.export_sync_state(&base).unwrap();
+        let left=temp.path().join("left.db"); let right=temp.path().join("right.db");
+        fs::copy(&base,&left).unwrap();fs::copy(&base,&right).unwrap();
+        mutate_sync_page(&left,None,Some("Left evidence"));
+        mutate_sync_page(&right,None,Some("Right evidence"));
+        let merged=temp.path().join("merged.db");
+        let result=merge_sync_states(&base,&left,&right,&merged).unwrap();
+        assert_eq!(result.conflict_count,1);
+        let mut payload=load_sync_objects(&left).unwrap()[&("page".into(),"guide".into())].payload.clone();
+        payload["body"]=json!("Both observations retained with their respective contexts.");
+        let mut resolution=json!({"version":2,"decisions":[{"kind":"page","logical_key":"guide",
+            "conflict_id":result.conflicts[0]["conflict_id"],"strategy":"merge","payload":payload}]});
+        let before=sync_state_digest(&merged).unwrap();
+        resolution["decisions"][0]["payload"]["source_hashes"]=json!(["f".repeat(64)]);
+        assert!(resolve_sync_conflicts(&merged,&result.conflicts,&resolution).is_err());
+        assert_eq!(sync_state_digest(&merged).unwrap(),before);
+        resolution["decisions"][0]["payload"]["source_hashes"]=json!([]);
+        resolution["decisions"][0]["conflict_id"]=json!("f".repeat(64));
+        assert_eq!(resolve_sync_conflicts(&merged,&result.conflicts,&resolution).unwrap_err().code,"sync_resolution_stale");
+        assert_eq!(sync_state_digest(&merged).unwrap(),before);
+        resolution["decisions"][0]["conflict_id"]=result.conflicts[0]["conflict_id"].clone();
+        resolve_sync_conflicts(&merged,&result.conflicts,&resolution).unwrap();
+        let mut target=test_store();
+        target.publish_sync_state(&merged,&target.identity().unwrap(),"replica-v2").unwrap();
+        assert_eq!(target.page_show("guide").unwrap().page.body,payload["body"].as_str().unwrap());
+    }
+
+    #[test]
+    fn replica_history_concurrent_append_preserves_both_local_revision_two_events() {
+        let initial=json!({"revision":1,"request_id":"initial","input":{"action":"start"},"created_at":"2026-09-28T01:00:00Z"});
+        let a=json!({"revision":2,"request_id":"a","input":{"action":"reply","text":"A"},"created_at":"2026-09-28T01:00:01Z"});
+        let b=json!({"revision":2,"request_id":"b","input":{"action":"reply","text":"B"},"created_at":"2026-09-28T01:00:01Z"});
+        let base=json!([initial.clone()]);
+        let left=vec![initial.clone(),a]; let right=vec![initial,b];
+        let mut conflicts=vec![];
+        let merged=merge_sync_arrays(Some(&base),&left,&right,"history",&mut conflicts);
+        assert!(conflicts.is_empty());
+        assert_eq!(merged.as_array().unwrap().len(),3);
+        assert_eq!(merged[2]["revision"],3);
+        assert_eq!(merged,merge_sync_arrays(Some(&base),&right,&left,"history",&mut conflicts));
+        let mut changed=right.clone(); changed[1]["request_id"]=json!("a");
+        merge_sync_arrays(Some(&base),&left,&changed,"history",&mut conflicts);
+        assert!(!conflicts.is_empty());
+    }
+
+    #[test]
+    fn replica_team_head_receipt_and_memory_commit_atomically() {
+        let temp=tempdir().unwrap();let normalized=temp.path().join("normalized.db");
+        populated_sync_source().export_sync_state(&normalized).unwrap();
+        let mut target=test_store();target.bind_team_space(&"1".repeat(64),&"2".repeat(64)).unwrap();
+        let commit=TeamCommit{recovery:None,epoch:"2".repeat(64),expected_head:0,actor:"3".repeat(64),principal:Value::Null,replica_id:"4".repeat(64),batch_id:"5".repeat(64),artifact_id:"6".repeat(64),payload_digest:sync_state_digest(&normalized).unwrap()};
+        let expected=target.identity().unwrap();
+        target.conn.execute_batch("CREATE TEMP TRIGGER reject_receipt BEFORE INSERT ON operations WHEN NEW.action='sync_merge' BEGIN SELECT RAISE(ABORT,'simulated commit fault'); END;").unwrap();
+        assert!(target.publish_team_state(&normalized,&expected,&commit).is_err());
+        assert_eq!(target.team_head().unwrap()["head"],0);
+        assert_eq!(target.identity().unwrap(),expected);
+        assert!(target.team_receipt(&commit.replica_id,&commit.batch_id).unwrap().is_none());
+        assert!(target.page_show("sync-guide").is_err());
+        target.conn.execute_batch("DROP TRIGGER reject_receipt").unwrap();
+        target.publish_team_state(&normalized,&expected,&commit).unwrap();
+        assert_eq!(target.team_head().unwrap()["head"],1);
+        assert!(target.page_show("sync-guide").is_ok());
+        let receipt=target.team_receipt(&commit.replica_id,&commit.batch_id).unwrap().unwrap();
+        assert_eq!(receipt["team"]["accepted_digest"],commit.payload_digest);
+        assert_eq!(receipt["team"]["actor"],commit.actor);
+        assert_eq!(target.publish_team_state(&normalized,&target.identity().unwrap(),&commit).unwrap_err().code,"batch_already_committed");
+        let mut stale=commit.clone();stale.batch_id="7".repeat(64);
+        assert_eq!(target.publish_team_state(&normalized,&target.identity().unwrap(),&stale).unwrap_err().code,"head_changed");
+        assert_eq!(target.team_head().unwrap()["head"],1);
+    }
+
 }

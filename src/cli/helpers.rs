@@ -710,6 +710,7 @@ fn file_fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
 }
 
 fn project_root(store_path: &StorePath) -> Result<PathBuf> {
+    if let Some(root)=crate::scope::selected_source_root()? {return Ok(root);}
     let root = store_path
         .authority_path()
         .parent()

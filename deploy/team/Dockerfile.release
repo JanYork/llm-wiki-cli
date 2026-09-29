@@ -1,0 +1,15 @@
+# Release binaries are built on Ubuntu 24.04; retain a compatible glibc runtime.
+FROM ubuntu:24.04
+LABEL org.opencontainers.image.source="https://github.com/JanYork/llm-wiki-cli"
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --create-home lwc \
+    && mkdir -m 0700 /data && chown lwc:lwc /data
+ARG TARGETARCH
+COPY binaries/${TARGETARCH}/lwc /usr/local/bin/lwc
+COPY admin /opt/lwc/admin
+USER lwc
+WORKDIR /data
+EXPOSE 8787
+ENTRYPOINT ["lwc"]
+CMD ["server", "run", "--config", "/etc/lwc/server.jsonc"]

@@ -37,7 +37,7 @@ fn attached_store_identity(conn: &Connection) -> Result<StoreIdentity> {
 }
 
 fn validate_changeset_table_inventory(conn: &Connection, schema: &str) -> Result<()> {
-    const TABLES: [&str; 66] = [
+    const TABLES: [&str; 67] = [
         "agent_plan_tracks",
         "agent_todo_tracks",
         "changesets",
@@ -77,6 +77,7 @@ fn validate_changeset_table_inventory(conn: &Connection, schema: &str) -> Result
         "plan_steps",
         "plan_tags",
         "plans",
+        "replica_history",
         "retrieval_feedback",
         "retrieval_weights",
         "search_fts",
@@ -298,6 +299,13 @@ fn replace_main_from_attached(tx: &Transaction<'_>, source_schema: &str) -> Resu
             "unsupported attached changeset schema",
         ));
     }
+    let role: Option<String> = tx.query_row("SELECT value FROM meta WHERE key='replica_role'",[],|row|row.get(0)).optional()?;
+    if role.as_deref()==Some("viewer") {
+        return Err(AppError::new("space_read_only","a viewer cannot publish or restore shared memory"));
+    }
+    let bindings = tx.prepare("SELECT key,value FROM meta WHERE key GLOB 'replica_*' OR key GLOB 'team_*'")?
+        .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     tx.execute_batch(
         "DELETE FROM semantic_relations;
          DELETE FROM search_spans;
@@ -369,6 +377,8 @@ fn replace_main_from_attached(tx: &Transaction<'_>, source_schema: &str) -> Resu
          ) SELECT
              target_type, target_identifier, provenance, weight, reason, updated_at
            FROM candidate.retrieval_weights;
+         INSERT OR IGNORE INTO replica_history(kind, logical_key, payload_json)
+         SELECT kind, logical_key, payload_json FROM candidate.replica_history;
          INSERT INTO retrieval_feedback(
              query_fingerprint, target_type, target_identifier,
              provenance, signal, reason, updated_at
@@ -401,6 +411,10 @@ fn replace_main_from_attached(tx: &Transaction<'_>, source_schema: &str) -> Resu
            FROM candidate.search_spans;",
     )
     .map_err(changeset_copy_error)?;
+    tx.execute("DELETE FROM meta WHERE key GLOB 'replica_*' OR key GLOB 'team_*'",[])?;
+    for (key,value) in bindings {
+        tx.execute("INSERT INTO meta(key,value) VALUES(?1,?2)",params![key,value])?;
+    }
     rebuild_span_index(tx)?;
     Ok(())
 }
@@ -569,6 +583,10 @@ fn record_operation(
     target: &str,
     detail: &Value,
 ) -> Result<String> {
+    let replica_role:Option<String>=tx.query_row("SELECT value FROM meta WHERE key='replica_role'",[],|row|row.get(0)).optional()?;
+    if replica_role.as_deref()==Some("viewer") && !matches!(action,"sync_merge"|"search"|"context"|"query"|"reindex"|"materialize") {
+        return Err(AppError::new("space_read_only","this local replica has viewer access; shared memory writes are disabled"));
+    }
     if tx
         .query_row(
             "SELECT 1 FROM meta WHERE key = ?1 LIMIT 1",
@@ -600,6 +618,9 @@ fn record_operation(
             "corrupt_store",
             "wiki store_revision metadata is missing",
         ));
+    }
+    if tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name='lwc_policy_created')",[],|r|r.get::<_,bool>(0))? {
+        tx.execute("DELETE FROM temp.lwc_policy_created",[])?;
     }
     Ok(revision)
 }

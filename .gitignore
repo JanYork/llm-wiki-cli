@@ -15,3 +15,10 @@ web/node_modules/
 /.tmp/
 __pycache__/
 *.py[cod]
+
+/admin/node_modules/
+/admin/dist/
+/deploy/team/server.jsonc
+/deploy/team/.env
+/deploy/team/data/
+/deploy/team/backups/

@@ -40,6 +40,8 @@ Translated READMEs, package summaries, integration summaries, and copied Skill t
 
 ## Current durable execution
 
+- Active team-edition Plan `84715af7b63db12278d87a62cf00f13c` (`lwc --scope project plan brief 84715af7b63db12278d87a62cf00f13c`) owns execution state for the local-first team edition. Design map: `docs/team-cloud/design.md`, `docs/team-cloud/implementation-plan.md`, `docs/team-cloud/admin-ui.md`, `docs/team-cloud/sync-engineering.md`, and `docs/team-cloud/access-policy-recovery.md`. Sync covers all core durable memory (including temporal events and Discussion); LWC delivers conflict signals through Hooks or the next CLI/MCP response, and Agents must prioritize merging immediately. The accepted architecture keeps external Agents on CLI/MCP; the requested cloud console uses React + shadcn/ui and LWC visual tokens. Discussion `team-cloud-design-20260928` owns requirements and corrections. `docs/team-cloud/user-acceptance.md` records verified direct personal-key browser/CLI sign-in, authorized space choice, key revocation and remaining external-provider/deployment gates. Read the Plan for current execution state; no v0.19.0 publication is established by these checks.
+
 - Current release/install (2026-09-12): v0.18.5 is published on GitHub, npm, crates.io and Homebrew; release workflow 34686421271 passed acceptance and all six native targets. Local Homebrew LWC was removed at user request; npm @i-xor/lwc@0.18.5 now owns /Users/muyouzhi/.local/bin/lwc. Tutor/Book/Practice and enabled Codex plugin are 0.18.5. Pro was not upgraded in this task. Wiki `lwc-contributor-release-contract` owns release evidence; `lwc-npm-distribution` owns local installation and download limitations. This entry supersedes historical current-installation claims below.
 
 - Completed Plan `db23988c37654ebd1f8d92fece6837e9`: LWC Discussion 持久问答与头脑风暴记录. Plan owns implementation scope and acceptance; implementation and targeted checks completed; subsequently published and locally installed in v0.18.5. Wiki `lwc-discussion` owns the durable architecture. See `docs/discussion.md` and `docs/discussion-acceptance.md`.
@@ -68,3 +70,5 @@ Translated READMEs, package summaries, integration summaries, and copied Skill t
 ## Deliberately absent
 
 There are no project-brain todos, activity logs, or operations journals yet. Create one only when current evidence demonstrates a continuity need, and update this discovery map at the same time.
+
+- Team implementation entry points: `src/team/` (instance admission, identities, signed policies, API), `src/replica/` (client credentials, project binding, worker and merge lifecycle), `admin/` (React console reusing `web/src/tokens.css`), and `deploy/team/` (self-host configuration). `docs/team-cloud/protocol.md` records current commands and remaining delivery boundaries.

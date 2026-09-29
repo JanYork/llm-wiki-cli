@@ -1,0 +1,3 @@
+CREATE TABLE user_profiles(user_id TEXT PRIMARY KEY REFERENCES users(id),email_hint TEXT NOT NULL,nickname TEXT NOT NULL,updated_at INTEGER NOT NULL DEFAULT(unixepoch()));
+CREATE TABLE devices(id TEXT NOT NULL,user_id TEXT NOT NULL REFERENCES users(id),metadata_json TEXT NOT NULL,registered_at INTEGER NOT NULL DEFAULT(unixepoch()),PRIMARY KEY(user_id,id));
+CREATE TABLE agents(id TEXT NOT NULL,user_id TEXT NOT NULL,device_id TEXT NOT NULL,name TEXT NOT NULL,registered_at INTEGER NOT NULL DEFAULT(unixepoch()),PRIMARY KEY(user_id,id),FOREIGN KEY(user_id,device_id) REFERENCES devices(user_id,id));

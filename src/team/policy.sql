@@ -1,0 +1,1 @@
+CREATE TABLE memory_denials(space_id TEXT NOT NULL REFERENCES spaces(id),user_id TEXT NOT NULL REFERENCES users(id),kind TEXT NOT NULL,logical_key TEXT NOT NULL,action TEXT NOT NULL CHECK(action IN('create','update','delete','*')),PRIMARY KEY(space_id,user_id,kind,logical_key,action));

@@ -50,6 +50,13 @@ jobs:
           npm run build
           git diff --exit-code -- dist
 
+      - name: Team interface
+        working-directory: admin
+        run: |
+          npm ci
+          npm test
+          npm run build
+
       - name: Check formatting
         run: cargo fmt --check
 

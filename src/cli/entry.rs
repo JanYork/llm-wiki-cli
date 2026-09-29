@@ -1,14 +1,26 @@
 pub fn main() {
     let cli = Cli::parse();
+    let selected_space=if matches!(&cli.command,Command::Agent {command:AgentCommand::Hook {..}} | Command::Cloud {..} | Command::Recovery {..}) {None}else{cli.selected_space.clone().or_else(||if cli.scope==Scope::Project && supports_space(&cli.command){std::env::current_dir().ok().and_then(|cwd|crate::replica::project_binding(&cwd).ok().flatten())}else{None})};
     let full = cli.full || !matches!(&cli.command, Command::Plan { .. } | Command::Remember { .. });
     match run(cli) {
         Ok(Value::Null) => {}
-        Ok(value) => println!("{}", serde_json::to_string_pretty(&if full { value } else { compact_receipt(value) }).unwrap()),
+        Ok(value) => {
+            let mut value=if full {value}else{compact_receipt(value)};
+            if let Some(space)=selected_space.as_deref() {
+                if let Ok(Some(signal))=crate::replica::conflict_signal(space)
+                    && let Some(object)=value.as_object_mut() {object.insert("signals".into(),json!([signal]));}
+                if let Err(error)=crate::replica::start_worker(space)
+                    && let Some(object)=value.as_object_mut() {object.insert("sync_warning".into(),json!({"code":error.code}));}
+            }
+            println!("{}",serde_json::to_string_pretty(&value).unwrap());
+        },
         Err(error) => {
             if error.code == "codegraph_exit" {
                 std::process::exit(error.details.as_ref().and_then(|d| d["exit_code"].as_i64()).unwrap_or(1) as i32);
             }
             let mut payload = json!({"code": error.code, "message": error.message});
+            if let Some(space)=selected_space.as_deref()
+                && let Ok(Some(signal))=crate::replica::conflict_signal(space) {payload["signals"]=json!([signal]);}
             if let Some(details) = error.details {
                 payload["details"] = details;
             }

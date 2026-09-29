@@ -216,6 +216,7 @@ fn bootstrap_schema(conn: &mut Connection) -> Result<bool> {
     create_plan_schema(&tx)?;
     create_agent_tracking_schema(&tx)?;
     create_discussion_schema(&tx)?;
+    create_replica_history_schema(&tx)?;
     create_changeset_state(&tx)?;
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('schema', ?1)",
@@ -351,12 +352,12 @@ fn validate_store_read_only(conn: &Connection) -> Result<()> {
             'memory_changes', 'memory_evidence', 'memory_relations', 'memory_feedback',
             'memory_hint_state', 'memory_state', 'memory_fts',
             'todo_items', 'todo_tags', 'todo_fts', 'plans', 'plan_tags',
-            'plan_constraints', 'plan_steps', 'plan_history', 'plan_fts'
+            'plan_constraints', 'plan_steps', 'plan_history', 'plan_fts', 'replica_history'
          )",
         [],
         |row| row.get(0),
     )?;
-    if essential_tables != 34 {
+    if essential_tables != 35 {
         return Err(AppError::new(
             "corrupt_store",
             "wiki database schema is incomplete",

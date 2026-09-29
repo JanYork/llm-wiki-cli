@@ -39,6 +39,17 @@ LWC 把经过筛选的文档转化为可长期维护的 Wiki。Agent 负责理�
   <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-overview-zh.png" alt="LWC 产品概览" width="820">
 </p>
 
+## 自建团队记忆
+
+团队空间将核心记忆保留在本地 SQLite 与 Wiki，再由 LWC 自动双向同步。
+外部智能体通过命令行或工具接口处理冲突，程序不内嵌模型。团队界面支持中英文，
+提供显式空间授权、设备与智能体管理、可审计的记忆恢复；只读智能体也可以直接
+查询云端，不创建本地记忆副本。
+
+参见[部署指南](deploy/team/README.md)、[复制合同](docs/team-cloud/protocol.md)
+和[访问及恢复设计](docs/team-cloud/access-policy-recovery.md)。邮箱验证码、飞书和
+代码托管账号登录所需配置由部署者提供。
+
 ## LWC 是 Agent 记忆，不是 RAG
 
 RAG 和 LWC 都能帮助大模型使用外部文档，但二者把状态留在不同的地方。典型的

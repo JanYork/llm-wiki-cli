@@ -39,4 +39,13 @@ describe('renderMarkdown', () => {
     expect(structured.html).toContain('<h2 id="context">Context</h2>')
     expect(structured.html).toContain('<h2 id="context-2">Context</h2>')
   })
+  it('routes wiki and relative page links without activating code or unsafe markup', () => {
+    const href = (slug: string) => `#space=test&page=${encodeURIComponent(slug)}`
+    const result = projectMarkdown('[[guide|Guide]] [Guide](guide.md) [Nested](../docs/guide.md#section) `[[code]]` [[x|<img src=x onerror=alert(1)>]]', '', href)
+    expect(result.html.match(/href="#space=test&amp;page=guide"/g)).toHaveLength(3)
+    expect(result.html).toContain('<code>[[code]]</code>')
+    expect(result.html).not.toContain('<img')
+    expect(projectMarkdown('[[guide]]', '').html).not.toContain('<a')
+  })
+
 })

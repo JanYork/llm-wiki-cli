@@ -1,0 +1,14 @@
+.git
+.lwc
+.tmp
+target
+**/node_modules
+admin/dist
+deploy/team/data
+deploy/team/backups
+deploy/team/server.jsonc
+deploy/team/.env
+**/.DS_Store
+
+**/.env
+**/.env.*

@@ -878,6 +878,10 @@ impl Store {
     }
 
     pub fn checkpoint_restore(&mut self, name: &str) -> Result<CheckpointResponse> {
+        self.require_replica_action("rollback")?;
+        if self.conn.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key='replica_space')",[],|r|r.get::<_,bool>(0))? {
+            return Err(AppError::new("replica_restore_requires_compensation","a shared replica must use a compensating recovery; raw checkpoint replacement would erase synchronization history"));
+        }
         validate_checkpoint_name(name)?;
         let path = checkpoint_path(&self.database, name)?;
         let metadata = fs::symlink_metadata(&path).map_err(|error| {

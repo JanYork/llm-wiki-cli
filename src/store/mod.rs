@@ -16,8 +16,12 @@ include!("word_graph.rs");
 include!("tags.rs");
 include!("todo.rs");
 include!("plan.rs");
+include!("replica_history.rs");
 include!("sync.rs");
+include!("sync_resolution.rs");
 include!("sync_publish.rs");
+include!("team_publish.rs");
+include!("replica_policy.rs");
 include!("tests.rs");
 
 include!("discussion.rs");

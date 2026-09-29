@@ -88,7 +88,8 @@ pub(crate) fn compress(cwd: &Path, scope: Scope, output: Option<&Path>) -> Resul
     let normalized = unique_sibling(&store_path.path, "archive-export", "db");
     let cleanup = FileCleanup::new(normalized.clone());
     let store = Store::open_for_read(scope_name(scope), &store_path.path)?;
-    let summary = store.export_sync_state(&normalized)?;
+    store.require_replica_action("export")?;
+    let summary = crate::sync::export_sync_state_with_continuity(&store_path, &store, &normalized)?;
     set_private_permissions(&normalized)?;
     let payload_bytes = regular_file_len(&normalized, "archive_invalid")?;
     if payload_bytes > MAX_PAYLOAD_BYTES {
@@ -662,6 +663,7 @@ fn finish_rebuild(
     publication: &Value,
     recovered: bool,
 ) -> Result<Value> {
+    crate::sync::replay_sync_continuity_inner(target, &directory.join("merged.db"))?;
     let mut derived = crate::sync::rebuild_derived(target, publication);
     derived["codegraph"] = json!({"status":"not_applicable"});
     let store = Store::open(scope_name(target.scope), &target.path)?;

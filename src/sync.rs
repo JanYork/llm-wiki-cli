@@ -3833,7 +3833,7 @@ pub(crate) fn peer() -> Result<Value> {
     }
 }
 
-fn export_sync_state_with_continuity(
+pub(crate) fn export_sync_state_with_continuity(
     live: &StorePath,
     store: &Store,
     normalized: &Path,
@@ -3992,7 +3992,10 @@ fn replay_sync_continuity(live: &StorePath, normalized: &Path) -> Value {
     }
 }
 
-fn replay_sync_continuity_inner(live: &StorePath, normalized: &Path) -> Result<Vec<Value>> {
+pub(crate) fn replay_sync_continuity_inner(
+    live: &StorePath,
+    normalized: &Path,
+) -> Result<Vec<Value>> {
     sync_state_digest(normalized)?;
     let target_store_id = Store::open_for_read(scope_name(live.scope), &live.path)?
         .identity()?

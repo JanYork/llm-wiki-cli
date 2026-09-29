@@ -1,0 +1,27 @@
+services:
+  memory:
+    image: ${LWC_IMAGE:-lwc-team:local}
+    build:
+      context: ../..
+      dockerfile: deploy/team/Dockerfile
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - memory:/data
+      - ./server.jsonc:/etc/lwc/server.jsonc:ro
+    environment:
+      LWC_SMTP_PASSWORD: ${LWC_SMTP_PASSWORD:-}
+      LWC_GITHUB_SECRET: ${LWC_GITHUB_SECRET:-}
+      LWC_FEISHU_SECRET: ${LWC_FEISHU_SECRET:-}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    stop_grace_period: 30s
+volumes:
+  memory:

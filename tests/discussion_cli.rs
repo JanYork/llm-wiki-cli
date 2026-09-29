@@ -226,7 +226,7 @@ fn discussion_migrates_prototype_and_rejects_secret_or_cyclic_summary() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        19
+        20
     );
     let cycle = json!({"id":"migration","context":c,"request_id":"2","if_revision":1,"operations":[{"op":"revise","id":"s","text":"Cycle","reason":"Bad","refs":["s"]}]});
     assert!(

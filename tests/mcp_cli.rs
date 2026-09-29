@@ -192,7 +192,7 @@ fn mcp_server_negotiates_and_lists_read_only_tools() {
 
     assert_eq!(responses[1]["id"], 2);
     let tools = responses[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 4);
+    assert_eq!(tools.len(), 8);
     let tool = tools
         .iter()
         .find(|tool| tool["name"] == "lwc_explore")
@@ -266,12 +266,16 @@ fn mcp_enforces_declared_mode_scope_and_count_bounds() {
         json!({"query": "x", "projectPath": project.path(), "maxDocuments": 0}),
         json!({"query": "x", "projectPath": project.path(), "maxFiles": 21}),
     ] {
-        let output = run_mcp(&[json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "lwc_explore", "arguments": arguments}
-        })]);
+        let output = run_mcp_in(
+            project.path(),
+            None,
+            &[json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "lwc_explore", "arguments": arguments}
+            })],
+        );
         assert!(output.status.success());
         let response = responses(&output).remove(0);
         assert_eq!(response["result"]["isError"], true);

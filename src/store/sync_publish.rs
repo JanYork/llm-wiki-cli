@@ -77,6 +77,8 @@ fn bounded_sync_selection(
         "todo",
         "plan",
         "discussion",
+        "source_revision",
+        "memory_audit",
         "work_audit",
         "draft_intent",
     ] {
@@ -279,6 +281,16 @@ impl Store {
         expected: &StoreIdentity,
         session_id: &str,
     ) -> Result<SyncPublishSummary> {
+        self.publish_sync_state_inner(normalized,expected,session_id,None)
+    }
+
+    fn publish_sync_state_inner(
+        &mut self,
+        normalized: &Path,
+        expected: &StoreIdentity,
+        session_id: &str,
+        team: Option<&TeamCommit>,
+    ) -> Result<SyncPublishSummary> {
         let state = prepare_sync_state(normalized)?;
         if self.identity()? != *expected {
             return Err(sync_store_changed());
@@ -345,6 +357,7 @@ impl Store {
             if store_identity(&tx)? != *expected {
                 return Err(sync_store_changed());
             }
+            if let Some(team)=team { validate_team_commit(&tx,team,session_id,&state.digest)?; }
             old_source_ids = source_ids_for_hashes(&tx, affected.keys("source"))?;
             old_relation_documents = relation_documents_for_ids(
                 &tx,
@@ -375,6 +388,7 @@ impl Store {
                 "affected": selection.affected,
                 "affected_graph_documents": selection.graph_documents,
             });
+            if let Some(team)=team { detail["team"]=commit_team_head(&tx,team,&state.digest)?; }
             let revision = record_operation(
                 &tx,
                 "sync_merge",
@@ -752,6 +766,8 @@ fn prepare_sync_state(path: &Path) -> Result<PreparedSyncState> {
         "todo",
         "plan",
         "discussion",
+        "source_revision",
+        "memory_audit",
         "work_audit",
         "draft_intent",
     ];
@@ -848,6 +864,7 @@ fn apply_prepared_sync_state(tx: &Transaction<'_>, state: &PreparedSyncState) ->
     import_sync_todos(tx, state, &todo_revisions, &todo_requests)?;
     import_sync_plans(tx, state, &plan_revisions, &plan_requests)?;
     import_sync_discussions(tx,state)?;
+    import_replica_history(tx, state)?;
     tx.execute_batch(
         "DELETE FROM agent_todo_tracks
          WHERE NOT EXISTS(SELECT 1 FROM todo_items WHERE id=agent_todo_tracks.todo_id);

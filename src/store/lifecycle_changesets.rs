@@ -232,6 +232,7 @@ impl Store {
                 json!({ "user_version": USER_VERSION, "tokenizer": TOKENIZER_ID }),
             )?;
         }
+        install_replica_policy_guards(&store.conn)?;
         store.reconcile_graph_projection()?;
         Ok((store, created))
     }
@@ -255,6 +256,7 @@ impl Store {
             database,
             conn,
         };
+        install_replica_policy_guards(&store.conn)?;
         store.reconcile_graph_projection()?;
         Ok(store)
     }
@@ -283,6 +285,7 @@ impl Store {
             conn,
         };
         progress(1, 1, "projecting")?;
+        install_replica_policy_guards(&store.conn)?;
         store.reconcile_graph_projection()?;
         Ok(store)
     }
@@ -2426,6 +2429,7 @@ impl Store {
         &mut self,
         input: &ChangesetRollbackInput,
     ) -> Result<ChangesetRollbackState> {
+        self.require_replica_action("rollback")?;
         let checkpoint = input
             .history
             .pre_commit_checkpoint

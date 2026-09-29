@@ -42,6 +42,18 @@ query.
   <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-overview-en.png" alt="LWC product overview" width="820">
 </p>
 
+## Self-hosted team memory
+
+LWC team spaces keep core memory in local SQLite and Wiki files and synchronize
+it automatically through a self-hosted server. External Agents resolve conflicts
+through CLI/MCP; LWC does not embed an LLM. The team console supports English and
+Simplified Chinese, explicit space permissions, device/Agent access and auditable
+memory recovery. Cloud-only readers can query without creating a local replica.
+
+See the [deployment guide](deploy/team/README.md), [protocol](docs/team-cloud/protocol.md)
+and [access and recovery design](docs/team-cloud/access-policy-recovery.md).
+Email, Feishu and GitHub sign-in use deployment-supplied provider configuration.
+
 ## LWC Is Agent Memory, Not RAG
 
 RAG and LWC can both help an LLM work with external documents, but they keep

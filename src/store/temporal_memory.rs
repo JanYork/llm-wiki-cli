@@ -1162,6 +1162,13 @@ fn enforce_memory_retention(
     retained_event_id: Option<&str>,
     fail_if_over_capacity: bool,
 ) -> Result<Value> {
+    if tx.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key='replica_space')", [], |r| r.get::<_, bool>(0))? {
+        let bytes: i64 = tx.query_row("SELECT COALESCE(SUM(logical_bytes),0) FROM memory_events", [], |r| r.get(0))?;
+        if fail_if_over_capacity && bytes as u64 > max_bytes {
+            return Err(AppError::new("memory_capacity_exceeded", "replicated memory is preserved; increase the configured capacity instead of evicting unsynced events"));
+        }
+        return Ok(empty_memory_retention());
+    }
     let age_sql = format!(
         "SELECT e.id, e.logical_bytes, e.event_type, e.context
          FROM memory_events e

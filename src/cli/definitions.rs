@@ -158,6 +158,10 @@ struct Cli {
     #[arg(long, value_enum, default_value = "project", global = true)]
     scope: Scope,
 
+    /// Select an explicitly joined local team space for core memory commands.
+    #[arg(long = "space", global = true, value_name = "REFERENCE")]
+    selected_space: Option<String>,
+
     /// Run a supported command against an isolated draft changeset.
     #[arg(long, global = true, value_name = "NAME")]
     changeset: Option<String>,
@@ -172,6 +176,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Join and inspect local-first shared spaces.
+    Space { #[command(subcommand)] command: SpaceCommand },
+    /// Read cloud memory without creating a local replica.
+    Cloud { #[arg(long)] server: String, #[command(subcommand)] command: CloudCommand },
+    /// Sign in to a team server using browser-approved device authorization.
+    Login { #[arg(long)] server: String, #[arg(long,default_value="LWC")] name: String, #[arg(long)] key_stdin:bool },
+    /// Revoke and remove this device's saved server session.
+    Logout { #[arg(long)] server: String },
+    /// Run or initialize the self-hosted team service.
+    Server { #[command(subcommand)] command: ServerCommand },
+    /// Read history or prepare/resolve/apply a permission-checked compensating recovery.
+    Recovery { #[arg(long)] server:String, #[arg(long)] json:String },
     /// Persist opt-in discussion Q/A in SQLite.
     Discussion { #[command(subcommand)] command: DiscussionCommand },
     /// Inspect the resolved project, checkout, capability and index state without writes.
@@ -523,6 +539,51 @@ counts and total describe all issues in the complete Wiki; blocking_total counts
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum ServerCommand {
+    /// Copy a stopped server into a new private backup directory.
+    Backup { #[arg(long)] data:PathBuf, #[arg(long)] output:PathBuf },
+    /// Restore a complete backup into a new directory and rotate every space epoch.
+    Restore { #[arg(long)] backup:PathBuf, #[arg(long)] authority_data:PathBuf, #[arg(long)] output:PathBuf },
+    /// Rotate the instance token; connected clients must configure the new token.
+    RotateToken { #[arg(long)] data:PathBuf },
+    /// Serve the team API with deployer-supplied JSONC configuration.
+    Run { #[arg(long)] config: PathBuf },
+    /// Initialize a private control store and reserve the initial owner's verified-email identity.
+    Init {
+        #[arg(long)] data: PathBuf,
+        #[arg(long)] admin_email: String,
+        #[arg(long, default_value="LWC")] name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SpaceCommand {
+    /// Supervise all automatic replicas for the current user/Agent, for native user services.
+    Supervise,
+    /// Use a joined space for core commands in this project; optionally merge existing memory first.
+    Bind { space:String, #[arg(long)] import_project:bool },
+    /// Remove this project's default team-space binding without deleting memory.
+    Unbind,
+    /// Run one recoverable bidirectional synchronization.
+    Sync { space: String },
+    /// Run the automatic sync worker in the foreground.
+    Watch { space: String },
+    /// Configure autonomous synchronization and its polling interval.
+    Configure { space: String, #[arg(long)] interval_ms: Option<u64>, #[arg(long)] automatic: Option<bool> },
+    /// Read the current bounded Agent conflict packet.
+    Conflicts { space: String },
+    /// Claim or renew a conflict packet for 120 seconds.
+    Claim { space:String, #[arg(long)] session:String, #[arg(long)] if_digest:String, #[arg(long)] claim:Option<String> },
+    /// Read complete conflict candidate JSON in bounded character chunks.
+    Candidate { space: String, #[arg(long)] session: String, #[arg(long)] if_digest: String, #[arg(long)] reference: String, #[arg(long, default_value_t=0)] offset: u64, #[arg(long, default_value_t=8192)] limit: u64 },
+    /// Apply a versioned Agent merge decision to the exact conflict packet.
+    Resolve { space: String, #[arg(long)] session: String, #[arg(long)] if_digest: String, #[arg(long)] file: PathBuf, #[arg(long)] claim:Option<String> },
+    Join { space: String, #[arg(long)] server: String, #[arg(long,default_value="LWC local replica")] device: String, #[arg(long)] manual: bool },
+    List,
+    Show { space: String },
 }
 
 #[derive(Subcommand)]
@@ -1094,6 +1155,12 @@ This prevents completion after merely indexing raw text or writing a detached su
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)] // Clap owns this short-lived parse tree; boxing leaf flags adds no value.
 enum ConfigCommand {
+    /// Save the instance admission token privately from standard input.
+    Server { #[arg(long)] server:String, #[arg(long, required=true)] token_stdin:bool },
+    /// Mint a space-scoped Agent credential without exposing the owner session.
+    Delegate { #[arg(long)] server:String, #[arg(long)] agent_id:String, #[arg(long)] grant_space:String, #[arg(long)] write:bool, #[arg(long)] output:PathBuf },
+    /// Configure user-level team identity and register this device/Agent after login.
+    Team { #[arg(long)] server:String, #[arg(long)] email:String, #[arg(long)] nickname:String, #[arg(long,default_value="LWC Agent")] agent:String },
     /// Show effective graph, trans, memory, and Office configuration plus value origins.
     Show,
     /// Atomically set graph, trans, memory, and Office configuration.
@@ -1552,4 +1619,17 @@ enum DiscussionCommand {
     Current { id: Option<String>, #[arg(long)] context: String },
     History { id: String, #[arg(long)] context: String, #[arg(long, default_value_t=0)] offset: usize, #[arg(long, default_value_t=50)] limit: usize },
     Export { id: String, #[arg(long)] context: String },
+}
+
+#[derive(Subcommand)]
+enum CloudCommand {
+    /// Read a bounded content-addressed source/blob window from the cloud snapshot.
+    Blob { hash:String, #[arg(long,default_value_t=0)] offset:usize, #[arg(long,default_value_t=16384)] limit:usize, #[arg(long,requires="epoch")] head:Option<u64>, #[arg(long,requires="head")] epoch:Option<String> },
+    /// Browse portable core memory objects, including temporal and task history.
+    Objects { #[arg(long,default_value="")] kind:String, #[arg(long,default_value_t=20)] limit:usize, #[arg(long,default_value_t=0)] offset:usize, #[arg(long,requires="epoch")] head:Option<u64>, #[arg(long,requires="head")] epoch:Option<String> },
+    /// Read an exact portable core memory object from the accepted cloud snapshot.
+    Object { kind:String, key:String, #[arg(long,requires="epoch")] head:Option<u64>, #[arg(long,requires="head")] epoch:Option<String> },
+    Search { query:String, #[arg(long,default_value_t=20)] limit:usize },
+    Get { slug:String },
+    List { #[arg(long,default_value_t=20)] limit:usize, #[arg(long,default_value_t=0)] offset:usize },
 }

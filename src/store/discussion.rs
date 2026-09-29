@@ -504,13 +504,7 @@ impl Store {
                 params![input.context, input.id],
             )?;
         }
-        tx.execute(
-            "INSERT INTO operations(action,target,detail_json) VALUES('discussion.apply',?1,?2)",
-            params![
-                input.id,
-                json!({"revision":revision+1,"operation_count":input.operations.len()}).to_string()
-            ],
-        )?;
+        record_operation(&tx,"discussion.apply",&input.id,&json!({"revision":revision+1,"operation_count":input.operations.len()}))?;
         tx.commit()?;
         Ok(json!({"id":input.id,"revision":revision+1}))
     }

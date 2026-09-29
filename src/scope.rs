@@ -96,6 +96,44 @@ pub(crate) fn require_database_runtime_root(database: &Path) -> Result<PathBuf> 
     Ok(runtime)
 }
 
+thread_local! {
+    static SELECTED_SPACE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+// Scoped to one synchronous CLI/MCP request; never changes process environment.
+pub(crate) struct SpaceSelection(Option<PathBuf>);
+impl Drop for SpaceSelection {
+    fn drop(&mut self) {
+        SELECTED_SPACE.with(|selected| *selected.borrow_mut() = self.0.take());
+    }
+}
+pub(crate) fn select_space(database: Option<PathBuf>) -> SpaceSelection {
+    SpaceSelection(SELECTED_SPACE.with(|selected| selected.replace(database)))
+}
+fn selected_space() -> Result<Option<PathBuf>> {
+    let selected = SELECTED_SPACE.with(|selected| selected.borrow().clone());
+    if let Some(path) = &selected
+        && !inspect_store_path(path, None)?
+    {
+        return Err(store_not_found(
+            "selected space has no local database; join it first",
+        ));
+    }
+    Ok(selected)
+}
+
+pub(crate) fn selected_source_root() -> Result<Option<PathBuf>> {
+    if selected_space()?.is_none() {
+        return Ok(None);
+    }
+    let cwd = env::current_dir()?.canonicalize()?;
+    Ok(Some(
+        configured_project_paths(&cwd)?
+            .map(|(_, root)| root)
+            .unwrap_or(cwd),
+    ))
+}
+
 pub fn init_store_path(scope: Scope, cwd: &Path) -> Result<StorePath> {
     match scope {
         Scope::Project => Ok(StorePath::new(
@@ -165,11 +203,13 @@ pub fn resolve_explicit_read_store_paths(
     scope: Scope,
     project_path: &Path,
 ) -> Result<Vec<StorePath>> {
-    let project =
-        || -> Result<Option<StorePath>> {
-            Ok(find_project_store(project_path, None)?
-                .map(|path| StorePath::new(Scope::Project, path)))
-        };
+    let project = || -> Result<Option<StorePath>> {
+        Ok(match selected_space()? {
+            Some(path) => Some(path),
+            None => find_project_store(project_path, None)?,
+        }
+        .map(|path| StorePath::new(Scope::Project, path)))
+    };
     let global = || -> Result<Option<StorePath>> {
         let path = global_store_path()?;
         Ok(inspect_store_path(&path, None)?.then(|| StorePath::new(Scope::Global, path)))
@@ -197,6 +237,9 @@ fn project_store_path(root: &Path) -> PathBuf {
 }
 
 fn project_store(cwd: &Path, initialize: bool) -> Result<Option<PathBuf>> {
+    if let Some(path) = selected_space()? {
+        return Ok(Some(path));
+    }
     let configured = configured_project_paths(cwd)?;
     let (start, boundary, initialization_root) = match configured.as_ref() {
         Some((cwd, root)) => (cwd.as_path(), Some(root.as_path()), root.as_path()),

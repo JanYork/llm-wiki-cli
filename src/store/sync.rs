@@ -149,7 +149,8 @@ impl Store {
         self.export_sync_memory(output)?;
         self.export_sync_todos(output)?;
         self.export_sync_plans(output)?;
-        self.export_sync_discussions(output)
+        self.export_sync_discussions(output)?;
+        self.export_replica_history(output)
     }
 
     fn export_sync_meta(&self, output: &Connection) -> Result<()> {
@@ -1348,7 +1349,7 @@ fn merge_sync_object_directional(
                 ));
             }
             let mut fields = Vec::new();
-            let payload = merge_sync_value_directional(
+            let mut payload = merge_sync_value_directional(
                 base_left.map(|row| &row.payload),
                 &left.payload,
                 base_right.map(|row| &row.payload),
@@ -1356,6 +1357,15 @@ fn merge_sync_object_directional(
                 "",
                 &mut fields,
             );
+            if kind == "discussion"
+                && let Some(last) = payload["history"].as_array().and_then(|events| events.last()) {
+                    let revision = last["revision"].clone();
+                    payload["body"]["revision"] = revision;
+                }
+            if kind == "memory" {
+                refresh_sync_memory_fields(&mut payload)?;
+                fields.retain(|field| !matches!(field["path"].as_str(),Some("fingerprint"|"logical_bytes")));
+            }
             if !fields.is_empty() {
                 let candidate_refs = store_sync_conflict_candidates(
                     kind,
@@ -1731,6 +1741,10 @@ fn merge_sync_arrays_directional(
     path: &str,
     conflicts: &mut Vec<Value>,
 ) -> Value {
+    // History is append-only evidence. Branch-local counters are not event IDs.
+    if path == "history" && left.iter().chain(right).all(|v| v.is_object()) {
+        return merge_sync_history(left, right, conflicts);
+    }
     if left.iter().chain(right).all(Value::is_string) {
         let base_left_members = base_left
             .and_then(Value::as_array)
@@ -2014,10 +2028,10 @@ pub(crate) fn resolve_sync_conflicts(
     resolution: &Value,
 ) -> Result<String> {
     validate_sync_resolution_schema(conflicts, resolution)?;
-    if resolution["version"] != 1 {
+    if resolution["version"] != 1 && resolution["version"] != 2 {
         return Err(AppError::new(
             "sync_resolution_invalid",
-            "resolution packet version must be 1",
+            "resolution packet version must be 1 or 2",
         ));
     }
     let decisions = resolution["decisions"].as_array().ok_or_else(|| {
@@ -2043,6 +2057,7 @@ pub(crate) fn resolve_sync_conflicts(
         .collect::<Result<BTreeMap<_, _>>>()?;
     let mut indexed = BTreeMap::new();
     let mut preserve_both = BTreeSet::new();
+    let mut synthesized = BTreeMap::new();
     for decision in decisions {
         let kind = decision["kind"]
             .as_str()
@@ -2068,6 +2083,12 @@ pub(crate) fn resolve_sync_conflicts(
                 "sync_resolution_stale",
                 format!("resolution conflict ID is stale or unknown for {kind}:{key}"),
             ));
+        }
+        if decision["strategy"] == "merge" {
+            if synthesized.insert((kind.to_owned(),key.to_owned()),decision["payload"].clone()).is_some() {
+                return Err(AppError::new("sync_resolution_invalid","merge decisions must be unique per object"));
+            }
+            continue;
         }
         if decision["strategy"] == "preserve_both" {
             if !preserve_both.insert((kind.to_string(), key.to_string())) {
@@ -2113,6 +2134,7 @@ pub(crate) fn resolve_sync_conflicts(
                 .zip(conflict["logical_key"].as_str())
                 .is_some_and(|(kind, key)| {
                     preserve_both.contains(&(kind.to_owned(), key.to_owned()))
+                        || synthesized.contains_key(&(kind.to_owned(), key.to_owned()))
                 })
         })
         .map(|conflict| conflict["fields"].as_array().map_or(0, Vec::len))
@@ -2135,6 +2157,13 @@ pub(crate) fn resolve_sync_conflicts(
         let key = conflict["logical_key"].as_str().ok_or_else(|| {
             AppError::new("sync_state_invalid", "conflict logical key is missing")
         })?;
+        if let Some(mut payload) = synthesized.remove(&(kind.to_owned(),key.to_owned())) {
+            validate_synthesized_sync_payload(&tx,kind,key,conflict,&payload)?;
+            if kind == "memory" { refresh_sync_memory_fields(&mut payload)?; }
+            tx.execute("DELETE FROM sync_objects WHERE kind=?1 AND logical_key=?2",params![kind,key])?;
+            insert_sync_object(&tx,kind,key,&payload)?;
+            continue;
+        }
         if preserve_both.remove(&(kind.to_string(), key.to_string())) {
             apply_sync_preserve_both(&tx, kind, key, conflict)?;
             continue;
@@ -2202,7 +2231,8 @@ pub(crate) fn resolve_sync_conflicts(
             "DELETE FROM sync_objects WHERE kind=?1 AND logical_key=?2",
             params![kind, key],
         )?;
-        if let Some(payload) = payload {
+        if let Some(mut payload) = payload {
+            if kind == "memory" { refresh_sync_memory_fields(&mut payload)?; }
             insert_sync_object(&tx, kind, key, &payload)?;
         }
     }
@@ -2212,7 +2242,7 @@ pub(crate) fn resolve_sync_conflicts(
             "resolution contains decisions that are not in the conflict packet",
         ));
     }
-    if !preserve_both.is_empty() {
+    if !preserve_both.is_empty() || !synthesized.is_empty() {
         return Err(AppError::new(
             "sync_resolution_invalid",
             "preserve-both decision does not match the conflict packet",
@@ -2255,10 +2285,13 @@ fn validate_sync_resolution_schema(conflicts: &[Value], resolution: &Value) -> R
         let keys = decision.keys().map(String::as_str).collect::<BTreeSet<_>>();
         let candidate = BTreeSet::from(["candidate", "conflict_id", "kind", "logical_key", "path"]);
         let preserve = BTreeSet::from(["conflict_id", "kind", "logical_key", "strategy"]);
-        if keys != candidate && keys != preserve {
+        let merge = BTreeSet::from(["conflict_id", "kind", "logical_key", "strategy", "payload"]);
+        let is_merge = resolution["version"] == 2 && keys == merge
+            && decision["strategy"] == "merge" && decision["payload"].is_object();
+        if keys != candidate && keys != preserve && !is_merge {
             return Err(AppError::new(
                 "sync_resolution_invalid",
-                "decision must be exactly one candidate or preserve-both shape",
+                "decision must be exactly a candidate, preserve-both, or version-2 merge shape",
             ));
         }
         if keys == preserve && decision["strategy"] != "preserve_both" {
@@ -2653,6 +2686,10 @@ fn refresh_sync_memory_variant(variant: &mut Value, original_id: &str) -> Result
         evidence.push(json!({"reference": reference, "excerpt": null}));
         evidence.sort_by_key(|item| canonical_sync_value(&item["reference"]));
     }
+    refresh_sync_memory_fields(variant)
+}
+
+fn refresh_sync_memory_fields(variant: &mut Value) -> Result<()> {
     let input = MemoryEventInput {
         request_id: None,
         event_type: required_str(variant, "type")?.to_owned(),
@@ -2742,4 +2779,21 @@ fn set_sync_json_path(root: &mut Value, path: &str, value: Value) -> Result<()> 
         "sync_resolution_invalid",
         "resolution path is empty",
     ))
+}
+
+/// Keep portable draft intent from the last accepted snapshot even when its local
+/// replay is deliberately excluded from re-export as a newly owned draft.
+pub(crate) fn inherit_sync_continuity(normalized:&Path,baseline:&Path)->Result<()> {
+    let previous=validate_sync_state_file(baseline)?;
+    let mut statement=previous.prepare("SELECT kind,logical_key,payload_json FROM sync_objects WHERE kind IN ('draft_intent','work_audit') ORDER BY kind,logical_key")?;
+    let objects=statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let conn=Connection::open(normalized)?;
+    conn.execute("ATTACH DATABASE ?1 AS inherited",[baseline.to_string_lossy().as_ref()])?;
+    for (kind,key,raw) in objects {
+        if conn.query_row("SELECT EXISTS(SELECT 1 FROM sync_objects WHERE kind=?1 AND logical_key=?2)",params![kind,key],|r|r.get::<_,bool>(0))?{continue;}
+        let value:Value=serde_json::from_str(&raw).map_err(|_|AppError::new("sync_state_invalid","invalid inherited continuity"))?;
+        insert_sync_object(&conn,&kind,&key,&value)?;
+        if kind=="draft_intent"{for hash in required_sync_draft_blobs(&key,&value)?{conn.execute("INSERT OR IGNORE INTO sync_blobs SELECT content_hash,content FROM inherited.sync_blobs WHERE content_hash=?1",[hash])?;}}
+    }
+    Ok(())
 }

@@ -1,9 +1,28 @@
-fn run(cli: Cli) -> Result<Value> {
+fn run(mut cli: Cli) -> Result<Value> {
     let cwd = env::current_dir()?;
+    if cli.selected_space.is_none() && cli.scope==Scope::Project && supports_space(&cli.command){cli.selected_space=crate::replica::project_binding(&cwd)?;}
     let selected_changeset = cli.changeset.clone();
+    let local_space = if matches!(&cli.command,Command::Cloud {..} | Command::Recovery {..}) {None} else {cli.selected_space.as_deref()};
+    let _space_selection = if let Some(space) = local_space {
+        if cli.scope != Scope::Project {
+            return Err(AppError::new("space_scope_conflict", "--space requires project scope"));
+        }
+        if !supports_space(&cli.command) {
+            return Err(AppError::new("space_not_supported", "this command does not operate on a joined core memory space"));
+        }
+        Some(crate::scope::select_space(Some(crate::replica::selected_database(space)?)))
+    } else { None };
+
     if !matches!(
         &cli.command,
         Command::Serve { .. }
+            | Command::Server { .. }
+            | Command::Login { .. }
+            | Command::Logout { .. }
+            | Command::Space { .. }
+            | Command::Cloud { .. }
+            | Command::Recovery { .. }
+            | Command::Config { command:ConfigCommand::Team {..} | ConfigCommand::Delegate {..} | ConfigCommand::Server {..} }
             | Command::Init { .. }
             | Command::Work { .. }
             | Command::WorkRun { .. }
@@ -39,6 +58,64 @@ fn run(cli: Cli) -> Result<Value> {
         }
     }
     match cli.command {
+        Command::Cloud { server, command } => {
+            let space=cli.selected_space.as_deref().ok_or_else(||AppError::new("space_required","cloud requires --space SPACE_ID"))?;
+            changeset::reject_selector(selected_changeset.as_deref(),"cloud")?;
+            let query=match command {
+                CloudCommand::Blob {hash,offset,limit,head,epoch}=>crate::team::CloudQuery::Blob {hash,offset,limit,head,epoch},
+                CloudCommand::Objects {kind,limit,offset,head,epoch}=>crate::team::CloudQuery::Objects {kind,limit,offset,head,epoch},
+                CloudCommand::Object {kind,key,head,epoch}=>crate::team::CloudQuery::Object {kind,key,head,epoch},
+                CloudCommand::Search {query,limit}=>crate::team::CloudQuery::Search {query,limit},
+                CloudCommand::Get {slug}=>crate::team::CloudQuery::Get {slug},
+                CloudCommand::List {limit,offset}=>crate::team::CloudQuery::List {limit,offset},
+            };
+            crate::replica::cloud_query(&server,space,&query)
+        },
+        Command::Space { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(),"space")?;
+            match command {
+                SpaceCommand::Bind {space,import_project} => crate::replica::bind_project(&cwd,Some(&space),import_project),
+                SpaceCommand::Unbind => crate::replica::bind_project(&cwd,None,false),
+                SpaceCommand::Join {space,server,device,manual} => {
+                    let result=crate::replica::join_space(&server,&space,&device,!manual)?;
+                    if !manual {crate::replica::start_worker(result["reference"].as_str().unwrap())?;}
+                    Ok(result)
+                },
+                SpaceCommand::Supervise => crate::replica::supervise(),
+                SpaceCommand::Watch {space} => crate::replica::watch_space(&space),
+                SpaceCommand::Configure {space,interval_ms,automatic} => crate::replica::configure_space(&space,interval_ms,automatic),
+                SpaceCommand::Candidate {space,session,if_digest,reference,offset,limit} => crate::replica::conflict_candidate(&space,&session,&if_digest,&reference,offset,limit),
+                SpaceCommand::Conflicts {space} => crate::replica::conflict_packet(&space),
+                SpaceCommand::Claim {space,session,if_digest,claim} => crate::replica::claim_conflict(&space,&session,&if_digest,claim.as_deref()),
+                SpaceCommand::Resolve {space,session,if_digest,file,claim} => crate::replica::resolve_space(&space,&session,&if_digest,&file,claim.as_deref()),
+                SpaceCommand::Sync {space} => crate::replica::sync_space(&space),
+                SpaceCommand::List => crate::replica::list_spaces(),
+                SpaceCommand::Show {space} => crate::replica::show_space(&space),
+            }
+        }
+        Command::Login { server, name, key_stdin } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "login")?;
+            if key_stdin { crate::replica::login_key(&server) } else {crate::replica::login(&server,&name)}
+        }
+        Command::Logout { server } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "logout")?;
+            crate::replica::logout(&server)
+        }
+        Command::Recovery {server,json} => {
+            changeset::reject_selector(selected_changeset.as_deref(),"recovery")?;
+            let space=cli.selected_space.as_deref().ok_or_else(||AppError::new("invalid_space","recovery requires --space SPACE_ID"))?;
+            crate::replica::recovery_json(&server,space,&json)
+        }
+        Command::Server { command } => {
+            changeset::reject_selector(selected_changeset.as_deref(), "server")?;
+            match command {
+                ServerCommand::Backup {data,output} => crate::team::snapshot_server(&data,&output,None),
+                ServerCommand::Restore {backup,authority_data,output} => crate::team::snapshot_server(&backup,&output,Some(&authority_data)),
+                ServerCommand::RotateToken {data} => crate::team::rotate_access_token(&data),
+                ServerCommand::Run { config } => crate::team::run(&config),
+                ServerCommand::Init { data, admin_email, name } => crate::team::initialize(&data,&admin_email,&name),
+            }
+        }
         Command::Discussion { command } => {
             changeset::reject_selector(selected_changeset.as_deref(), "discussion")?;
             ensure_scope_supported(cli.scope, false, "discussion")?;
@@ -1063,8 +1140,17 @@ fn run(cli: Cli) -> Result<Value> {
                     "configuration is deployment-local and cannot be changed in a changeset",
                 ));
             }
+            if let ConfigCommand::Server {server,..}=&command { return crate::replica::configure_server(server); }
+            if let ConfigCommand::Delegate {server,agent_id,grant_space,write,output}=&command {
+                let output=if output.is_absolute(){output.clone()}else{cwd.join(output)};
+                return crate::replica::delegate(server,agent_id,grant_space,*write,&output);
+            }
+            if let ConfigCommand::Team {server,email,nickname,agent}=&command {
+                return crate::replica::configure_identity(server,email,nickname,agent);
+            }
             let store_path = resolve_live_store_path(cli.scope, &cwd)?;
             match command {
+                ConfigCommand::Team {..} | ConfigCommand::Delegate {..} | ConfigCommand::Server {..} => unreachable!(),
                 ConfigCommand::Show => {
                     config::response(scope_name(store_path.scope), &store_path.path)
                 }
@@ -1785,4 +1871,18 @@ fn run(cli: Cli) -> Result<Value> {
             to_json(store.log(limit)?)
         }
     }
+}
+
+fn supports_space(command:&Command)->bool {
+    matches!(command,
+            Command::Discussion {..} | Command::View {..} | Command::Changeset {..} | Command::Work {..} |
+            Command::Schema {..} | Command::Purpose {..} | Command::Source {..} |
+            Command::Page {..} | Command::Tag {..} | Command::Todo {..} | Command::Plan {..} |
+            Command::Compress {..} | Command::Merge {..} | Command::Load {..} | Command::Ingest {..} |
+            Command::Remember {..} | Command::Memory {..} | Command::Graph {..} |
+            Command::Weight {..} | Command::Maintenance {..} | Command::Checkpoint {..} |
+            Command::Search {..} | Command::Span {..} | Command::Context {..} |
+            Command::Lint {..} | Command::Log {..} |
+            Command::Agent {command:AgentCommand::Hook {..}}
+        )
 }

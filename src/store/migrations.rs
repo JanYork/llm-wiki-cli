@@ -152,6 +152,14 @@ fn prepare_store(
         tx.commit()?;
         version=DISCUSSION_VERSION;
     }
+    if version == DISCUSSION_VERSION {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        create_replica_history_schema(&tx)?;
+        tx.execute("UPDATE meta SET value=?1 WHERE key='format_version'", [REPLICA_HISTORY_VERSION.to_string()])?;
+        tx.pragma_update(None, "user_version", REPLICA_HISTORY_VERSION)?;
+        tx.commit()?;
+        version = REPLICA_HISTORY_VERSION;
+    }
     if version != USER_VERSION {
         return Err(AppError::new(
             "unsupported_store_version",

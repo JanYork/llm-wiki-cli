@@ -1,0 +1,2 @@
+CREATE TABLE personal_keys(key_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),issued_by TEXT NOT NULL REFERENCES users(id),name TEXT NOT NULL,expires_at INTEGER NOT NULL,revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN(0,1)),created_at INTEGER NOT NULL DEFAULT(unixepoch()));
+CREATE TABLE key_credentials(credential_hash TEXT PRIMARY KEY,key_hash TEXT NOT NULL REFERENCES personal_keys(key_hash));
