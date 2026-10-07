@@ -39,7 +39,7 @@ LWC 把经过筛选的文档转化为可长期维护的 Wiki。Agent 负责理�
   <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-overview-zh.png" alt="LWC 产品概览" width="820">
 </p>
 
-## 自建团队记忆 — v0.19.4
+## 自建团队记忆 — v0.19.5
 
 团队空间将核心记忆保留在本地 SQLite 与 Wiki，再由 LWC 自动双向同步。
 外部智能体通过命令行或工具接口处理冲突，程序不内嵌模型。团队界面支持中英文，
@@ -50,7 +50,9 @@ LWC 把经过筛选的文档转化为可长期维护的 Wiki。Agent 负责理�
 和[访问及恢复设计](docs/team-cloud/access-policy-recovery.md)。邮箱验证码、飞书和
 代码托管账号登录所需配置由部署者提供。
 
-使用自动生成的个人密钥登录并选择有权访问的空间；开通成员时可同时授予初始空间权限。知识页支持受权限保护的分享链接和正文知识跳转。[团队版指南](https://github.com/JanYork/llm-wiki-cli/wiki/Team-Memory-zh-CN) · [版本说明](docs/releases/v0.19.4.md)。
+使用自动生成的个人密钥登录并选择有权访问的空间；开通成员时可同时授予初始空间权限。知识页支持受权限保护的分享链接和正文知识跳转。[团队版指南](https://github.com/JanYork/llm-wiki-cli/wiki/Team-Memory-zh-CN) · [版本说明](docs/releases/v0.19.5.md)。
+
+团队所有者和空间管理者可将资源移入回收站并恢复，记忆内容持续保留。空间变化会使旧删除确认失效；回收站内仍可交接管理权限。资源不可访问时，客户端保留待发送记忆并暂停共享写入。
 
 自动同步将连续编辑聚合为持久批次，并控制后台处理节奏。接收远端修改时保留本地独立编辑；搜索索引恢复期间，进度、回执与正文仍可读取。全量快照仍有开销，传播速度取决于存储与负载。
 

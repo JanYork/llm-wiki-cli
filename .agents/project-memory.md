@@ -42,6 +42,8 @@ Translated READMEs, package summaries, integration summaries, and copied Skill t
 
 ## Current durable execution
 
+- v0.19.5 publication: Plan `ad39e9506455f250e0a79c4cadee1116` owns release gates and channel readback for the resource lifecycle candidate and four review fixes. Production remains on 0.19.4 until a separately requested upgrade.
+
 - Resource lifecycle candidate (2026-10-07): Plan `95ca7ea798bbf68ca5a29b6ea70e6e7b` completed delivery of Todo `6b44b5286b1372eba741ac335f737753` (team/space soft deletion, recycle bin, authorized restore). `docs/team-cloud/resource-lifecycle.md` owns schema 7, local preservation and targeted acceptance. This is an unreleased candidate; production remains on public 0.19.4. Other audit Todos are independent backlog items.
 
 - Production upgrade (2026-10-07): HTTPS 8788 backend runs 0.19.4 using verified public program/admin artifacts on its retained runtime base. Old-version offline backup completed; downtime about 30 seconds. All 3 original spaces and 9,074 objects matched before/after; owner login, associations, TLS/assets and two-way automatic CLI sync passed. Two small-space propagation samples were 20/40 seconds, not a second-level guarantee. Temporary clients/sessions/credentials were cleaned up; private synthetic space and rollback material remain. Normal local/Pro CLIs were not upgraded. `docs/team-cloud/production-upgrade-0.19.4.md` and Wiki `lwc-team-cloud` own current evidence.

@@ -42,7 +42,7 @@ query.
   <img src="https://raw.githubusercontent.com/JanYork/llm-wiki-cli/main/docs/images/lwc-overview-en.png" alt="LWC product overview" width="820">
 </p>
 
-## Self-hosted team memory — v0.19.4
+## Self-hosted team memory — v0.19.5
 
 LWC team spaces keep core memory in local SQLite and Wiki files and synchronize
 it automatically through a self-hosted server. External Agents resolve conflicts
@@ -54,7 +54,9 @@ See the [deployment guide](deploy/team/README.md), [protocol](docs/team-cloud/pr
 and [access and recovery design](docs/team-cloud/access-policy-recovery.md).
 Email, Feishu and GitHub sign-in use deployment-supplied provider configuration.
 
-Sign in with a generated personal key, select an authorized space, and provision a member with initial space access in one step. Share permission-checked page links and follow knowledge links without leaving the reader. [Team guide](https://github.com/JanYork/llm-wiki-cli/wiki/Team-Memory) · [Release notes](docs/releases/v0.19.4.md).
+Sign in with a generated personal key, select an authorized space, and provision a member with initial space access in one step. Share permission-checked page links and follow knowledge links without leaving the reader. [Team guide](https://github.com/JanYork/llm-wiki-cli/wiki/Team-Memory) · [Release notes](docs/releases/v0.19.5.md).
+
+Team owners and space managers can move resources to the recycle bin and restore them without losing memory. Changes to a team’s spaces invalidate old deletion confirmations; permission handover remains available while archived. Clients preserve pending memory and pause shared writes when a resource becomes unavailable.
 
 Automatic sync coalesces edits into durable batches and paces background work. Independent local edits can continue while remote changes arrive; progress, receipts and page reads remain available while search indexes recover. Full snapshots still have a cost, so propagation depends on storage and workload.
 
