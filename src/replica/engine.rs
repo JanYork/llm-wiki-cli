@@ -253,11 +253,11 @@ pub(crate) fn sync_space(space: &str) -> Result<Value> {
         }
         Err(error) => {
             // Authorization can disappear after head, during any transfer or commit.
-            if error
-                .details
-                .as_ref()
-                .is_some_and(|d| matches!(d["http_status"].as_u64(), Some(401 | 403 | 410)))
-            {
+            if error.details.as_ref().is_some_and(|d| {
+                matches!(d["http_status"].as_u64(), Some(401 | 410))
+                    || (d["http_status"] == 403
+                        && d["remote_details"]["permission_scope"] != "resource")
+            }) {
                 Store::open("project", directory.join("wiki.db"))?.suspend_replica_policy()?;
             }
             save_credentials(

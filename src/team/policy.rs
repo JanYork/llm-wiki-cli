@@ -109,7 +109,9 @@ pub(super) fn authorize_delta(
                 "forbidden",
                 "shared memory delta violates a resource permission",
             )
-            .with_details(json!({"kind":kind,"key":key,"action":action})));
+            .with_details(
+                json!({"kind":kind,"key":key,"action":action,"permission_scope":"resource"}),
+            ));
         }
     }
     // A new event may supersede a protected original without changing that original's row.
@@ -124,7 +126,7 @@ pub(super) fn authorize_delta(
             return Err(AppError::new(
                 "forbidden",
                 "superseding a protected memory is not permitted",
-            ));
+            ).with_details(json!({"kind":"memory","key":target,"action":"update","permission_scope":"resource"})));
         }
     }
     Ok(())
