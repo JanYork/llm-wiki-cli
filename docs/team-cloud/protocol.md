@@ -2,9 +2,9 @@
 
 本合同冻结首版双方的边界；接口交付状态以LWC Plan为准。上层网络信封为`lwc-team-sync/1`、`share_schema=1`；规范化SQLite沿用`sync_manifest/sync_objects/sync_blobs`，不传输本机活动数据库文件。新增来源/领域历史需要Store schema 20。未知协议、Store版本或对象类型必须拒绝，不能忽略后返回成功。
 
-## 未发布候选：资源生命周期
+## v0.19.5：资源生命周期
 
-删除/回收站/恢复及控制库 schema 7 属于未发布候选，尚未部署生产。具体权限、并发、客户端保全和验收边界见 [资源生命周期](resource-lifecycle.md)。当前公开 0.19.4 使用 schema 6；升级后的控制库不能直接交给旧服务端读取。
+删除/回收站/恢复及控制库 schema 7 已随 v0.19.5 发布，尚未部署生产。具体权限、并发、客户端保全和验收边界见 [资源生命周期](resource-lifecycle.md)；发行证据见 [v0.19.5 验收](../releases/v0.19.5-acceptance.md)。生产 0.19.4 使用 schema 6；升级后的控制库不能直接交给旧服务端读取。
 
 ## 核心覆盖与身份
 
