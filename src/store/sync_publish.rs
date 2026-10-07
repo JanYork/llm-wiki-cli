@@ -178,6 +178,55 @@ fn read_sync_publication_receipt(
 }
 
 impl Store {
+    /// Canonical team commits persist a pending derived receipt before COMMIT.
+    /// After interruption rebuild from the current immutable head, never replay content.
+    pub(crate) fn team_indexes_pending(&self) -> Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE action='sync_merge' AND json_type(detail_json,'$.team')='object' AND COALESCE(json_extract(detail_json,'$.derived.retry_after'),0)<=CAST(strftime('%s','now') AS INTEGER) AND (COALESCE(json_extract(detail_json,'$.derived.status'),'pending')='pending' OR (json_extract(detail_json,'$.derived.status')='failed' AND (COALESCE(json_extract(detail_json,'$.derived.error'),'')!='sync_source_index_too_large' OR COALESCE(json_extract(detail_json,'$.derived.head'),-1)!=(SELECT CAST(value AS INTEGER) FROM meta WHERE key='team_head')))))",
+            [], |r| r.get(0),
+        ).map_err(Into::into)
+    }
+
+    pub(crate) fn resume_team_indexes(&mut self) -> Result<()> {
+        if !self.team_indexes_pending()? { return Ok(()); }
+        let head=self.team_head()?;
+        let attempts:i64=self.conn.query_row("SELECT COALESCE(MAX(CAST(json_extract(detail_json,'$.derived.attempts') AS INTEGER)),0) FROM operations WHERE action='sync_merge' AND json_type(detail_json,'$.team')='object' AND COALESCE(json_extract(detail_json,'$.derived.status'),'pending')!='completed'",[],|r| r.get(0))?;
+        let attempts=attempts.max(0).saturating_add(1);
+        let retry_after=crate::team::lease::now()?.saturating_add((30_u64.saturating_mul(1_u64 << (attempts.min(5)-1) as u32)).min(300));
+        // Persist the retry deadline before preparation; a crash cannot cause a
+        // recovery storm on every head poll after restart.
+        self.set_team_derived(&json!({"status":"pending","attempts":attempts,"retry_after":retry_after}))?;
+        let outcome=(|| -> Result<()> {
+            let artifact=head["artifact_id"].as_str().ok_or_else(|| AppError::new("replica_not_ready","missing accepted snapshot"))?;
+            if !is_lower_sync_hex(artifact,64) { return Err(AppError::new("invalid_snapshot","invalid accepted snapshot")); }
+            let path=self.database.parent().unwrap().join("snapshots").join(artifact);
+            let state=prepare_sync_state(&path)?;
+            if head["digest"] != state.digest { return Err(AppError::new("sync_checksum_mismatch","accepted snapshot changed")); }
+            let affected=changed_sync_objects(&BTreeMap::new(),&state.objects);
+            let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch("DELETE FROM search_fts; DELETE FROM memory_fts; DELETE FROM todo_fts; DELETE FROM plan_fts; UPDATE search_spans SET active=0;")?;
+            rebuild_sync_indexes(&tx,&state,&affected,&BTreeMap::new())?;
+            tx.execute("UPDATE operations SET detail_json=json_set(detail_json,'$.derived',json(?1)) WHERE action='sync_merge' AND json_type(detail_json,'$.team')='object' AND COALESCE(json_extract(detail_json,'$.derived.status'),'pending')!='completed'",[json!({"status":"completed","recovered":true}).to_string()])?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error)=outcome {
+            self.set_team_derived(&json!({"status":"failed","error":error.code,"committed":true,"head":head["head"],"attempts":attempts,"retry_after":retry_after}))?;
+        }
+        Ok(())
+    }
+
+    fn set_team_derived(&self, value:&Value) -> Result<()> {
+        self.conn.execute("UPDATE operations SET detail_json=json_set(detail_json,'$.derived',json(?1)) WHERE action='sync_merge' AND json_type(detail_json,'$.team')='object' AND COALESCE(json_extract(detail_json,'$.derived.status'),'pending')!='completed'",[value.to_string()])?;
+        Ok(())
+    }
+
+    pub(crate) fn require_team_indexes(&self) -> Result<()> {
+        let bad: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE action='sync_merge' AND json_type(detail_json,'$.team')='object' AND COALESCE(json_extract(detail_json,'$.derived.status'),'pending')!='completed')",[],|r|r.get(0))?;
+        if bad { return Err(AppError::new("sync_derived_unavailable","accepted memory is available, but search indexes need recovery")); }
+        Ok(())
+    }
+
     pub(crate) fn persist_sync_derived_receipt(
         &self,
         session_id: &str,
@@ -281,18 +330,23 @@ impl Store {
         expected: &StoreIdentity,
         session_id: &str,
     ) -> Result<SyncPublishSummary> {
-        self.publish_sync_state_inner(normalized,expected,session_id,None)
+        self.publish_sync_state_inner(normalized,expected,session_id,None,None, || Ok(()))
     }
 
-    fn publish_sync_state_inner(
+    #[allow(clippy::too_many_arguments)]
+    fn publish_sync_state_inner<G>(
         &mut self,
         normalized: &Path,
         expected: &StoreIdentity,
         session_id: &str,
         team: Option<&TeamCommit>,
+        replica_base: Option<&Path>,
+        before_commit: impl FnOnce() -> Result<G>,
     ) -> Result<SyncPublishSummary> {
         let state = prepare_sync_state(normalized)?;
-        if self.identity()? != *expected {
+        let base = replica_base.map(load_sync_objects).transpose()?;
+        let checkpoint_identity = self.identity()?;
+        if base.is_none() && checkpoint_identity != *expected {
             return Err(sync_store_changed());
         }
 
@@ -301,7 +355,7 @@ impl Store {
             &format!(
                 "sync-{}-{}-{}",
                 &hash_content(session_id)[..8],
-                &expected.revision[..8],
+                &checkpoint_identity.revision[..8],
                 &state.digest[..8]
             ),
         )?;
@@ -314,7 +368,7 @@ impl Store {
                     ));
                 }
                 let saved = Store::open_for_read(self.scope.clone(), &checkpoint)?.identity()?;
-                if saved != *expected {
+                if base.is_none() && saved != *expected {
                     return Err(AppError::new(
                         "checkpoint_exists",
                         "the existing Sync recovery checkpoint does not match the expected store",
@@ -339,6 +393,8 @@ impl Store {
             .into_iter()
             .map(|(key, row)| (key, row.payload))
             .collect::<BTreeMap<_, _>>();
+        let previous = base.as_ref().map(|objects| objects.iter()
+            .map(|(key,row)| (key.clone(),row.payload.clone())).collect()).unwrap_or(previous);
         let affected = derived_sync_affected(&previous, &state.objects);
 
         let normalized_database = state.normalized.to_string_lossy().into_owned();
@@ -351,11 +407,13 @@ impl Store {
         let mut affected_graph_documents = Vec::new();
         let mut bounded_selection = None;
         let result = (|| -> Result<String> {
-            let tx = self
-                .conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if store_identity(&tx)? != *expected {
+            let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            let starting = store_identity(&tx)?;
+            if starting.store_id != expected.store_id || (base.is_none() && starting != *expected) {
                 return Err(sync_store_changed());
+            }
+            if base.is_some() {
+                self.require_replica_patch_base(&previous, &state)?;
             }
             if let Some(team)=team { validate_team_commit(&tx,team,session_id,&state.digest)?; }
             old_source_ids = source_ids_for_hashes(&tx, affected.keys("source"))?;
@@ -363,7 +421,13 @@ impl Store {
                 &tx,
                 affected.keys("semantic_relation"),
             )?;
-            apply_prepared_sync_state(&tx, &state)?;
+            if base.is_some() {
+                apply_replica_patch(&tx, &previous, &state).map_err(|error| {
+                    if starting != *expected && error.code == "sync_state_invalid" { sync_store_changed() } else { error }
+                })?;
+            } else {
+                apply_prepared_sync_state(&tx, &state)?;
+            }
             affected_graph_documents = sync_graph_documents(
                 &tx,
                 &affected,
@@ -375,13 +439,17 @@ impl Store {
                 &affected_graph_documents,
             )?);
             let selection = bounded_selection.as_ref().expect("selection was prepared");
-            validate_database_integrity(&tx)
-                .map_err(|error| AppError::new("sync_state_invalid", error.message))?;
+            validate_database_integrity(&tx).map_err(|error| {
+                if base.is_some() && starting != *expected { sync_store_changed() }
+                else { AppError::new("sync_state_invalid", error.message) }
+            })?;
             let mut detail = json!({
+                "derived": {"status":"pending"},
                 "state_digest": state.digest,
                 "blob_count": state.blob_count,
                 "checkpoint": checkpoint.file_name().map(|name| name.to_string_lossy()),
-                "starting_identity": expected,
+                "starting_identity": starting,
+                "concurrent_local": starting != *expected,
                 "derived_selection": selection.mode,
                 "affected_counts": selection.counts,
                 "affected_digest": selection.digest,
@@ -407,9 +475,19 @@ impl Store {
                 "UPDATE operations SET detail_json=?1 WHERE id=?2",
                 params![detail_json, operation_id],
             )?;
-            validate_database_integrity(&tx)
-                .map_err(|error| AppError::new("sync_state_invalid", error.message))?;
+            validate_database_integrity(&tx).map_err(|error| {
+                if base.is_some() && starting != *expected { sync_store_changed() }
+                else { AppError::new("sync_state_invalid", error.message) }
+            })?;
+            // Keep the final authorization guard alive only through canonical commit.
+            // Expensive preparation/import and post-commit indexes do not hold it.
+            #[cfg(feature = "sync-fault-injection")]
+            sync_test_fault("before-commit")?;
+            let guard = before_commit()?;
             tx.commit()?;
+            drop(guard);
+            #[cfg(feature = "sync-fault-injection")]
+            sync_test_fault("after-commit")?;
             Ok(revision)
         })();
         let detach = self.conn.execute_batch("DETACH DATABASE sync_normalized");
@@ -854,7 +932,7 @@ fn apply_prepared_sync_state(tx: &Transaction<'_>, state: &PreparedSyncState) ->
     let plan_requests = local_object_request_ids(tx, "plans")?;
     clear_synced_semantic_state(tx)?;
     import_sync_meta(tx, state)?;
-    let source_ids = import_sync_sources(tx, state)?;
+    let source_ids = import_sync_sources(tx, state, true)?;
     import_sync_pages(tx, state, &source_ids)?;
     import_sync_tags(tx, state)?;
     import_sync_ingest(tx, state, &source_ids)?;
@@ -1114,6 +1192,7 @@ fn import_sync_meta(tx: &Transaction<'_>, state: &PreparedSyncState) -> Result<(
 fn import_sync_sources(
     tx: &Transaction<'_>,
     state: &PreparedSyncState,
+    remove_absent: bool,
 ) -> Result<BTreeMap<String, i64>> {
     let desired = objects_of_kind(state, "source")
         .map(|(key, _)| key.to_owned())
@@ -1127,7 +1206,7 @@ fn import_sync_sources(
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     for (id, hash) in stale {
-        if !desired.contains(&hash) {
+        if remove_absent && !desired.contains(&hash) {
             tx.execute(
                 "DELETE FROM source_path_revisions
                  WHERE source_id=?1 OR tracked_path IN (
@@ -1145,7 +1224,9 @@ fn import_sync_sources(
         }
     }
 
-    let mut ids = BTreeMap::new();
+    let mut ids = tx.prepare("SELECT content_hash,id FROM sources")?
+        .query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,i64>(1)?)))?
+        .collect::<rusqlite::Result<BTreeMap<_,_>>>()?;
     for (hash, payload) in objects_of_kind(state, "source") {
         if optional_str(payload, "content_hash")?.is_some_and(|value| value != hash) {
             return Err(invalid_object(
@@ -1680,7 +1761,7 @@ fn next_sync_local_revision(current: Option<i64>, kind: &str, id: &str) -> Resul
 
 fn rebuild_sync_indexes(
     tx: &Transaction<'_>,
-    state: &PreparedSyncState,
+    _state: &PreparedSyncState,
     affected: &SyncAffected,
     old_source_ids: &BTreeMap<String, Vec<i64>>,
 ) -> Result<()> {
@@ -1756,9 +1837,9 @@ fn rebuild_sync_indexes(
     }
     for id in affected.keys("memory") {
         tx.execute("DELETE FROM memory_fts WHERE event_id=?1", [id])?;
-        let Some(payload) = object(state, "memory", id) else {
-            continue;
-        };
+        if !tx.query_row("SELECT EXISTS(SELECT 1 FROM memory_events WHERE id=?1)",[id],|r| r.get::<_,bool>(0))? { continue; }
+        let current = load_memory_event(tx, id)?;
+        let payload = &current;
         let input = MemoryEventInput {
             request_id: None,
             event_type: required_str(payload, "type")?.to_owned(),
@@ -1796,9 +1877,9 @@ fn rebuild_sync_indexes(
     }
     for id in affected.keys("todo") {
         tx.execute("DELETE FROM todo_fts WHERE todo_id=?1", [id])?;
-        let Some(payload) = object(state, "todo", id) else {
-            continue;
-        };
+        if !tx.query_row("SELECT EXISTS(SELECT 1 FROM todo_items WHERE id=?1)",[id],|r| r.get::<_,bool>(0))? { continue; }
+        let current = load_todo(tx, id, "project")?;
+        let payload = &current;
         let tags = owned_string_array(payload, "tags")?;
         index_todo(
             tx,
@@ -1811,9 +1892,9 @@ fn rebuild_sync_indexes(
     }
     for id in affected.keys("plan") {
         tx.execute("DELETE FROM plan_fts WHERE plan_id=?1", [id])?;
-        let Some(payload) = object(state, "plan", id) else {
-            continue;
-        };
+        if !tx.query_row("SELECT EXISTS(SELECT 1 FROM plans WHERE id=?1)",[id],|r| r.get::<_,bool>(0))? { continue; }
+        let current = load_plan(tx, id, "project")?;
+        let payload = &current;
         index_plan(tx, id, payload)?;
     }
     Ok(())
@@ -1953,4 +2034,27 @@ fn local_target_identifier(
     } else {
         Ok(identifier.to_owned())
     }
+}
+
+#[cfg(feature = "sync-fault-injection")]
+pub(crate) fn sync_test_fault(stage: &str) -> Result<()> {
+    let Some(directory)=std::env::var_os("LWC_SYNC_TEST_DIR") else { return Ok(()); };
+    let directory=PathBuf::from(directory);
+    let armed=directory.join(format!("{stage}.arm"));
+    let action=match fs::read_to_string(&armed) {
+        Ok(action)=>action,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(()),
+        Err(error)=>return Err(error.into()),
+    };
+    fs::rename(&armed,directory.join(format!("{stage}.hit")))?;
+    if action.trim()=="exit" { std::process::exit(86); }
+    if action.trim()!="pause" { return Err(AppError::new("invalid_test_fault","unknown test fault")); }
+    let resume=directory.join(format!("{stage}.resume"));
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);
+    while !resume.exists() {
+        if std::time::Instant::now()>deadline { return Err(AppError::new("test_fault_timeout","test barrier was not released")); }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    fs::remove_file(resume)?;
+    Ok(())
 }

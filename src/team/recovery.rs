@@ -200,6 +200,7 @@ pub(super) async fn execute(
         "editor"
     };
     let target = space.clone();
+    let final_secret = secret.clone();
     let capacity = state.config.max_space_bytes;
     Ok(Json(hub::space_operation(&state,secret,space,role,move|tx,store,directory,actor|{
         match input {
@@ -256,7 +257,11 @@ pub(super) async fn execute(
                 let artifact_id=control::token()?;let published=directory.join("snapshots").join(&artifact_id);fs::copy(&candidate,&published)?;fs::OpenOptions::new().write(true).open(&published)?.sync_all()?;
                 #[cfg(unix)] fs::File::open(directory.join("snapshots"))?.sync_all()?;
                 let commit=TeamCommit{epoch:head["server_epoch"].as_str().unwrap().into(),expected_head:head["head"].as_u64().unwrap(),actor:actor.into(),principal:json!(super::delegation::current(tx)?),recovery:Some(json!({"revert_head":preview.revert_head,"preview_id":preview.id,"rejected_images":rejected})),replica_id:preview_id.clone(),batch_id:request_id.clone(),artifact_id,payload_digest:digest};
-                store.publish_team_state(&published,&store.identity()?,&commit)?;
+                let rules=hub::policy_rules(tx,actor,&target)?;
+                let principal=json!(super::delegation::current(tx)?);
+                store.publish_team_state_guarded(&published,&store.identity()?,&commit, || {
+                    hub::publication_guard(directory,&final_secret,&target,actor,&commit.epoch,&rules,&principal)
+                })?;
                 hub::signed_receipt(directory,store.team_receipt(&preview_id,&request_id)?.ok_or_else(||AppError::new("sync_receipt_invalid","recovery receipt unavailable"))?)
             }
         }

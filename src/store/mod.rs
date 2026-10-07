@@ -20,6 +20,7 @@ include!("replica_history.rs");
 include!("sync.rs");
 include!("sync_resolution.rs");
 include!("sync_publish.rs");
+include!("replica_apply.rs");
 include!("team_publish.rs");
 include!("replica_policy.rs");
 include!("tests.rs");

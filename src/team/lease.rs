@@ -44,6 +44,15 @@ pub(crate) fn now() -> Result<u64> {
         .map_err(|_| invalid())
 }
 fn key(directory: &Path) -> Result<SigningKey> {
+    // Space preparation no longer shares the global control write lock. Serialize
+    // first key creation so concurrent spaces cannot observe a partially written key.
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join("policy-signing.lock"))?;
+    lock.lock()?;
     let path = directory.join("policy-signing.key");
     if !path.try_exists()? {
         let mut bytes = [0; 32];

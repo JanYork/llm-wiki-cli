@@ -124,12 +124,17 @@ impl Store {
         tx.commit()?;
         install_replica_policy_guards(&self.conn)
     }
-    pub(crate) fn publish_replica_state(&mut self,normalized:&Path,expected:&StoreIdentity,session:&str)->Result<SyncPublishSummary> {
+    pub(crate) fn publish_replica_state(&mut self,normalized:&Path,baseline:&Path,expected:&StoreIdentity,session:&str)->Result<SyncPublishSummary> {
         // Called only by the authenticated replica engine after the server policy/head checks.
         let guarded:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name='lwc_policy_context')",[],|r|r.get(0))?;
         if guarded {self.conn.execute("UPDATE temp.lwc_policy_context SET remote_apply=1",[])?;}
-        let result=self.publish_sync_state(normalized,expected,session);
+        // Suppress automatic FK cascades while replacing touched owners only. The
+        // transaction validates every FK before commit; unrelated dependents survive.
+        self.conn.pragma_update(None, "foreign_keys", false)?;
+        let result=self.publish_sync_state_inner(normalized,expected,session,None,Some(baseline), || Ok(()));
+        let foreign_keys=self.conn.pragma_update(None, "foreign_keys", true);
         if guarded {self.conn.execute("UPDATE temp.lwc_policy_context SET remote_apply=0",[])?;}
+        foreign_keys?;
         result
     }
 }

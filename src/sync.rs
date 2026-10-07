@@ -3898,15 +3898,17 @@ pub(crate) fn export_sync_state_with_continuity(
             detached?;
         }
     }
+    let tx = conn.unchecked_transaction()?;
     for audit in audits {
         let key = audit.audit_key.clone();
         let payload = serde_json::to_value(audit)
             .map_err(|error| AppError::new("sync_audit_invalid", error.to_string()))?;
-        insert_continuity_object(&conn, "work_audit", &key, &payload)?;
+        insert_continuity_object(&tx, "work_audit", &key, &payload)?;
     }
     for (key, payload) in inherited_audits {
-        insert_continuity_object(&conn, "work_audit", &key, &payload)?;
+        insert_continuity_object(&tx, "work_audit", &key, &payload)?;
     }
+    tx.commit()?;
     conn.execute_batch("VACUUM;")?;
     summary.object_count =
         conn.query_row("SELECT COUNT(*) FROM sync_objects", [], |row| row.get(0))?;

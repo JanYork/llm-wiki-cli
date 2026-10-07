@@ -29,7 +29,7 @@ lwc space join SPACE_ID --server https://memory.example.com
 lwc space configure SPACE_ID --interval-ms 2000 --automatic true
 ```
 
-首条命令从标准输入读取密钥，避免命令历史保存密钥。命令行登录的设备授权码可在管理界面总览的“连接我的智能体”中确认。`join` 默认启动自动同步；`--manual` 仅用于明确需要手动同步的副本。轮询间隔范围为 250–300000 毫秒。
+首条命令从标准输入读取密钥，避免命令历史保存密钥。命令行登录的设备授权码可在管理界面总览的“连接我的智能体”中确认。`join` 默认启动自动同步；`--manual` 仅用于明确需要手动同步的副本。轮询间隔范围为 250–300000 毫秒。该参数是聚合与轮询的基础周期，不是传播时延保证：首次大同步和后续批次均采用固定在途窗口，连续编辑留到下一批；批次完成后按工作耗时休息，故障重试错峰退避。同步状态、回执和正文不依赖搜索索引恢复；索引未就绪时搜索明确返回未就绪。
 
 需要跨登录和进程退出恢复时，运行本目录的当前用户服务安装器：macOS/Linux 使用 `sh install-sync-service.sh /absolute/path/to/lwc`，Windows 使用 `install-sync-service.ps1 -Executable C:\path\lwc.exe`。委托智能体先设置 `LWC_TEAM_CREDENTIALS_FILE` 再安装；服务仅保存凭据路径，不复制密钥。原生服务管理器重启监督进程，监督进程恢复已开启自动同步的副本。
 

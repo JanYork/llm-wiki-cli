@@ -315,7 +315,9 @@ fn team_server_bootstrap_and_http_boundaries() {
             let recovered=cli(&["space","sync",space_id]);
             assert_eq!(recovered["status"],"synced");
             assert_eq!(recovered["head"],1,"receipt recovery must not create another remote commit");
+            let idle_record_time=fs::metadata(replica.join("replica.json")).unwrap().modified().unwrap();
             assert_eq!(cli(&["space","sync",space_id])["status"],"current");
+            assert_eq!(fs::metadata(replica.join("replica.json")).unwrap().modified().unwrap(),idle_record_time,"idle polling must not rewrite unchanged replica state");
             let repeated=cli(&["space","join",space_id,"--server",&origin,"--manual"]);
             assert_eq!(repeated["replica"]["joined"],true);
             assert_eq!(repeated["database"],joined["database"]);
@@ -399,11 +401,16 @@ fn team_server_bootstrap_and_http_boundaries() {
             let bodies=pages["pages"].as_array().unwrap().iter().map(|p|cli(&["--space",space_id,"page","show",p["slug"].as_str().unwrap()])["page"]["body"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
             assert!(bodies.iter().any(|body|body=="Evidence from A"));
             assert!(bodies.iter().any(|body|body=="Evidence from B"));
-            // One autonomous propagation check; no manual sync on the writing replica.
-            cli(&["space","configure",space_id,"--interval-ms","250","--automatic","true"]);
+            // A burst goes through the autonomous coalescing queue; no manual writer sync.
+            let before_burst:Value=client.get(format!("{origin}/api/spaces/{space_id}/head")).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
+            cli(&["space","configure",space_id,"--interval-ms","2000","--automatic","true"]);
+            for index in 0..8 {
+                fs::write(temp.path().join("body.md"),format!("Queued body {index}")).unwrap();
+                cli(&["--space",space_id,"page","put",&format!("queued-{index}"),"--title","Queued","--file","body.md","--provenance","agent-observed"]);
+            }
             fs::write(temp.path().join("body.md"),"Autonomous propagation").unwrap();
             cli(&["--space",space_id,"page","put","automatic-page","--title","Automatic","--file","body.md","--provenance","agent-observed"]);
-            let deadline=Instant::now()+Duration::from_secs(10);
+            let deadline=Instant::now()+Duration::from_secs(30);
             loop {
                 b(&["space","sync",space_id]);
                 let pages=b(&["--space",space_id,"page","list"]);
@@ -411,6 +418,23 @@ fn team_server_bootstrap_and_http_boundaries() {
                 assert!(Instant::now()<deadline,"worker did not propagate the local write");
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
+            for index in 0..8 {
+                assert_eq!(b(&["--space",space_id,"page","show",&format!("queued-{index}")])["page"]["body"],format!("Queued body {index}"));
+            }
+            let after_burst:Value=client.get(format!("{origin}/api/spaces/{space_id}/head")).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
+            let accepted_batches=after_burst["head"].as_u64().unwrap()-before_burst["head"].as_u64().unwrap();
+            assert!(accepted_batches<9,"the burst must coalesce, not publish every edit separately");
+            println!("automatic burst: 9 writes, {accepted_batches} accepted batches, all bodies verified");
+            let worker_report=replica.join("worker.json");
+            loop {
+                let report:Value=serde_json::from_slice(&fs::read(&worker_report).unwrap()).unwrap();
+                if report["result"]["status"]=="current" {break;}
+                assert!(Instant::now()<deadline,"worker did not reach an idle state");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let report_mtime=fs::metadata(&worker_report).unwrap().modified().unwrap();
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            assert_eq!(fs::metadata(&worker_report).unwrap().modified().unwrap(),report_mtime,"idle polling must not flush the worker report every cycle");
             loop {
                 let output=Command::new(env!("CARGO_BIN_EXE_lwc")).current_dir(temp.path()).env("HOME",&home).env("USERPROFILE",&home)
                     .args(["space","configure",space_id,"--automatic","false"]).output().unwrap();

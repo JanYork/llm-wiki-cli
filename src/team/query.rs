@@ -98,6 +98,9 @@ impl CloudQuery {
     pub(super) fn execute(&self, store: &Store, directory: &std::path::Path) -> Result<Value> {
         self.validate()?;
         // Return domain payloads only; do not expose the server database path.
+        if matches!(self, Self::Search { .. }) {
+            store.require_team_indexes()?;
+        }
         let current = store.team_head()?;
         let data = match self {
             Self::Objects { head, epoch, .. }

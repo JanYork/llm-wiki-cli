@@ -2,6 +2,32 @@ use super::spaces::*;
 use super::*;
 use std::process::{Command, Stdio};
 
+fn paced_delay_ms(interval: u64, elapsed: Duration, failures: u32, entropy: u64) -> u64 {
+    if failures == 0 {
+        // Leave breathing room after expensive batches. Local durable state is the
+        // coalescing queue; edits during this pause belong to the next fixed window.
+        let work = elapsed.as_millis().min(60_000) as u64;
+        let delay = interval.max(work);
+        delay.saturating_add(entropy % ((delay / 10).min(5_000) + 1))
+    } else {
+        let delay = interval
+            .saturating_mul(1u64 << failures.min(7))
+            .min(60_000)
+            .max(interval);
+        delay
+            .saturating_sub(delay / 4)
+            .saturating_add(entropy % (delay / 4 + 1))
+            .max(interval)
+    }
+}
+
+fn entropy() -> Result<u64> {
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random)
+        .map_err(|_| AppError::new("random_failed", "sync pacing jitter unavailable"))?;
+    Ok(u64::from_le_bytes(random))
+}
+
 fn worker_lock(directory: &Path) -> Result<fs::File> {
     let path = directory.join("worker.lock");
     if path.exists() && fs::symlink_metadata(&path)?.file_type().is_symlink() {
@@ -80,42 +106,62 @@ pub(crate) fn watch_space(space: &str) -> Result<Value> {
     };
     let reference = reference(&directory, &record);
     let mut failures = 0u32;
+    let mut last_status = None;
+    let mut last_report = Instant::now();
+    // Aggregate startup edits, but resume an uncertain in-flight batch immediately.
+    // This window never restarts on each edit, so continuous editing cannot starve it.
+    if !directory.join("active.json").exists() {
+        std::thread::sleep(Duration::from_millis(paced_delay_ms(
+            record.interval_ms,
+            Duration::ZERO,
+            0,
+            entropy()?,
+        )));
+    }
     loop {
         let record = read_record(&directory.join("replica.json"))?;
         if !record.automatic {
             return Ok(json!({"status":"stopped"}));
         }
+        let started = Instant::now();
         let result = sync_space(&reference);
-        let (status, delay) = match result {
+        let status = match result {
             Ok(value) => {
-                failures = 0;
-                (value, record.interval_ms)
+                // A completed local rebase is progress, not a failing transport.
+                failures = if value["status"] == "retry" && value["reason"] != "local_changed" {
+                    failures.saturating_add(1)
+                } else {
+                    0
+                };
+                value
             }
             Err(error) => {
                 failures = failures.saturating_add(1);
-                let delay = record
-                    .interval_ms
-                    .saturating_mul(1u64 << failures.min(7))
-                    .min(60_000);
-                (
-                    json!({"status":"retry","error":error.code,"local_memory_preserved":true}),
-                    delay,
-                )
+                json!({"status":"retry","error":error.code,"local_memory_preserved":true})
             }
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| AppError::new("clock_error", "clock predates Unix epoch"))?
-            .as_millis();
-        save_credentials(
-            &directory.join("worker.json"),
-            &json!({"pid":std::process::id(),"checked_at_ms":now,"next_delay_ms":delay,"result":status}),
-        )?;
+        let delay = paced_delay_ms(record.interval_ms, started.elapsed(), failures, entropy()?);
+        // Reports are telemetry, not queue durability. Avoid two fsyncs every idle
+        // poll; record status changes immediately and otherwise heartbeat once a minute.
+        if last_status.as_ref() != Some(&status) || last_report.elapsed() >= Duration::from_secs(60)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| AppError::new("clock_error", "clock predates Unix epoch"))?
+                .as_millis();
+            save_credentials(
+                &directory.join("worker.json"),
+                &json!({"pid":std::process::id(),"checked_at_ms":now,"next_delay_ms":delay,"result":status}),
+            )?;
+            last_status = Some(status);
+            last_report = Instant::now();
+        }
         // Polling is portable and also catches writes by other processes. Store identity
         // avoids exports while idle; filesystem notifications can be added if measured necessary.
         std::thread::sleep(Duration::from_millis(delay));
     }
 }
+
 pub(crate) fn configure_space(
     space: &str,
     interval_ms: Option<u64>,
@@ -144,4 +190,33 @@ pub(crate) fn configure_space(
         start_worker(space)?;
     }
     show_space(space)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pacing_coalesces_slow_batches_and_bounds_retries() {
+        assert_eq!(paced_delay_ms(2_000, Duration::ZERO, 0, 0), 2_000);
+        assert_eq!(paced_delay_ms(2_000, Duration::from_secs(34), 0, 0), 34_000);
+        assert_eq!(
+            paced_delay_ms(2_000, Duration::from_secs(600), 0, 0),
+            60_000
+        );
+        assert_eq!(paced_delay_ms(2_000, Duration::ZERO, 1, 0), 3_000);
+        assert_eq!(paced_delay_ms(2_000, Duration::ZERO, u32::MAX, 0), 45_000);
+        for failures in [0, 1, 7, u32::MAX] {
+            let delay = paced_delay_ms(300_000, Duration::from_secs(600), failures, u64::MAX);
+            assert!((300_000..=305_000).contains(&delay));
+        }
+        for entropy in [0, 1, u64::MAX] {
+            assert!((34_000..=37_400).contains(&paced_delay_ms(
+                2_000,
+                Duration::from_secs(34),
+                0,
+                entropy,
+            )));
+        }
+    }
 }

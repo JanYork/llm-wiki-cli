@@ -652,6 +652,10 @@ impl Store {
 }
 
 fn import_sync_discussions(tx: &Transaction<'_>, state: &PreparedSyncState) -> Result<()> {
+    import_sync_discussions_selected(tx, state, None)
+}
+
+fn import_sync_discussions_selected(tx: &Transaction<'_>, state: &PreparedSyncState, selected: Option<&BTreeSet<String>>) -> Result<()> {
     let mut old = tx.prepare("SELECT id,context,revision FROM discussions")?;
     let owners = old
         .query_map([], |r| {
@@ -668,7 +672,15 @@ fn import_sync_discussions(tx: &Transaction<'_>, state: &PreparedSyncState) -> R
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(binding_query);
-    tx.execute_batch("DELETE FROM discussion_bindings; DELETE FROM discussion_revisions; DELETE FROM discussions;")?;
+    if let Some(selected) = selected {
+        for id in selected {
+            tx.execute("DELETE FROM discussion_bindings WHERE discussion_id=?1", [id])?;
+            tx.execute("DELETE FROM discussion_revisions WHERE discussion_id=?1", [id])?;
+            tx.execute("DELETE FROM discussions WHERE id=?1", [id])?;
+        }
+    } else {
+        tx.execute_batch("DELETE FROM discussion_bindings; DELETE FROM discussion_revisions; DELETE FROM discussions;")?;
+    }
     for (id, payload) in objects_of_kind(state, "discussion") {
         ensure_payload_key(payload, "id", id, "discussion")?;
         let mut body = payload["body"].clone();
@@ -718,7 +730,7 @@ fn import_sync_discussions(tx: &Transaction<'_>, state: &PreparedSyncState) -> R
         }
     }
     for (context, id) in bindings {
-        tx.execute("INSERT INTO discussion_bindings SELECT ?1,id FROM discussions WHERE id=?2 AND context=?1 AND json_extract(body,'$.state')='active'",params![context,id])?;
+        tx.execute("INSERT OR IGNORE INTO discussion_bindings SELECT ?1,id FROM discussions WHERE id=?2 AND context=?1 AND json_extract(body,'$.state')='active'",params![context,id])?;
     }
     Ok(())
 }

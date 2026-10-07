@@ -74,34 +74,8 @@ impl Store {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        create_empty_sync_state(path)?;
         let output = Connection::open(path)?;
-        output.execute_batch(
-            "PRAGMA journal_mode=DELETE;
-             PRAGMA synchronous=FULL;
-             CREATE TABLE sync_manifest(
-                 key TEXT PRIMARY KEY,
-                 value TEXT NOT NULL
-             ) WITHOUT ROWID;
-             CREATE TABLE sync_objects(
-                 kind TEXT NOT NULL,
-                 logical_key TEXT NOT NULL,
-                 payload_json TEXT NOT NULL,
-                 payload_hash TEXT NOT NULL,
-                 PRIMARY KEY(kind,logical_key)
-             ) WITHOUT ROWID;
-             CREATE TABLE sync_blobs(
-                 content_hash TEXT NOT NULL PRIMARY KEY,
-                 content BLOB NOT NULL
-             );",
-        )?;
-        output.execute(
-            "INSERT INTO sync_manifest(key,value) VALUES('format',?1)",
-            [SYNC_STATE_FORMAT.to_string()],
-        )?;
-        output.execute(
-            "INSERT INTO sync_manifest(key,value) VALUES('store_format',?1)",
-            [USER_VERSION.to_string()],
-        )?;
 
         self.export_sync_objects(&output, true)?;
 
@@ -139,6 +113,10 @@ impl Store {
     }
 
     fn export_sync_objects(&self, output: &Connection, copy_blobs: bool) -> Result<()> {
+        // Full exports and recovery inventories otherwise fsync once per object/blob.
+        // Keep durable output settings and roll back the entire batch on failure.
+        let tx = output.unchecked_transaction()?;
+        let output = &tx;
         self.export_sync_meta(output)?;
         let source_hashes = self.export_sync_sources(output, copy_blobs)?;
         self.export_sync_pages(output, &source_hashes)?;
@@ -150,7 +128,9 @@ impl Store {
         self.export_sync_todos(output)?;
         self.export_sync_plans(output)?;
         self.export_sync_discussions(output)?;
-        self.export_replica_history(output)
+        self.export_replica_history(output)?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn export_sync_meta(&self, output: &Connection) -> Result<()> {
@@ -1254,6 +1234,10 @@ pub(crate) fn merge_sync_states_directional(
 
 fn load_sync_objects(path: &Path) -> Result<BTreeMap<(String, String), SyncObjectRow>> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    load_sync_objects_from(&conn)
+}
+
+fn load_sync_objects_from(conn: &Connection) -> Result<BTreeMap<(String, String), SyncObjectRow>> {
     let mut statement = conn.prepare(
         "SELECT kind,logical_key,payload_json,payload_hash
          FROM sync_objects ORDER BY kind,logical_key",
@@ -2000,9 +1984,10 @@ pub(crate) fn create_empty_sync_state(path: &Path) -> Result<()> {
         ));
     }
     let conn = Connection::open(path)?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=DELETE;
-         CREATE TABLE sync_manifest(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID;
+    conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE sync_manifest(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID;
          CREATE TABLE sync_objects(
              kind TEXT NOT NULL,logical_key TEXT NOT NULL,payload_json TEXT NOT NULL,
              payload_hash TEXT NOT NULL,PRIMARY KEY(kind,logical_key)
@@ -2011,14 +1996,15 @@ pub(crate) fn create_empty_sync_state(path: &Path) -> Result<()> {
              content_hash TEXT NOT NULL PRIMARY KEY,content BLOB NOT NULL
          );",
     )?;
-    conn.execute(
+    tx.execute(
         "INSERT INTO sync_manifest(key,value) VALUES('format',?1)",
         [SYNC_STATE_FORMAT.to_string()],
     )?;
-    conn.execute(
+    tx.execute(
         "INSERT INTO sync_manifest(key,value) VALUES('store_format',?1)",
         [USER_VERSION.to_string()],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2789,11 +2775,13 @@ pub(crate) fn inherit_sync_continuity(normalized:&Path,baseline:&Path)->Result<(
     let objects=statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let conn=Connection::open(normalized)?;
     conn.execute("ATTACH DATABASE ?1 AS inherited",[baseline.to_string_lossy().as_ref()])?;
+    let tx=conn.unchecked_transaction()?;
     for (kind,key,raw) in objects {
-        if conn.query_row("SELECT EXISTS(SELECT 1 FROM sync_objects WHERE kind=?1 AND logical_key=?2)",params![kind,key],|r|r.get::<_,bool>(0))?{continue;}
+        if tx.query_row("SELECT EXISTS(SELECT 1 FROM sync_objects WHERE kind=?1 AND logical_key=?2)",params![kind,key],|r|r.get::<_,bool>(0))?{continue;}
         let value:Value=serde_json::from_str(&raw).map_err(|_|AppError::new("sync_state_invalid","invalid inherited continuity"))?;
-        insert_sync_object(&conn,&kind,&key,&value)?;
-        if kind=="draft_intent"{for hash in required_sync_draft_blobs(&key,&value)?{conn.execute("INSERT OR IGNORE INTO sync_blobs SELECT content_hash,content FROM inherited.sync_blobs WHERE content_hash=?1",[hash])?;}}
+        insert_sync_object(&tx,&kind,&key,&value)?;
+        if kind=="draft_intent"{for hash in required_sync_draft_blobs(&key,&value)?{tx.execute("INSERT OR IGNORE INTO sync_blobs SELECT content_hash,content FROM inherited.sync_blobs WHERE content_hash=?1",[hash])?;}}
     }
+    tx.commit()?;
     Ok(())
 }

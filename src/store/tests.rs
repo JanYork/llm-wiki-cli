@@ -2045,6 +2045,48 @@ rg '^[[:space:]]*[[fenced-fake]]'
     }
 
     #[test]
+    fn replica_patch_preserves_independent_edits_and_rejects_overlap() {
+        let temp = tempdir().unwrap();
+        let source = populated_sync_source();
+        let normalized = temp.path().join("remote.db");
+        source.export_sync_state(&normalized).unwrap();
+        let mut target = test_store();
+        let base = temp.path().join("base.db");
+        target.export_sync_state(&base).unwrap();
+        let expected = target.identity().unwrap();
+        target.page_put(PagePutInput {slug:"local-only".into(),title:"Local".into(),body:"keep".into(),kind:None,summary:None,source_ids:vec![],provenance:vec!["agent-observed".into()]}).unwrap();
+        target.publish_replica_state(&normalized,&base,&expected,"object-patch").unwrap();
+        let exported = temp.path().join("applied.db");
+        target.export_sync_state(&exported).unwrap();
+        let actual = load_sync_objects(&exported).unwrap();
+        for (key,row) in load_sync_objects(&normalized).unwrap() {
+            assert_eq!(actual.get(&key),Some(&row),"missing or altered {key:?}");
+        }
+        assert_eq!(target.page_show("local-only").unwrap().page.body,"keep");
+        let receipt=archive_publication_receipt(&target.database,"object-patch",&sync_state_digest(&normalized).unwrap()).unwrap().unwrap();
+        assert_eq!(receipt["concurrent_local"],true);
+        // A late reference to a remotely deleted page must not be cascaded away.
+        let deleted = temp.path().join("deleted.db");
+        fs::copy(&exported,&deleted).unwrap();
+        Connection::open(&deleted).unwrap().execute("DELETE FROM sync_objects WHERE kind='page' AND logical_key='local-only'",[]).unwrap();
+        let expected=target.identity().unwrap();
+        target.conn.execute("INSERT INTO tags VALUES('late',0,0,10,50000,'late','2026-01-01')",[]).unwrap();
+        target.conn.execute("INSERT INTO page_tags VALUES('late','local-only',0,'late','2026-01-01','2026-01-01')",[]).unwrap();
+        let tx=target.conn.transaction().unwrap();
+        record_operation(&tx,"tag_set","late",&json!({})).unwrap();
+        tx.commit().unwrap();
+        let before=target.identity().unwrap();
+        assert_eq!(target.publish_replica_state(&deleted,&exported,&expected,"late-reference").unwrap_err().code,"sync_store_changed");
+        assert_eq!(target.identity().unwrap(),before);
+        assert_eq!(target.conn.query_row("SELECT COUNT(*) FROM page_tags WHERE tag_name='late'",[],|r| r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(target.conn.query_row("PRAGMA foreign_keys",[],|r| r.get::<_,i64>(0)).unwrap(),1);
+        // Editing the same incoming object also preserves the entire local state.
+        target.page_put(PagePutInput {slug:"local-only".into(),title:"Local".into(),body:"newer".into(),kind:None,summary:None,source_ids:vec![],provenance:vec!["agent-observed".into()]}).unwrap();
+        assert_eq!(target.publish_replica_state(&deleted,&exported,&expected,"overlap").unwrap_err().code,"sync_store_changed");
+        assert_eq!(target.page_show("local-only").unwrap().page.body,"newer");
+    }
+
+    #[test]
     fn sync_publish_reports_only_changed_page_and_source_identifiers() {
         let temp = tempdir().unwrap();
         let source = populated_sync_source();
@@ -4542,6 +4584,80 @@ rg '^[[:space:]]*[[fenced-fake]]'
     }
 
     #[test]
+    #[ignore = "exports synthetic fixtures for isolated remote sync acceptance"]
+    fn team_sync_acceptance_fixture_export() {
+        let output=PathBuf::from(std::env::var_os("LWC_SYNC_QA_OUTPUT").expect("explicit fixture output directory"));
+        std::fs::create_dir_all(&output).unwrap();
+        for total in [4500usize,45000] {
+            let temp=tempdir().unwrap();
+            let (mut store,_)=Store::initialize("project",temp.path().join("wiki.db")).unwrap();
+            for index in 0..148 {
+                store.page_put(PagePutInput{slug:format!("qa-{index}"),title:format!("QA {index}"),kind:None,summary:None,body:format!("Synthetic evidence {index}"),source_ids:vec![],provenance:vec!["agent-observed".into()]}).unwrap();
+            }
+            let tx=store.conn.transaction().unwrap();
+            for index in 0..65 {
+                let content=format!("Synthetic source {index}");
+                tx.execute("INSERT INTO sources(content_hash,title,origin,content,structural_navigation,created_at) VALUES(?1,'QA','qa.md',?2,0,'2026-01-01T00:00:00.000Z')",params![hash_content(&content),content]).unwrap();
+            }
+            for _ in 0..total.saturating_sub(363) {
+                tx.execute("INSERT INTO operations(action,target,detail_json) VALUES('page_put','synthetic','{}')",[]).unwrap();
+            }
+            tx.commit().unwrap();
+            let normalized=output.join(format!("{total}.db"));
+            let summary=store.export_sync_state(&normalized).unwrap();
+            let artifact=output.join(format!("{total}.bin"));
+            let transfer=prepare_sync_transfer(None,&normalized,&artifact).unwrap();
+            std::fs::write(output.join(format!("{total}.json")),serde_json::to_vec(&transfer).unwrap()).unwrap();
+            eprintln!("synthetic fixture {total}: {} objects, {} sources, {} bytes",summary.object_count,summary.blob_count,transfer.size);
+        }
+    }
+
+    #[test]
+    fn sync_export_batches_objects_and_rolls_back_on_failure() {
+        let temp = tempdir().unwrap();
+        let (mut store, _) = Store::initialize("project", temp.path().join("wiki.db")).unwrap();
+        let tx = store.conn.transaction().unwrap();
+        for index in 0..4500 {
+            let content = format!("source {index}");
+            tx.execute(
+                "INSERT INTO sources(content_hash,title,origin,content,structural_navigation,created_at)
+                 VALUES(?1,'source','source.md',?2,0,'2026-01-01T00:00:00.000Z')",
+                params![hash_content(&content), content],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let normalized = temp.path().join("normalized.db");
+        let started = std::time::Instant::now();
+        let summary = store.export_sync_state(&normalized).unwrap();
+        eprintln!("4500-source full export: {:?}", started.elapsed());
+        assert_eq!(summary.blob_count, 4500);
+        let inventory = temp.path().join("inventory.db");
+        let started = std::time::Instant::now();
+        store.export_sync_object_inventory(&inventory).unwrap();
+        eprintln!("4500-source inventory: {:?}", started.elapsed());
+        let output = Connection::open(&inventory).unwrap();
+        output.execute("ATTACH DATABASE ?1 AS full_export", [normalized.to_str().unwrap()]).unwrap();
+        let difference: i64 = output.query_row(
+            "SELECT COUNT(*) FROM (SELECT * FROM sync_objects EXCEPT SELECT * FROM full_export.sync_objects)",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(difference, 0);
+        assert_eq!(output.query_row("SELECT COUNT(*) FROM sync_objects", [], |row| row.get::<_, i64>(0)).unwrap(), summary.object_count);
+
+        // A late failure must roll back earlier objects, not leave a partial inventory.
+        output.execute_batch(
+            "DELETE FROM sync_objects;
+             CREATE TRIGGER reject_source BEFORE INSERT ON sync_objects
+             WHEN NEW.kind='source' BEGIN SELECT RAISE(ABORT,'injected export failure'); END;",
+        ).unwrap();
+        assert!(store.export_sync_objects(&output, false).is_err());
+        assert!(output.is_autocommit());
+        assert_eq!(output.query_row("SELECT COUNT(*) FROM sync_objects", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
     fn sync_large_blob_export_merge_publish_uses_bounded_rust_buffer() {
         const BLOB_BYTES: usize = 129 * 1024 * 1024;
         SYNC_BLOB_MAX_BUFFERED_BYTES.store(0, Ordering::Relaxed);
@@ -4848,6 +4964,13 @@ rg '^[[:space:]]*[[fenced-fake]]'
         let third=temp.path().join("a-return.db");
         source.export_sync_state(&third).unwrap();
         assert_eq!(after,load_sync_objects(&third).unwrap(),"returning history must deduplicate");
+        if let Some(output) = std::env::var_os("LWC_SYNC_QA_OUTPUT") {
+            let output=PathBuf::from(output);
+            std::fs::create_dir_all(&output).unwrap();
+            std::fs::copy(&third,output.join("core.db")).unwrap();
+            let transfer=prepare_sync_transfer(None,&third,&output.join("core.bin")).unwrap();
+            std::fs::write(output.join("core.json"),serde_json::to_vec(&transfer).unwrap()).unwrap();
+        }
         // The fixture contains synthetic data only and can be reused by the HTTP/CLI acceptance journey.
         println!("CORE_FIXTURE_PROJECT={}", std::path::Path::new(source.conn.path().unwrap()).parent().unwrap().parent().unwrap().display());
     }

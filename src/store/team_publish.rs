@@ -101,6 +101,13 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn read_team_snapshot<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        let tx=self.conn.unchecked_transaction()?;
+        let result=operation(self)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     pub(crate) fn team_head(&self) -> Result<Value> {
         read_team_head(&self.conn)
     }
@@ -145,6 +152,21 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn publish_team_state_guarded<G>(
+        &mut self,
+        normalized: &Path,
+        expected: &StoreIdentity,
+        commit: &TeamCommit,
+        before_commit: impl FnOnce() -> Result<G>,
+    ) -> Result<SyncPublishSummary> {
+        self.publish_sync_state_inner(
+            normalized, expected,
+            &format!("team:{}:{}", commit.replica_id, commit.batch_id),
+            Some(commit), None, before_commit,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn publish_team_state(
         &mut self,
         normalized: &Path,
@@ -156,6 +178,8 @@ impl Store {
             expected,
             &format!("team:{}:{}", commit.replica_id, commit.batch_id),
             Some(commit),
+            None,
+            || Ok(()),
         )
     }
 }

@@ -14,6 +14,8 @@ LWC is an Agent-first Rust CLI that compiles curated documents into a persistent
 
 ## Authoritative documentation
 
+- `docs/team-cloud/sync-availability-repair.md` and `sync-availability-acceptance.md`: sync availability, smooth batching, object-scoped local apply, final authorization and crash recovery. The 2026-10-07 review candidate includes accepted-digest protection and asynchronous index recovery; verified on Pro and isolated Linux loopback 8790. Continuous bidirectional acceptance preserved 4500 original objects and coalesced 178 edits into 7 batches. Full-snapshot costs remain; local-write p95 was 2.3–2.4 seconds. Wiki `lwc-team-cloud` owns reusable behavior. Production 8788 and public releases are unchanged; see the report for exact artifacts, workload bounds and superseded observations.
+
 - `README.md` and its locale mirrors: product positioning, visual capability overview, basic installation, SEO entry points, and links to complete documentation; detailed commands deliberately live in the public Wiki.
 - Public GitHub Wiki: complete user guides, architecture, workflows, configuration, command reference, and troubleshooting in English and Simplified Chinese.
 - `docs/agent-workflow.md`: authoritative trust boundary, ingest, changesets, retrieval, maintenance, recovery, and projection contract.
@@ -39,6 +41,12 @@ Translated READMEs, package summaries, integration summaries, and copied Skill t
 - Keep this file concise. Detailed facts belong in one focused Wiki page per durable concept; transcripts, transient logs, guesses, credentials, and raw chain-of-thought belong nowhere in the brain.
 
 ## Current durable execution
+
+- Active v0.19.4 release: Plan `e49e3bdab052cdd9ef455a626b17cb7e` owns version preparation, immutable publication, four-channel verification and documentation closure. User authorized public release; production 8788 upgrade is outside this task.
+
+- Completed sync review delivery (2026-10-07): Plan `8b304d9f3dabf8e3ba992feb4489d99e` (“团队同步平缓队列审查修复”) completed at revision 8 and owns the three findings, implementation and closure evidence. The acceptance report records Pro regressions, 14 core object types, continuous bidirectional progress, authorization/crash recovery, artifact identity and restart readback. Test workers are stopped; the independent 8790 candidate is retained. No production replacement or public release.
+
+- Sync availability repair (2026-10-06): Plan `d9eeb6e56e4aa4e47e2665283e74cbcc` completed at revision 10. Pro targeted regressions/Clippy, isolated Linux CLI, 4500/45000 objects, authorization races, idempotency, crash/disk-full recovery, 500 automatic writes into 40 heads, 16MiB source bytes and six-space restart readback are recorded in the acceptance report. Test load is disabled; loopback 8790 candidate is retained. The newer 2026-10-07 review candidate and its separate evidence supersede this earlier Linux artifact; the old matrix remains historical evidence only. No public release or 8788 replacement.
 
 - Release update (2026-09-29): v0.19.3 is public on GitHub, crates.io, Homebrew and GHCR; workflow 36564661639 passed all six native targets and final container smoke. npm public version/latest also resolve to 0.19.3 and its checksum matches the uploaded package. Installed local/Pro CLIs were not upgraded. Wiki `lwc-contributor-release-contract` and `lwc-team-cloud` own exact evidence; the team Plan records final delivery and channel verification.
 

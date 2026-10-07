@@ -68,10 +68,14 @@ fn file(root: &Path, id: &str) -> PathBuf {
     root.join(format!("{id}.db"))
 }
 fn snapshot(
-    store: &Store,
     root: &Path,
     directory: &Path,
+    record: &SpaceRecord,
 ) -> Result<(String, StoreIdentity, String)> {
+    // Freeze a WAL read snapshot; later local edits belong to the next window.
+    let frozen = Store::open_for_read("project", directory.join("wiki.db"))?;
+    frozen.begin_read_snapshot()?;
+    let store = &frozen;
     let id = random_id()?;
     let before = store.identity()?;
     let auxiliary = auxiliary_fingerprint(directory)?;
@@ -80,8 +84,7 @@ fn snapshot(
         store,
         &file(root, &id),
     )?;
-    let record = read_record(&directory.join("replica.json"))?;
-    if let Some(generation) = record.baseline_generation {
+    if let Some(generation) = &record.baseline_generation {
         crate::store::inherit_sync_continuity(
             &file(root, &id),
             &directory
@@ -229,7 +232,10 @@ pub(crate) fn sync_space(space: &str) -> Result<Value> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(tick(&directory, &mut record, &credentials));
+    let result = runtime.block_on(async {
+        let client = client(&record.server)?;
+        tick(&directory, &mut record, &credentials, client).await
+    });
     if let Ok(value) = &result
         && matches!(value["status"].as_str(), Some("conflict" | "retry"))
     {
@@ -258,8 +264,8 @@ async fn tick(
     directory: &Path,
     record: &mut SpaceRecord,
     credentials: &Credentials,
+    client: reqwest::Client,
 ) -> Result<Value> {
-    let client = client(&record.server)?;
     let endpoint = format!("{}/api/spaces/{}", record.server, record.space_id);
     let head = request_json(
         client
@@ -319,7 +325,6 @@ async fn tick(
         record.acknowledged_auxiliary = None;
         save_credentials(&directory.join("replica.json"), record)?;
     }
-    record.role = role(&head)?.to_owned();
     store.set_replica_policy(&head["policy"], &record.user_id, &record.server)?;
     let policy: Value = serde_json::from_str(
         head["policy"]["payload"]
@@ -328,8 +333,13 @@ async fn tick(
     )
     .map_err(|_| AppError::new("invalid_policy_signature", "invalid verified policy"))?;
     let policy_revision = &policy["revision"];
-    record.server_key = Some(head["manifest"]["public_key"].as_str().unwrap().to_owned());
-    save_credentials(&directory.join("replica.json"), record)?;
+    let current_role = role(&head)?;
+    let server_key = head["manifest"]["public_key"].as_str().unwrap();
+    if record.role != current_role || record.server_key.as_deref() != Some(server_key) {
+        record.role = current_role.to_owned();
+        record.server_key = Some(server_key.to_owned());
+        save_credentials(&directory.join("replica.json"), record)?;
+    }
     let (root, mut pending) = if let Some(active) = active(directory)? {
         active
     } else {
@@ -347,7 +357,7 @@ async fn tick(
         let id = random_id()?;
         let root = directory.join("staging").join(&id);
         crate::team::private_directory(&root)?;
-        let (local, expected, auxiliary) = snapshot(&store, &root, directory)?;
+        let (local, expected, auxiliary) = snapshot(&root, directory, record)?;
         let generation = record
             .baseline_generation
             .as_deref()
@@ -411,6 +421,8 @@ async fn tick(
         ));
     }
     if pending.accepted.is_none() {
+        #[cfg(feature = "sync-fault-injection")]
+        crate::store::sync_test_fault("before-upload")?;
         // Consult the receipt before retrying any upload, including after a lost response.
         let receipt = request_json(
             client
@@ -434,12 +446,13 @@ async fn tick(
             pending.accepted = Some(pending.remote_head.clone());
             save_pending(&root, &pending)?;
         } else {
-            if store.identity()? != pending.expected
-                || auxiliary_fingerprint(directory)? != pending.auxiliary
+            if directory.join("rejection.json").exists()
+                && (store.identity()? != pending.expected
+                    || auxiliary_fingerprint(directory)? != pending.auxiliary)
             {
                 // Rebase before upload as well as after acceptance. A rejected batch must
                 // not keep retrying old bytes after an Agent has repaired the local objects.
-                let (local, expected, auxiliary) = snapshot(&store, &root, directory)?;
+                let (local, expected, auxiliary) = snapshot(&root, directory, record)?;
                 let merged = random_id()?;
                 let summary = merge_sync_states_directional(
                     &file(&root, &pending.local),
@@ -481,6 +494,16 @@ async fn tick(
                 ));
             }
             if head["head"] != pending.remote_head["head"] {
+                // This old-head batch cannot publish. Release its reservation so
+                // repeated CAS races do not consume all four in-flight slots.
+                if let Some(artifact) = pending.artifact.as_deref() {
+                    request_json(
+                        client
+                            .delete(format!("{endpoint}/uploads/{artifact}"))
+                            .bearer_auth(&credentials.access_token),
+                    )
+                    .await?;
+                }
                 // Nothing was committed. Keep evidence, clear only the active pointer and replan.
                 fs::remove_file(directory.join("active.json"))?;
                 return Ok(
@@ -562,9 +585,20 @@ async fn tick(
                 .write(true)
                 .open(root.join("accepted.db"))?
                 .sync_all()?;
-            let receipt=request_json(client.post(format!("{endpoint}/push")).bearer_auth(&credentials.access_token).json(&json!({"protocol":"lwc-team-sync/1","share_schema":1,"server_epoch":pending.remote_head["server_epoch"],"expected_head":pending.remote_head["head"],"replica_id":record.replica_id,"batch_id":pending.batch,"artifact_id":artifact,"payload_digest":pending.digest}))).await;
+            let receipt=request_json(client.post(format!("{endpoint}/push")).bearer_auth(&credentials.access_token).timeout(Duration::from_secs(600)).json(&json!({"protocol":"lwc-team-sync/1","share_schema":1,"server_epoch":pending.remote_head["server_epoch"],"expected_head":pending.remote_head["head"],"replica_id":record.replica_id,"batch_id":pending.batch,"artifact_id":artifact,"payload_digest":pending.digest}))).await;
             let receipt = match receipt {
                 Ok(receipt) => receipt,
+                Err(error)
+                    if error.details.as_ref().is_some_and(|details| {
+                        details["http_status"] == 409 && details["code"] == "head_changed"
+                    }) =>
+                {
+                    // Another writer winning the head CAS is normal concurrency.
+                    // Keep this pending evidence; the next tick pulls/rebases it.
+                    return Ok(
+                        json!({"status":"retry","reason":"head_changed","space_id":record.space_id}),
+                    );
+                }
                 Err(error) => {
                     save_credentials(
                         &directory.join("rejection.json"),
@@ -580,6 +614,32 @@ async fn tick(
             save_pending(&root, &pending)?;
         }
     }
+    if sync_state_digest(&file(&root, &pending.local))? == pending.digest {
+        // A pure outgoing batch is already present locally. Re-importing it would
+        // require editing to stop and could overwrite edits made after freezing.
+        let identity = store.identity()?;
+        let changed = identity != pending.expected
+            || auxiliary_fingerprint(directory)? != pending.auxiliary
+            || pending.accepted.as_ref().unwrap()["digest"] != pending.digest;
+        save_baseline(
+            directory,
+            record,
+            &root.join("accepted.db"),
+            &root.join("accepted.db"),
+            pending.accepted.as_ref().unwrap().clone(),
+            identity,
+        )?;
+        record.acknowledged_auxiliary = Some(pending.auxiliary.clone());
+        if changed {
+            record.acknowledged_identity = None;
+        }
+        save_credentials(&directory.join("replica.json"), record)?;
+        fs::remove_file(directory.join("active.json"))?;
+        project(directory, record, &mut store)?;
+        return Ok(
+            json!({"status":"synced","space_id":record.space_id,"head":pending.accepted.as_ref().unwrap()["head"],"acknowledged":acknowledge(&client,record,credentials).await}),
+        );
+    }
     let publication = format!("team-local:{}:{}", pending.id, pending.digest);
     let database = directory.join("wiki.db");
     let receipt =
@@ -587,10 +647,24 @@ async fn tick(
     let receipt = if let Some(receipt) = receipt {
         receipt
     } else {
-        if store.identity()? != pending.expected
-            || auxiliary_fingerprint(directory)? != pending.auxiliary
+        let applied = if auxiliary_fingerprint(directory)? != pending.auxiliary {
+            Err(AppError::new(
+                "sync_store_changed",
+                "auxiliary memory changed",
+            ))
+        } else {
+            store.publish_replica_state(
+                &file(&root, &pending.merged),
+                &file(&root, &pending.local),
+                &pending.expected,
+                &publication,
+            )
+        };
+        if applied
+            .as_ref()
+            .is_err_and(|error| error.code == "sync_store_changed")
         {
-            let (local, expected, auxiliary) = snapshot(&store, &root, directory)?;
+            let (local, expected, auxiliary) = snapshot(&root, directory, record)?;
             let merged = random_id()?;
             let summary = merge_sync_states_directional(
                 &file(&root, &pending.local),
@@ -612,11 +686,7 @@ async fn tick(
                 conflict_result(record, &pending)
             });
         }
-        store.publish_replica_state(
-            &file(&root, &pending.merged),
-            &pending.expected,
-            &publication,
-        )?;
+        applied?;
         crate::store::archive_publication_receipt(&database, &publication, &pending.digest)?
             .ok_or_else(|| {
                 AppError::new("sync_receipt_invalid", "local publication receipt missing")
@@ -635,7 +705,9 @@ async fn tick(
     )?;
     record.acknowledged_auxiliary = Some(pending.auxiliary.clone());
     save_credentials(&directory.join("replica.json"), record)?;
-    if pending.digest != accepted["digest"].as_str().unwrap_or("") {
+    if pending.digest != accepted["digest"].as_str().unwrap_or("")
+        || receipt["concurrent_local"] == true
+    {
         record.acknowledged_identity = None;
         save_credentials(&directory.join("replica.json"), record)?;
     }
@@ -1004,6 +1076,199 @@ fn auxiliary_fingerprint(directory: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn put(store: &mut Store, slug: &str) {
+        store
+            .page_put(crate::store::PagePutInput {
+                slug: slug.into(),
+                title: slug.into(),
+                body: slug.into(),
+                kind: None,
+                summary: None,
+                source_ids: vec![],
+                provenance: vec!["agent-observed".into()],
+            })
+            .unwrap();
+    }
+
+    struct AcceptedFixture {
+        _temp: tempfile::TempDir,
+        directory: PathBuf,
+        writer: Store,
+        record: SpaceRecord,
+        credentials: Credentials,
+        server: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for AcceptedFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+    impl AcceptedFixture {
+        async fn tick(&mut self) -> Value {
+            tick(
+                &self.directory,
+                &mut self.record,
+                &self.credentials,
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    }
+
+    // Exercise actual pending recovery and signed-head verification without writing
+    // global credentials. The remote batch is already accepted in both scenarios.
+    async fn accepted_fixture(inbound: bool) -> AcceptedFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("replica");
+        crate::team::private_directory(&directory).unwrap();
+        let (mut writer, _) = Store::initialize("project", directory.join("wiki.db")).unwrap();
+        let space = "a".repeat(64);
+        let epoch = "b".repeat(64);
+        writer.bind_team_space(&space, &epoch).unwrap();
+        let root = directory.join("staging").join("1".repeat(64));
+        crate::team::private_directory(&root).unwrap();
+        let local = "2".repeat(64);
+        let merged = "3".repeat(64);
+        let empty = root.join("empty.db");
+        writer.export_sync_state(&empty).unwrap();
+        writer.export_sync_state(&file(&root, &local)).unwrap();
+        let expected = writer.identity().unwrap();
+        let (mut remote, _) =
+            Store::initialize("project", temp.path().join("remote/wiki.db")).unwrap();
+        remote
+            .publish_sync_state(&empty, &remote.identity().unwrap(), "fixture-base")
+            .unwrap();
+        put(&mut remote, "remote-page");
+        remote.export_sync_state(&file(&root, &merged)).unwrap();
+        fs::copy(file(&root, &merged), root.join("accepted.db")).unwrap();
+        if !inbound {
+            // A core import can incorporate the accepted state while its replica
+            // receipt is pending. A later edit must still be sent after rebasing.
+            writer
+                .publish_sync_state(&file(&root, &merged), &expected, "concurrent-import")
+                .unwrap();
+            put(&mut writer, "later-page");
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let user = "c".repeat(64);
+        let credentials = Credentials {
+            server: origin.clone(),
+            user_id: user.clone(),
+            access_token: "d".repeat(64),
+            agent_id: None,
+            device_id: None,
+        };
+        let now = crate::team::lease::now().unwrap();
+        let policy = crate::team::lease::sign(
+            temp.path(),
+            &json!({
+                "version":1,"credential_hash":"e".repeat(64),"user_id":user,
+                "agent_id":null,"device_id":null,"space_id":space,"epoch":epoch,
+                "revision":1,"issued_at":now,"expires_at":now+900,"role":"manager","denials":[]
+            }),
+        )
+        .unwrap();
+        let mut head = json!({"protocol":"lwc-team-sync/1","share_schema":1,"space_id":space,
+            "server_epoch":epoch,"head":1,"digest":sync_state_digest(&root.join("accepted.db")).unwrap(),
+            "artifact_id":"4".repeat(64),"role":"manager","policy":policy});
+        head["manifest"] = json!(
+            crate::team::lease::sign(temp.path(), &json!({"kind":"space-head","head":head}))
+                .unwrap()
+        );
+        let reply = head.clone();
+        let router = axum::Router::new()
+            .route(
+                "/api/spaces/{space}/head",
+                axum::routing::get(move || {
+                    let reply = reply.clone();
+                    async move { axum::Json(reply) }
+                }),
+            )
+            .route(
+                "/api/spaces/{space}/ack",
+                axum::routing::post(|| async { axum::Json(json!({"acknowledged":1})) }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let mut record: SpaceRecord = serde_json::from_value(json!({"version":1,"server":origin,
+            "space_id":space,"user_id":user,"device_id":"5".repeat(64),"replica_id":"6".repeat(64),
+            "role":"manager","joined":true,"interval_ms":2000,"max_transfer_bytes":1000000,
+            "remote_head":head,"baseline_generation":null,"acknowledged_identity":null}))
+        .unwrap();
+        record.server_key = Some(head["manifest"]["public_key"].as_str().unwrap().into());
+        save_credentials(&directory.join("replica.json"), &record).unwrap();
+        let pending = Pending {
+            id: "1".repeat(64),
+            expected,
+            auxiliary: auxiliary_fingerprint(&directory).unwrap(),
+            local,
+            merged: merged.clone(),
+            digest: sync_state_digest(&file(&root, &merged)).unwrap(),
+            remote_head: head.clone(),
+            conflicts: vec![],
+            batch: "7".repeat(64),
+            request: "8".repeat(64),
+            artifact: None,
+            accepted: Some(head),
+        };
+        activate(&directory, &root, &pending).unwrap();
+        AcceptedFixture {
+            _temp: temp,
+            directory,
+            writer,
+            record,
+            credentials,
+            server,
+        }
+    }
+
+    #[test]
+    fn accepted_rebase_keeps_unuploaded_local_state_dirty() {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut fixture = accepted_fixture(false).await;
+                let mut result = fixture.tick().await;
+                if result["status"] == "retry" {
+                    result = fixture.tick().await;
+                }
+                assert_eq!(result["status"], "synced");
+                assert_eq!(
+                    fixture.writer.page_show("later-page").unwrap().page.body,
+                    "later-page"
+                );
+                assert!(
+                    fixture.record.acknowledged_identity.is_none(),
+                    "a newer local digest must remain queued beyond the accepted remote digest"
+                );
+            });
+    }
+
+    #[test]
+    fn accepted_inbound_progresses_while_local_writes_continue() {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap().block_on(async {
+            let mut fixture = accepted_fixture(true).await;
+            let mut applied = false;
+            for index in 0..3 {
+                put(&mut fixture.writer, &format!("concurrent-{index}"));
+                let result = fixture.tick().await;
+                applied |= fixture.writer.page_show("remote-page").is_ok();
+                if applied { assert_eq!(result["status"], "synced"); break; }
+            }
+            assert!(applied, "independent local writes must not indefinitely postpone an accepted remote page");
+            assert_eq!(fixture.writer.page_show("concurrent-0").unwrap().page.body, "concurrent-0");
+        });
+    }
+
     #[test]
     fn replica_rejects_restore_without_epoch_and_head_integrity() {
         let head = json!({"protocol":"lwc-team-sync/1","share_schema":1,"space_id":"a".repeat(64),"server_epoch":"b".repeat(64),"head":3,"digest":"c".repeat(64),"artifact_id":"d".repeat(64),"role":"manager"});
