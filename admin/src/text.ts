@@ -3,6 +3,7 @@ export const labels: Record<string, string> = {
   id: '标识', user_id: '用户', name: '名称', title: '标题', role: '角色', member: '团队成员', revision: '版本', nickname: '昵称', email_hint: '登记邮箱', device: '设备', device_id: '设备标识', agent_id: '智能体标识', registered_at: '登记时间', last_seen: '最近连接', ack_head: '已确认版本', revoked: '已撤销', kind: '类型', key: '对象', logical_key: '对象', action: '动作', target: '目标', actor: '操作者', created_at: '创建时间', updated_at: '更新时间', provider: '登录方式', subject: '身份', team_id: '团队', metadata_json: '机器资料', namespace: '身份范围',
   page: '知识页', source: '来源', memory: '时序记忆', discussion: '讨论', semantic_relation: '语义关系', tag: '标签', source_revision: '来源历史', memory_audit: '记忆审计', retrieval_weight: '检索权重', retrieval_feedback: '检索反馈', ingest: '采集记录', draft_intent: '草稿意图', work_audit: '执行审计', plan: '计划', todo: '待办',
   viewer: '只读成员', editor: '编辑者', manager: '管理者', owner: '所有者', github: '代码托管账号', feishu: '飞书', email: '邮箱',
+  'team.delete': '删除团队', 'space.delete': '删除空间', 'team.restore': '恢复团队', 'space.restore': '恢复空间',
   create: '创建', update: '修改', delete: '删除', compact: '压缩', rollback: '恢复', export: '导出', '*': '全部',
   pending_conflicts: '待合并内容', unknown: '等待首次同步', offline: '暂未连接', recovery_required: '等待安全恢复', status: '状态', state: '状态', pending: '待处理', in_progress: '进行中', completed: '已完成', active: '有效', blocked: '受阻', abandoned: '已放弃', cancelled: '已取消', resolved: '已解决', conflict: '有冲突', synced: '已同步', current: '已是最新', retry: '等待重试',
   body: '正文', summary: '摘要', content: '内容', payload: '记忆内容', hash: '校验摘要', digest: '校验摘要', provenance: '来源依据', links: '关联', tags: '标签', sources: '来源', slug: '页面标识', description: '说明', objective: '目标', constraints: '约束', steps: '步骤', result: '结果', evidence: '证据', items: '条目', revisions: '修订', history: '历史', messages: '消息', text: '内容', ordinal: '顺序', verify: '验收条件', done_when: '完成标准', event_type: '事件类型', context: '上下文', confidence: '可信度', relation_type: '关系类型', target_id: '目标标识', source_id: '来源标识', source_hash: '来源摘要', content_hash: '内容摘要', content_text: '内容正文', fragments: '记忆片段', changes: '变更', feedback: '反馈', relations: '关系',
@@ -14,13 +15,14 @@ export const errors: Record<string, string> = {
   invalid_invitation: '邀请已失效，或当前账号尚未验证受邀邮箱。请使用受邀邮箱登录，或在登录身份中绑定该邮箱。',
   invalid_personal_key: '个人密钥不正确、已过期或已撤销。',
   network_unavailable: '暂时无法连接服务，请稍后重试。',
+  space_deleted: '空间已移入回收站，本地记忆仍然保留。', team_deleted: '团队已移入回收站，请先恢复团队。',
   unauthorized: '登录已失效，请重新登录。', server_token_required: '请先配置服务端接入密钥。', forbidden: '当前账号或智能体没有此操作的权限。', invalid_server_token: '服务端接入密钥不正确。', rate_limited: '操作过于频繁，请稍后重试。', revision_conflict: '记录已更新，请刷新后重试。', head_changed: '记忆版本已变化，请重新准备恢复。', provider_unavailable: '此登录方式或服务尚未配置。', login_failed: '登录验证失败，请重新发起登录。', invalid_email: '请输入有效的邮箱地址。', last_identity: '至少需要保留一种登录方式。', last_owner: '团队必须保留一位所有者。', last_manager: '请先指定另一位空间管理者。', recovery_expired: '恢复预览已过期，请重新准备。', recovery_conflicts: '请先由智能体处理所有恢复冲突。', space_quota_exceeded: '空间存储容量不足，请联系部署管理员。', query_result_too_large: '记录超过单次读取容量，请通过命令行分段读取。', database_error: '数据操作失败，请检查服务端运行状态。', invalid_request: '请求内容不完整，请检查输入。', invitation_invalid: '邀请密钥已失效或不适用于当前账号。',
 };
 export function errorText(code: unknown) { return errors[String(code)] || '操作未完成，请检查输入、权限和服务状态后重试。'; }
 export function display(value: unknown, field = '', language: Language = 'zh'): string {
   if (value == null) return '—';
   if (field === 'revoked' && typeof value === 'number') return translate(value ? '是' : '否', language);
-  if (['created_at', 'updated_at', 'expires_at', 'last_seen', 'registered_at'].includes(field) && (typeof value === 'number' || typeof value === 'string')) { const date = new Date(typeof value === 'number' ? value * 1000 : value); if (!Number.isNaN(date.valueOf())) return date.toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US', { dateStyle: 'medium', timeStyle: 'short' }); }
+  if (['deleted_at', 'created_at', 'updated_at', 'expires_at', 'last_seen', 'registered_at'].includes(field) && (typeof value === 'number' || typeof value === 'string')) { const date = new Date(typeof value === 'number' ? value * 1000 : value); if (!Number.isNaN(date.valueOf())) return date.toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US', { dateStyle: 'medium', timeStyle: 'short' }); }
   if (typeof value === 'boolean') return translate(value ? '是' : '否', language);
   if (['kind','role','provider','status','state','action','next_action','provenance'].includes(field) && typeof value === 'string') return translate(labels[value] || '其他', language);
   if (typeof value === 'object') return Array.isArray(value) ? `${value.length} ${language === 'zh' ? '项' : 'items'}` : translate('查看详情', language);
@@ -137,3 +139,18 @@ Object.assign(english, { '暂时无法显示知识': 'Knowledge is temporarily u
 Object.assign(english, { '选择成员可访问的空间，开通时一并完成授权。未选择的空间保持不可访问。': 'Choose spaces to grant access when creating the member. Unselected spaces remain inaccessible.', '初始空间权限': 'Initial space access', '权限': 'Permissions', '你目前没有可授权的空间，可稍后由空间管理者授权。': 'You cannot grant access to any spaces yet. A space manager can grant access later.' });
 
 Object.assign(english, { '此链接指向的空间不存在或尚未授权。': 'This space does not exist or you do not have access.', '链接已复制，仅有权限的成员可访问。': 'Link copied. Only authorized members can open it.', '复制失败，请重试。': 'Copy failed. Please retry.', '复制页面链接': 'Copy page link' });
+
+Object.assign(english, {
+ '资源管理':'Resource management', '当前资源':'Current resources', '团队':'Team', '回收站':'Recycle bin',
+ '删除会停止服务端访问与同步。内容保留在回收站，可由有权限的管理者恢复。':'Deletion stops server access and synchronization. Data is retained and can be restored by authorized managers.',
+ '删除团队':'Delete team', '删除空间':'Delete space', '请先选择你可管理的团队或空间。':'Choose a team or space you can manage.',
+ '这里只显示你可以恢复的资源。恢复团队不会恢复此前单独删除的空间，也不会重新启用旧邀请。':'Only resources you can restore appear here. Restoring a team keeps independently deleted spaces in the recycle bin and does not reactivate old invitations.',
+ '删除时间':'Deleted', '操作':'Actions', '回收站暂无资源':'The recycle bin is empty', '确认恢复':'Confirm restore', '确认移入回收站':'Confirm deletion',
+ '恢复后按现有成员与空间权限重新开放，不会覆盖记忆内容。':'Restoration uses current memberships and permissions and preserves memory content.',
+ '所有成员的服务端访问和同步将停止。已下载的本地记忆会保留。':'Server access and synchronization stop for all members. Downloaded local memory is retained.',
+ '受影响的记忆空间':'Affected memory spaces', '移入回收站':'Move to recycle bin', '操作未完成，请重试。':'The operation failed. Please retry.',
+ '已恢复，成员可按现有权限重新访问。':'Restored. Members can access it with their current permissions.', '已移入回收站，数据仍然保留。':'Moved to the recycle bin. Data is retained.',
+ '空间已移入回收站，本地记忆仍然保留。':'This space is in the recycle bin. Local memory is retained.', '团队已移入回收站，请先恢复团队。':'This team is in the recycle bin. Restore the team first.',
+});
+
+Object.assign(english, {'恢复团队':'Restore team', '恢复空间':'Restore space'});

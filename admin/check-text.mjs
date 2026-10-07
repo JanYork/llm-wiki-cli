@@ -12,6 +12,7 @@ function visit(node) {
 }
 visit(ui);
 visit(ts.createSourceFile('knowledge-browser.tsx', fs.readFileSync(new URL('./src/knowledge-browser.tsx', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX));
+visit(ts.createSourceFile('resource-lifecycle.tsx', fs.readFileSync(new URL('./src/resource-lifecycle.tsx', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX));
 const missing = [...phrases].filter(text => !english[text]);
 assert.deepEqual(missing, [], `Missing English interface text: ${missing.join(' | ')}`);
 for (const phrase of phrases) assert.ok(!/[\u3400-\u9fff]/.test(translate(phrase, 'en')), phrase);

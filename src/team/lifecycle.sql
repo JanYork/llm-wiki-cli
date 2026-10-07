@@ -1,0 +1,4 @@
+ALTER TABLE teams ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN(0,1));
+ALTER TABLE teams ADD COLUMN deleted_at INTEGER;
+ALTER TABLE spaces ADD COLUMN deleted_at INTEGER;
+ALTER TABLE spaces ADD COLUMN archive_team TEXT REFERENCES teams(id);

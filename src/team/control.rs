@@ -30,17 +30,17 @@ pub(super) fn open(directory: &Path) -> Result<Connection> {
         "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
     )?;
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=6).contains(&version) {
+    if !(1..=7).contains(&version) {
         return Err(AppError::new(
             "team_schema_unsupported",
             "initialize the team control store or use a compatible server version",
         ));
     }
-    if version < 6 {
+    if version < 7 {
         conn.execute_batch("BEGIN IMMEDIATE;")?;
         let migrated = (|| -> Result<()> {
             let locked: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-            if !(1..=6).contains(&locked) {
+            if !(1..=7).contains(&locked) {
                 return Err(AppError::new(
                     "team_schema_unsupported",
                     "control schema changed during migration",
@@ -61,7 +61,10 @@ pub(super) fn open(directory: &Path) -> Result<Connection> {
             if locked < 6 {
                 conn.execute_batch(include_str!("keys.sql"))?;
             }
-            conn.pragma_update(None, "user_version", 6)?;
+            if locked < 7 {
+                conn.execute_batch(include_str!("lifecycle.sql"))?;
+            }
+            conn.pragma_update(None, "user_version", 7)?;
             conn.execute_batch("COMMIT;")?;
             Ok(())
         })();
@@ -100,7 +103,8 @@ pub(crate) fn initialize(directory: &Path, admin_email: &str, name: &str) -> Res
     let team = create_team(&tx, &user, &name)?;
     tx.execute_batch(REPLICA_STATUS_SCHEMA)?;
     tx.execute_batch(include_str!("keys.sql"))?;
-    tx.pragma_update(None, "user_version", 6)?;
+    tx.execute_batch(include_str!("lifecycle.sql"))?;
+    tx.pragma_update(None, "user_version", 7)?;
     audit(&tx, &user, "bootstrap", &team)?;
     let token_file = super::access::initialize(directory)?;
     let key = super::keys::issue(&tx, &user, &user, "Initial administrator", 365)?;
@@ -254,6 +258,21 @@ pub(super) fn authorize(conn: &Connection, user: &str, space: &str, required: &s
         "manager" => 3,
         _ => return Err(AppError::new("invalid_role", "unknown space role")),
     };
+    let deleted: Option<(bool,bool)> = conn.query_row("SELECT s.archived,COALESCE(t.archived,0) FROM spaces s LEFT JOIN teams t ON t.id=s.team_id JOIN space_grants g ON g.space_id=s.id WHERE s.id=?1 AND g.user_id=?2 AND (s.user_owner=?2 OR EXISTS(SELECT 1 FROM memberships m WHERE m.team_id=s.team_id AND m.user_id=?2))",params![space,user],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    if let Some((space_deleted, team_deleted)) = deleted {
+        if team_deleted {
+            return Err(AppError::new(
+                "team_deleted",
+                "team is in the recycle bin; local memory is preserved",
+            ));
+        }
+        if space_deleted {
+            return Err(AppError::new(
+                "space_deleted",
+                "space is in the recycle bin; local memory is preserved",
+            ));
+        }
+    }
     let permitted=conn.query_row("SELECT EXISTS(
         SELECT 1 FROM spaces s JOIN space_grants g ON g.space_id=s.id
         WHERE s.id=?1 AND g.user_id=?2 AND s.archived=0
@@ -269,7 +288,7 @@ pub(super) fn authorize(conn: &Connection, user: &str, space: &str, required: &s
 fn team_owner(conn: &Connection, user: &str, team: &str) -> Result<()> {
     active(conn, user)?;
     if !conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM memberships WHERE team_id=?1 AND user_id=?2 AND role='owner')",
+        "SELECT EXISTS(SELECT 1 FROM memberships m JOIN teams t ON t.id=m.team_id WHERE m.team_id=?1 AND m.user_id=?2 AND m.role='owner' AND t.archived=0)",
         params![team, user],
         |r| r.get::<_, bool>(0),
     )? {
@@ -289,6 +308,12 @@ pub(super) fn manage(conn: &mut Connection, actor: &str, input: &Value) -> Resul
     };
     let action = text("action")?;
     let result = match action {
+        "team.delete"
+        | "team.restore"
+        | "team.delete.preview"
+        | "space.delete"
+        | "space.restore"
+        | "space.delete.preview" => super::lifecycle::manage(&tx, actor, action, input)?,
         "key.create" => super::keys::issue(
             &tx,
             actor,
@@ -489,7 +514,7 @@ pub(super) fn manage(conn: &mut Connection, actor: &str, input: &Value) -> Resul
         }
         "invitation.accept" => {
             let hash = digest(text("invitation_token")?);
-            let team:Option<String>=tx.query_row("SELECT i.team_id FROM invitations i JOIN identities e ON e.provider='email' AND e.namespace='' AND e.subject=i.email WHERE i.token_hash=?1 AND i.expires_at>unixepoch() AND i.consumed_by IS NULL AND e.user_id=?2",params![hash,actor],|r|r.get(0)).optional()?;
+            let team:Option<String>=tx.query_row("SELECT i.team_id FROM invitations i JOIN identities e ON e.provider='email' AND e.namespace='' AND e.subject=i.email WHERE i.token_hash=?1 AND i.expires_at>unixepoch() AND i.consumed_by IS NULL AND e.user_id=?2 AND EXISTS(SELECT 1 FROM teams t WHERE t.id=i.team_id AND t.archived=0)",params![hash,actor],|r|r.get(0)).optional()?;
             let team = team.ok_or_else(|| {
                 AppError::new(
                     "invalid_invitation",
@@ -877,14 +902,14 @@ mod migration_tests {
         let initialized = initialize(&data, "owner@example.com", "Migration").unwrap();
         let conn = open(&data).unwrap();
         // Fixture representing the previous control schema, with its original account intact.
-        conn.execute_batch("DROP TABLE key_credentials; DROP TABLE personal_keys; DROP TABLE agent_sessions; DROP TABLE agents; DROP TABLE devices; DROP TABLE user_profiles; DROP TABLE memory_denials; ALTER TABLE replicas DROP COLUMN sync_status; ALTER TABLE replicas DROP COLUMN pending_conflicts; PRAGMA user_version=1;").unwrap();
+        conn.execute_batch("DROP TABLE key_credentials; DROP TABLE personal_keys; DROP TABLE agent_sessions; DROP TABLE agents; DROP TABLE devices; DROP TABLE user_profiles; DROP TABLE memory_denials; ALTER TABLE replicas DROP COLUMN sync_status; ALTER TABLE replicas DROP COLUMN pending_conflicts; ALTER TABLE spaces DROP COLUMN archive_team; ALTER TABLE spaces DROP COLUMN deleted_at; ALTER TABLE teams DROP COLUMN deleted_at; ALTER TABLE teams DROP COLUMN archived; PRAGMA user_version=1;").unwrap();
         drop(conn);
         let migrated = open(&data).unwrap();
         assert_eq!(
             migrated
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
         assert!(
             migrated
@@ -912,7 +937,27 @@ mod migration_tests {
                     .unwrap()
             );
         }
+        // Production schema 6 also migrates once and retains its identity.
+        migrated.execute_batch("ALTER TABLE spaces DROP COLUMN archive_team; ALTER TABLE spaces DROP COLUMN deleted_at; ALTER TABLE teams DROP COLUMN deleted_at; ALTER TABLE teams DROP COLUMN archived; PRAGMA user_version=6;").unwrap();
         drop(migrated);
+        let current = open(&data).unwrap();
+        assert_eq!(
+            current
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            current
+                .query_row(
+                    "SELECT name FROM teams WHERE id=?1",
+                    [initialized["team_id"].as_str().unwrap()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "Migration"
+        );
+        drop(current);
         open(&data).unwrap();
     }
 }

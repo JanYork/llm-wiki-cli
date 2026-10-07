@@ -616,7 +616,7 @@ pub(super) async fn invitation_preview(
         return Err(AppError::new("invalid_invitation", "invitation is invalid or expired").into());
     }
     Ok(Json(database(&state, move |conn| {
-        conn.query_row("SELECT t.name,i.expires_at FROM invitations i JOIN teams t ON t.id=i.team_id WHERE i.token_hash=?1 AND i.expires_at>unixepoch() AND i.consumed_by IS NULL", [control::digest(&input.invitation_token)], |row|Ok(json!({"team_name":row.get::<_,String>(0)?,"expires_at":row.get::<_,i64>(1)?}))).optional()?.ok_or_else(||AppError::new("invalid_invitation","invitation is invalid or expired"))
+        conn.query_row("SELECT t.name,i.expires_at FROM invitations i JOIN teams t ON t.id=i.team_id WHERE i.token_hash=?1 AND i.expires_at>unixepoch() AND i.consumed_by IS NULL AND t.archived=0", [control::digest(&input.invitation_token)], |row|Ok(json!({"team_name":row.get::<_,String>(0)?,"expires_at":row.get::<_,i64>(1)?}))).optional()?.ok_or_else(||AppError::new("invalid_invitation","invitation is invalid or expired"))
     }).await?))
 }
 

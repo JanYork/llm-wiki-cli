@@ -76,6 +76,7 @@ impl IntoResponse for HttpError {
         let status = match self.0.code {
             "unauthorized" | "login_failed" => StatusCode::UNAUTHORIZED,
             "forbidden" => StatusCode::FORBIDDEN,
+            "space_deleted" | "team_deleted" => StatusCode::GONE,
             "rate_limited" => StatusCode::TOO_MANY_REQUESTS,
             "revision_conflict"
             | "head_changed"
@@ -333,7 +334,7 @@ async fn me(
     let secret = session(&headers)?;
     Ok(Json(database(&state,move|conn|{
         let user=control::session_user(conn,&secret)?;
-        let mut stmt=conn.prepare("SELECT s.id,s.name,g.role,s.revision,s.team_id FROM spaces s JOIN space_grants g ON g.space_id=s.id WHERE g.user_id=?1 AND s.archived=0 AND (s.user_owner=?1 OR EXISTS(SELECT 1 FROM memberships m WHERE m.team_id=s.team_id AND m.user_id=?1)) ORDER BY s.name,s.id")?;
+        let mut stmt=conn.prepare("SELECT s.id,s.name,g.role,s.revision,s.team_id FROM spaces s JOIN space_grants g ON g.space_id=s.id WHERE g.user_id=?1 AND s.archived=0 AND (s.team_id IS NULL OR EXISTS(SELECT 1 FROM teams t WHERE t.id=s.team_id AND t.archived=0)) AND (s.user_owner=?1 OR EXISTS(SELECT 1 FROM memberships m WHERE m.team_id=s.team_id AND m.user_id=?1)) ORDER BY s.name,s.id")?;
         let spaces=stmt.query_map([&user],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"revision":r.get::<_,i64>(3)?,"team_id":r.get::<_,Option<String>>(4)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(json!({"user_id":user,"spaces":spaces}))
     }).await?))

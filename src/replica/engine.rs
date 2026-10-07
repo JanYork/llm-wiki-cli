@@ -279,7 +279,7 @@ async fn tick(
             if error
                 .details
                 .as_ref()
-                .is_some_and(|d| matches!(d["http_status"].as_u64(), Some(401 | 403)))
+                .is_some_and(|d| matches!(d["http_status"].as_u64(), Some(401 | 403 | 410)))
             {
                 Store::open("project", directory.join("wiki.db"))?.suspend_replica_policy()?;
             }
@@ -922,6 +922,14 @@ pub(crate) fn conflict_signal(space: &str) -> Result<Option<Value>> {
     if fault.exists() {
         let fault: Value = serde_json::from_slice(&fs::read(fault)?)
             .map_err(|_| AppError::new("invalid_replica", "invalid sync fault"))?;
+        if matches!(
+            fault["details"]["code"].as_str(),
+            Some("space_deleted" | "team_deleted")
+        ) {
+            return Ok(Some(
+                json!({"schema":"lwc.signal/v1","kind":"replica.resource.deleted","priority":80,"space":reference(&directory,&record),"local_memory_preserved":true,"required_action":"The server resource is in the recycle bin. Preserve local memory and pending evidence; do not recreate or bypass the resource. Shared writes remain blocked until an authorized restore; automatic sync will recheck."}),
+            ));
+        }
         if matches!(
             fault["code"].as_str(),
             Some(

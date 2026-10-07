@@ -4,6 +4,7 @@ mod delegation;
 mod hub;
 mod identity;
 pub(crate) mod lease;
+mod lifecycle;
 mod policy;
 mod query;
 mod server;

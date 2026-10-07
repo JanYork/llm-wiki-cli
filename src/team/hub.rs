@@ -830,120 +830,127 @@ mod tests {
 
     #[test]
     fn team_publication_rechecks_revocation_without_holding_control_during_prepare() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("hub");
-        let initialized = control::initialize(&data, "owner@example.com", "Test").unwrap();
-        let owner = initialized["user_id"].as_str().unwrap();
-        let team = initialized["team_id"].as_str().unwrap();
-        let mut conn = control::open(&data).unwrap();
-        let space = control::manage(
-            &mut conn,
-            owner,
-            &json!({"action":"space.create","team_id":team,"name":"Barrier"}),
-        )
-        .unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let tx = conn.transaction().unwrap();
-        let member = control::identity_user(&tx, "github", "test", "barrier").unwrap();
-        tx.execute(
-            "INSERT INTO memberships VALUES(?1,?2,'member')",
-            params![team, member],
-        )
-        .unwrap();
-        let secret = control::create_session(&tx, &member).unwrap();
-        tx.commit().unwrap();
-        control::manage(&mut conn, owner, &json!({"action":"space.grant","space_id":space,"user_id":member,"role":"editor","expected_revision":1})).unwrap();
-        let directory = data.join("spaces").join(&space);
-        super::super::private_directory(&directory).unwrap();
-        let epoch: String = conn
-            .query_row("SELECT epoch FROM spaces WHERE id=?1", [&space], |r| {
-                r.get(0)
-            })
+        for (action, expected_error) in [
+            ("space.revoke", "forbidden"),
+            ("space.delete", "space_deleted"),
+            ("team.delete", "team_deleted"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("hub");
+            let initialized = control::initialize(&data, "owner@example.com", "Test").unwrap();
+            let owner = initialized["user_id"].as_str().unwrap();
+            let team = initialized["team_id"].as_str().unwrap();
+            let mut conn = control::open(&data).unwrap();
+            let space = control::manage(
+                &mut conn,
+                owner,
+                &json!({"action":"space.create","team_id":team,"name":"Barrier"}),
+            )
+            .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let tx = conn.transaction().unwrap();
+            let member = control::identity_user(&tx, "github", "test", "barrier").unwrap();
+            tx.execute(
+                "INSERT INTO memberships VALUES(?1,?2,'member')",
+                params![team, member],
+            )
             .unwrap();
-        let rules = policy_rules(&conn, &member, &space).unwrap();
-        let (mut source, _) =
-            Store::initialize("project", temp.path().join("source/wiki.db")).unwrap();
-        source
-            .page_put(PagePutInput {
-                slug: "guarded".into(),
-                title: "Guarded".into(),
-                kind: None,
-                summary: None,
-                body: "Must roll back after revocation".into(),
-                source_ids: vec![],
-                provenance: vec!["agent-observed".into()],
-            })
-            .unwrap();
-        let candidate = temp.path().join("candidate.db");
-        let summary = source.export_sync_state(&candidate).unwrap();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        let worker_space = space.clone();
-        let worker_member = member.clone();
-        let worker_directory = directory.clone();
-        let worker = std::thread::spawn(move || {
-            let _lock = space_lock(&worker_directory).unwrap();
-            let (mut store, _) =
-                Store::initialize("team", worker_directory.join("wiki.db")).unwrap();
-            store.bind_team_space(&worker_space, &epoch).unwrap();
-            let expected = store.identity().unwrap();
-            let commit = TeamCommit {
-                recovery: None,
-                epoch,
-                expected_head: 0,
-                actor: worker_member.clone(),
-                principal: Value::Null,
-                replica_id: "1".repeat(64),
-                batch_id: "2".repeat(64),
-                artifact_id: "3".repeat(64),
-                payload_digest: summary.state_digest,
-            };
-            let result = store.publish_team_state_guarded(&candidate, &expected, &commit, || {
-                ready_tx.send(()).unwrap();
-                resume_rx
-                    .recv_timeout(std::time::Duration::from_secs(15))
-                    .unwrap();
-                publication_guard(
-                    &worker_directory,
-                    &secret,
-                    &worker_space,
-                    &worker_member,
-                    &commit.epoch,
-                    &rules,
-                    &Value::Null,
-                )
+            let secret = control::create_session(&tx, &member).unwrap();
+            tx.commit().unwrap();
+            control::manage(&mut conn, owner, &json!({"action":"space.grant","space_id":space,"user_id":member,"role":"editor","expected_revision":1})).unwrap();
+            let directory = data.join("spaces").join(&space);
+            super::super::private_directory(&directory).unwrap();
+            let epoch: String = conn
+                .query_row("SELECT epoch FROM spaces WHERE id=?1", [&space], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let rules = policy_rules(&conn, &member, &space).unwrap();
+            let (mut source, _) =
+                Store::initialize("project", temp.path().join("source/wiki.db")).unwrap();
+            source
+                .page_put(PagePutInput {
+                    slug: "guarded".into(),
+                    title: "Guarded".into(),
+                    kind: None,
+                    summary: None,
+                    body: "Must roll back after revocation".into(),
+                    source_ids: vec![],
+                    provenance: vec!["agent-observed".into()],
+                })
+                .unwrap();
+            let candidate = temp.path().join("candidate.db");
+            let summary = source.export_sync_state(&candidate).unwrap();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let worker_space = space.clone();
+            let worker_member = member.clone();
+            let worker_directory = directory.clone();
+            let worker = std::thread::spawn(move || {
+                let _lock = space_lock(&worker_directory).unwrap();
+                let (mut store, _) =
+                    Store::initialize("team", worker_directory.join("wiki.db")).unwrap();
+                store.bind_team_space(&worker_space, &epoch).unwrap();
+                let expected = store.identity().unwrap();
+                let commit = TeamCommit {
+                    recovery: None,
+                    epoch,
+                    expected_head: 0,
+                    actor: worker_member.clone(),
+                    principal: Value::Null,
+                    replica_id: "1".repeat(64),
+                    batch_id: "2".repeat(64),
+                    artifact_id: "3".repeat(64),
+                    payload_digest: summary.state_digest,
+                };
+                let result =
+                    store.publish_team_state_guarded(&candidate, &expected, &commit, || {
+                        ready_tx.send(()).unwrap();
+                        resume_rx
+                            .recv_timeout(std::time::Duration::from_secs(15))
+                            .unwrap();
+                        publication_guard(
+                            &worker_directory,
+                            &secret,
+                            &worker_space,
+                            &worker_member,
+                            &commit.epoch,
+                            &rules,
+                            &Value::Null,
+                        )
+                    });
+                assert_eq!(result.unwrap_err().code, expected_error);
+                assert_eq!(store.identity().unwrap(), expected);
+                assert_eq!(store.team_head().unwrap()["head"], 0);
+                assert!(
+                    store
+                        .team_receipt(&commit.replica_id, &commit.batch_id)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(store.page_show("guarded").is_err());
             });
-            assert_eq!(result.unwrap_err().code, "forbidden");
-            assert_eq!(store.identity().unwrap(), expected);
-            assert_eq!(store.team_head().unwrap()["head"], 0);
-            assert!(
-                store
-                    .team_receipt(&commit.replica_id, &commit.batch_id)
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(store.page_show("guarded").is_err());
-        });
-        ready_rx
-            .recv_timeout(std::time::Duration::from_secs(15))
-            .unwrap();
-        // Complete management and another space operation while the first space
-        // remains paused with its canonical transaction still uncommitted.
-        let other = control::manage(
-            &mut conn,
-            owner,
-            &json!({"action":"space.create","team_id":team,"name":"Independent"}),
-        )
-        .unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let _other_lock = space_lock(&data.join("spaces").join(other)).unwrap();
-        control::manage(&mut conn,owner,&json!({"action":"space.revoke","space_id":space,"user_id":member,"expected_revision":2})).unwrap();
-        resume_tx.send(()).unwrap();
-        worker.join().unwrap();
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .unwrap();
+            // Complete management and another space operation while the first space
+            // remains paused with its canonical transaction still uncommitted.
+            let other = control::manage(
+                &mut conn,
+                owner,
+                &json!({"action":"space.create","team_id":team,"name":"Independent"}),
+            )
+            .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let _other_lock = space_lock(&data.join("spaces").join(other)).unwrap();
+            control::manage(&mut conn,owner,&json!({"action":action,"team_id":team,"space_id":space,"user_id":member,"expected_revision":if action=="team.delete"{1}else{2}})).unwrap();
+            resume_tx.send(()).unwrap();
+            worker.join().unwrap();
+        }
     }
 
     #[test]
