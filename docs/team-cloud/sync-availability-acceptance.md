@@ -132,3 +132,7 @@ Pro通过28项相关单元/HTTP回归：21项共享发布、5项副本、1项对
 证据位于目标主机 `/home/zd/lwc-sync-qa-20261006/`：`review-acceptance.json`、`review-recovery.json`、`review-cleanup.json`、`review-source-manifest.json` 及上述首次观察记录。可运行驱动为 `tests/team_sync_review_acceptance.py`、`tests/team_sync_review_recovery.py`，复用已有隔离QA工具。
 
 这轮没有重新声称45000对象、十分钟或无限持续超负荷得到验证；新增对象CAS的完整内存清单仍为O(n)，全量快照和检查点成本仍在。业务容器读回仍是 `lwc-team:0.19.3`，启动时间为 `2026-10-06T07:34:42.694456555Z`。本节证明隔离候选与所列场景，不代表业务实例已经修复。
+
+## Public release follow-up (2026-10-07)
+
+The reviewed fixes are included in immutable `v0.19.4` (`99685aa37f55a4400f5a5aaa94e16ca363229e24`). Formal release workflow `37564068025` passed release acceptance, all six native targets and container/installer smoke. [The publication verification report](../releases/v0.19.4-acceptance.md) owns registry and artifact evidence. This publishes the implementation; it does not upgrade the business service on port 8788 or replace the isolated loopback 8790 candidate. The workload limits and historical failed observations above still apply.
