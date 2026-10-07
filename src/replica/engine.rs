@@ -252,6 +252,14 @@ pub(crate) fn sync_space(space: &str) -> Result<Value> {
             }
         }
         Err(error) => {
+            // Authorization can disappear after head, during any transfer or commit.
+            if error
+                .details
+                .as_ref()
+                .is_some_and(|d| matches!(d["http_status"].as_u64(), Some(401 | 403 | 410)))
+            {
+                Store::open("project", directory.join("wiki.db"))?.suspend_replica_policy()?;
+            }
             save_credentials(
                 &fault,
                 &json!({"code":error.code,"details":error.details,"observed_at":crate::team::lease::now()?,"local_memory_preserved":true}),
@@ -272,20 +280,7 @@ async fn tick(
             .get(format!("{endpoint}/head"))
             .bearer_auth(&credentials.access_token),
     )
-    .await;
-    let head = match head {
-        Ok(head) => head,
-        Err(error) => {
-            if error
-                .details
-                .as_ref()
-                .is_some_and(|d| matches!(d["http_status"].as_u64(), Some(401 | 403 | 410)))
-            {
-                Store::open("project", directory.join("wiki.db"))?.suspend_replica_policy()?;
-            }
-            return Err(error);
-        }
-    };
+    .await?;
     let mut store = Store::open("project", directory.join("wiki.db"))?;
     if let Err(error) = verify_head(record, &head) {
         if error.code != "server_epoch_changed" {

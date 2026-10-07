@@ -947,7 +947,7 @@ mod tests {
                 .unwrap()
                 .to_owned();
             let _other_lock = space_lock(&data.join("spaces").join(other)).unwrap();
-            control::manage(&mut conn,owner,&json!({"action":action,"team_id":team,"space_id":space,"user_id":member,"expected_revision":if action=="team.delete"{1}else{2}})).unwrap();
+            control::manage(&mut conn,owner,&json!({"action":action,"team_id":team,"space_id":space,"user_id":member,"expected_revision":if action=="team.delete"{3}else{2}})).unwrap();
             resume_tx.send(()).unwrap();
             worker.join().unwrap();
         }

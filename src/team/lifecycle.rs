@@ -80,6 +80,8 @@ pub(super) fn manage(
         }
     } else {
         tx.execute("UPDATE spaces SET archived=?2,deleted_at=CASE WHEN ?2 THEN unixepoch() ELSE NULL END,archive_team=NULL,revision=revision+1 WHERE id=?1",params![id,deleting])?;
+        // A team confirmation binds the current affected set, including child restores.
+        tx.execute("UPDATE teams SET revision=revision+1 WHERE id=(SELECT team_id FROM spaces WHERE id=?1)", [id])?;
     }
     control::audit(tx, actor, action, id)?;
     receipt["revision"] = json!(revision + 1);
@@ -153,7 +155,7 @@ mod tests {
                 .code,
             "revision_conflict"
         );
-        control::manage(&mut conn, owner, &req("team.delete", team, 1)).unwrap();
+        control::manage(&mut conn, owner, &req("team.delete", team, 4)).unwrap();
         assert_eq!(
             control::authorize(&conn, owner, &b, "editor")
                 .unwrap_err()
@@ -176,10 +178,10 @@ mod tests {
         );
         // Current revision retries do not create another deletion transition.
         assert_eq!(
-            control::manage(&mut conn, owner, &req("team.delete", team, 2)).unwrap()["unchanged"],
+            control::manage(&mut conn, owner, &req("team.delete", team, 5)).unwrap()["unchanged"],
             true
         );
-        control::manage(&mut conn, owner, &req("team.restore", team, 2)).unwrap();
+        control::manage(&mut conn, owner, &req("team.restore", team, 5)).unwrap();
         control::authorize(&conn, owner, &b, "editor").unwrap();
         assert_eq!(
             control::authorize(&conn, owner, &a, "viewer")

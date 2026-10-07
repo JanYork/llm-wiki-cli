@@ -17,6 +17,7 @@ def main():
     parser.add_argument("binary")
     parser.add_argument("--assets", required=True)
     parser.add_argument("--keep-for-browser", action="store_true")
+    parser.add_argument("--fault-injection", action="store_true", help="Requires the sync-fault-injection candidate build")
     args = parser.parse_args()
     root = pathlib.Path(tempfile.mkdtemp(prefix="lwc-lifecycle-"))
     root.chmod(0o700)
@@ -99,6 +100,16 @@ def main():
         manage({"action": "space.delete", "space_id": b, "expected_revision": 1})
         invitation = manage({"action": "invitation.create", "team_id": team, "email": "invitee@example.com"})
         team_revision = next(t["revision"] for t in call("/api/admin?view=teams")["rows"] if t["id"] == team)
+        # Every child-set change invalidates an earlier team confirmation.
+        unexpected = manage({"action": "space.create", "team_id": team, "name": "Created after preview"})["id"]
+        call("/api/manage", {"action": "team.delete", "team_id": team, "expected_revision": team_revision}, status=409)
+        preview = manage({"action": "team.delete.preview", "team_id": team})
+        child = manage({"action": "space.delete", "space_id": unexpected, "expected_revision": 1})
+        call("/api/manage", {"action": "team.delete", "team_id": team, "expected_revision": preview["revision"]}, status=409)
+        preview = manage({"action": "team.delete.preview", "team_id": team})
+        manage({"action": "space.restore", "space_id": unexpected, "expected_revision": child["revision"]})
+        call("/api/manage", {"action": "team.delete", "team_id": team, "expected_revision": preview["revision"]}, status=409)
+        team_revision = manage({"action": "team.delete.preview", "team_id": team})["revision"]
         deleted = manage({"action": "team.delete", "team_id": team, "expected_revision": team_revision})
         assert call("/api/me")["spaces"] == []
         call(f"/api/spaces/{other_space}/head", credential=reader_token)
@@ -115,9 +126,47 @@ def main():
         cli("--space", a, "page", "put", "after-restore", "--title", "Restored", "--file", "-", "--provenance", "agent-observed", stdin="New writes work after restore")
         cli("space", "sync", a)
         assert call(f"/api/spaces/{a}/query", {"action": "get", "slug": "after-restore"})["data"]["page"]["body"] == "New writes work after restore"
+        # Control-plane permissions remain manageable while data access stays denied.
+        employee = call("/api/me", credential=reader_token)["user_id"]
+        managed = manage({"action": "space.create", "team_id": team, "name": "Archived manager"})["id"]
+        manage({"action": "space.grant", "space_id": managed, "user_id": employee, "role": "manager", "expected_revision": 1})
+        manage({"action": "space.revoke", "space_id": managed, "user_id": initial["user_id"], "expected_revision": 2})
+        call("/api/manage", {"action": "space.delete", "space_id": managed, "expected_revision": 3}, credential=reader_token)
+        call("/api/manage", {"action": "space.grant", "space_id": managed, "user_id": initial["user_id"], "role": "manager", "expected_revision": 4}, status=403)
+        call("/api/manage", {"action": "space.grant", "space_id": managed, "user_id": initial["user_id"], "role": "manager", "expected_revision": 4}, credential=reader_token)
+        call(f"/api/spaces/{managed}/head", status=410)
+        revision_now = manage({"action": "team.delete.preview", "team_id": team})["revision"]
+        manage({"action": "member.remove", "team_id": team, "user_id": employee, "expected_revision": revision_now})
+        restored_revision = manage({"action": "space.delete.preview", "space_id": managed})["revision"]
+        manage({"action": "space.restore", "space_id": managed, "expected_revision": restored_revision})
+        call(f"/api/spaces/{managed}/head", status=403, credential=reader_token)
+        if args.fault_injection:
+            # Pause after a successful head/policy read, before the next remote request.
+            cli("--space", a, "page", "put", "late-deletion", "--title", "Late deletion", "--file", "-", "--provenance", "agent-observed", stdin="Preserve this pending change")
+            barrier = root / "barrier"; barrier.mkdir(mode=0o700)
+            (barrier / "before-upload.arm").write_text("pause")
+            child = subprocess.Popen([binary, "space", "sync", a], cwd=root, env=dict(env, LWC_SYNC_TEST_DIR=str(barrier)), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                for _ in range(200):
+                    if (barrier / "before-upload.hit").exists(): break
+                    assert child.poll() is None, "sync ended before the test barrier"
+                    time.sleep(0.05)
+                assert (barrier / "before-upload.hit").exists(), "test barrier not reached"
+                revision_now = manage({"action": "space.delete.preview", "space_id": a})["revision"]
+                removed = manage({"action": "space.delete", "space_id": a, "expected_revision": revision_now})
+                (barrier / "before-upload.resume").touch()
+                stdout, stderr = child.communicate(timeout=30)
+                assert child.returncode != 0 and "space_deleted" in stderr
+                cli("--space", a, "page", "put", "late-blocked", "--title", "Blocked", "--file", "-", "--provenance", "agent-observed", stdin="Must reject immediately", success=False)
+                assert cli("--space", a, "page", "show", "late-deletion")["page"]["body"] == "Preserve this pending change"
+                manage({"action": "space.restore", "space_id": a, "expected_revision": removed["revision"]})
+                cli("space", "sync", a)
+                assert call(f"/api/spaces/{a}/query", {"action": "get", "slug": "late-deletion"})["data"]["page"]["body"] == "Preserve this pending change"
+            finally:
+                if child.poll() is None: child.kill(); child.wait()
         cli("logout", "--server", origin)
         passed = True
-        print(json.dumps({"passed": True, "cases": ["reader denied", "CAS and idempotence", "read/push reject deleted resource", "local memory retained and writes blocked", "restore and sync preserve head/body", "team cascade and independent deletion", "trash authorization", "old invitation remains invalid", "catalog preserved", "unsent content retained", "new writes after restore", "CLI and Hook deletion signal", "cross-team isolation"], "origin": origin, "private_fixture": str(root), "server_pid": process.pid}))
+        print(json.dumps({"passed": True, "cases": ["reader denied", "CAS and idempotence", "read/push reject deleted resource", "local memory retained and writes blocked", "restore and sync preserve head/body", "team cascade and independent deletion", "trash authorization", "old invitation remains invalid", "catalog preserved", "unsent content retained", "new writes after restore", "CLI and Hook deletion signal", "cross-team isolation", "preview child-set CAS", "archived permission handover"], "late_deletion_checked": args.fault_injection, "origin": origin, "private_fixture": str(root), "server_pid": process.pid}))
     finally:
         if not args.keep_for_browser or not passed:
             process.terminate(); process.wait(timeout=15)

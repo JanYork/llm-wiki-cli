@@ -251,6 +251,16 @@ fn active(conn: &Connection, user: &str) -> Result<()> {
 }
 
 pub(super) fn authorize(conn: &Connection, user: &str, space: &str, required: &str) -> Result<()> {
+    authorize_role(conn, user, space, required, false)
+}
+
+fn authorize_role(
+    conn: &Connection,
+    user: &str,
+    space: &str,
+    required: &str,
+    allow_archived: bool,
+) -> Result<()> {
     active(conn, user)?;
     let rank = match required {
         "viewer" => 1,
@@ -259,7 +269,7 @@ pub(super) fn authorize(conn: &Connection, user: &str, space: &str, required: &s
         _ => return Err(AppError::new("invalid_role", "unknown space role")),
     };
     let deleted: Option<(bool,bool)> = conn.query_row("SELECT s.archived,COALESCE(t.archived,0) FROM spaces s LEFT JOIN teams t ON t.id=s.team_id JOIN space_grants g ON g.space_id=s.id WHERE s.id=?1 AND g.user_id=?2 AND (s.user_owner=?2 OR EXISTS(SELECT 1 FROM memberships m WHERE m.team_id=s.team_id AND m.user_id=?2))",params![space,user],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-    if let Some((space_deleted, team_deleted)) = deleted {
+    if !allow_archived && let Some((space_deleted, team_deleted)) = deleted {
         if team_deleted {
             return Err(AppError::new(
                 "team_deleted",
@@ -275,10 +285,10 @@ pub(super) fn authorize(conn: &Connection, user: &str, space: &str, required: &s
     }
     let permitted=conn.query_row("SELECT EXISTS(
         SELECT 1 FROM spaces s JOIN space_grants g ON g.space_id=s.id
-        WHERE s.id=?1 AND g.user_id=?2 AND s.archived=0
+        WHERE s.id=?1 AND g.user_id=?2 AND (s.archived=0 OR ?4)
         AND (s.user_owner=?2 OR EXISTS(SELECT 1 FROM memberships m WHERE m.team_id=s.team_id AND m.user_id=?2))
         AND CASE g.role WHEN 'viewer' THEN 1 WHEN 'editor' THEN 2 WHEN 'manager' THEN 3 ELSE 0 END >= ?3
-    )",params![space,user,rank],|r|r.get::<_,bool>(0))?;
+    )",params![space,user,rank,allow_archived],|r|r.get::<_,bool>(0))?;
     if !permitted {
         return Err(AppError::new("forbidden", "space access is not granted"));
     }
@@ -533,7 +543,7 @@ pub(super) fn manage(conn: &mut Connection, actor: &str, input: &Value) -> Resul
         "member.remove" => {
             let team = text("team_id")?;
             let user = text("user_id")?;
-            team_owner(&tx, actor, team)?;
+            super::lifecycle::owner(&tx, actor, team)?;
             let revision = input["expected_revision"].as_i64().ok_or_else(|| {
                 AppError::new("revision_required", "expected_revision is required")
             })?;
@@ -610,6 +620,9 @@ pub(super) fn manage(conn: &mut Connection, actor: &str, input: &Value) -> Resul
                 "INSERT INTO space_grants(space_id,user_id,role) VALUES(?1,?2,'manager')",
                 params![id, actor],
             )?;
+            if let Some(team) = team {
+                tx.execute("UPDATE teams SET revision=revision+1 WHERE id=?1", [team])?;
+            }
             audit(&tx, actor, action, &id)?;
             json!({"id":id,"revision":1})
         }
@@ -682,7 +695,7 @@ pub(super) fn manage(conn: &mut Connection, actor: &str, input: &Value) -> Resul
         "space.grant" | "space.revoke" => {
             let space = text("space_id")?;
             let user = text("user_id")?;
-            authorize(&tx, actor, space, "manager")?;
+            authorize_role(&tx, actor, space, "manager", true)?;
             let revision = input["expected_revision"].as_i64().ok_or_else(|| {
                 AppError::new("revision_required", "expected_revision is required")
             })?;

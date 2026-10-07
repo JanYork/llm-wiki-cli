@@ -154,3 +154,5 @@ Object.assign(english, {
 });
 
 Object.assign(english, {'恢复团队':'Restore team', '恢复空间':'Restore space'});
+
+Object.assign(english, {'重新查看':'Reload preview'});
